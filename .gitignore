@@ -1,0 +1,17 @@
+build/
+build-*/
+*.o
+*.obj
+*.a
+*.exe
+*.out
+.cache/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+third_party/deps/
+*.pem
+*.key
+.gh_token
