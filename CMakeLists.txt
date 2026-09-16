@@ -17,6 +17,8 @@ option(ABR_WITH_OPENSSL
        "Enable OpenSSL for AVB RSA re-signing (--avb-key). Hashing (boot id, AVB digest) always uses the bundled dependency-free SHA-1/256/512 and does not need this." ON)
 option(ABR_VENDOR_DEPS
        "Fetch and statically build zlib/lz4/zstd/xz/bzip2 from source (the shipping default). Turn OFF to use system dev packages instead, for fast local iteration." ON)
+option(ABR_STATIC_BINARY
+       "Link the abr executable statically (-static on Linux; -static-libgcc/-static-libstdc++ on Windows/Android, since bionic has no static libc to link against in the first place)." OFF)
 
 include(FetchContent)
 
@@ -69,6 +71,9 @@ target_link_libraries(abr_core PUBLIC
 )
 
 if(ABR_WITH_OPENSSL)
+  if(ABR_STATIC_BINARY)
+    set(OPENSSL_USE_STATIC_LIBS TRUE)
+  endif()
   find_package(OpenSSL QUIET)
   if(OpenSSL_FOUND)
     target_compile_definitions(abr_core PUBLIC ABR_WITH_OPENSSL=1)

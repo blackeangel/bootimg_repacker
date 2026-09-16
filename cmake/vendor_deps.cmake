@@ -20,7 +20,10 @@ FetchContent_Declare(zlib_vendor
   GIT_TAG        v${ABR_ZLIB_VERSION}
   GIT_SHALLOW    TRUE
 )
-set(ZLIB_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(ZLIB_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+set(ZLIB_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+set(ZLIB_BUILD_STATIC ON CACHE BOOL "" FORCE)
+set(ZLIB_INSTALL OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(zlib_vendor)
 # Older zlib CMakeLists use directory-scoped include_directories() rather
 # than target_include_directories(), which doesn't reliably propagate to
@@ -75,6 +78,7 @@ FetchContent_Declare(xz_vendor
   GIT_SHALLOW    TRUE
 )
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
 set(ENABLE_NLS OFF CACHE BOOL "" FORCE)
 set(XZ_TOOL_XZ OFF CACHE BOOL "" FORCE)
 set(XZ_TOOL_XZDEC OFF CACHE BOOL "" FORCE)

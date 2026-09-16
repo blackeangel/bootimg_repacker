@@ -240,27 +240,22 @@ void BootImage::recompute_id() {
         id.fill(0);
         return;
     }
-    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
-    if (!ctx) throw FormatError("EVP_MD_CTX_new failed");
-    EVP_DigestInit_ex(ctx, EVP_sha1(), nullptr);
+    hash::Sha1 sha1;
     auto feed = [&](const Bytes& data) {
-        if (!data.empty()) EVP_DigestUpdate(ctx, data.data(), data.size());
+        if (!data.empty()) sha1.update(data.data(), data.size());
         uint32_t sz = static_cast<uint32_t>(data.size());
         uint8_t le[4] = {static_cast<uint8_t>(sz), static_cast<uint8_t>(sz >> 8),
                           static_cast<uint8_t>(sz >> 16), static_cast<uint8_t>(sz >> 24)};
-        EVP_DigestUpdate(ctx, le, 4);
+        sha1.update(le, 4);
     };
     feed(kernel);
     feed(ramdisk);
     feed(second);
     if (header_version >= 1) feed(recovery_dtbo);
     if (header_version >= 2) feed(dtb);
-    unsigned char digest[EVP_MAX_MD_SIZE];
-    unsigned int len = 0;
-    EVP_DigestFinal_ex(ctx, digest, &len);
-    EVP_MD_CTX_free(ctx);
+    Bytes digest = sha1.finish();
     id.fill(0);
-    std::memcpy(id.data(), digest, std::min<size_t>(len, sizeof(id)));
+    std::memcpy(id.data(), digest.data(), std::min(digest.size(), sizeof(id)));
 }
 
 }  // namespace abr
