@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "abr/vbmeta.hpp"
 
+#include "abr/sha.hpp"
+
+#ifdef ABR_WITH_OPENSSL
 #include <openssl/bio.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
+#endif
 
 #include <cstring>
 #include <sstream>
@@ -37,15 +41,10 @@ AlgoParams algo_params(uint32_t algorithm_type) {
 }
 
 Bytes digest(const Bytes& data, bool sha512) {
-    Bytes out(sha512 ? 64 : 32);
-    unsigned int len = 0;
-    if (EVP_Digest(data.data(), data.size(), out.data(), &len,
-                    sha512 ? EVP_sha512() : EVP_sha256(), nullptr) != 1)
-        throw FormatError("EVP_Digest failed");
-    out.resize(len);
-    return out;
+    return sha512 ? hash::sha512(data) : hash::sha256(data);
 }
 
+#ifdef ABR_WITH_OPENSSL
 Bytes rsa_sign_pkcs1(const std::string& pem, const Bytes& msg_digest, bool sha512) {
     BIO* bio = BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()));
     if (!bio) throw FormatError("BIO_new_mem_buf failed");
@@ -73,6 +72,14 @@ Bytes rsa_sign_pkcs1(const std::string& pem, const Bytes& msg_digest, bool sha51
     if (!ok) throw FormatError("RSA signing failed (check that the key size matches algorithm_type)");
     return sig;
 }
+#else
+Bytes rsa_sign_pkcs1(const std::string&, const Bytes&, bool) {
+    throw FormatError(
+        "this build was compiled without OpenSSL, so it cannot re-sign an AVB vbmeta "
+        "(pass no key to keep an unchanged passthrough signature, or rebuild with "
+        "ABR_WITH_OPENSSL and OpenSSL available)");
+}
+#endif
 
 Bytes build_avb_footer(uint64_t original_image_size, uint64_t vbmeta_offset,
                         uint64_t vbmeta_size) {

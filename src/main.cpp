@@ -20,6 +20,7 @@
 #include "abr/dtb.hpp"
 #include "abr/dtbo.hpp"
 #include "abr/manifest.hpp"
+#include "abr/sha.hpp"
 #include "abr/uimage.hpp"
 #include "abr/vbmeta.hpp"
 #include "abr/vendor_boot.hpp"
@@ -574,6 +575,11 @@ void usage() {
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (!hash::sha_selftest()) {
+        std::cerr << "internal error: bundled SHA implementation failed its self-test; "
+                     "refusing to run since boot ids and AVB hashes would be silently wrong\n";
+        return 2;
+    }
     try {
         if (argc < 2) {
             usage();
