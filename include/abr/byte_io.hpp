@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: GPL-3.0-or-later
 //
 // abr::byte_io -- small binary I/O helpers used by every image parser in
 // this project.

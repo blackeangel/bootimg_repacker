@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: GPL-3.0-or-later
 //
 // abr::BootImage -- parser/builder for the "boot image" container used by
 // boot.img, init_boot.img, boot-debug.img, boot-test-harness.img,

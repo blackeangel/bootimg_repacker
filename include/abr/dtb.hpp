@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: GPL-3.0-or-later
 //
 // abr::dtb -- helpers for the raw "dtb" partition. Some devices ship a
 // single Flattened Device Tree blob there; others concatenate several

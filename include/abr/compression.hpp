@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: GPL-3.0-or-later
 //
 // abr::compression -- codec detection + (de)compression for the blobs
 // embedded in Android boot-family images (kernel, ramdisk, vendor

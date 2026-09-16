@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: GPL-3.0-or-later
 //
 // abr::VendorBootImage -- parser/builder for the vendor_boot container
 // (header v3/v4). Per AOSP's own layout notes ("For partitions: /vendor_boot

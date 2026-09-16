@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: GPL-3.0-or-later
 //
 // abr::UImage -- parser/builder for the U-Boot "legacy" image format
 // (mkimage's classic 64-byte header, magic 0x27051956). This is the

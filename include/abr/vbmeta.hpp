@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: GPL-3.0-or-later
 //
 // abr::VbmetaImage -- parser/builder for AVB vbmeta blobs (vbmeta.img,
 // vbmeta_system.img), and for the AVB hash footer some other partitions

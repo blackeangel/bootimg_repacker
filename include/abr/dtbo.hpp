@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: GPL-3.0-or-later
 //
 // abr::DtboImage -- parser/builder for dtbo.img (Device Tree Blob Overlay
 // table). Field layout and big-endian byte order verified against AOSP
