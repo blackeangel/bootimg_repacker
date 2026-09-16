@@ -75,6 +75,14 @@ Fmt fmt_from_name(const std::string& s) {
 
 // Auto-detects/decompresses on the way out to a component file, and
 // records the codec so repack can recompress the same way by default.
+// Also stashes the exact original (still-compressed) bytes plus a hash
+// of the decompressed content: if the extracted file comes back
+// unmodified at repack time, we replay those original bytes verbatim
+// instead of recompressing, so an untouched component round-trips
+// byte-for-byte rather than merely content-equivalent (recompressing
+// e.g. gzip data essentially never reproduces the exact original bytes,
+// since gzip/zstd/etc. headers and encoder choices vary by tool/version
+// even for identical decompressed content).
 void save_component(Manifest& m, const fs::path& dir, const std::string& prefix, const Bytes& raw,
                      const std::string& filename) {
     if (raw.empty()) return;
@@ -83,12 +91,22 @@ void save_component(Manifest& m, const fs::path& dir, const std::string& prefix,
     m.set(prefix + "_file", filename);
     m.set(prefix + "_compression", std::string(codec_name(c)));
     write_file(dir / filename, plain);
+    m.set_hex(prefix + "_orig_hash", hash::sha256(plain));
+    fs::path raw_dir = dir / ".abr_raw";
+    fs::create_directories(raw_dir);
+    write_file(raw_dir / (filename + ".raw"), raw);
 }
 
 Bytes load_component(const Manifest& m, const fs::path& dir, const std::string& prefix) {
     std::string key = prefix + "_file";
     if (!m.has(key)) return {};
-    Bytes plain = read_file(dir / m.get(key));
+    std::string filename = m.get(key);
+    Bytes plain = read_file(dir / filename);
+    Bytes stored_hash = m.get_hex(prefix + "_orig_hash");
+    if (!stored_hash.empty()) {
+        fs::path raw_path = dir / ".abr_raw" / (filename + ".raw");
+        if (hash::sha256(plain) == stored_hash && fs::exists(raw_path)) return read_file(raw_path);
+    }
     auto c = codec_from_name(m.get(prefix + "_compression", "none"));
     return compress(c.value_or(Codec::NONE), plain);
 }
@@ -161,10 +179,6 @@ Bytes repack_boot(const Manifest& m, const fs::path& dir) {
         img.second_addr = static_cast<uint32_t>(m.get_addr("second_addr", 0x00f00000));
         img.tags_addr = static_cast<uint32_t>(m.get_addr("tags_addr", 0x00000100));
         img.board_name = m.get("board_name");
-        Bytes idb = m.get_hex("id");
-        for (size_t i = 0; i < img.id.size() && i * 4 + 3 < idb.size(); ++i)
-            img.id[i] = uint32_t(idb[i * 4]) | (uint32_t(idb[i * 4 + 1]) << 8) |
-                        (uint32_t(idb[i * 4 + 2]) << 16) | (uint32_t(idb[i * 4 + 3]) << 24);
         if (img.header_version >= 2) img.dtb_addr = static_cast<uint32_t>(m.get_addr("dtb_addr", 0));
     }
     auto ov = OsVersion::parse(m.get("os_version"), m.get("os_patch_level"));
@@ -177,6 +191,7 @@ Bytes repack_boot(const Manifest& m, const fs::path& dir) {
     img.recovery_dtbo = load_raw(m, dir, "recovery_dtbo");
     img.dtb = load_raw(m, dir, "dtb");
     img.boot_signature = load_raw(m, dir, "boot_signature");
+    img.recompute_id();  // content hash -- recompute fresh rather than trust a possibly-stale manifest value
 
     return img.build();
 }
