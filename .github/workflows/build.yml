@@ -1,0 +1,116 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch: {}
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools + test-suite oracles
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cmake ninja-build python3 device-tree-compiler \
+            u-boot-tools openssl lz4 zstd
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DABR_STATIC_BINARY=ON
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Test (byte-identical round trips against real reference tools)
+        run: ./tests/run_tests.sh build/abr
+
+      - name: Verify static linking
+        run: |
+          file build/abr
+          ldd build/abr 2>&1 | grep -q "not a dynamic executable" \
+            && echo "OK: fully static" \
+            || { echo "expected a fully static binary"; exit 1; }
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp build/abr dist/abr-linux-x86_64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: abr-linux-x86_64
+          path: dist/abr-linux-x86_64
+
+  windows-x86_64:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install mingw-w64 cross toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cmake ninja-build mingw-w64
+
+      - name: Configure
+        run: >
+          cmake -S . -B build-windows -G Ninja
+          -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/mingw-w64.cmake
+          -DCMAKE_BUILD_TYPE=Release
+          -DABR_STATIC_BINARY=ON
+
+      - name: Build
+        run: cmake --build build-windows -j
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp build-windows/abr.exe dist/abr-windows-x86_64.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: abr-windows-x86_64
+          path: dist/abr-windows-x86_64.exe
+
+  android-arm64:
+    runs-on: ubuntu-24.04
+    env:
+      NDK_VERSION: r27d
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cmake/ninja
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cmake ninja-build
+
+      - name: Download Android NDK
+        run: |
+          curl -fL -o ndk.zip "https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip"
+          unzip -q ndk.zip
+          echo "ANDROID_NDK_HOME=$PWD/android-ndk-${NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Configure
+        run: >
+          cmake -S . -B build-android -G Ninja
+          -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/android-arm64.cmake
+          -DCMAKE_BUILD_TYPE=Release
+          -DABR_STATIC_BINARY=ON
+
+      - name: Build
+        run: cmake --build build-android -j
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp build-android/abr dist/abr-android-arm64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: abr-android-arm64
+          path: dist/abr-android-arm64
