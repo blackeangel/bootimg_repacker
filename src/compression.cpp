@@ -8,6 +8,8 @@
 #include <zlib.h>
 #include <zstd.h>
 
+#include "minilzo.h"
+
 #include <algorithm>
 #include <cstring>
 
@@ -26,6 +28,7 @@ constexpr uint8_t kLz4FrameMagic[] = {0x04, 0x22, 0x4d, 0x18};   // LE(0x184D220
 constexpr uint8_t kZstdMagic[] = {0x28, 0xb5, 0x2f, 0xfd};       // LE(0xFD2FB528)
 constexpr uint8_t kXzMagic[] = {0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00};
 constexpr uint8_t kBzip2Magic[] = {0x42, 0x5a, 0x68};  // "BZh"
+constexpr uint8_t kLzopMagic[] = {0x89, 0x4c, 0x5a, 0x4f, 0x00, 0x0d, 0x0a, 0x1a, 0x0a};
 
 bool starts_with(const Bytes& d, const uint8_t* magic, size_t len) {
     return d.size() >= len && std::memcmp(d.data(), magic, len) == 0;
@@ -320,6 +323,96 @@ Bytes bzip2_decompress(const Bytes& in) {
     }
 }
 
+// -------------------------------------------------------- lzo (lzop) --
+
+// Raw LZO1X has no magic/header of its own -- it's just a compressed
+// byte stream, with nothing to auto-detect or to tell a decompressor
+// how big the blocks are. The Linux kernel's own lib/decompress_unlzo.c
+// (what actually decompresses an LZO-compressed kernel/ramdisk/initramfs
+// on a real device) expects the "lzop" file format's header and framing
+// specifically, so that's what's implemented here: not full lzop-tool
+// compatibility, just what that kernel decompressor actually parses.
+// Ported from lib/decompress_unlzo.c's parse_header()/unlzo() (see
+// third_party/minilzo/README.md); this project's encoder always emits
+// the minimal form (no filter, no filename, header version < 0x0940),
+// while the decoder tolerates the newer/optional fields a real lzop
+// file could still have, matching the kernel's own leniency.
+constexpr size_t kLzoBlockSize = 256 * 1024;  // kernel's LZO_BLOCK_SIZE; also its declared max
+
+Bytes lzo_compress(const Bytes& in) {
+    lzo_init();
+    BinaryWriter w;
+    w.bytes(kLzopMagic, sizeof(kLzopMagic));
+    w.be16(0x0100);       // version (kept below 0x0940 so no extra 'level' byte is needed)
+    w.be16(0x0100);       // library version
+    w.be16(0x0100);       // version needed to extract
+    w.u8(1);              // method: M_LZO1X_1
+    w.be32(0x00000002);   // flags: F_ADLER32_C (one checksum, of the compressed block)
+    w.be32(0);            // mode
+    w.be32(0);            // mtime_low
+    w.u8(0);              // filename_length (no filename)
+    uint32_t hchk = static_cast<uint32_t>(
+        adler32(0, w.data().data() + sizeof(kLzopMagic), w.size() - sizeof(kLzopMagic)));
+    w.be32(hchk);          // header checksum
+
+    Bytes wrkmem(LZO1X_1_MEM_COMPRESS);
+    Bytes cbuf(in.size() + in.size() / 16 + 64 + 3);
+    size_t pos = 0;
+    while (pos < in.size()) {
+        size_t chunk = std::min(kLzoBlockSize, in.size() - pos);
+        lzo_uint out_len = 0;
+        int rc = lzo1x_1_compress(in.data() + pos, chunk, cbuf.data(), &out_len, wrkmem.data());
+        if (rc != LZO_E_OK) fail("lzo1x_1_compress failed: rc=" + std::to_string(rc));
+        w.be32(static_cast<uint32_t>(chunk));    // dst_len: uncompressed size of this block
+        w.be32(static_cast<uint32_t>(out_len));  // src_len: compressed size of this block
+        w.be32(static_cast<uint32_t>(adler32(0, cbuf.data(), static_cast<uInt>(out_len))));
+        w.bytes(cbuf.data(), out_len);
+        pos += chunk;
+    }
+    w.be32(0);  // dst_len == 0 marks end of stream
+    return w.take();
+}
+
+Bytes lzo_decompress(const Bytes& in) {
+    lzo_init();
+    BinaryReader r(in);
+    if (!r.starts_with(reinterpret_cast<const char*>(kLzopMagic), sizeof(kLzopMagic)))
+        fail("not an lzop/LZO stream (bad magic)");
+    r.skip(sizeof(kLzopMagic));
+    uint16_t version = r.be16();
+    r.skip(5);  // library_version(2) + version_needed(2) + method(1)
+    if (version >= 0x0940) r.skip(1);  // level
+    uint32_t flags = r.be32();
+    if (flags & 0x00000800u) r.skip(4);  // filter info, only present with HEADER_HAS_FILTER
+    r.skip(4);                           // mode
+    r.skip(4);                           // mtime_low
+    if (version >= 0x0940) r.skip(4);    // mtime_high
+    uint8_t fname_len = r.u8();
+    r.skip(fname_len);
+    r.skip(4);  // header checksum -- not validated, matching decompress_unlzo.c
+
+    Bytes out;
+    Bytes scratch(kLzoBlockSize);
+    for (;;) {
+        uint32_t dst_len = r.be32();
+        if (dst_len == 0) break;  // end-of-stream marker
+        if (dst_len > kLzoBlockSize) fail("lzo block's uncompressed size exceeds the max block size");
+        uint32_t src_len = r.be32();
+        r.skip(4);  // block checksum -- not validated, matching decompress_unlzo.c
+        Bytes block = r.bytes(src_len);
+        if (src_len == dst_len) {
+            out.insert(out.end(), block.begin(), block.end());  // stored uncompressed
+            continue;
+        }
+        lzo_uint out_len = dst_len;
+        int rc = lzo1x_decompress_safe(block.data(), src_len, scratch.data(), &out_len, nullptr);
+        if (rc != LZO_E_OK || out_len != dst_len)
+            fail("lzo1x_decompress_safe failed: rc=" + std::to_string(rc));
+        out.insert(out.end(), scratch.data(), scratch.data() + out_len);
+    }
+    return out;
+}
+
 }  // namespace
 
 std::string_view codec_name(Codec c) {
@@ -332,6 +425,7 @@ std::string_view codec_name(Codec c) {
         case Codec::XZ: return "xz";
         case Codec::LZMA: return "lzma";
         case Codec::BZIP2: return "bzip2";
+        case Codec::LZO: return "lzo";
     }
     return "none";
 }
@@ -345,6 +439,7 @@ std::optional<Codec> codec_from_name(std::string_view name) {
     if (name == "xz") return Codec::XZ;
     if (name == "lzma") return Codec::LZMA;
     if (name == "bzip2") return Codec::BZIP2;
+    if (name == "lzo") return Codec::LZO;
     return std::nullopt;
 }
 
@@ -355,6 +450,7 @@ Codec detect_codec(const Bytes& d) {
     if (starts_with(d, kZstdMagic, sizeof(kZstdMagic))) return Codec::ZSTD;
     if (starts_with(d, kXzMagic, sizeof(kXzMagic))) return Codec::XZ;
     if (starts_with(d, kBzip2Magic, sizeof(kBzip2Magic))) return Codec::BZIP2;
+    if (starts_with(d, kLzopMagic, sizeof(kLzopMagic))) return Codec::LZO;
     if (looks_like_lzma_alone(d)) return Codec::LZMA;
     return Codec::NONE;
 }
@@ -369,6 +465,7 @@ Bytes decompress(Codec codec, const Bytes& data) {
         case Codec::XZ: return xz_decompress(data);
         case Codec::LZMA: return lzma_stream_run(data, /*encode=*/false);
         case Codec::BZIP2: return bzip2_decompress(data);
+        case Codec::LZO: return lzo_decompress(data);
     }
     fail("unknown codec");
 }
@@ -383,6 +480,7 @@ Bytes compress(Codec codec, const Bytes& data, int level) {
         case Codec::XZ: return xz_compress(data, level);
         case Codec::LZMA: return lzma_stream_run(data, /*encode=*/true);
         case Codec::BZIP2: return bzip2_compress(data, level);
+        case Codec::LZO: return lzo_compress(data);
     }
     fail("unknown codec");
 }

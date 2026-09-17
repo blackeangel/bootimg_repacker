@@ -150,6 +150,102 @@ cp a.dtb dtbo_manifest/entry0.dtb
 "$ABR" repack dtbo_manifest -o dtbo_built.img >/dev/null
 roundtrip_check dtbo_built.img "dtbo (v1, zlib-compressed entry)" dtbo1
 
+# ------------------------------------------------------------------ lzo --
+# Raw LZO1X has no magic, so it can only be exercised through a
+# container that names its compression explicitly (a boot.img ramdisk
+# here) rather than via detect_codec() on a bare blob.
+python3 -c "open('lzo_payload.bin','wb').write((b'the quick brown fox jumps over the lazy dog ' * 5000)[:200000])"
+mkdir -p lzo_manifest
+cat >lzo_manifest/manifest.txt <<'EOF'
+type=boot
+header_version=4
+os_version=14.0.0
+os_patch_level=2024-05
+cmdline=test
+kernel_file=kernel
+kernel_compression=none
+ramdisk_file=ramdisk.cpio
+ramdisk_compression=lzo
+EOF
+cp lzo_payload.bin lzo_manifest/kernel
+cp lzo_payload.bin lzo_manifest/ramdisk.cpio
+"$ABR" repack lzo_manifest -o lzo_boot.img >/dev/null
+roundtrip_check lzo_boot.img "boot v4 (lzo ramdisk)" lzoboot
+
+if python3 -c "import lzo" 2>/dev/null; then
+    # abr's encoder -> independently decompressed by real liblzo2 (not minilzo)
+    python3 - <<'PYEOF'
+import struct, lzo, sys
+raw = open("rt_lzoboot/.abr_raw/ramdisk.cpio.raw", "rb").read()
+assert raw[:9] == b"\x89\x4c\x5a\x4f\x00\x0d\x0a\x1a\x0a"
+pos = 9
+version = struct.unpack(">H", raw[pos:pos+2])[0]; pos += 7
+if version >= 0x0940: pos += 1
+flags = struct.unpack(">I", raw[pos:pos+4])[0]; pos += 4
+if flags & 0x800: pos += 4
+pos += 8
+if version >= 0x0940: pos += 4
+fname_len = raw[pos]; pos += 1 + fname_len + 4
+out = b""
+while True:
+    dst_len = struct.unpack(">I", raw[pos:pos+4])[0]; pos += 4
+    if dst_len == 0:
+        break
+    src_len = struct.unpack(">I", raw[pos:pos+4])[0]; pos += 8
+    block = raw[pos:pos+src_len]; pos += src_len
+    out += block if src_len == dst_len else lzo.decompress(block, False, dst_len)
+sys.exit(0 if out == open("lzo_payload.bin", "rb").read() else 1)
+PYEOF
+    if [ $? -eq 0 ]; then
+        echo "PASS: lzo -- abr's encoder output independently decompressed by real liblzo2"
+        PASS=$((PASS + 1))
+    else
+        echo "FAIL: lzo -- abr's encoder output rejected by real liblzo2"
+        FAIL=$((FAIL + 1))
+    fi
+
+    # real liblzo2 (not minilzo) -> abr's decoder, via a hand-built boot.img
+    # so abr's own recompress-on-repack convenience doesn't mask the check
+    python3 - <<'PYEOF'
+import struct, lzo, zlib
+payload = open("lzo_payload.bin", "rb").read()
+block = lzo.compress(payload, 1, False)
+h = bytearray()
+h += b"\x89\x4c\x5a\x4f\x00\x0d\x0a\x1a\x0a"
+h += struct.pack(">H", 0x0100) * 3
+h += bytes([1])
+h += struct.pack(">I", 2)
+h += struct.pack(">I", 0) * 2
+h += bytes([0])
+h += struct.pack(">I", zlib.adler32(bytes(h[9:])) & 0xffffffff)
+h += struct.pack(">I", len(payload))
+h += struct.pack(">I", len(block))
+h += struct.pack(">I", zlib.adler32(block) & 0xffffffff)
+h += block
+h += struct.pack(">I", 0)
+ramdisk = bytes(h)
+kernel = b"x"
+img = bytearray(b"ANDROID!")
+img += struct.pack("<I", len(kernel)) + struct.pack("<I", len(ramdisk))
+img += struct.pack("<I", 0) + struct.pack("<I", 1584) + b"\x00" * 16
+img += struct.pack("<I", 4) + b"test".ljust(1536, b"\x00") + struct.pack("<I", 0)
+img += b"\x00" * (4096 - len(img))
+img += kernel + b"\x00" * ((-len(kernel)) % 4096)
+img += ramdisk + b"\x00" * ((-len(ramdisk)) % 4096)
+open("liblzo2_cross.img", "wb").write(bytes(img))
+PYEOF
+    "$ABR" unpack liblzo2_cross.img -o liblzo2_cross_unpacked >/dev/null
+    if cmp -s lzo_payload.bin liblzo2_cross_unpacked/ramdisk.cpio; then
+        echo "PASS: lzo -- abr's decoder correctly reads a real-liblzo2-produced stream"
+        PASS=$((PASS + 1))
+    else
+        echo "FAIL: lzo -- abr's decoder misreads a real-liblzo2-produced stream"
+        FAIL=$((FAIL + 1))
+    fi
+else
+    echo "SKIP: lzo cross-validation against real liblzo2 (python-lzo not installed)"
+fi
+
 # --------------------------------------------------------------- vbmeta --
 mkdir -p vbmeta_unsigned
 cat >vbmeta_unsigned/manifest.txt <<'EOF'

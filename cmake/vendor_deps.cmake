@@ -115,3 +115,14 @@ add_library(bz2_static STATIC
 target_include_directories(bz2_static PUBLIC $<BUILD_INTERFACE:${bzip2_vendor_SOURCE_DIR}>)
 add_library(abr_bz2_iface INTERFACE)
 target_link_libraries(abr_bz2_iface INTERFACE bz2_static)
+
+# ------------------------------------------------------------------ lzo --
+# miniLZO is committed directly under third_party/minilzo/ rather than
+# fetched (see third_party/minilzo/README.md for why): it's small,
+# stable, and has no CMakeLists.txt of its own either way, so there's
+# no FetchContent step to gain by pulling it over the network here.
+add_library(lzo_static STATIC ${CMAKE_CURRENT_SOURCE_DIR}/third_party/minilzo/minilzo.c)
+target_include_directories(lzo_static PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/minilzo>)
+add_library(abr_lzo_iface INTERFACE)
+target_link_libraries(abr_lzo_iface INTERFACE lzo_static)

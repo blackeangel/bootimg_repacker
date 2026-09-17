@@ -22,14 +22,13 @@ tools" below.
 | dtb (raw/concatenated FDT) | **done + verified** |
 | vbmeta (AVB): vbmeta.img, vbmeta_system.img, footer-on-other-partitions | **done + verified**, incl. real RSA signing |
 | uboot: U-Boot legacy uImage | **done + verified** |
-| compression: gzip, lz4, lz4-legacy, zstd, xz, lzma(alone), bzip2 | **done**. LZO not implemented (see Next steps) |
+| compression: gzip, lz4, lz4-legacy, zstd, xz, lzma(alone), bzip2, lzo | **done + verified, all algorithms** |
 | bundled SHA-1/256/512 (no-OpenSSL fallback) | **done**, self-test passes, catches its own transcription bug once already (see Verification below) |
 | manifest + CLI (`abr info/unpack/repack`) | **done** |
 | CMake: FetchContent-vendored static zlib/lz4/zstd/xz/bzip2 | **done + build-verified natively on Linux**, both dynamic-OpenSSL and `-DABR_STATIC_BINARY=ON` fully-static configurations |
 | Test suite (`tests/run_tests.sh`) | **done, 13/13 passing** -- see Verification |
-| CMake cross toolchains (mingw-w64, Android NDK) | TODO -- next up |
-| GitHub Actions static build matrix (linux-x86_64, windows-x86_64, android-arm64) | TODO |
-| LZO support for uImage IH_COMP_LZO | not started, not blocking |
+| CMake cross toolchains (mingw-w64, Android NDK) | written, CI run in progress as of this session (see CI status below) |
+| GitHub Actions static build matrix (linux-x86_64, windows-x86_64, android-arm64) | pushed, first run in progress -- linux job failed once already (log unreachable from this sandbox, see below), windows/android were still building |
 
 ## Verification (this is the part to trust over any code comment)
 
@@ -105,6 +104,49 @@ doesn't (the file was edited). See `save_component`/`load_component`
 in `src/main.cpp`. This is what makes the "byte-for-byte" claims above
 true even though every compressed component gets decompressed for
 editing.
+
+### LZO specifically: why it needed a container format of its own
+
+Raw LZO1X (what `lzo1x_1_compress`/`lzo1x_decompress_safe` produce/
+consume) has **no magic bytes or header at all** -- unlike every other
+codec here, there's nothing for `detect_codec()` to sniff, and nothing
+telling a decoder where one compressed block ends. Checked what a real
+LZO-compressed kernel/ramdisk/initramfs on an actual device would
+therefore need to look like by reading the Linux kernel's own
+`lib/decompress_unlzo.c` directly (not guessing): it expects the
+**lzop file format**'s header and per-block framing (magic
+`\x89LZO\x00\x0d\x0a\x1a\x0a`, then a fairly involved header, then
+repeated `{dst_len BE32, src_len BE32, checksum BE32, block bytes}`
+until a `dst_len == 0` terminator). That's what's implemented
+(`lzo_compress`/`lzo_decompress` in `src/compression.cpp`), using
+miniLZO (`third_party/minilzo/`, vendored directly rather than
+FetchContent'd -- see its README for why) for the actual LZO1X
+compress/decompress calls. The encoder always writes the minimal
+header form; the decoder tolerates the newer/optional fields
+(filter info, mtime_high, a filename) a real lzop file could have,
+matching the kernel decompressor's own leniency.
+
+Verified in both directions independently of `abr`'s own code, using
+`python-lzo` (real liblzo2, not miniLZO) -- see the `lzo` section of
+`tests/run_tests.sh`:
+- **abr encode -> real liblzo2 decode**: `abr`'s lzop-framed output is
+  parsed by hand in Python and the LZO1X blocks are decompressed with
+  `lzo.decompress()`; matches the original content exactly.
+- **real liblzo2 encode -> abr decode**: an lzop stream is hand-built
+  in Python around a block compressed with `lzo.compress()` (real
+  liblzo2), spliced into a manually-constructed boot.img header (to
+  bypass `abr`'s own recompress-on-repack convenience, which would
+  otherwise mask this check by re-encoding the payload with `abr`'s
+  own encoder before it ever reached the decoder) -- `abr unpack`
+  reads it correctly.
+(First attempt at this test had a methodology bug -- the boot.img was
+built via `abr repack` with the hand-made lzop bytes as the *input*
+file, which `abr` correctly treated as plaintext-to-be-compressed and
+re-encoded, so the "cross-check" was accidentally only testing abr
+against itself. Caught by the ramdisk size in `abr info` output being
+implausibly small for the supposedly-already-compressed input; fixed
+by constructing the test boot.img's bytes directly instead of going
+through `abr repack` for that part.)
 
 ## Conventions inherited from the sibling tools (apply here too)
 
@@ -217,29 +259,100 @@ editing.
   expected to happen in GitHub Actions (unrestricted runner network),
   driven/monitored from here via the GitHub API, not built locally.
 
+## AIK format parity (requested, large scope, sequenced -- not started)
+
+User wants parity with what Android Image Kitchen (AIK) handles,
+explicitly comparing the end goal to Magisk: **one static binary, no
+shell-outs to other tools**. Reference implementations given (all
+`osm0sis` on GitHub unless noted -- a long-time XDA maintainer of
+exactly this ecosystem of tools):
+
+| Format/tool | What it is | Reference |
+|---|---|---|
+| ELF boot images (Sony) | whole file is an ELF executable, kernel/ramdisk/etc as segments, instead of an "ANDROID!" header | `osm0sis/elftool`, `osm0sis/unpackelf`, `osm0sis/mkbootimg` (has ELF support built in), `osm0sis/pxa-mkbootimg` |
+| OSIP / KRNL | old ASUS/Rockchip boot header format | not yet researched |
+| MTK headers | MediaTek wraps kernel/ramdisk each in a small sub-header *inside* an otherwise-normal boot.img | `osm0sis/mkmtkhdr`; DHTB_MAGIC and an `mtk_hdr` struct were already seen once in Magisk's `native/src/boot/bootimg.hpp` this session (not recorded verbatim -- re-check that file) |
+| PXA (Marvell) | another boot header variant, Magisk's bootimg.hpp has a `boot_img_hdr_pxa` (seen, not recorded verbatim) | `osm0sis/pxa-mkbootimg` |
+| LOKI | a 2013-era boot.img patcher for specific locked Samsung/LG bootloaders (aboot exploit) -- a transform on an existing image, not a container format of its own | `djrbliss/loki` (`loki_tool`) |
+| DHTB | a signature-wrapper header prepended to a boot.img; `DHTB_MAGIC` already seen in Magisk's `format.rs` this session (value not recorded -- re-check) | `osm0sis/dhtbsign` |
+| Older AOSP "boot signature" / verity (pre-AVB, Android ~4.4-6) | a distinct, simpler signing scheme AVB superseded | `boot_signer` (AOSP `system/extras/verity`, Java) |
+| ChromeOS vboot signature | yet another distinct signing scheme (not AVB); also used by some Google/Android devices historically | `osm0sis/futility` |
+| blobpack/blobunpack | some OEMs' combined-image "blob" wrapper | `AndroidRoot/BlobTools` |
+| Rockchip RKCRC | Rockchip-specific CRC-wrapped image format | `neo-technologies/rkflashtool` (`rkcrc.c`) |
+| `androidbootimg.magic` | an XDA-posted `file`(1)/libmagic pattern file covering several of the above -- worth fetching as a cross-check for magic bytes once picking this up | `osm0sis @ xda-developers` (forum post, not a repo -- will need a web search, not a git clone) |
+
+None of this has been started. Suggested order, roughly by
+tractability and how well-defined/low-risk each format is (revisit if
+new information changes this):
+
+1. **MTK headers** -- integrates as an extension to the *existing*
+   `BootImage`/`VendorBootImage` classes (a sub-header inside the
+   kernel/ramdisk blob, not a new top-level container), so it's the
+   smallest incremental change. Re-fetch Magisk's `bootimg.hpp` first
+   (it was read once already this session but the exact struct wasn't
+   saved anywhere durable).
+2. **DHTB** -- same reasoning: it's a wrapper (header + hash) around
+   an otherwise-normal boot.img, likely implementable as something
+   closer to how the AVB footer is handled (an optional outer layer)
+   than a whole new parser. Re-check Magisk's `format.rs` for
+   `DHTB_MAGIC`'s actual byte value first.
+3. **ELF (Sony)** -- a genuinely new top-level container, but ELF
+   itself is a completely open, extremely well-documented standard
+   (not Android-specific reverse-engineering) -- read `elftool`/
+   `unpackelf` source to see exactly which segments map to which boot
+   image components before writing anything.
+4. **PXA, OSIP/KRNL, RKCRC, blobpack** -- each needs dedicated research
+   (read the linked source for each) before implementing; no shortcuts
+   from what's already known this session.
+5. **ChromeOS vboot (futility) and the pre-AVB AOSP boot_signer verity
+   scheme** -- both are full signing schemes similar in scope/care-
+   needed to AVB (see how much research + independent verification
+   went into `vbmeta.cpp` above) -- budget real time for these, don't
+   rush them just because they're later in this list.
+6. **LOKI** -- a patch/transform technique for old locked-bootloader
+   devices, not a container format; scope this as its own CLI
+   operation (e.g. `abr loki-patch`) once everything else here is
+   solid, since it's conceptually different from unpack/repack.
+
+Do **not** implement any of these by adding a runtime dependency on
+the actual `elftool`/`mkmtkhdr`/`loki_tool`/etc. binaries or by
+shelling out to them -- the whole point (explicitly stated) is one
+self-contained static binary like Magisk, not a wrapper around a pile
+of other people's tools. Their source is a reference for the format,
+not something to link against or invoke.
+
 ## Next steps (in order)
 
-1. `cmake/toolchains/mingw-w64.cmake`,
-   `cmake/toolchains/android-ndk-arm64.cmake` (`ANDROID_STL=c++_static`
-   -- see Conventions on bionic).
-2. `.github/workflows/build.yml`: matrix build (linux-x86_64,
-   windows-x86_64 via mingw, android-arm64 via NDK), `-DABR_STATIC_BINARY=ON`,
-   run `tests/run_tests.sh` on the linux job at minimum (it needs
-   python3/dtc/mkimage/openssl, easy on a Linux runner; running the
-   *produced* windows/android binaries under Wine/an emulator to test
-   them too would be a nice-to-have, not required), upload artifacts /
-   attach to a Release.
-3. Push, trigger the workflow via the API, poll run status/logs via
-   the API, fix failures. Nothing here has been tried on a real CI
-   runner yet -- treat the first attempt as likely needing iteration,
-   same as the local build did.
-4. Consider adding LZO (`liblzo2`, GPL-compatible, already vendored
-   elsewhere in the suite for F2FS) so U-Boot uImage IH_COMP_LZO
-   payloads round-trip too. Not blocking.
-5. If a working `mkdtboimg.py` mirror turns up, wire it into
+User's explicit priority: finish AIK format parity (previous section)
+*before* going back to polishing the build/CI. Concretely:
+
+1. Start on the AIK format-parity list above (MTK header support
+   first -- see the reasoning there for the ordering).
+2. Once formats are in a good place, come back to CI: the workflow run
+   triggered this session had the linux-x86_64 job fail (log content
+   unreachable from this sandbox -- see "CI status" below) while
+   windows-x86_64/android-arm64 were still running; that needs
+   diagnosing (check the Actions tab directly, or try the API log
+   endpoint again -- see the note below on why it failed here
+   specifically, which may not apply from a different environment).
+3. If a working `mkdtboimg.py` mirror turns up, wire it into
    `tests/run_tests.sh` the same way as `mkbootimg.py` (see
-   Verification above for why that's worth doing).
-6. Write `README.md` (usage, build instructions, supported formats,
-   the caveats already documented in code comments) -- deliberately
-   left for after the build/CI actually works end to end, so it
-   documents something verified rather than aspirational.
+   Verification above for why that's worth doing). Low priority.
+
+### CI status as of this session
+
+Pushed `.github/workflows/build.yml` and it triggered
+(`blackeangel/bootimg_repacker` run, commit `43cb4cd`). Per-job status
+observed: `android-arm64` and `windows-x86_64` configure steps
+succeeded and were building; `linux-x86_64`'s build step failed.
+**Could not fetch the actual failure log from this Claude sandbox**:
+`GET .../actions/jobs/{id}/logs` 302-redirects to
+`productionresultssa1.blob.core.windows.net`, which isn't in this
+sandbox's network egress allowlist (only `api.github.com`/`github.com`
+are). This is a sandbox-specific limitation, not a GitHub API
+limitation -- from a normal environment (or a future sandbox with that
+host allowlisted, or just the Actions tab in a browser), fetching the
+log directly should work fine. If resuming this: check
+https://github.com/blackeangel/bootimg_repacker/actions first thing,
+since the run's outcome (including whatever the windows/android jobs
+ended up doing) was never confirmed.

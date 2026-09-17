@@ -29,6 +29,7 @@ enum class Codec {
     XZ,     // .xz container
     LZMA,   // legacy "LZMA alone" stream (no container), as used by 7-Zip's .lzma
     BZIP2,
+    LZO,    // LZO1X wrapped in the lzop container framing (see compression.cpp for why)
 };
 
 std::string_view codec_name(Codec c);

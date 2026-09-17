@@ -37,6 +37,7 @@ else()
   pkg_check_modules(ZSTD REQUIRED IMPORTED_TARGET libzstd)
   pkg_check_modules(LZMA REQUIRED IMPORTED_TARGET liblzma)
   pkg_check_modules(BZIP2 REQUIRED IMPORTED_TARGET bzip2)
+  pkg_check_modules(LZO REQUIRED IMPORTED_TARGET lzo2)
   add_library(abr_zlib_iface INTERFACE)
   target_link_libraries(abr_zlib_iface INTERFACE ZLIB::ZLIB)
   add_library(abr_lz4_iface INTERFACE)
@@ -47,6 +48,8 @@ else()
   target_link_libraries(abr_lzma_iface INTERFACE PkgConfig::LZMA)
   add_library(abr_bz2_iface INTERFACE)
   target_link_libraries(abr_bz2_iface INTERFACE PkgConfig::BZIP2)
+  add_library(abr_lzo_iface INTERFACE)
+  target_link_libraries(abr_lzo_iface INTERFACE PkgConfig::LZO)
 endif()
 
 add_library(abr_core STATIC
@@ -68,6 +71,7 @@ target_link_libraries(abr_core PUBLIC
   abr_zstd_iface
   abr_lzma_iface
   abr_bz2_iface
+  abr_lzo_iface
 )
 
 if(ABR_WITH_OPENSSL)
