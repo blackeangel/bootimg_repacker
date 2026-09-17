@@ -6,6 +6,9 @@ on:
   pull_request:
   workflow_dispatch: {}
 
+permissions:
+  contents: write
+
 jobs:
   linux-x86_64:
     runs-on: ubuntu-24.04
@@ -26,7 +29,13 @@ jobs:
           -DABR_STATIC_BINARY=ON
 
       - name: Build
-        run: cmake --build build -j
+        run: cmake --build build -j 2>&1 | tee build.log
+
+      - name: Post build log on failure
+        if: failure()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 .github/scripts/post_failure_log.py "linux-x86_64" build.log
 
       - name: Test (byte-identical round trips against real reference tools)
         run: ./tests/run_tests.sh build/abr
@@ -66,7 +75,13 @@ jobs:
           -DABR_STATIC_BINARY=ON
 
       - name: Build
-        run: cmake --build build-windows -j
+        run: cmake --build build-windows -j 2>&1 | tee build.log
+
+      - name: Post build log on failure
+        if: failure()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 .github/scripts/post_failure_log.py "windows-x86_64" build.log
 
       - name: Package
         run: |
@@ -104,7 +119,13 @@ jobs:
           -DABR_STATIC_BINARY=ON
 
       - name: Build
-        run: cmake --build build-android -j
+        run: cmake --build build-android -j 2>&1 | tee build.log
+
+      - name: Post build log on failure
+        if: failure()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 .github/scripts/post_failure_log.py "android-arm64" build.log
 
       - name: Package
         run: |
