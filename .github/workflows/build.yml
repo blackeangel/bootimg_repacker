@@ -38,7 +38,13 @@ jobs:
         run: python3 .github/scripts/post_failure_log.py "linux-x86_64" build.log
 
       - name: Test (byte-identical round trips against real reference tools)
-        run: ./tests/run_tests.sh build/abr
+        run: ./tests/run_tests.sh build/abr 2>&1 | tee test.log
+
+      - name: Post test log on failure
+        if: failure()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 .github/scripts/post_failure_log.py "linux-x86_64 test" test.log
 
       - name: Verify static linking
         run: |

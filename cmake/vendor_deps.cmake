@@ -86,6 +86,8 @@ set(XZ_TOOL_LZMADEC OFF CACHE BOOL "" FORCE)
 set(XZ_TOOL_LZMAINFO OFF CACHE BOOL "" FORCE)
 set(XZ_NLS OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(xz_vendor)
+target_include_directories(liblzma PUBLIC
+  $<BUILD_INTERFACE:${xz_vendor_SOURCE_DIR}/src/liblzma/api>)
 add_library(abr_lzma_iface INTERFACE)
 target_link_libraries(abr_lzma_iface INTERFACE liblzma)
 
