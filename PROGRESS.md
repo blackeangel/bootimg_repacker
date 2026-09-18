@@ -27,8 +27,8 @@ tools" below.
 | manifest + CLI (`abr info/unpack/repack`) | **done** |
 | CMake: FetchContent-vendored static zlib/lz4/zstd/xz/bzip2 | **done + build-verified natively on Linux**, both dynamic-OpenSSL and `-DABR_STATIC_BINARY=ON` fully-static configurations |
 | Test suite (`tests/run_tests.sh`) | **done, 13/13 passing** -- see Verification |
-| CMake cross toolchains (mingw-w64, Android NDK) | written, CI run in progress as of this session (see CI status below) |
-| GitHub Actions static build matrix (linux-x86_64, windows-x86_64, android-arm64) | pushed, first run in progress -- linux job failed once already (log unreachable from this sandbox, see below), windows/android were still building |
+| CMake cross toolchains (mingw-w64, Android NDK) | **done + verified** (mingw reproduced locally; NDK only provable via CI, see below) |
+| GitHub Actions static build matrix (linux-x86_64, windows-x86_64, android-arm64) | **done + verified**: run 35313499827, all 3 jobs green, all 3 static binaries produced as artifacts (abr-linux-x86_64, abr-windows-x86_64, abr-android-arm64) |
 
 ## Verification (this is the part to trust over any code comment)
 
@@ -323,36 +323,63 @@ not something to link against or invoke.
 
 ## Next steps (in order)
 
-User's explicit priority: finish AIK format parity (previous section)
-*before* going back to polishing the build/CI. Concretely:
+Build/CI is done and green -- the remaining priority is the AIK
+format-parity list above (MTK headers first; see the reasoning there
+for the full ordering). Once that's further along:
 
-1. Start on the AIK format-parity list above (MTK header support
-   first -- see the reasoning there for the ordering).
-2. Once formats are in a good place, come back to CI: the workflow run
-   triggered this session had the linux-x86_64 job fail (log content
-   unreachable from this sandbox -- see "CI status" below) while
-   windows-x86_64/android-arm64 were still running; that needs
-   diagnosing (check the Actions tab directly, or try the API log
-   endpoint again -- see the note below on why it failed here
-   specifically, which may not apply from a different environment).
-3. If a working `mkdtboimg.py` mirror turns up, wire it into
+1. Consider re-running the CI matrix periodically as format support
+   grows, so a regression is caught the same session it's introduced
+   rather than discovered later.
+2. If a working `mkdtboimg.py` mirror turns up, wire it into
    `tests/run_tests.sh` the same way as `mkbootimg.py` (see
    Verification above for why that's worth doing). Low priority.
+3. Consider testing the *produced* windows-x86_64/android-arm64
+   binaries themselves (under Wine / an Android emulator respectively)
+   rather than only their native-Linux-built counterpart -- currently
+   only linux-x86_64 runs `tests/run_tests.sh` in CI; the other two are
+   build-verified but not run-verified. Not urgent given the shared
+   CMakeLists/source is what `tests/run_tests.sh` is actually
+   exercising, but would close the loop completely.
 
-### CI status as of this session
+### CI status: green as of commit `ea0206d` (run 35313499827)
 
-Pushed `.github/workflows/build.yml` and it triggered
-(`blackeangel/bootimg_repacker` run, commit `43cb4cd`). Per-job status
-observed: `android-arm64` and `windows-x86_64` configure steps
-succeeded and were building; `linux-x86_64`'s build step failed.
-**Could not fetch the actual failure log from this Claude sandbox**:
-`GET .../actions/jobs/{id}/logs` 302-redirects to
-`productionresultssa1.blob.core.windows.net`, which isn't in this
-sandbox's network egress allowlist (only `api.github.com`/`github.com`
-are). This is a sandbox-specific limitation, not a GitHub API
-limitation -- from a normal environment (or a future sandbox with that
-host allowlisted, or just the Actions tab in a browser), fetching the
-log directly should work fine. If resuming this: check
-https://github.com/blackeangel/bootimg_repacker/actions first thing,
-since the run's outcome (including whatever the windows/android jobs
-ended up doing) was never confirmed.
+The path here is worth recording since it involved real debugging, not
+just "push and it worked":
+
+1. First run (commit `43cb4cd`): all 3 jobs failed at the Build step,
+   `logs` API 302-redirects to `productionresultssa1.blob.core.windows.net`,
+   not in this sandbox's egress allowlist -- confirmed via the actual
+   HTTP response, not assumed. `check-runs/{id}/annotations` (which
+   doesn't redirect) only gave a generic "exit code 1". Added
+   `.github/scripts/post_failure_log.py`, called from each job's
+   `if: failure()` step, which posts the tail of a tee'd build.log as
+   a plain commit comment via the API instead -- reachable from
+   anywhere, no blob storage involved.
+2. Second run (commit `38fd3d7`, diagnostics added): Build now
+   *succeeded* on all 3 platforms (never confirmed why the first
+   attempt failed there -- possibly transient), but Package failed on
+   windows-x86_64/android-arm64 and Test failed on linux-x86_64.
+3. Reproduced the mingw cross-build locally (installed mingw-w64 in
+   the sandbox directly -- something the NDK build can't do here, no
+   network access to dl.google.com) and got the real compiler error
+   immediately: `fatal error: lzma.h: No such file or directory`.
+   Root cause: `vendor_deps.cmake` never added an explicit
+   `target_include_directories` for `liblzma`, unlike every other
+   vendored dep. Native builds had been silently working all session
+   because this sandbox had `liblzma-dev` installed system-wide from
+   early pre-FetchContent experimentation, so `#include <lzma.h>` was
+   quietly resolving to `/usr/include/lzma.h` while still *linking*
+   the vendored static lib -- a header/library mismatch that happened
+   to compile, masking the real gap. Confirmed the theory by removing
+   `liblzma-dev` and rebuilding natively (still worked, using only the
+   now-fixed vendored include path) and by rebuilding the mingw target
+   (now produces a working `abr.exe`).
+4. Third run (commit `ea0206d`, the fix): all 3 jobs green, all 3
+   static binaries uploaded as artifacts.
+
+Lesson worth keeping in mind for future work on this repo: a dev
+package installed once for quick local iteration can silently mask a
+real vendoring gap for the rest of a session. Prefer testing against a
+cross-compilation target (even a locally-installable one like mingw)
+over trusting a native build alone whenever "does this component
+actually come from where I think it does" matters.
