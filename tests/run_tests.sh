@@ -107,6 +107,53 @@ python3 "$MKBOOTIMG" >/dev/null --header_version 4 --dtb vendor.dtb \
     --vendor_boot vendor_boot_v4.img
 roundtrip_check vendor_boot_v4.img "vendor_boot v4 (2 typed/named fragments)" vbv4
 
+# vendor_boot v4 with a trailing AVB hash-footer (unsigned, one hash +
+# one property descriptor) -- mirrors a real OrangeFox recovery
+# vendor_boot.img that first exposed this as a real gap: unpack was
+# silently ignoring the footer since VendorBootImage doesn't need it,
+# but repack was dropping it entirely instead of reproducing it.
+python3 - <<'PYEOF'
+import struct
+vb = open("vendor_boot_v4.img", "rb").read()
+descriptors = b""
+partition = b"vendor_boot"
+digest = b"\x11" * 32  # placeholder digest -- this test checks byte-for-byte
+                        # tail preservation through unpack+repack, not AVB semantics
+d1 = struct.pack(">Q", len(vb)) + b"sha256".ljust(32, b"\x00")
+d1 += struct.pack(">III", len(partition), 0, len(digest)) + struct.pack(">I", 0) + b"\x00" * 60
+d1 += partition + digest
+descriptors += struct.pack(">QQ", 2, len(d1)) + d1  # tag 2 = HASH
+prop_key = b"com.android.build.vendor_boot.fingerprint"
+prop_val = b"test/fingerprint/0"
+d0 = struct.pack(">QQ", len(prop_key), len(prop_val)) + prop_key + b"\x00" + prop_val + b"\x00"
+d0 += b"\x00" * ((-len(d0)) % 8)
+descriptors += struct.pack(">QQ", 0, len(d0)) + d0  # tag 0 = PROPERTY
+desc_size = len(descriptors)
+aux = descriptors + b"\x00" * ((-desc_size) % 64)
+pubkey_off = desc_size + ((-desc_size) % 8)  # matches abr's own 8-byte-aligned layout convention
+header = b"AVB0" + struct.pack(">II", 1, 0) + struct.pack(">QQ", 0, len(aux))
+header += struct.pack(">I", 0)  # algorithm NONE
+header += struct.pack(">QQQQQQQQQQ", 0, 0, 0, 0, pubkey_off, 0, pubkey_off, 0, 0, desc_size)
+header += struct.pack(">Q", 0)  # rollback_index
+header += struct.pack(">II", 0, 0)  # flags, rollback_index_location
+header += b"avbtool 1.3.0".ljust(48, b"\x00")
+header += b"\x00" * 80
+assert len(header) == 256
+vbmeta = header + aux
+partition_size = len(vb) + ((-len(vb)) % 4096) + len(vbmeta) + ((-len(vbmeta)) % 4096) + 4096
+out = bytearray(partition_size)
+out[0:len(vb)] = vb
+vbmeta_offset = len(vb) + ((-len(vb)) % 4096)
+out[vbmeta_offset:vbmeta_offset + len(vbmeta)] = vbmeta
+footer_pos = partition_size - 64
+out[footer_pos:footer_pos + 64] = struct.pack(">4sIIQQQ28x", b"AVBf", 1, 0, len(vb), vbmeta_offset, len(vbmeta))
+open("vendor_boot_v4_avbfooter.img", "wb").write(bytes(out))
+PYEOF
+roundtrip_check vendor_boot_v4_avbfooter.img "vendor_boot v4 + trailing AVB footer (hash+property descriptors)" vbv4avb
+grep -q "^has_avb_footer=true" rt_vbv4avb/manifest.txt \
+  && { echo "PASS: vendor_boot AVB footer decomposed into manifest fields"; PASS=$((PASS + 1)); } \
+  || { echo "FAIL: vendor_boot AVB footer not recorded in manifest"; FAIL=$((FAIL + 1)); }
+
 # --------------------------------------------------------------- dtb --
 dtc -I dts -O dtb -o a.dtb v2.dts 2>/dev/null
 cp a.dtb b.dtb
