@@ -125,6 +125,85 @@ Bytes load_raw(const Manifest& m, const fs::path& dir, const std::string& prefix
     return read_file(dir / m.get(key));
 }
 
+// ------------------------------------------------- trailing AVB footer --
+//
+// Any of the container formats below (boot, vendor_boot, dtbo) can have
+// an AVB hash/hashtree footer appended after its own content -- common
+// with per-partition (chained) AVB configurations, where e.g. a whole
+// vendor_boot.img partition is [vendor_boot content][padding][vbmeta
+// blob][padding][64-byte AVBf footer]. The primary format's own parser
+// doesn't need to know or care about this (it only reads what it
+// declares up front), but a naive repack would otherwise silently drop
+// that entire tail. Reuses VbmetaImage's existing footer handling
+// (already covers recomputing offsets/hash/signature for edited
+// content) rather than duplicating any of that here.
+bool save_avb_tail(Manifest& m, const fs::path& dir, const Bytes& whole_file) {
+    if (whole_file.size() < 64 ||
+        std::memcmp(whole_file.data() + whole_file.size() - 64, "AVBf", 4) != 0)
+        return false;
+    VbmetaImage v;
+    try {
+        v = VbmetaImage::parse(whole_file);
+    } catch (const FormatError&) {
+        return false;  // "AVBf"-looking bytes that don't actually parse; leave as opaque tail
+    }
+    if (!v.has_footer) return false;
+
+    m.set_bool("has_avb_footer", true);
+    m.set_u64("avb_partition_size", v.source_total_size);
+    m.set_u32("avb_algorithm_type", v.algorithm_type);
+    m.set("avb_algorithm_name", avb_algorithm_name(v.algorithm_type));
+    m.set_u64("avb_rollback_index", v.rollback_index);
+    m.set_u32("avb_flags", v.flags);
+    m.set_u32("avb_rollback_index_location", v.rollback_index_location);
+    m.set("avb_release_string", v.release_string);
+    m.set_hex("avb_hash", v.hash);
+    m.set_hex("avb_signature", v.signature);
+    save_raw(m, dir, "avb_public_key", v.public_key, "avb_public_key.bin");
+    save_raw(m, dir, "avb_public_key_metadata", v.public_key_metadata, "avb_public_key_metadata.bin");
+    m.set_u32("avb_descriptor_count", static_cast<uint32_t>(v.descriptors.size()));
+    for (size_t i = 0; i < v.descriptors.size(); ++i) {
+        std::string p = "avb_descriptor" + std::to_string(i);
+        m.set_u64(p + "_tag", v.descriptors[i].tag);
+        std::string filename = p + ".bin";
+        m.set(p + "_file", filename);
+        write_file(dir / filename, v.descriptors[i].content);
+        m.set(p + "_info", v.descriptors[i].describe());  // informational only, ignored on read
+    }
+    return true;
+}
+
+// primary_content is the freshly-*built* (possibly-edited) primary
+// format's bytes; returns it unchanged if there was no footer to
+// restore, or the full [primary_content][...][footer] file otherwise.
+Bytes reattach_avb_tail(const Manifest& m, const fs::path& dir, Bytes primary_content,
+                         const std::string& avb_key_pem) {
+    if (!m.get_bool("has_avb_footer", false)) return primary_content;
+    VbmetaImage v;
+    v.has_footer = true;
+    v.source_total_size = m.get_u64("avb_partition_size", 0);
+    v.footer_original_image_size = primary_content.size();
+    v.host_prefix = std::move(primary_content);
+    v.algorithm_type = m.get_u32("avb_algorithm_type", 0);
+    v.rollback_index = m.get_u64("avb_rollback_index", 0);
+    v.flags = m.get_u32("avb_flags", 0);
+    v.rollback_index_location = m.get_u32("avb_rollback_index_location", 0);
+    v.release_string = m.get("avb_release_string");
+    v.hash = m.get_hex("avb_hash");
+    v.signature = m.get_hex("avb_signature");
+    v.public_key = load_raw(m, dir, "avb_public_key");
+    v.public_key_metadata = load_raw(m, dir, "avb_public_key_metadata");
+    uint32_t count = m.get_u32("avb_descriptor_count", 0);
+    for (uint32_t i = 0; i < count; ++i) {
+        std::string p = "avb_descriptor" + std::to_string(i);
+        AvbDescriptor d;
+        d.tag = m.get_u64(p + "_tag", 0);
+        d.content = load_raw(m, dir, p);
+        v.descriptors.push_back(std::move(d));
+    }
+    return v.build(avb_key_pem);
+}
+
 // ------------------------------------------------------------- boot.img --
 
 void unpack_boot(const Bytes& data, const fs::path& dir) {
@@ -164,12 +243,13 @@ void unpack_boot(const Bytes& data, const fs::path& dir) {
     save_raw(m, dir, "recovery_dtbo", img.recovery_dtbo, "recovery_dtbo.img");
     save_raw(m, dir, "dtb", img.dtb, "dtb");
     save_raw(m, dir, "boot_signature", img.boot_signature, "boot_signature.bin");
+    save_avb_tail(m, dir, data);
 
     m.save(dir / "manifest.txt", "abr boot manifest -- edit then `abr repack " + dir.string() +
                                       " -o out.img`");
 }
 
-Bytes repack_boot(const Manifest& m, const fs::path& dir) {
+Bytes repack_boot(const Manifest& m, const fs::path& dir, const std::string& avb_key_pem) {
     BootImage img;
     img.header_version = m.get_u32("header_version", 4);
     if (img.header_version <= 2) {
@@ -193,7 +273,7 @@ Bytes repack_boot(const Manifest& m, const fs::path& dir) {
     img.boot_signature = load_raw(m, dir, "boot_signature");
     img.recompute_id();  // content hash -- recompute fresh rather than trust a possibly-stale manifest value
 
-    return img.build();
+    return reattach_avb_tail(m, dir, img.build(), avb_key_pem);
 }
 
 // ------------------------------------------------------- vendor_boot.img --
@@ -234,11 +314,12 @@ void unpack_vendor_boot(const Bytes& data, const fs::path& dir) {
         }
         save_component(m, dir, p, e.data, p + ".cpio");
     }
+    save_avb_tail(m, dir, data);
     m.save(dir / "manifest.txt", "abr vendor_boot manifest -- edit then `abr repack " +
                                       dir.string() + " -o out.img`");
 }
 
-Bytes repack_vendor_boot(const Manifest& m, const fs::path& dir) {
+Bytes repack_vendor_boot(const Manifest& m, const fs::path& dir, const std::string& avb_key_pem) {
     VendorBootImage img;
     img.header_version = m.get_u32("header_version", 4);
     img.page_size = m.get_u32("page_size", 4096);
@@ -264,7 +345,7 @@ Bytes repack_vendor_boot(const Manifest& m, const fs::path& dir) {
         e.data = load_component(m, dir, p);
         img.ramdisk_fragments.push_back(std::move(e));
     }
-    return img.build();
+    return reattach_avb_tail(m, dir, img.build(), avb_key_pem);
 }
 
 // ------------------------------------------------------------ dtbo.img --
@@ -292,11 +373,12 @@ void unpack_dtbo(const Bytes& data, const fs::path& dir) {
         m.set_hex(p + "_extra", extra);
         save_raw(m, dir, p, e.data, p + ".dtb");
     }
+    save_avb_tail(m, dir, data);
     m.save(dir / "manifest.txt",
            "abr dtbo manifest -- edit then `abr repack " + dir.string() + " -o out.img`");
 }
 
-Bytes repack_dtbo(const Manifest& m, const fs::path& dir) {
+Bytes repack_dtbo(const Manifest& m, const fs::path& dir, const std::string& avb_key_pem) {
     DtboImage img;
     img.version = m.get_u32("version", 0);
     img.page_size = m.get_u32("page_size", 2048);
@@ -314,7 +396,7 @@ Bytes repack_dtbo(const Manifest& m, const fs::path& dir) {
         e.data = load_raw(m, dir, p);
         img.entries.push_back(std::move(e));
     }
-    return img.build();
+    return reattach_avb_tail(m, dir, img.build(), avb_key_pem);
 }
 
 // --------------------------------------------------------------- dtb --
@@ -561,9 +643,9 @@ void do_repack(const fs::path& dir, const fs::path& out, const std::string& avb_
     Fmt f = fmt_from_name(m.get("type"));
     Bytes result;
     switch (f) {
-        case Fmt::BOOT: result = repack_boot(m, dir); break;
-        case Fmt::VENDOR_BOOT: result = repack_vendor_boot(m, dir); break;
-        case Fmt::DTBO: result = repack_dtbo(m, dir); break;
+        case Fmt::BOOT: result = repack_boot(m, dir, avb_key_pem); break;
+        case Fmt::VENDOR_BOOT: result = repack_vendor_boot(m, dir, avb_key_pem); break;
+        case Fmt::DTBO: result = repack_dtbo(m, dir, avb_key_pem); break;
         case Fmt::DTB: result = repack_dtb(m, dir); break;
         case Fmt::VBMETA: result = repack_vbmeta(m, dir, avb_key_pem); break;
         case Fmt::UIMAGE: result = repack_uimage(m, dir); break;
