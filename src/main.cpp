@@ -19,6 +19,8 @@
 #include "abr/compression.hpp"
 #include "abr/dtb.hpp"
 #include "abr/dtbo.hpp"
+#include "abr/legacy/dhtb.hpp"
+#include "abr/legacy/mtk.hpp"
 #include "abr/manifest.hpp"
 #include "abr/sha.hpp"
 #include "abr/uimage.hpp"
@@ -27,6 +29,7 @@
 
 namespace fs = std::filesystem;
 using namespace abr;
+using namespace abr::legacy;
 
 namespace {
 
@@ -83,18 +86,30 @@ Fmt fmt_from_name(const std::string& s) {
 // e.g. gzip data essentially never reproduces the exact original bytes,
 // since gzip/zstd/etc. headers and encoder choices vary by tool/version
 // even for identical decompressed content).
+//
+// Also transparently strips a MediaTek (MTK) sub-header if this
+// component has one (common on MTK-based devices' kernel/ramdisk),
+// recording its declared type name so repack can re-add an identical
+// header -- this applies uniformly to every component that goes
+// through save_component/load_component (boot's kernel/ramdisk,
+// vendor_boot's ramdisk fragments) since any of them could have one.
 void save_component(Manifest& m, const fs::path& dir, const std::string& prefix, const Bytes& raw,
                      const std::string& filename) {
     if (raw.empty()) return;
-    Codec c = detect_codec(raw);
-    Bytes plain = decompress(c, raw);
+    Bytes after_mtk;
+    auto mtk = strip_mtk_header(raw, after_mtk);
+    if (mtk) m.set(prefix + "_mtk_name", mtk->name);
+    const Bytes& working = mtk ? after_mtk : raw;
+
+    Codec c = detect_codec(working);
+    Bytes plain = decompress(c, working);
     m.set(prefix + "_file", filename);
     m.set(prefix + "_compression", std::string(codec_name(c)));
     write_file(dir / filename, plain);
     m.set_hex(prefix + "_orig_hash", hash::sha256(plain));
     fs::path raw_dir = dir / ".abr_raw";
     fs::create_directories(raw_dir);
-    write_file(raw_dir / (filename + ".raw"), raw);
+    write_file(raw_dir / (filename + ".raw"), working);  // stored *without* the MTK header
 }
 
 Bytes load_component(const Manifest& m, const fs::path& dir, const std::string& prefix) {
@@ -102,13 +117,23 @@ Bytes load_component(const Manifest& m, const fs::path& dir, const std::string& 
     if (!m.has(key)) return {};
     std::string filename = m.get(key);
     Bytes plain = read_file(dir / filename);
+
+    Bytes result;
+    bool have_result = false;
     Bytes stored_hash = m.get_hex(prefix + "_orig_hash");
     if (!stored_hash.empty()) {
         fs::path raw_path = dir / ".abr_raw" / (filename + ".raw");
-        if (hash::sha256(plain) == stored_hash && fs::exists(raw_path)) return read_file(raw_path);
+        if (hash::sha256(plain) == stored_hash && fs::exists(raw_path)) {
+            result = read_file(raw_path);
+            have_result = true;
+        }
     }
-    auto c = codec_from_name(m.get(prefix + "_compression", "none"));
-    return compress(c.value_or(Codec::NONE), plain);
+    if (!have_result) {
+        auto c = codec_from_name(m.get(prefix + "_compression", "none"));
+        result = compress(c.value_or(Codec::NONE), plain);
+    }
+    if (m.has(prefix + "_mtk_name")) result = add_mtk_header(result, m.get(prefix + "_mtk_name"));
+    return result;
 }
 
 // Plain, uncompressed passthrough for blobs that are never themselves
@@ -537,9 +562,18 @@ Bytes repack_uimage(const Manifest& m, const fs::path& dir) {
 // ------------------------------------------------------------ info cmd --
 
 void print_info(const fs::path& path) {
-    Bytes data = read_file(path);
+    Bytes raw = read_file(path);
+    Bytes inner;
+    auto dhtb = strip_dhtb(raw, inner);
+    const Bytes& data = dhtb ? inner : raw;
+
     Fmt f = detect_format(data);
-    std::cout << "file:   " << path.string() << " (" << data.size() << " bytes)\n";
+    std::cout << "file:   " << path.string() << " (" << raw.size() << " bytes)\n";
+    if (dhtb) {
+        std::cout << "wrapper: DHTB (" << (dhtb->has_seandroid_footer ? "+SEAndroid footer " : "")
+                   << (dhtb->has_padding ? "+padding " : "") << ", inner " << data.size()
+                   << " bytes)\n";
+    }
     std::cout << "format: " << fmt_name(f) << "\n";
     switch (f) {
         case Fmt::BOOT: {
@@ -624,18 +658,36 @@ void print_info(const fs::path& path) {
 
 void do_unpack(const fs::path& in, const fs::path& outdir) {
     Bytes data = read_file(in);
-    Fmt f = detect_format(data);
     fs::create_directories(outdir);
+
+    Bytes inner;
+    auto dhtb = strip_dhtb(data, inner);
+    const Bytes& payload = dhtb ? inner : data;
+
+    Fmt f = detect_format(payload);
     switch (f) {
-        case Fmt::BOOT: unpack_boot(data, outdir); break;
-        case Fmt::VENDOR_BOOT: unpack_vendor_boot(data, outdir); break;
-        case Fmt::DTBO: unpack_dtbo(data, outdir); break;
-        case Fmt::DTB: unpack_dtb(data, outdir); break;
-        case Fmt::VBMETA: unpack_vbmeta(data, outdir); break;
-        case Fmt::UIMAGE: unpack_uimage(data, outdir); break;
+        case Fmt::BOOT: unpack_boot(payload, outdir); break;
+        case Fmt::VENDOR_BOOT: unpack_vendor_boot(payload, outdir); break;
+        case Fmt::DTBO: unpack_dtbo(payload, outdir); break;
+        case Fmt::DTB: unpack_dtb(payload, outdir); break;
+        case Fmt::VBMETA: unpack_vbmeta(payload, outdir); break;
+        case Fmt::UIMAGE: unpack_uimage(payload, outdir); break;
         case Fmt::UNKNOWN: throw FormatError("unrecognized image format: " + in.string());
     }
-    std::cout << "unpacked " << fmt_name(f) << " -> " << outdir.string() << "/\n";
+
+    if (dhtb) {
+        Manifest m = Manifest::load(outdir / "manifest.txt");
+        m.set_bool("has_dhtb", true);
+        m.set_bool("dhtb_seandroid_footer", dhtb->has_seandroid_footer);
+        m.set_bool("dhtb_padding", dhtb->has_padding);
+        save_raw(m, outdir, "dhtb_trailing_extra", dhtb->trailing_extra, "dhtb_trailing_extra.bin");
+        m.save(outdir / "manifest.txt",
+               "abr manifest (DHTB-wrapped) -- edit then `abr repack " + outdir.string() +
+                   " -o out.img`");
+    }
+
+    std::cout << "unpacked " << (dhtb ? std::string("dhtb-wrapped ") : std::string()) << fmt_name(f)
+              << " -> " << outdir.string() << "/\n";
 }
 
 void do_repack(const fs::path& dir, const fs::path& out, const std::string& avb_key_pem) {
@@ -652,6 +704,15 @@ void do_repack(const fs::path& dir, const fs::path& out, const std::string& avb_
         case Fmt::UNKNOWN:
             throw FormatError("manifest.txt has no (or an unrecognized) 'type=' field");
     }
+
+    if (m.get_bool("has_dhtb", false)) {
+        legacy::DhtbInfo dhtb;
+        dhtb.has_seandroid_footer = m.get_bool("dhtb_seandroid_footer", false);
+        dhtb.has_padding = m.get_bool("dhtb_padding", false);
+        dhtb.trailing_extra = load_raw(m, dir, "dhtb_trailing_extra");
+        result = wrap_dhtb(result, dhtb);
+    }
+
     write_file(out, result);
     std::cout << "repacked " << fmt_name(f) << " -> " << out.string() << " (" << result.size()
               << " bytes)\n";
@@ -666,7 +727,10 @@ void usage() {
         "Supported: boot.img/init_boot.img/boot-debug.img/boot-test-harness.img,\n"
         "recovery.img/recovery-two-step.img (header v0-v4), vendor_boot.img/\n"
         "vendor_boot-debug.img/vendor_kernel_boot.img (header v3-v4), dtbo.img,\n"
-        "raw dtb, vbmeta.img/vbmeta_system.img (AVB), U-Boot legacy uImage.\n";
+        "raw dtb, vbmeta.img/vbmeta_system.img (AVB), U-Boot legacy uImage.\n"
+        "Also transparently handled: a trailing AVB hash footer on boot/\n"
+        "vendor_boot/dtbo; a DHTB wrapper (with SEAndroid footer/padding) around\n"
+        "any of them; a MediaTek (MTK) sub-header on the kernel and/or ramdisk.\n";
 }
 
 }  // namespace

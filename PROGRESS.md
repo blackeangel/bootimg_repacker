@@ -383,3 +383,121 @@ real vendoring gap for the rest of a session. Prefer testing against a
 cross-compilation target (even a locally-installable one like mingw)
 over trusting a native build alone whenever "does this component
 actually come from where I think it does" matters.
+
+
+## Real device file validation + AIK format parity progress (this session)
+
+The user sent a real vendor_boot.img from an OrangeFox recovery build
+(`vendor_boot_ofox.img`, 64MiB) as the promised test case, plus links
+to more (Yandex Disk `disk.yandex.ru/d/HbnFvaV-ihx0Tw` and Google Drive
+`drive.google.com/drive/folders/1-kgXpos3bKC9NhoNBQls91pGXCT-sMOU` --
+**neither is reachable from this sandbox** and the Google Drive
+connector tool errored with "user didn't complete authentication", so
+further test files need to come as direct chat uploads).
+
+That one real file was extremely productive:
+- Confirmed the core vendor_boot v4 multi-fragment/mixed-compression
+  support (2 fragments, zstd + lz4_legacy) exactly as designed --
+  content-level round trip was already perfect.
+- Exposed a real gap: it has a trailing AVB hash-footer (unsigned,
+  hash + property descriptor) after the vendor_boot content, which
+  unpack correctly ignored (doesn't need it) but repack was silently
+  dropping. Fixed generically for boot/vendor_boot/dtbo by reusing the
+  existing VbmetaImage footer handling (`save_avb_tail`/
+  `reattach_avb_tail` in main.cpp) rather than a vendor_boot-specific
+  patch -- see git log for the full writeup. Whole 67108864-byte file
+  now round-trips byte-for-byte. Added a synthetic permanent regression
+  test mirroring this (18 tests total at that point).
+- Known limitation, documented not fixed: an edited-and-repacked image
+  keeps stale AVB hash-descriptor digests (passthrough-by-design for
+  descriptors). Fine for algorithm_type=NONE as seen here; would matter
+  more for a strict independent verifier.
+
+Followed up on the user's "Продолжай... тяни исходники, переделывай
+под C++20" instruction to keep working through AIK format parity, per
+the roadmap below. Studied AIK's actual `unpackimg.sh`/`repackimg.sh`
+(osm0sis/Android-Image-Kitchen, AIK-Linux branch) for the real
+detection cascade and orchestration, and its `bin/androidbootimg.magic`
+for authoritative magic bytes/offsets for every format on the roadmap
+list (BLOB, NOOK/NOOKTAB, CHROMEOS, DHTB, SIN, AOSP/AOSP_VNDR/AOSP-PXA,
+ELF+MTK, KRNL, OSIP, LOKI, AMONET, QCDT, AVBv1/AVBv2 footers, Bump,
+SEAndroid) -- this single file is the best reference for the whole
+list and is worth re-reading rather than re-deriving; not vendored
+into this repo (unclear/no stated license on that specific file).
+
+Implemented and shipped, organized under `include/abr/legacy/` +
+`src/legacy/` per the user's request to keep this separate from the
+core AOSP-standard format code:
+- **MTK sub-header** (`legacy/mtk.{hpp,cpp}`): wraps kernel and/or
+  ramdisk independently inside an ordinary boot.img on MediaTek
+  devices. 512-byte header, magic 0x58881688 LE, 0xFF-padded (not
+  zero -- easy to miss), struct from osm0sis/mkmtkhdr's mtkimg.h.
+  Wired transparently into `save_component`/`load_component` so it
+  applies to any component (boot's kernel/ramdisk, vendor_boot's
+  ramdisk fragments) uniformly.
+- **DHTB wrapper** (`legacy/dhtb.{hpp,cpp}`): a 512-byte header (magic
+  + SHA-256 integrity checksum, not a real signature) some
+  Samsung/Qualcomm-based devices' bootloaders require around a whole
+  boot.img, itself conventionally followed by a 16-byte
+  "SEANDROIDENFORCE" footer and/or 4 bytes of 0xFF padding. Struct
+  from osm0sis/dhtbsign's dhtbsign.c. Wired as a pre/post-processing
+  step in `do_unpack`/`do_repack`, same pattern as the AVB tail.
+
+Verification: compiled **real** `mkmtkhdr` and `dhtbsign` locally in
+this sandbox (`gcc -o mkmtkhdr mkmtkhdr.c`, and dhtbsign + its bundled
+libmincrypt sha256.c) and used them as independent oracles --
+byte-identical round trips confirmed against both, including a
+combined case (DHTB-wrapped + MTK-headered-kernel boot.img together).
+This caught one real bug: `strip_mtk_header` never skipped the 4-byte
+magic before reading size/name, misaligning every field by 4 bytes
+(payload extraction was still correct, since that used a fixed offset
+independent of the parse bug, but the recorded component type name
+came out as garbage, e.g. "PM-C" instead of "KERNEL" -- a real
+round-trip mismatch that a byte-identical check catches regardless of
+whether the reference oracle is real or self-consistent). Fixed.
+`dhtbsign` itself crashes on exit (double-free) but writes a complete,
+correct file before crashing -- usable as an oracle regardless.
+
+**Did not vendor mkmtkhdr.c/dhtbsign.c source into this repo** (unlike
+mkbootimg.py): neither has a clear repo-level license, so the
+permanent regression tests (`tests/run_tests.sh`) generate equivalent
+fixtures directly in Python from this project's own documented struct
+layout instead of redistributing that code. Real-tool verification
+above was ad hoc (done once, this session, not repeatable via
+`run_tests.sh`) -- 22/22 tests passing as of this update, all via
+synthetic fixtures for MTK/DHTB specifically.
+
+### Remaining AIK format-parity roadmap (updated, larger than first scoped)
+
+Reading `androidbootimg.magic` directly revealed more distinct formats
+than the original ask enumerated. Rough priority, revisit as needed:
+
+1. **ELF (Sony)** -- next up. Whole file is an ELF (32/64-bit,
+   little-endian, EI_OSABI=0x61 as the Android-boot marker,
+   e_machine identifies CPU arch), components stored as ELF segments.
+   Sources fetched already: osm0sis/elftool (elfboot.h, elftool.cpp)
+   and osm0sis/unpackelf (unpackelf.c) -- read the struct/segment
+   layout from these, not yet done.
+2. **PXA (Marvell)** -- osm0sis/pxa-mkbootimg fetched (bootimg.h,
+   unpackbootimg.c), not yet read/implemented.
+3. **OSIP/KRNL (ASUS/Rockchip)** -- magic bytes known from
+   androidbootimg.magic (`$OS$\x00\x00\x01` for OSIP, plain "KRNL"
+   for the Rockchip one), but AIK's own KRNL handling in unpackimg.sh
+   looks minimal/incomplete (an 8-byte skip with no separate kernel
+   extraction shown) -- needs osm0sis/mboot source or real sample
+   files to do properly, not just the magic file.
+4. **RKCRC, blobpack/blobunpack, QCDT** -- each needs its own source
+   read (neo-technologies/rkflashtool's rkcrc.c,
+   AndroidRoot/BlobTools, no source identified yet for QCDT).
+5. **AVBv1 (old boot_signer verity) and ChromeOS futility signing** --
+   both full signing schemes, comparable in scope/care to AVB itself;
+   don't rush these. androidbootimg.magic gives the AVBv1 footer
+   pattern (`\x02\x01\x01\x30\x82`, DER/ASN.1-looking) as a
+   starting point.
+6. **LOKI, AMONET** -- bootloader-exploit patch/reversal techniques for
+   specific old locked devices, not container formats -- scope as
+   their own explicit CLI operations later, not part of unpack/repack
+   detection.
+7. **BLOB, NOOK/NOOKTAB, SIN (Sony's outer container, separate from the
+   ELF format itself)** -- lower priority, older/niche device
+   ecosystems; magic bytes are in androidbootimg.magic when it's time.

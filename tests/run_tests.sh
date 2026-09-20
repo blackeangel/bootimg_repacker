@@ -197,6 +197,50 @@ cp a.dtb dtbo_manifest/entry0.dtb
 "$ABR" repack dtbo_manifest -o dtbo_built.img >/dev/null
 roundtrip_check dtbo_built.img "dtbo (v1, zlib-compressed entry)" dtbo1
 
+# --------------------------------------------------------------- mtk --
+# Synthetic fixtures (not vendoring osm0sis/mkmtkhdr's source here --
+# unlike mkbootimg.py it carries no explicit repo-level license, so
+# this project generates the MTK sub-header itself in Python from the
+# struct layout documented in include/abr/legacy/mtk.hpp instead of
+# redistributing that tool's code). The struct/magic/512-byte-size
+# were independently confirmed against a locally-compiled mkmtkhdr
+# during development, just not re-verified by every test run.
+python3 - <<'PYEOF'
+import struct
+def mtk_wrap(payload, name):
+    h = struct.pack("<II", 0x58881688, len(payload)) + name.encode().ljust(32, b"\x00")
+    h += b"\xff" * (512 - len(h))
+    return h + payload
+open("mtk_kernel.bin", "wb").write(mtk_wrap(b"fake kernel data" * 500, "KERNEL"))
+open("mtk_ramdisk.bin", "wb").write(mtk_wrap(b"fake ramdisk data" * 300, "ROOTFS"))
+PYEOF
+python3 "$MKBOOTIMG" --header_version 0 --kernel mtk_kernel.bin --ramdisk mtk_ramdisk.bin \
+    --cmdline "console=ttyMT0" --base 0x40000000 --pagesize 2048 --output boot_mtk.img
+roundtrip_check boot_mtk.img "boot v0 (MTK header on both kernel and ramdisk)" mtk1
+grep -q "^kernel_mtk_name=KERNEL$" rt_mtk1/manifest.txt && grep -q "^ramdisk_mtk_name=ROOTFS$" rt_mtk1/manifest.txt \
+  && { echo "PASS: MTK header names recorded correctly for both components"; PASS=$((PASS + 1)); } \
+  || { echo "FAIL: MTK header names missing/wrong in manifest"; FAIL=$((FAIL + 1)); }
+
+# -------------------------------------------------------------- dhtb --
+# Same rationale as above for not vendoring osm0sis/dhtbsign's source
+# (no repo-level license at all there, plus that specific reference
+# tool has its own memory-corruption bug on exit -- see PROGRESS.md).
+python3 - <<'PYEOF'
+import hashlib, struct
+inner = open("boot_mtk.img", "rb").read()
+seandroid = b"SEANDROIDENFORCE"
+padding = b"\xff\xff\xff\xff"
+payload = inner + seandroid + padding
+digest = hashlib.sha256(payload).digest()
+header = b"DHTB\x01\x00\x00\x00" + digest + b"\x00" * 8 + struct.pack("<I", len(payload))
+header += b"\x00" * (512 - len(header))
+open("dhtb_wrapped.img", "wb").write(header + payload)
+PYEOF
+roundtrip_check dhtb_wrapped.img "boot (DHTB-wrapped, with SEAndroid footer + padding)" dhtb1
+grep -q "^has_dhtb=true$" rt_dhtb1/manifest.txt \
+  && { echo "PASS: DHTB wrapper decomposed into manifest fields"; PASS=$((PASS + 1)); } \
+  || { echo "FAIL: DHTB wrapper not recorded in manifest"; FAIL=$((FAIL + 1)); }
+
 # ------------------------------------------------------------------ lzo --
 # Raw LZO1X has no magic, so it can only be exercised through a
 # container that names its compression explicitly (a boot.img ramdisk
