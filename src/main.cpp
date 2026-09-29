@@ -20,6 +20,7 @@
 #include "abr/dtb.hpp"
 #include "abr/dtbo.hpp"
 #include "abr/legacy/dhtb.hpp"
+#include "abr/legacy/elf_boot.hpp"
 #include "abr/legacy/mtk.hpp"
 #include "abr/manifest.hpp"
 #include "abr/sha.hpp"
@@ -35,7 +36,7 @@ namespace {
 
 // ------------------------------------------------------------ detection --
 
-enum class Fmt { BOOT, VENDOR_BOOT, DTBO, DTB, VBMETA, UIMAGE, UNKNOWN };
+enum class Fmt { BOOT, VENDOR_BOOT, DTBO, DTB, VBMETA, UIMAGE, ELF_BOOT, UNKNOWN };
 
 Fmt detect_format(const Bytes& d) {
     if (d.size() >= 8 && std::memcmp(d.data(), "ANDROID!", 8) == 0) return Fmt::BOOT;
@@ -48,6 +49,7 @@ Fmt detect_format(const Bytes& d) {
         if (be == kUimageMagic) return Fmt::UIMAGE;
     }
     if (d.size() >= 64 && std::memcmp(d.data() + d.size() - 64, "AVBf", 4) == 0) return Fmt::VBMETA;
+    if (ElfBootImage::looks_like(d)) return Fmt::ELF_BOOT;
     return Fmt::UNKNOWN;
 }
 
@@ -59,6 +61,7 @@ const char* fmt_name(Fmt f) {
         case Fmt::DTB: return "dtb";
         case Fmt::VBMETA: return "vbmeta";
         case Fmt::UIMAGE: return "uimage";
+        case Fmt::ELF_BOOT: return "elf_boot";
         case Fmt::UNKNOWN: return "unknown";
     }
     return "unknown";
@@ -71,6 +74,7 @@ Fmt fmt_from_name(const std::string& s) {
     if (s == "dtb") return Fmt::DTB;
     if (s == "vbmeta") return Fmt::VBMETA;
     if (s == "uimage") return Fmt::UIMAGE;
+    if (s == "elf_boot") return Fmt::ELF_BOOT;
     return Fmt::UNKNOWN;
 }
 
@@ -559,6 +563,44 @@ Bytes repack_uimage(const Manifest& m, const fs::path& dir) {
     return img.build();
 }
 
+// ----------------------------------------------------------- elf_boot --
+
+void unpack_elf_boot(const Bytes& data, const fs::path& dir) {
+    legacy::ElfBootImage img = legacy::ElfBootImage::parse(data);
+    Manifest m;
+    m.set("type", "elf_boot");
+    m.set_bool("is_64bit", img.is_64bit);
+    m.set_u32("machine", img.machine);
+    m.set_u32("segment_count", static_cast<uint32_t>(img.segments.size()));
+    for (size_t i = 0; i < img.segments.size(); ++i) {
+        auto& s = img.segments[i];
+        std::string p = "segment" + std::to_string(i);
+        m.set(p + "_role", s.role);
+        m.set_u32(p + "_flags", s.flags);
+        m.set_addr(p + "_addr", s.addr);
+        save_component(m, dir, p, s.data, p + "_" + s.role + ".bin");
+    }
+    m.save(dir / "manifest.txt",
+           "abr elf_boot manifest -- edit then `abr repack " + dir.string() + " -o out.img`");
+}
+
+Bytes repack_elf_boot(const Manifest& m, const fs::path& dir) {
+    legacy::ElfBootImage img;
+    img.is_64bit = m.get_bool("is_64bit", false);
+    img.machine = static_cast<uint16_t>(m.get_u32("machine", 40));
+    uint32_t count = m.get_u32("segment_count", 0);
+    for (uint32_t i = 0; i < count; ++i) {
+        std::string p = "segment" + std::to_string(i);
+        legacy::ElfSegment s;
+        s.role = m.get(p + "_role", "kernel");
+        s.flags = m.get_u32(p + "_flags", 0);
+        s.addr = static_cast<uint32_t>(m.get_addr(p + "_addr", 0));
+        s.data = load_component(m, dir, p);
+        img.segments.push_back(std::move(s));
+    }
+    return img.build();
+}
+
 // ------------------------------------------------------------ info cmd --
 
 void print_info(const fs::path& path) {
@@ -648,6 +690,18 @@ void print_info(const fs::path& path) {
             std::cout << "data:        " << img.data.size() << " bytes\n";
             break;
         }
+        case Fmt::ELF_BOOT: {
+            legacy::ElfBootImage img = legacy::ElfBootImage::parse(data);
+            std::cout << "class:    " << (img.is_64bit ? "ELF64" : "ELF32") << "\n";
+            std::cout << "machine:  " << img.machine << "\n";
+            std::cout << "segments: " << img.segments.size() << "\n";
+            for (auto& s : img.segments)
+                std::cout << "  - " << s.role << " (flags=0x" << std::hex << s.flags << std::dec
+                           << ") addr=0x" << std::hex << s.addr << std::dec
+                           << " size=" << s.data.size() << " (" << codec_name(detect_codec(s.data))
+                           << ")\n";
+            break;
+        }
         case Fmt::UNKNOWN:
             std::cout << "(unrecognized format)\n";
             break;
@@ -672,6 +726,7 @@ void do_unpack(const fs::path& in, const fs::path& outdir) {
         case Fmt::DTB: unpack_dtb(payload, outdir); break;
         case Fmt::VBMETA: unpack_vbmeta(payload, outdir); break;
         case Fmt::UIMAGE: unpack_uimage(payload, outdir); break;
+        case Fmt::ELF_BOOT: unpack_elf_boot(payload, outdir); break;
         case Fmt::UNKNOWN: throw FormatError("unrecognized image format: " + in.string());
     }
 
@@ -701,6 +756,7 @@ void do_repack(const fs::path& dir, const fs::path& out, const std::string& avb_
         case Fmt::DTB: result = repack_dtb(m, dir); break;
         case Fmt::VBMETA: result = repack_vbmeta(m, dir, avb_key_pem); break;
         case Fmt::UIMAGE: result = repack_uimage(m, dir); break;
+        case Fmt::ELF_BOOT: result = repack_elf_boot(m, dir); break;
         case Fmt::UNKNOWN:
             throw FormatError("manifest.txt has no (or an unrecognized) 'type=' field");
     }
