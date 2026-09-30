@@ -17,3 +17,7 @@ third_party/deps/
 *.pem
 *.key
 .gh_token
+
+# Python bytecode (vendored reference scripts get imported by the tests)
+__pycache__/
+*.pyc
