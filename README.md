@@ -17,6 +17,12 @@ build-time contents:
 | dtb | raw or concatenated Flattened Device Tree blobs |
 | vbmeta (AVB) | `vbmeta.img`, `vbmeta_system.img`, and AVB footers appended to other partitions |
 | uboot | U-Boot's legacy `mkimage`/uImage container |
+| ELF boot image | Sony/Xperia-style boot images that are an ELF file with the kernel/ramdisk as segments |
+
+Also handled transparently, wherever it appears around those: a
+MediaTek (MTK) sub-header on the kernel and/or ramdisk, a DHTB wrapper
+(with its SEAndroid footer/padding), an AVB hash footer on boot /
+vendor_boot / dtbo, and the vendor data described below.
 
 Compression: gzip, lz4 (frame and the Android/GKI "legacy" block
 format), zstd, xz, LZMA (headerless "alone" stream), bzip2, and LZO
@@ -25,7 +31,10 @@ decompressor expects, since raw LZO1X has no header of its own to
 detect or frame blocks with).
 
 Format is auto-detected from magic bytes; you don't need to tell `abr`
-what kind of file it's looking at.
+what kind of file it's looking at. Things that are not boot-family
+containers (an ext4/F2FS/EROFS/SquashFS filesystem, a sparse image, a
+ZIP, a raw cpio) are recognised and rejected with an explanation instead
+of a bare "unknown format".
 
 ## Usage
 
@@ -40,13 +49,43 @@ one file per component (kernel, ramdisk, dtb, ...) into the output
 directory. Edit whatever you need to, then `repack`.
 
 **An unpack/repack round trip is byte-for-byte identical to the
-original if you don't touch any of the extracted files.** Compressed
+original if you don't touch any of the extracted files** -- and `unpack`
+checks this itself (it rebuilds the image in memory and compares), saying
+so, or saying where the first difference is. 13 of the 14 real device
+dumps tried so far round-trip exactly (the 14th is an ext4 filesystem).
+Compressed
 components (kernel, ramdisk, vendor ramdisk fragments) are
 decompressed on unpack so they're actually editable, but the original
 compressed bytes are kept on the side and replayed verbatim if the
 extracted file comes back unchanged -- only an actual edit triggers
 recompression. See `tests/run_tests.sh` for this being checked against
 real images built with AOSP's own `mkbootimg.py`, `dtc`, and `mkimage`.
+
+### What `abr` keeps so a round trip stays exact
+
+Real images carry more than the format documents. `abr` records all of
+this in the manifest / as side files and writes it back:
+
+- bytes **before** the image (a vendor wrapper such as a BFBF/SSSS
+  header) and **after** it (signature trailers, an AVBv1 `BootSignature`,
+  a `SEANDROIDENFORCE` marker), and zero/0xFF **fill up to the original
+  partition size**;
+- the boot header `id` and **how it was computed** (AOSP SHA-1, SHA-1
+  that also covers a Qualcomm dt blob, SHA-256, or an unrecognised value
+  kept verbatim) -- after an edit the id is recomputed the same way;
+- Qualcomm/CAF `dt_size` in a v0 header, reserved words, a non-standard
+  `header_size` or `recovery_dtbo_offset`, data hidden in the header
+  page, dumps whose last page was trimmed;
+- vendor_boot v4 images that declare no ramdisk table;
+- an AVB footer: laid out the way `avbtool` does, with the digest checked
+  at unpack time and **refreshed after you edit the image** (a signed
+  footer needs `--avb-key`; without it `abr` refuses rather than emit an
+  image that fails verification).
+
+If you edit an image that sits inside a vendor wrapper or signature
+trailer, `abr` warns: the wrapper is kept as it was, so a signature or
+checksum in it no longer matches. It cannot re-create vendor signatures
+it has no key for.
 
 ### Re-signing a vbmeta
 
@@ -122,7 +161,10 @@ Everything in the table above has a byte-identical round-trip test
 against a real reference tool (AOSP's `mkbootimg.py`, `dtc`, or
 `mkimage`) or, for AVB signing specifically, an independent signature
 check with `openssl pkeyutl -verify` -- see `tests/run_tests.sh` and
-`PROGRESS.md` for exactly what's covered and how. Two exceptions:
+`PROGRESS.md` for exactly what's covered and how. The quirks found on
+real device dumps are pinned by synthetic fixtures built from the format
+specs (`tests/tools/fixtures.py`) and re-checked by an independent
+verifier (`tests/tools/verify.py`). Two exceptions:
 
 - **dtbo.img** has no external-oracle test in this repo (couldn't get
   a working `mkdtboimg.py` mirror reachable during development); the
@@ -133,10 +175,20 @@ check with `openssl pkeyutl -verify` -- see `tests/run_tests.sh` and
   has not been checked against `avbtool verify_image` or booted on a
   real device.
 
-## Not implemented
+## Not implemented (yet)
 
+- **AVBv1 `BootSignature`** (the pre-AVB `boot_signer` DER blob after the
+  image): preserved byte-for-byte, but not verified or re-generated after
+  an edit. Next on the list.
+- **cpio ramdisk as a directory tree**: the ramdisk is extracted as one
+  decompressed `ramdisk.cpio`; unpacking/packing its files is planned.
+- The rest of the Android Image Kitchen format list: PXA, OSIP/KRNL,
+  RKCRC, blobpack, QCDT tooling, ChromeOS `futility` signing, LOKI/AMONET,
+  BLOB/NOOK/SIN. See `PROGRESS.md` for the plan.
 - U-Boot's newer FIT (Flattened Image Tree) format -- only the older
   legacy `mkimage` container is supported.
+- Filesystems (ext4, F2FS, EROFS, SquashFS) and sparse images: out of
+  scope; see the sibling tools in the same suite.
 
 ## License
 
