@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "abr/byte_io.hpp"
 
@@ -41,6 +42,22 @@ struct OsVersion {
                                            const std::string& patch_level);
 };
 
+// How the 32-byte `id` field of a v0-v2 header was derived. The field is a
+// content fingerprint that no bootloader checks, but tools disagree on how
+// to compute it, so we detect which recipe matches the image at hand and
+// reproduce exactly that one when a component changes. Unrecognised values
+// are kept verbatim (RAW) rather than overwritten with a guess.
+enum class IdScheme {
+    SHA1,       // SHA-1 over kernel, ramdisk, second [, recovery_dtbo] [, dtb], each as data || le32(size)
+    SHA1_DT,    // as SHA1 for v0, plus a trailing dt entry (data || le32(size), or a lone le32(0))
+    SHA256,     // same input as SHA1, SHA-256 digest (osm0sis mkbootimg --hash sha256)
+    SHA256_DT,  // SHA1_DT with a SHA-256 digest
+    RAW,        // unknown recipe (or all-zero): keep whatever the image had
+};
+
+const char* id_scheme_name(IdScheme s);
+std::optional<IdScheme> id_scheme_from_name(const std::string& name);
+
 struct BootImage {
     uint32_t header_version = 4;  // 0..4
 
@@ -49,10 +66,11 @@ struct BootImage {
     uint32_t ramdisk_addr = 0x01000000;
     uint32_t second_addr = 0x00f00000;
     uint32_t tags_addr = 0x00000100;
-    uint32_t dtb_addr = 0x01f00000;  // v2 only; stored as u64 on disk, high bits usually 0
+    uint64_t dtb_addr = 0x01f00000;  // v2 only; u64 on disk
     uint32_t page_size = 2048;       // v0-v2 only; v3/v4 fix this at 4096
     std::string board_name;          // v0-v2 only, <=16 bytes
-    std::array<uint32_t, 8> id{};    // v0-v2 only; sha1 digest, zero-padded to 32 bytes
+    std::array<uint32_t, 8> id{};    // v0-v2 only; as found on disk (see id_scheme)
+    IdScheme id_scheme = IdScheme::SHA1;
 
     // --- shared ---
     OsVersion os_version{};
@@ -72,11 +90,33 @@ struct BootImage {
     Bytes boot_signature;  // v4 only; GKI boot_signature blob (up to 4096/16384 bytes, AVB
                             // footer for the whole file is separate and handled by VbmetaImage)
 
+    // v0 only. Qualcomm/CAF ("QCDT") images reuse the header_version word
+    // as `dt_size` and append a device-tree blob after `second`. A header
+    // word above 8 is read that way (osm0sis' unpackbootimg does the same).
+    Bytes dt;
+
+    // Things a plain re-serialisation would silently normalise away. They
+    // are recorded by parse() and reused by build() so an untouched image
+    // rebuilds bit-exactly.
+    std::optional<uint32_t> header_size_field;          // v1-v4: value found if not the standard one
+    std::optional<uint64_t> recovery_dtbo_offset_field; // v1-v2: ditto
+    std::array<uint32_t, 4> reserved{};                 // v3-v4 reserved[4]
+    Bytes header_padding;                               // non-zero bytes between header struct and page end
+    uint64_t missing_tail_padding = 0;                  // final page padding absent from the source file
+
+    // Set by parse(): number of bytes of `image` that belong to the boot
+    // image proper (end of the last component, page aligned, clipped to
+    // the file). Anything after that is the caller's business.
+    size_t consumed = 0;
+
     static BootImage parse(const Bytes& image);
     Bytes build() const;
 
-    // Recomputes the `id` field using the same SHA-1(payload||size) scheme
-    // as AOSP mkbootimg.py's write_header(); only meaningful for v0-v2.
+    // Digest per `id_scheme` over the current components. Empty for RAW.
+    Bytes compute_id(IdScheme scheme) const;
+    // The scheme (if any) whose digest reproduces the id found in the source.
+    IdScheme detect_id_scheme() const;
+    // Recomputes `id` following `id_scheme`; RAW leaves it untouched.
     void recompute_id();
 };
 

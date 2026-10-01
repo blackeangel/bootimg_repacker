@@ -63,6 +63,7 @@ add_library(abr_core STATIC
   src/vbmeta.cpp
   src/uimage.cpp
   src/manifest.cpp
+  src/envelope.cpp
   src/legacy/mtk.cpp
   src/legacy/dhtb.cpp
   src/legacy/elf_boot.cpp

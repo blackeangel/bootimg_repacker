@@ -60,11 +60,62 @@ std::optional<OsVersion> OsVersion::parse(const std::string& version,
 
 // ------------------------------------------------------------ BootImage --
 
+const char* id_scheme_name(IdScheme s) {
+    switch (s) {
+        case IdScheme::SHA1: return "sha1";
+        case IdScheme::SHA1_DT: return "sha1_dt";
+        case IdScheme::SHA256: return "sha256";
+        case IdScheme::SHA256_DT: return "sha256_dt";
+        case IdScheme::RAW: return "raw";
+    }
+    return "raw";
+}
+
+std::optional<IdScheme> id_scheme_from_name(const std::string& name) {
+    for (IdScheme s : {IdScheme::SHA1, IdScheme::SHA1_DT, IdScheme::SHA256, IdScheme::SHA256_DT,
+                       IdScheme::RAW})
+        if (name == id_scheme_name(s)) return s;
+    return std::nullopt;
+}
+
 namespace {
 constexpr uint32_t kHeaderSizeV1 = 1648;
 constexpr uint32_t kHeaderSizeV2 = 1660;
 constexpr uint32_t kHeaderSizeV3 = 1580;
 constexpr uint32_t kHeaderSizeV4 = 1584;
+
+// Header word 10 (byte offset 40) is `header_version` in AOSP images. The
+// Qualcomm/CAF variant of the v0 header stores `dt_size` there instead;
+// osm0sis' unpackbootimg treats anything above 8 as a size, so do we.
+constexpr uint32_t kMaxHeaderVersionWord = 8;
+
+uint32_t standard_header_size(uint32_t version) {
+    switch (version) {
+        case 1: return kHeaderSizeV1;
+        case 2: return kHeaderSizeV2;
+        case 3: return kHeaderSizeV3;
+        case 4: return kHeaderSizeV4;
+        default: return 0;
+    }
+}
+
+// Where AOSP's get_recovery_dtbo_offset() puts the recovery dtbo.
+uint64_t computed_recovery_dtbo_offset(uint32_t page, size_t kernel, size_t ramdisk,
+                                       size_t second) {
+    auto pages = [&](size_t n) { return align_up(n, page) / page; };
+    return static_cast<uint64_t>(page) * (1 + pages(kernel) + pages(ramdisk) + pages(second));
+}
+
+std::array<uint32_t, 8> id_words(const Bytes& digest) {
+    std::array<uint32_t, 8> out{};
+    for (size_t i = 0; i < out.size() && i * 4 < digest.size(); ++i) {
+        uint32_t w = 0;
+        for (size_t b = 0; b < 4 && i * 4 + b < digest.size(); ++b)
+            w |= static_cast<uint32_t>(digest[i * 4 + b]) << (8 * b);
+        out[i] = w;
+    }
+    return out;
+}
 }  // namespace
 
 BootImage BootImage::parse(const Bytes& image) {
@@ -72,18 +123,31 @@ BootImage BootImage::parse(const Bytes& image) {
           std::equal(kBootMagic, kBootMagic + kBootMagicSize, image.begin())))
         throw FormatError("not a boot image (magic mismatch, expected 'ANDROID!')");
 
-    // header_version sits at byte offset 40 in *every* header layout
-    // (v0-v2 and v3-v4 both place 8 leading 4-byte fields before it).
+    // Word 10 sits at byte offset 40 in *every* header layout (v0-v2 and
+    // v3-v4 both place 8 leading 4-byte fields before it).
     if (image.size() < 44) throw FormatError("boot image too small to contain a header");
     BinaryReader peek(image);
     peek.seek(40);
-    uint32_t header_version = peek.le32();
+    uint32_t version_word = peek.le32();
 
     BootImage img;
-    img.header_version = header_version;
+    uint32_t dt_size = 0;
+    if (version_word > kMaxHeaderVersionWord) {
+        img.header_version = 0;  // CAF v0 header: the word is a device-tree size
+        dt_size = version_word;
+    } else {
+        img.header_version = version_word;
+    }
+    const uint32_t header_version = img.header_version;
 
     BinaryReader r(image);
     r.skip(kBootMagicSize);
+
+    // Moves to the next page boundary, but never past the end of the file:
+    // dumps whose final page padding was trimmed are common and harmless.
+    auto to_page = [&](uint32_t page) {
+        r.seek(static_cast<size_t>(std::min<uint64_t>(align_up(r.pos(), page), image.size())));
+    };
 
     if (header_version <= 2) {
         uint32_t kernel_size = r.le32();
@@ -94,7 +158,7 @@ BootImage BootImage::parse(const Bytes& image) {
         img.second_addr = r.le32();
         img.tags_addr = r.le32();
         img.page_size = r.le32();
-        r.le32();  // header_version, already known
+        r.le32();  // header_version / dt_size, already known
         img.os_version = OsVersion::unpack(r.le32());
         img.board_name = r.asciiz(kBootNameSize);
         std::string part1 = r.asciiz(kBootArgsSize);
@@ -103,56 +167,111 @@ BootImage BootImage::parse(const Bytes& image) {
         img.cmdline = part1 + part2;
 
         uint32_t recovery_dtbo_size = 0;
+        uint64_t recovery_dtbo_offset = 0;
         if (header_version >= 1) {
             recovery_dtbo_size = r.le32();
-            r.le64();  // recovery_dtbo_offset -- recomputed on build(), not trusted here
-            r.le32();  // header_size -- ditto
+            recovery_dtbo_offset = r.le64();
+            uint32_t hs = r.le32();
+            if (hs != standard_header_size(header_version)) img.header_size_field = hs;
         }
         uint32_t dtb_size = 0;
         if (header_version >= 2) {
             dtb_size = r.le32();
-            img.dtb_addr = static_cast<uint32_t>(r.le64());
+            img.dtb_addr = r.le64();
         }
 
         if (img.page_size == 0) throw FormatError("boot image page_size is zero");
-        r.seek(static_cast<size_t>(align_up(r.pos(), img.page_size)));
+
+        // Whatever sits between the end of the header struct and the end of
+        // its page is padding by definition -- unless a vendor stashed
+        // something there, in which case it must survive a repack.
+        {
+            size_t struct_end = r.pos();
+            size_t page_end = static_cast<size_t>(
+                std::min<uint64_t>(align_up(struct_end, img.page_size), image.size()));
+            for (size_t i = struct_end; i < page_end; ++i)
+                if (image[i] != 0) {
+                    img.header_padding.assign(image.begin() + static_cast<long>(struct_end),
+                                              image.begin() + static_cast<long>(page_end));
+                    break;
+                }
+        }
+
+        to_page(img.page_size);
         img.kernel = r.bytes(kernel_size);
-        r.seek(static_cast<size_t>(align_up(r.pos(), img.page_size)));
+        to_page(img.page_size);
         img.ramdisk = r.bytes(ramdisk_size);
-        r.seek(static_cast<size_t>(align_up(r.pos(), img.page_size)));
+        to_page(img.page_size);
         img.second = r.bytes(second_size);
-        r.seek(static_cast<size_t>(align_up(r.pos(), img.page_size)));
+        to_page(img.page_size);
+        if (header_version == 0 && dt_size) {
+            img.dt = r.bytes(dt_size);
+            to_page(img.page_size);
+        }
         if (header_version >= 1) {
             img.recovery_dtbo = r.bytes(recovery_dtbo_size);
-            r.seek(static_cast<size_t>(align_up(r.pos(), img.page_size)));
+            to_page(img.page_size);
+            uint64_t expected =
+                recovery_dtbo_size
+                    ? computed_recovery_dtbo_offset(img.page_size, kernel_size, ramdisk_size,
+                                                    second_size)
+                    : 0;
+            if (recovery_dtbo_offset != expected) img.recovery_dtbo_offset_field = recovery_dtbo_offset;
         }
         if (header_version >= 2) {
             img.dtb = r.bytes(dtb_size);
-            r.seek(static_cast<size_t>(align_up(r.pos(), img.page_size)));
+            to_page(img.page_size);
         }
+        img.consumed = r.pos();
+        img.id_scheme = img.detect_id_scheme();
     } else if (header_version == 3 || header_version == 4) {
         uint32_t kernel_size = r.le32();
         uint32_t ramdisk_size = r.le32();
         img.os_version = OsVersion::unpack(r.le32());
-        r.le32();       // header_size, recomputed on build()
-        r.skip(4 * 4);  // reserved[4]
-        r.le32();       // header_version, already known
+        uint32_t hs = r.le32();
+        if (hs != standard_header_size(header_version)) img.header_size_field = hs;
+        for (auto& w : img.reserved) w = r.le32();
+        r.le32();  // header_version, already known
         img.cmdline = r.asciiz(kBootArgsSize + kBootExtraArgsSize);
         uint32_t signature_size = 0;
         if (header_version == 4) signature_size = r.le32();
         img.page_size = 4096;
 
-        r.seek(static_cast<size_t>(align_up(r.pos(), 4096)));
+        {
+            size_t struct_end = r.pos();
+            size_t page_end =
+                static_cast<size_t>(std::min<uint64_t>(align_up(struct_end, 4096), image.size()));
+            for (size_t i = struct_end; i < page_end; ++i)
+                if (image[i] != 0) {
+                    img.header_padding.assign(image.begin() + static_cast<long>(struct_end),
+                                              image.begin() + static_cast<long>(page_end));
+                    break;
+                }
+        }
+
+        to_page(4096);
         img.kernel = r.bytes(kernel_size);
-        r.seek(static_cast<size_t>(align_up(r.pos(), 4096)));
+        to_page(4096);
         img.ramdisk = r.bytes(ramdisk_size);
-        r.seek(static_cast<size_t>(align_up(r.pos(), 4096)));
+        to_page(4096);
         if (signature_size > 0) {
             img.boot_signature = r.bytes(signature_size);
-            r.seek(static_cast<size_t>(align_up(r.pos(), 4096)));
+            to_page(4096);
         }
+        img.consumed = r.pos();
     } else {
-        throw FormatError("unsupported boot header version: " + std::to_string(header_version));
+        throw FormatError("unsupported boot header version: " + std::to_string(version_word));
+    }
+
+    // If the file ends inside the final page (trailing padding trimmed by
+    // whoever dumped it), remember by how much, so build() can reproduce
+    // the same short file rather than "fixing" it.
+    {
+        // `consumed` was clipped at image.size(); anything left to the next
+        // page boundary was missing from the source.
+        uint64_t nominal = align_up(img.consumed, img.page_size);
+        if (img.consumed == image.size() && nominal > img.consumed)
+            img.missing_tail_padding = nominal - img.consumed;
     }
     return img;
 }
@@ -171,7 +290,9 @@ Bytes BootImage::build() const {
         w.le32(second_addr);
         w.le32(tags_addr);
         w.le32(page_sz);
-        w.le32(header_version);
+        // Word 10: header_version, or -- CAF v0 images -- the dt size.
+        w.le32((header_version == 0 && !dt.empty()) ? static_cast<uint32_t>(dt.size())
+                                                   : header_version);
         w.le32(os_version.pack());
         w.asciiz(board_name, kBootNameSize);
         std::string part1 = cmdline.substr(0, std::min(cmdline.size(), kBootArgsSize));
@@ -181,21 +302,21 @@ Bytes BootImage::build() const {
         for (auto v : id) w.le32(v);
         w.asciiz(part2, kBootExtraArgsSize);
 
-        // recovery_dtbo_offset mirrors AOSP's get_recovery_dtbo_offset():
-        // pages(header=1) + pages(kernel) + pages(ramdisk) + pages(second).
-        auto pages = [&](size_t n) { return align_up(n, page_sz) / page_sz; };
-        uint64_t recovery_dtbo_offset =
-            page_sz * (1 + pages(kernel.size()) + pages(ramdisk.size()) + pages(second.size()));
-
         if (header_version >= 1) {
             w.le32(static_cast<uint32_t>(recovery_dtbo.size()));
-            w.le64(recovery_dtbo.empty() ? 0 : recovery_dtbo_offset);
-            w.le32(header_version == 1 ? kHeaderSizeV1 : kHeaderSizeV2);
+            uint64_t off = recovery_dtbo_offset_field.value_or(
+                recovery_dtbo.empty()
+                    ? 0
+                    : computed_recovery_dtbo_offset(page_sz, kernel.size(), ramdisk.size(),
+                                                    second.size()));
+            w.le64(off);
+            w.le32(header_size_field.value_or(standard_header_size(header_version)));
         }
         if (header_version >= 2) {
             w.le32(static_cast<uint32_t>(dtb.size()));
             w.le64(dtb_addr);
         }
+        if (!header_padding.empty()) w.bytes(header_padding);
         w.align(page_sz);
         w.bytes(kernel);
         w.align(page_sz);
@@ -203,6 +324,10 @@ Bytes BootImage::build() const {
         w.align(page_sz);
         w.bytes(second);
         w.align(page_sz);
+        if (header_version == 0 && !dt.empty()) {
+            w.bytes(dt);
+            w.align(page_sz);
+        }
         if (header_version >= 1) {
             w.bytes(recovery_dtbo);
             w.align(page_sz);
@@ -215,11 +340,12 @@ Bytes BootImage::build() const {
         w.le32(static_cast<uint32_t>(kernel.size()));
         w.le32(static_cast<uint32_t>(ramdisk.size()));
         w.le32(os_version.pack());
-        w.le32(header_version == 3 ? kHeaderSizeV3 : kHeaderSizeV4);
-        w.zeros(4 * 4);
+        w.le32(header_size_field.value_or(standard_header_size(header_version)));
+        for (auto v : reserved) w.le32(v);
         w.le32(header_version);
         w.asciiz(cmdline, kBootArgsSize + kBootExtraArgsSize);
         if (header_version == 4) w.le32(static_cast<uint32_t>(boot_signature.size()));
+        if (!header_padding.empty()) w.bytes(header_padding);
         w.align(4096);
         w.bytes(kernel);
         w.align(4096);
@@ -232,30 +358,56 @@ Bytes BootImage::build() const {
     } else {
         throw FormatError("unsupported boot header version: " + std::to_string(header_version));
     }
-    return w.take();
+    Bytes out = w.take();
+    if (missing_tail_padding && missing_tail_padding <= out.size())
+        out.resize(out.size() - static_cast<size_t>(missing_tail_padding));
+    return out;
+}
+
+Bytes BootImage::compute_id(IdScheme scheme) const {
+    if (scheme == IdScheme::RAW || header_version > 2) return {};
+    const bool sha256 = scheme == IdScheme::SHA256 || scheme == IdScheme::SHA256_DT;
+    const bool with_dt = scheme == IdScheme::SHA1_DT || scheme == IdScheme::SHA256_DT;
+    auto run = [&](auto& h) {
+        auto feed = [&](const Bytes& data) {
+            if (!data.empty()) h.update(data.data(), data.size());
+            uint32_t sz = static_cast<uint32_t>(data.size());
+            uint8_t le[4] = {static_cast<uint8_t>(sz), static_cast<uint8_t>(sz >> 8),
+                             static_cast<uint8_t>(sz >> 16), static_cast<uint8_t>(sz >> 24)};
+            h.update(le, 4);
+        };
+        feed(kernel);
+        feed(ramdisk);
+        feed(second);
+        if (header_version == 0 && with_dt) feed(dt);
+        if (header_version >= 1) feed(recovery_dtbo);
+        if (header_version >= 2) feed(dtb);
+        return h.finish();
+    };
+    if (sha256) {
+        hash::Sha256 h;
+        return run(h);
+    }
+    hash::Sha1 h;
+    return run(h);
+}
+
+IdScheme BootImage::detect_id_scheme() const {
+    if (header_version > 2) return IdScheme::RAW;
+    bool any = false;
+    for (auto v : id)
+        if (v) any = true;
+    if (!any) return IdScheme::RAW;  // nothing to reproduce; leave it zero
+    for (IdScheme s : {IdScheme::SHA1, IdScheme::SHA1_DT, IdScheme::SHA256, IdScheme::SHA256_DT}) {
+        if ((s == IdScheme::SHA1_DT || s == IdScheme::SHA256_DT) && header_version != 0) continue;
+        if (id_words(compute_id(s)) == id) return s;
+    }
+    return IdScheme::RAW;
 }
 
 void BootImage::recompute_id() {
-    if (header_version > 2) {
-        id.fill(0);
-        return;
-    }
-    hash::Sha1 sha1;
-    auto feed = [&](const Bytes& data) {
-        if (!data.empty()) sha1.update(data.data(), data.size());
-        uint32_t sz = static_cast<uint32_t>(data.size());
-        uint8_t le[4] = {static_cast<uint8_t>(sz), static_cast<uint8_t>(sz >> 8),
-                          static_cast<uint8_t>(sz >> 16), static_cast<uint8_t>(sz >> 24)};
-        sha1.update(le, 4);
-    };
-    feed(kernel);
-    feed(ramdisk);
-    feed(second);
-    if (header_version >= 1) feed(recovery_dtbo);
-    if (header_version >= 2) feed(dtb);
-    Bytes digest = sha1.finish();
-    id.fill(0);
-    std::memcpy(id.data(), digest.data(), std::min(digest.size(), sizeof(id)));
+    if (header_version > 2 || id_scheme == IdScheme::RAW) return;
+    id = id_words(compute_id(id_scheme));
 }
 
 }  // namespace abr

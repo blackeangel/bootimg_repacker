@@ -38,6 +38,7 @@ struct DtboImage {
     uint32_t page_size = 2048;
     bool acpio = false;  // ACPIO table vs. plain DTBO table (same container format)
     std::vector<DtboEntry> entries;
+    size_t consumed = 0;  // set by parse(): bytes of the source that belong to the table proper
 
     static DtboImage parse(const Bytes& image);
     Bytes build() const;

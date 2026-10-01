@@ -9,6 +9,7 @@
 #include <openssl/pem.h>
 #endif
 
+#include <algorithm>
 #include <cstring>
 #include <sstream>
 
@@ -192,6 +193,92 @@ std::string AvbDescriptor::describe() const {
         case AvbDescriptorTag::CHAIN_PARTITION: name = "chain_partition"; break;
     }
     return std::string(name) + " descriptor (" + std::to_string(content.size()) + " bytes)";
+}
+
+namespace {
+
+// Byte layout of AvbHashDescriptor's payload (everything after the generic
+// tag/length pair): image_size, hash_algorithm[32], partition_name_len,
+// salt_len, digest_len, flags, reserved[60], then name, salt, digest.
+struct HashDescLayout {
+    uint64_t image_size = 0;
+    std::string algorithm;
+    size_t name_off = 0, salt_off = 0, digest_off = 0;
+    uint32_t name_len = 0, salt_len = 0, digest_len = 0;
+};
+
+bool parse_hash_descriptor(const Bytes& c, HashDescLayout& out) {
+    constexpr size_t kFixed = 8 + 32 + 4 * 4 + 60;
+    if (c.size() < kFixed) return false;
+    BinaryReader r(c);
+    out.image_size = r.be64();
+    auto algo = r.fixed_bytes<32>();
+    size_t n = 0;
+    while (n < algo.size() && algo[n]) ++n;
+    out.algorithm.assign(reinterpret_cast<const char*>(algo.data()), n);
+    out.name_len = r.be32();
+    out.salt_len = r.be32();
+    out.digest_len = r.be32();
+    r.be32();  // flags
+    r.skip(60);
+    out.name_off = kFixed;
+    out.salt_off = out.name_off + out.name_len;
+    out.digest_off = out.salt_off + out.salt_len;
+    return out.digest_off + out.digest_len <= c.size();
+}
+
+bool digest_named(const std::string& algo, const Bytes& salt, const Bytes& image, Bytes& out) {
+    Bytes data = salt;
+    data.insert(data.end(), image.begin(), image.end());
+    if (algo == "sha256") out = hash::sha256(data);
+    else if (algo == "sha512") out = hash::sha512(data);
+    else if (algo == "sha1") out = hash::sha1(data);
+    else return false;
+    return true;
+}
+}  // namespace
+
+size_t VbmetaImage::verify_hash_descriptors(const Bytes& host_image, size_t* mismatches) const {
+    size_t checked = 0, bad = 0;
+    for (auto& d : descriptors) {
+        if (d.tag != static_cast<uint64_t>(AvbDescriptorTag::HASH)) continue;
+        HashDescLayout L;
+        if (!parse_hash_descriptor(d.content, L)) continue;
+        Bytes salt(d.content.begin() + static_cast<long>(L.salt_off),
+                   d.content.begin() + static_cast<long>(L.salt_off + L.salt_len));
+        Bytes have(d.content.begin() + static_cast<long>(L.digest_off),
+                   d.content.begin() + static_cast<long>(L.digest_off + L.digest_len));
+        Bytes want;
+        if (!digest_named(L.algorithm, salt, host_image, want)) continue;
+        ++checked;
+        if (want != have || L.image_size != host_image.size()) ++bad;
+    }
+    if (mismatches) *mismatches = bad;
+    return checked;
+}
+
+bool VbmetaImage::refresh_hash_descriptors(const Bytes& host_image) {
+    bool changed = false;
+    for (auto& d : descriptors) {
+        if (d.tag != static_cast<uint64_t>(AvbDescriptorTag::HASH)) continue;
+        HashDescLayout L;
+        if (!parse_hash_descriptor(d.content, L)) continue;
+        Bytes salt(d.content.begin() + static_cast<long>(L.salt_off),
+                   d.content.begin() + static_cast<long>(L.salt_off + L.salt_len));
+        Bytes want;
+        if (!digest_named(L.algorithm, salt, host_image, want) || want.size() != L.digest_len)
+            continue;
+        Bytes updated = d.content;
+        for (int i = 0; i < 8; ++i)
+            updated[static_cast<size_t>(i)] =
+                static_cast<uint8_t>(uint64_t(host_image.size()) >> (8 * (7 - i)));
+        std::copy(want.begin(), want.end(), updated.begin() + static_cast<long>(L.digest_off));
+        if (updated != d.content) {
+            d.content = std::move(updated);
+            changed = true;
+        }
+    }
+    return changed;
 }
 
 namespace {
@@ -381,19 +468,39 @@ Bytes VbmetaImage::build(const std::string& private_key_pem) const {
     Bytes blob = build_blob(*this, private_key_pem);
     if (!has_footer) return blob;
 
+    // Layout follows `avbtool add_*_footer`: the protected image (its
+    // original size, which need not be block aligned), zero padding up to
+    // the next 4096 boundary, the vbmeta blob, zero fill, and the 64-byte
+    // footer in the very last bytes of the partition.
+    //
+    // host_prefix comes in two flavours. Freshly built by the caller (boot,
+    // vendor_boot, dtbo): exactly the protected image, so the padding is
+    // ours to add. Unpacked from a file by parse(): everything in front of
+    // the vbmeta blob -- including any padding, and for HASHTREE footers
+    // the hash tree and FEC data -- which must be kept as it is.
+    constexpr uint64_t kBlock = 4096;
+    uint64_t orig_size = footer_original_image_size ? footer_original_image_size : host_prefix.size();
     Bytes out = host_prefix;
+    if (out.size() <= orig_size) {
+        out.resize(static_cast<size_t>(orig_size), 0);
+        out.resize(static_cast<size_t>(align_up(orig_size, kBlock)), 0);
+    }
     uint64_t vbmeta_offset = out.size();
     out.insert(out.end(), blob.begin(), blob.end());
 
     uint64_t footer_pos =
         source_total_size >= kAvbFooterSize ? source_total_size - kAvbFooterSize : out.size();
-    if (footer_pos < out.size()) footer_pos = out.size();
+    if (footer_pos < out.size()) {
+        if (source_total_size)
+            throw FormatError("image plus AVB metadata (" + std::to_string(out.size() + kAvbFooterSize) +
+                              " bytes) no longer fits the original partition size (" +
+                              std::to_string(source_total_size) + " bytes)");
+        footer_pos = out.size();
+    }
     out.resize(static_cast<size_t>(footer_pos), 0);
 
-    uint64_t orig_size = footer_original_image_size ? footer_original_image_size : vbmeta_offset;
     Bytes footer = build_avb_footer(orig_size, vbmeta_offset, blob.size());
     out.insert(out.end(), footer.begin(), footer.end());
-    if (source_total_size > out.size()) out.resize(static_cast<size_t>(source_total_size), 0);
     return out;
 }
 

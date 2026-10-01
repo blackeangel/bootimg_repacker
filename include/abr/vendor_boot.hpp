@@ -11,6 +11,7 @@
 
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -53,6 +54,19 @@ struct VendorBootImage {
     // have several. Either way this vector is the source of truth for the
     // vendor ramdisk section.
     std::vector<VendorRamdiskEntry> ramdisk_fragments;
+
+    // A v4 header whose ramdisk table is empty (some vendors and Magisk's
+    // repacker emit these) keeps its ramdisk as one anonymous blob; build()
+    // must then not invent a table. Always true for images read with a
+    // populated table and for newly created v4 images.
+    bool has_ramdisk_table = true;
+
+    // As-found values a plain re-serialisation would normalise away; see
+    // BootImage for the same idea.
+    std::optional<uint32_t> header_size_field;  // only if not the standard 2112/2128
+    Bytes header_padding;                       // non-zero bytes between header struct and page end
+    uint64_t missing_tail_padding = 0;          // final page padding absent from the source
+    size_t consumed = 0;                        // bytes of the source that belong to the image proper
 
     static VendorBootImage parse(const Bytes& image);
     Bytes build() const;

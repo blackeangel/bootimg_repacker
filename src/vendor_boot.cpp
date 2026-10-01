@@ -49,7 +49,7 @@ VendorBootImage VendorBootImage::parse(const Bytes& image) {
     img.cmdline = r.asciiz(kVendorBootArgsSize);
     img.tags_addr = r.le32();
     img.board_name = r.asciiz(kVendorBootNameSize);
-    r.le32();  // header_size, recomputed on build()
+    uint32_t header_size_found = r.le32();
     uint32_t dtb_size = r.le32();
     img.dtb_addr = r.le64();
 
@@ -64,11 +64,32 @@ VendorBootImage VendorBootImage::parse(const Bytes& image) {
                                std::to_string(table_entry_size));
     }
 
-    r.seek(static_cast<size_t>(align_up(r.pos(), img.page_size)));
+    const uint32_t standard_hs = img.header_version == 3 ? kHeaderSizeV3 : kHeaderSizeV4;
+    if (header_size_found != standard_hs) img.header_size_field = header_size_found;
+
+    // Never seek past the end of the file: a dump whose last page padding was
+    // trimmed is still a valid image (build() re-trims it via
+    // missing_tail_padding).
+    auto to_page = [&]() {
+        r.seek(static_cast<size_t>(
+            std::min<uint64_t>(align_up(r.pos(), img.page_size), image.size())));
+    };
+    {
+        size_t struct_end = r.pos();
+        size_t page_end = static_cast<size_t>(
+            std::min<uint64_t>(align_up(struct_end, img.page_size), image.size()));
+        for (size_t i = struct_end; i < page_end; ++i)
+            if (image[i] != 0) {
+                img.header_padding.assign(image.begin() + static_cast<long>(struct_end),
+                                          image.begin() + static_cast<long>(page_end));
+                break;
+            }
+    }
+    to_page();
     Bytes ramdisk_section = r.bytes(vendor_ramdisk_size);
-    r.seek(static_cast<size_t>(align_up(r.pos(), img.page_size)));
+    to_page();
     img.dtb = r.bytes(dtb_size);
-    r.seek(static_cast<size_t>(align_up(r.pos(), img.page_size)));
+    to_page();
 
     if (img.header_version >= 4 && table_entry_num > 0) {
         size_t table_start = r.pos();
@@ -89,16 +110,28 @@ VendorBootImage VendorBootImage::parse(const Bytes& image) {
             img.ramdisk_fragments.push_back(std::move(e));
         }
         r.seek(table_start + static_cast<size_t>(table_entry_num) * table_entry_size);
-        r.seek(static_cast<size_t>(align_up(r.pos(), img.page_size)));
+        to_page();
         if (bootconfig_size > 0) {
             img.bootconfig = r.bytes(bootconfig_size);
-            r.seek(static_cast<size_t>(align_up(r.pos(), img.page_size)));
+            to_page();
         }
     } else {
+        // v3, or a v4 header with an empty ramdisk table: one anonymous blob.
+        img.has_ramdisk_table = img.header_version < 4 ? true : false;
         VendorRamdiskEntry e;
         e.type = 0;
         e.data = std::move(ramdisk_section);
         img.ramdisk_fragments.push_back(std::move(e));
+        if (img.header_version >= 4 && bootconfig_size > 0) {
+            img.bootconfig = r.bytes(bootconfig_size);
+            to_page();
+        }
+    }
+    img.consumed = r.pos();
+    {
+        uint64_t nominal = align_up(img.consumed, img.page_size);
+        if (img.consumed == image.size() && nominal > img.consumed)
+            img.missing_tail_padding = nominal - img.consumed;
     }
     return img;
 }
@@ -129,16 +162,19 @@ Bytes VendorBootImage::build() const {
     w.asciiz(cmdline, kVendorBootArgsSize);
     w.le32(tags_addr);
     w.asciiz(board_name, kVendorBootNameSize);
-    w.le32(header_version == 3 ? kHeaderSizeV3 : kHeaderSizeV4);
+    w.le32(header_size_field.value_or(header_version == 3 ? kHeaderSizeV3 : kHeaderSizeV4));
     w.le32(static_cast<uint32_t>(dtb.size()));
     w.le64(dtb_addr);
 
+    const bool with_table = header_version >= 4 && has_ramdisk_table;
     if (header_version >= 4) {
-        w.le32(static_cast<uint32_t>(ramdisk_fragments.size() * kVendorRamdiskTableEntrySize));
-        w.le32(static_cast<uint32_t>(ramdisk_fragments.size()));
-        w.le32(static_cast<uint32_t>(kVendorRamdiskTableEntrySize));
+        size_t n = with_table ? ramdisk_fragments.size() : 0;
+        w.le32(static_cast<uint32_t>(n * kVendorRamdiskTableEntrySize));
+        w.le32(static_cast<uint32_t>(n));
+        w.le32(static_cast<uint32_t>(with_table ? kVendorRamdiskTableEntrySize : 0));
         w.le32(static_cast<uint32_t>(bootconfig.size()));
     }
+    if (!header_padding.empty()) w.bytes(header_padding);
     w.align(page_sz);
     w.bytes(ramdisk_section);
     w.align(page_sz);
@@ -146,22 +182,27 @@ Bytes VendorBootImage::build() const {
     w.align(page_sz);
 
     if (header_version >= 4) {
-        uint32_t running_offset = 0;
-        for (auto& e : ramdisk_fragments) {
-            w.le32(static_cast<uint32_t>(e.data.size()));
-            w.le32(running_offset);
-            w.le32(e.type);
-            w.asciiz(e.name, kVendorRamdiskNameSize);
-            for (auto b : e.board_id) w.le32(b);
-            running_offset += static_cast<uint32_t>(e.data.size());
+        if (with_table) {
+            uint32_t running_offset = 0;
+            for (auto& e : ramdisk_fragments) {
+                w.le32(static_cast<uint32_t>(e.data.size()));
+                w.le32(running_offset);
+                w.le32(e.type);
+                w.asciiz(e.name, kVendorRamdiskNameSize);
+                for (auto b : e.board_id) w.le32(b);
+                running_offset += static_cast<uint32_t>(e.data.size());
+            }
+            w.align(page_sz);
         }
-        w.align(page_sz);
         if (!bootconfig.empty()) {
             w.bytes(bootconfig);
             w.align(page_sz);
         }
     }
-    return w.take();
+    Bytes out = w.take();
+    if (missing_tail_padding && missing_tail_padding <= out.size())
+        out.resize(out.size() - static_cast<size_t>(missing_tail_padding));
+    return out;
 }
 
 }  // namespace abr

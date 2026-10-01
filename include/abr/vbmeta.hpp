@@ -85,6 +85,17 @@ struct VbmetaImage {
 
     static VbmetaImage parse(const Bytes& image);
 
+    // Footer mode only. Checks the digest of every HASH descriptor against
+    // `host_image` (the bytes the footer protects). Returns the number of
+    // descriptors checked and, via `mismatches`, how many did not match.
+    size_t verify_hash_descriptors(const Bytes& host_image, size_t* mismatches) const;
+
+    // Footer mode only. Recomputes image_size and digest = H(salt || image)
+    // in the HASH descriptor(s) for a changed `host_image`, the way
+    // `avbtool add_hash_footer` would. Returns true if anything changed.
+    // HASHTREE descriptors (filesystem images) cannot be refreshed here.
+    bool refresh_hash_descriptors(const Bytes& host_image);
+
     // Rebuilds the AVB blob. If this instance has_footer, the return
     // value is the *whole* host image (host_prefix + new blob + footer,
     // padded back out to source_total_size); otherwise it's just the

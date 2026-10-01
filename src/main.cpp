@@ -11,6 +11,7 @@
 #include <cstring>
 #include <filesystem>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -19,6 +20,7 @@
 #include "abr/compression.hpp"
 #include "abr/dtb.hpp"
 #include "abr/dtbo.hpp"
+#include "abr/envelope.hpp"
 #include "abr/legacy/dhtb.hpp"
 #include "abr/legacy/elf_boot.hpp"
 #include "abr/legacy/mtk.hpp"
@@ -50,7 +52,49 @@ Fmt detect_format(const Bytes& d) {
     }
     if (d.size() >= 64 && std::memcmp(d.data() + d.size() - 64, "AVBf", 4) == 0) return Fmt::VBMETA;
     if (ElfBootImage::looks_like(d)) return Fmt::ELF_BOOT;
+    // A vendor wrapper in front of an ordinary image (Spreadtrum BFBF/SSSS,
+    // for one): the container's magic is not at offset 0 but close to it.
+    // This is only consulted once nothing else matched, so a stray
+    // "ANDROID!" deep inside some other format cannot hijack it.
+    size_t a = find_magic(d, "ANDROID!", 8);
+    size_t v = find_magic(d, "VNDRBOOT", 8);
+    if (a != std::string::npos && (v == std::string::npos || a < v)) return Fmt::BOOT;
+    if (v != std::string::npos) return Fmt::VENDOR_BOOT;
     return Fmt::UNKNOWN;
+}
+
+// A clear message for the things people commonly feed to a boot-image tool
+// by mistake, instead of a bare "unrecognized format".
+std::string describe_unknown(const Bytes& d) {
+    auto u32le = [&](size_t off) -> uint32_t {
+        if (off + 4 > d.size()) return 0;
+        return uint32_t(d[off]) | (uint32_t(d[off + 1]) << 8) | (uint32_t(d[off + 2]) << 16) |
+               (uint32_t(d[off + 3]) << 24);
+    };
+    auto u16le = [&](size_t off) -> uint32_t {
+        if (off + 2 > d.size()) return 0;
+        return uint32_t(d[off]) | (uint32_t(d[off + 1]) << 8);
+    };
+    if (u16le(0x438) == 0xEF53)
+        return "this is an ext2/3/4 filesystem image (system/vendor/product/... or a recovery "
+               "dumped as a filesystem), not a boot-family container. Filesystems are out of "
+               "scope for abr; extract it with an ext4 tool (e.g. e2fstool / debugfs) instead";
+    if (u32le(0) == 0xED26FF3A)
+        return "this is an Android sparse image; convert it with simg2img first (sparse/"
+               "filesystem images are out of scope for abr)";
+    if (u32le(1024) == 0xF2F52010)
+        return "this is an F2FS filesystem image; use f2fs_unpacker (filesystems are out of scope "
+               "for abr)";
+    if (u32le(1024) == 0xE0F5E1E2)
+        return "this is an EROFS filesystem image (filesystems are out of scope for abr)";
+    if (d.size() >= 4 && std::memcmp(d.data(), "hsqs", 4) == 0)
+        return "this is a SquashFS image (filesystems are out of scope for abr)";
+    if (d.size() >= 4 && std::memcmp(d.data(), "PK\x03\x04", 4) == 0)
+        return "this is a ZIP archive, not a boot-family image";
+    if (d.size() >= 6 && std::memcmp(d.data(), "070701", 6) == 0)
+        return "this is a raw cpio archive (a ramdisk), not a boot-family image";
+    return "unrecognized image format (no boot/vendor_boot/dtbo/dtb/vbmeta/uImage/ELF signature "
+           "found in the first 64 KiB)";
 }
 
 const char* fmt_name(Fmt f) {
@@ -154,6 +198,41 @@ Bytes load_raw(const Manifest& m, const fs::path& dir, const std::string& prefix
     return read_file(dir / m.get(key));
 }
 
+// ------------------------------------------------- envelope (prefix/tail) --
+//
+// See abr/envelope.hpp. The manifest records the bytes around the container
+// as plain files (`prefix.bin`, `tail.bin`) plus `pad_byte`/`pad_to`, so the
+// rebuilt file is the original wrapper around the rebuilt container.
+
+void save_envelope(Manifest& m, const fs::path& dir, const Envelope& e) {
+    if (!e.prefix.empty()) save_raw(m, dir, "prefix", e.prefix, "prefix.bin");
+    if (!e.tail.empty()) save_raw(m, dir, "tail", e.tail, "tail.bin");
+    if (e.pad_to) {
+        m.set_addr("pad_byte", e.pad_byte);
+        m.set_u64("pad_to", e.pad_to);
+    }
+}
+
+Envelope load_envelope(const Manifest& m, const fs::path& dir) {
+    Envelope e;
+    e.prefix = load_raw(m, dir, "prefix");
+    e.tail = load_raw(m, dir, "tail");
+    e.pad_byte = static_cast<uint8_t>(m.get_u32("pad_byte", 0));
+    e.pad_to = m.get_u64("pad_to", 0);
+    return e;
+}
+
+// Notes for the user that should not abort anything.
+void warn(const std::string& msg) { std::cerr << "warning: " << msg << "\n"; }
+
+Bytes assemble_envelope(const Manifest& m, const fs::path& dir, const Bytes& core) {
+    Envelope e = load_envelope(m, dir);
+    std::string note;
+    Bytes out = e.assemble(core, &note);
+    if (!note.empty()) warn(note);
+    return out;
+}
+
 // ------------------------------------------------- trailing AVB footer --
 //
 // Any of the container formats below (boot, vendor_boot, dtbo) can have
@@ -166,20 +245,37 @@ Bytes load_raw(const Manifest& m, const fs::path& dir, const std::string& prefix
 // that entire tail. Reuses VbmetaImage's existing footer handling
 // (already covers recomputing offsets/hash/signature for edited
 // content) rather than duplicating any of that here.
-bool save_avb_tail(Manifest& m, const fs::path& dir, const Bytes& whole_file) {
-    if (whole_file.size() < 64 ||
-        std::memcmp(whole_file.data() + whole_file.size() - 64, "AVBf", 4) != 0)
-        return false;
-    VbmetaImage v;
-    try {
-        v = VbmetaImage::parse(whole_file);
-    } catch (const FormatError&) {
-        return false;  // "AVBf"-looking bytes that don't actually parse; leave as opaque tail
-    }
-    if (!v.has_footer) return false;
 
+struct AvbFooter {
+    bool present = false;
+    VbmetaImage v;
+    size_t host_size = 0;  // bytes the footer protects (== whole.size() when absent)
+};
+
+AvbFooter detect_avb_footer(const Bytes& whole) {
+    AvbFooter f;
+    f.host_size = whole.size();
+    if (whole.size() < 64 || std::memcmp(whole.data() + whole.size() - 64, "AVBf", 4) != 0)
+        return f;
+    try {
+        f.v = VbmetaImage::parse(whole);
+    } catch (const FormatError&) {
+        return f;  // "AVBf"-looking bytes that don't actually parse; leave as opaque tail
+    }
+    if (!f.v.has_footer) return f;
+    if (f.v.footer_original_image_size == 0 || f.v.footer_original_image_size > whole.size())
+        return f;
+    f.present = true;
+    f.host_size = static_cast<size_t>(f.v.footer_original_image_size);
+    return f;
+}
+
+void save_avb_footer(Manifest& m, const fs::path& dir, const AvbFooter& f, const Bytes& host) {
+    if (!f.present) return;
+    const VbmetaImage& v = f.v;
     m.set_bool("has_avb_footer", true);
     m.set_u64("avb_partition_size", v.source_total_size);
+    m.set_hex("avb_host_sha256", hash::sha256(host));
     m.set_u32("avb_algorithm_type", v.algorithm_type);
     m.set("avb_algorithm_name", avb_algorithm_name(v.algorithm_type));
     m.set_u64("avb_rollback_index", v.rollback_index);
@@ -199,20 +295,23 @@ bool save_avb_tail(Manifest& m, const fs::path& dir, const Bytes& whole_file) {
         write_file(dir / filename, v.descriptors[i].content);
         m.set(p + "_info", v.descriptors[i].describe());  // informational only, ignored on read
     }
-    return true;
+    size_t bad = 0;
+    size_t checked = v.verify_hash_descriptors(host, &bad);
+    if (checked && bad)
+        warn("the AVB hash descriptor in this image's footer does not match its content "
+             "(already modified without re-signing?)");
 }
 
-// primary_content is the freshly-*built* (possibly-edited) primary
-// format's bytes; returns it unchanged if there was no footer to
-// restore, or the full [primary_content][...][footer] file otherwise.
-Bytes reattach_avb_tail(const Manifest& m, const fs::path& dir, Bytes primary_content,
-                         const std::string& avb_key_pem) {
-    if (!m.get_bool("has_avb_footer", false)) return primary_content;
+// `host` is the freshly-built (possibly edited) protected image. Returns it
+// unchanged when the source had no footer, else the full
+// [host][padding][vbmeta][padding][footer] partition image.
+Bytes reattach_avb_footer(const Manifest& m, const fs::path& dir, Bytes host,
+                          const std::string& avb_key_pem) {
+    if (!m.get_bool("has_avb_footer", false)) return host;
     VbmetaImage v;
     v.has_footer = true;
     v.source_total_size = m.get_u64("avb_partition_size", 0);
-    v.footer_original_image_size = primary_content.size();
-    v.host_prefix = std::move(primary_content);
+    v.footer_original_image_size = host.size();
     v.algorithm_type = m.get_u32("avb_algorithm_type", 0);
     v.rollback_index = m.get_u64("avb_rollback_index", 0);
     v.flags = m.get_u32("avb_flags", 0);
@@ -230,13 +329,41 @@ Bytes reattach_avb_tail(const Manifest& m, const fs::path& dir, Bytes primary_co
         d.content = load_raw(m, dir, p);
         v.descriptors.push_back(std::move(d));
     }
+    // Only touch the digests if the protected image really changed: an
+    // untouched repack must reproduce the source byte-for-byte, even if the
+    // source's own digest was already stale.
+    if (hash::sha256(host) != m.get_hex("avb_host_sha256") && v.refresh_hash_descriptors(host)) {
+        if (v.algorithm_type != 0 && avb_key_pem.empty())
+            throw FormatError(
+                "the image content changed, so its AVB hash descriptor (and the vbmeta signature, "
+                "algorithm " + avb_algorithm_name(v.algorithm_type) +
+                ") must be regenerated: pass --avb-key <private_key.pem>. Without the original "
+                "vendor key the result will not verify on a locked device");
+    }
+    v.host_prefix = std::move(host);
     return v.build(avb_key_pem);
 }
 
 // ------------------------------------------------------------- boot.img --
 
-void unpack_boot(const Bytes& data, const fs::path& dir) {
-    BootImage img = BootImage::parse(data);
+std::string hex_words(const std::array<uint32_t, 4>& w) {
+    Bytes b;
+    for (auto v : w)
+        for (int i = 0; i < 4; ++i) b.push_back(uint8_t(v >> (8 * i)));
+    Manifest tmp;
+    tmp.set_hex("x", b);
+    return tmp.get("x");
+}
+
+void unpack_boot(const Bytes& whole, const fs::path& dir) {
+    AvbFooter footer = detect_avb_footer(whole);
+    Bytes host(whole.begin(), whole.begin() + static_cast<long>(footer.host_size));
+
+    size_t off = find_magic(host, "ANDROID!", 8);
+    if (off == std::string::npos) throw FormatError("no 'ANDROID!' magic found");
+    Bytes image(host.begin() + static_cast<long>(off), host.end());
+    BootImage img = BootImage::parse(image);
+
     Manifest m;
     m.set("type", "boot");
     m.set_u32("header_version", img.header_version);
@@ -260,19 +387,38 @@ void unpack_boot(const Bytes& data, const fs::path& dir) {
             }
             m.set_hex("id", idb);
         }
+        m.set("id_scheme", id_scheme_name(img.id_scheme));
         if (img.header_version >= 2) m.set_addr("dtb_addr", img.dtb_addr);
+        if (img.recovery_dtbo_offset_field)
+            m.set_u64("recovery_dtbo_offset", *img.recovery_dtbo_offset_field);
+    } else {
+        bool any = false;
+        for (auto v : img.reserved)
+            if (v) any = true;
+        if (any) m.set("reserved", hex_words(img.reserved));
     }
+    if (img.header_size_field) m.set_u32("header_size", *img.header_size_field);
     m.set("os_version", img.os_version.to_string());
     m.set("os_patch_level", img.os_version.patch_level_string());
     m.set("cmdline", img.cmdline);
+    if (img.missing_tail_padding) m.set_u64("missing_tail_padding", img.missing_tail_padding);
 
     save_component(m, dir, "kernel", img.kernel, "kernel");
     save_component(m, dir, "ramdisk", img.ramdisk, "ramdisk.cpio");
     save_component(m, dir, "second", img.second, "second");
+    save_raw(m, dir, "dt", img.dt, "dt.img");
     save_raw(m, dir, "recovery_dtbo", img.recovery_dtbo, "recovery_dtbo.img");
     save_raw(m, dir, "dtb", img.dtb, "dtb");
     save_raw(m, dir, "boot_signature", img.boot_signature, "boot_signature.bin");
-    save_avb_tail(m, dir, data);
+    save_raw(m, dir, "header_padding", img.header_padding, "header_padding.bin");
+
+    Envelope env = Envelope::capture(host, off, img.consumed);
+    save_envelope(m, dir, env);
+    if (!env.prefix.empty() || !env.tail.empty()) {
+        std::cout << "note: " << env.prefix.size() << " bytes before and " << env.tail.size()
+                  << " bytes after the boot image are kept verbatim (prefix.bin / tail.bin)\n";
+    }
+    save_avb_footer(m, dir, footer, host);
 
     m.save(dir / "manifest.txt", "abr boot manifest -- edit then `abr repack " + dir.string() +
                                       " -o out.img`");
@@ -288,27 +434,52 @@ Bytes repack_boot(const Manifest& m, const fs::path& dir, const std::string& avb
         img.second_addr = static_cast<uint32_t>(m.get_addr("second_addr", 0x00f00000));
         img.tags_addr = static_cast<uint32_t>(m.get_addr("tags_addr", 0x00000100));
         img.board_name = m.get("board_name");
-        if (img.header_version >= 2) img.dtb_addr = static_cast<uint32_t>(m.get_addr("dtb_addr", 0));
+        if (img.header_version >= 2) img.dtb_addr = m.get_addr("dtb_addr", 0);
+        Bytes idb = m.get_hex("id");
+        for (size_t i = 0; i < img.id.size() && i * 4 + 3 < idb.size(); ++i)
+            img.id[i] = uint32_t(idb[i * 4]) | (uint32_t(idb[i * 4 + 1]) << 8) |
+                        (uint32_t(idb[i * 4 + 2]) << 16) | (uint32_t(idb[i * 4 + 3]) << 24);
+        // No id_scheme in the manifest (hand-written, or from an older abr):
+        // fall back to the AOSP mkbootimg recipe, as before.
+        img.id_scheme =
+            id_scheme_from_name(m.get("id_scheme", "sha1")).value_or(IdScheme::SHA1);
+        if (m.has("recovery_dtbo_offset"))
+            img.recovery_dtbo_offset_field = m.get_u64("recovery_dtbo_offset");
+    } else {
+        Bytes rb = m.get_hex("reserved");
+        for (size_t i = 0; i < img.reserved.size() && i * 4 + 3 < rb.size(); ++i)
+            img.reserved[i] = uint32_t(rb[i * 4]) | (uint32_t(rb[i * 4 + 1]) << 8) |
+                              (uint32_t(rb[i * 4 + 2]) << 16) | (uint32_t(rb[i * 4 + 3]) << 24);
     }
+    if (m.has("header_size")) img.header_size_field = m.get_u32("header_size");
     auto ov = OsVersion::parse(m.get("os_version"), m.get("os_patch_level"));
     if (ov) img.os_version = *ov;
     img.cmdline = m.get("cmdline");
+    img.missing_tail_padding = m.get_u64("missing_tail_padding", 0);
 
     img.kernel = load_component(m, dir, "kernel");
     img.ramdisk = load_component(m, dir, "ramdisk");
     img.second = load_component(m, dir, "second");
+    img.dt = load_raw(m, dir, "dt");
     img.recovery_dtbo = load_raw(m, dir, "recovery_dtbo");
     img.dtb = load_raw(m, dir, "dtb");
     img.boot_signature = load_raw(m, dir, "boot_signature");
-    img.recompute_id();  // content hash -- recompute fresh rather than trust a possibly-stale manifest value
+    img.header_padding = load_raw(m, dir, "header_padding");
+    img.recompute_id();  // follows id_scheme; `raw` keeps the id found in the source
 
-    return reattach_avb_tail(m, dir, img.build(), avb_key_pem);
+    Bytes host = assemble_envelope(m, dir, img.build());
+    return reattach_avb_footer(m, dir, std::move(host), avb_key_pem);
 }
 
 // ------------------------------------------------------- vendor_boot.img --
 
-void unpack_vendor_boot(const Bytes& data, const fs::path& dir) {
-    VendorBootImage img = VendorBootImage::parse(data);
+void unpack_vendor_boot(const Bytes& whole, const fs::path& dir) {
+    AvbFooter footer = detect_avb_footer(whole);
+    Bytes host(whole.begin(), whole.begin() + static_cast<long>(footer.host_size));
+    size_t off = find_magic(host, "VNDRBOOT", 8);
+    if (off == std::string::npos) throw FormatError("no 'VNDRBOOT' magic found");
+    Bytes image(host.begin() + static_cast<long>(off), host.end());
+    VendorBootImage img = VendorBootImage::parse(image);
     Manifest m;
     m.set("type", "vendor_boot");
     m.set_u32("header_version", img.header_version);
@@ -319,8 +490,12 @@ void unpack_vendor_boot(const Bytes& data, const fs::path& dir) {
     m.set("board_name", img.board_name);
     m.set("cmdline", img.cmdline);
     m.set_addr("dtb_addr", img.dtb_addr);
+    if (img.header_size_field) m.set_u32("header_size", *img.header_size_field);
+    if (img.header_version >= 4 && !img.has_ramdisk_table) m.set_bool("ramdisk_table", false);
+    if (img.missing_tail_padding) m.set_u64("missing_tail_padding", img.missing_tail_padding);
     save_raw(m, dir, "dtb", img.dtb, "dtb");
     save_raw(m, dir, "bootconfig", img.bootconfig, "bootconfig");
+    save_raw(m, dir, "header_padding", img.header_padding, "header_padding.bin");
 
     m.set_u32("ramdisk_count", static_cast<uint32_t>(img.ramdisk_fragments.size()));
     for (size_t i = 0; i < img.ramdisk_fragments.size(); ++i) {
@@ -343,7 +518,9 @@ void unpack_vendor_boot(const Bytes& data, const fs::path& dir) {
         }
         save_component(m, dir, p, e.data, p + ".cpio");
     }
-    save_avb_tail(m, dir, data);
+    Envelope env = Envelope::capture(host, off, img.consumed);
+    save_envelope(m, dir, env);
+    save_avb_footer(m, dir, footer, host);
     m.save(dir / "manifest.txt", "abr vendor_boot manifest -- edit then `abr repack " +
                                       dir.string() + " -o out.img`");
 }
@@ -358,8 +535,12 @@ Bytes repack_vendor_boot(const Manifest& m, const fs::path& dir, const std::stri
     img.board_name = m.get("board_name");
     img.cmdline = m.get("cmdline");
     img.dtb_addr = m.get_addr("dtb_addr", 0);
+    if (m.has("header_size")) img.header_size_field = m.get_u32("header_size");
+    img.has_ramdisk_table = m.get_bool("ramdisk_table", true);
+    img.missing_tail_padding = m.get_u64("missing_tail_padding", 0);
     img.dtb = load_raw(m, dir, "dtb");
     img.bootconfig = load_raw(m, dir, "bootconfig");
+    img.header_padding = load_raw(m, dir, "header_padding");
 
     uint32_t count = m.get_u32("ramdisk_count", 0);
     for (uint32_t i = 0; i < count; ++i) {
@@ -374,12 +555,15 @@ Bytes repack_vendor_boot(const Manifest& m, const fs::path& dir, const std::stri
         e.data = load_component(m, dir, p);
         img.ramdisk_fragments.push_back(std::move(e));
     }
-    return reattach_avb_tail(m, dir, img.build(), avb_key_pem);
+    Bytes host = assemble_envelope(m, dir, img.build());
+    return reattach_avb_footer(m, dir, std::move(host), avb_key_pem);
 }
 
 // ------------------------------------------------------------ dtbo.img --
 
-void unpack_dtbo(const Bytes& data, const fs::path& dir) {
+void unpack_dtbo(const Bytes& whole, const fs::path& dir) {
+    AvbFooter footer = detect_avb_footer(whole);
+    Bytes data(whole.begin(), whole.begin() + static_cast<long>(footer.host_size));
     DtboImage img = DtboImage::parse(data);
     Manifest m;
     m.set("type", "dtbo");
@@ -402,7 +586,8 @@ void unpack_dtbo(const Bytes& data, const fs::path& dir) {
         m.set_hex(p + "_extra", extra);
         save_raw(m, dir, p, e.data, p + ".dtb");
     }
-    save_avb_tail(m, dir, data);
+    save_envelope(m, dir, Envelope::capture(data, 0, img.consumed));
+    save_avb_footer(m, dir, footer, data);
     m.save(dir / "manifest.txt",
            "abr dtbo manifest -- edit then `abr repack " + dir.string() + " -o out.img`");
 }
@@ -425,7 +610,8 @@ Bytes repack_dtbo(const Manifest& m, const fs::path& dir, const std::string& avb
         e.data = load_raw(m, dir, p);
         img.entries.push_back(std::move(e));
     }
-    return reattach_avb_tail(m, dir, img.build(), avb_key_pem);
+    Bytes host = assemble_envelope(m, dir, img.build());
+    return reattach_avb_footer(m, dir, std::move(host), avb_key_pem);
 }
 
 // --------------------------------------------------------------- dtb --
@@ -619,7 +805,9 @@ void print_info(const fs::path& path) {
     std::cout << "format: " << fmt_name(f) << "\n";
     switch (f) {
         case Fmt::BOOT: {
-            BootImage img = BootImage::parse(data);
+            size_t off = find_magic(data, "ANDROID!", 8);
+            if (off) std::cout << "wrapper: " << off << " bytes before the boot image\n";
+            BootImage img = BootImage::parse(Bytes(data.begin() + static_cast<long>(off), data.end()));
             std::cout << "header_version: " << img.header_version << "\n";
             std::cout << "os_version:     " << img.os_version.to_string() << "\n";
             std::cout << "patch_level:    " << img.os_version.patch_level_string() << "\n";
@@ -629,6 +817,12 @@ void print_info(const fs::path& path) {
             std::cout << "ramdisk:        " << img.ramdisk.size() << " bytes ("
                        << codec_name(detect_codec(img.ramdisk)) << ")\n";
             if (!img.second.empty()) std::cout << "second:         " << img.second.size() << " bytes\n";
+            if (!img.dt.empty()) std::cout << "dt (QCDT):      " << img.dt.size() << " bytes\n";
+            if (img.header_version <= 2)
+                std::cout << "id scheme:      " << id_scheme_name(img.id_scheme) << "\n";
+            if (off + img.consumed < data.size())
+                std::cout << "trailing:       " << data.size() - off - img.consumed
+                          << " bytes after the image (kept on repack)\n";
             if (!img.recovery_dtbo.empty())
                 std::cout << "recovery_dtbo:  " << img.recovery_dtbo.size() << " bytes\n";
             if (!img.dtb.empty()) std::cout << "dtb:            " << img.dtb.size() << " bytes\n";
@@ -637,7 +831,9 @@ void print_info(const fs::path& path) {
             break;
         }
         case Fmt::VENDOR_BOOT: {
-            VendorBootImage img = VendorBootImage::parse(data);
+            size_t off = find_magic(data, "VNDRBOOT", 8);
+            VendorBootImage img =
+                VendorBootImage::parse(Bytes(data.begin() + static_cast<long>(off), data.end()));
             std::cout << "header_version: " << img.header_version << "\n";
             std::cout << "cmdline:        " << img.cmdline << "\n";
             std::cout << "dtb:            " << img.dtb.size() << " bytes\n";
@@ -710,42 +906,9 @@ void print_info(const fs::path& path) {
 
 // ------------------------------------------------------------- dispatch --
 
-void do_unpack(const fs::path& in, const fs::path& outdir) {
-    Bytes data = read_file(in);
-    fs::create_directories(outdir);
-
-    Bytes inner;
-    auto dhtb = strip_dhtb(data, inner);
-    const Bytes& payload = dhtb ? inner : data;
-
-    Fmt f = detect_format(payload);
-    switch (f) {
-        case Fmt::BOOT: unpack_boot(payload, outdir); break;
-        case Fmt::VENDOR_BOOT: unpack_vendor_boot(payload, outdir); break;
-        case Fmt::DTBO: unpack_dtbo(payload, outdir); break;
-        case Fmt::DTB: unpack_dtb(payload, outdir); break;
-        case Fmt::VBMETA: unpack_vbmeta(payload, outdir); break;
-        case Fmt::UIMAGE: unpack_uimage(payload, outdir); break;
-        case Fmt::ELF_BOOT: unpack_elf_boot(payload, outdir); break;
-        case Fmt::UNKNOWN: throw FormatError("unrecognized image format: " + in.string());
-    }
-
-    if (dhtb) {
-        Manifest m = Manifest::load(outdir / "manifest.txt");
-        m.set_bool("has_dhtb", true);
-        m.set_bool("dhtb_seandroid_footer", dhtb->has_seandroid_footer);
-        m.set_bool("dhtb_padding", dhtb->has_padding);
-        save_raw(m, outdir, "dhtb_trailing_extra", dhtb->trailing_extra, "dhtb_trailing_extra.bin");
-        m.save(outdir / "manifest.txt",
-               "abr manifest (DHTB-wrapped) -- edit then `abr repack " + outdir.string() +
-                   " -o out.img`");
-    }
-
-    std::cout << "unpacked " << (dhtb ? std::string("dhtb-wrapped ") : std::string()) << fmt_name(f)
-              << " -> " << outdir.string() << "/\n";
-}
-
-void do_repack(const fs::path& dir, const fs::path& out, const std::string& avb_key_pem) {
+// Rebuilds the file described by an unpacked directory (everything `repack`
+// does except writing the result).
+Bytes build_image(const fs::path& dir, const std::string& avb_key_pem) {
     Manifest m = Manifest::load(dir / "manifest.txt");
     Fmt f = fmt_from_name(m.get("type"));
     Bytes result;
@@ -768,7 +931,80 @@ void do_repack(const fs::path& dir, const fs::path& out, const std::string& avb_
         dhtb.trailing_extra = load_raw(m, dir, "dhtb_trailing_extra");
         result = wrap_dhtb(result, dhtb);
     }
+    return result;
+}
 
+// Offset of the first byte where a and b differ (or the shorter length).
+size_t first_difference(const Bytes& a, const Bytes& b) {
+    size_t n = std::min(a.size(), b.size());
+    for (size_t i = 0; i < n; ++i)
+        if (a[i] != b[i]) return i;
+    return n;
+}
+
+// Right after unpacking, rebuild the image from the freshly written tree and
+// compare it with the source. Every byte the tool failed to model shows up
+// here, so a repack of an untouched image is either provably identical or
+// the user is told, at once, where it is not.
+void self_check(const fs::path& outdir, const Bytes& original) {
+    try {
+        Bytes rebuilt = build_image(outdir, "");
+        if (rebuilt == original) {
+            std::cout << "round-trip: an untouched repack reproduces this image byte-for-byte\n";
+            return;
+        }
+        std::ostringstream os;
+        os << "an untouched repack does NOT reproduce this image exactly (source " << original.size()
+           << " bytes, rebuilt " << rebuilt.size() << " bytes, first difference at offset 0x"
+           << std::hex << first_difference(original, rebuilt) << std::dec
+           << "). The unpacked files are still usable, but please report this image.";
+        warn(os.str());
+    } catch (const std::exception& e) {
+        warn(std::string("could not verify the round trip: ") + e.what());
+    }
+}
+
+void do_unpack(const fs::path& in, const fs::path& outdir) {
+    Bytes data = read_file(in);
+    fs::create_directories(outdir);
+
+    Bytes inner;
+    auto dhtb = strip_dhtb(data, inner);
+    const Bytes& payload = dhtb ? inner : data;
+
+    Fmt f = detect_format(payload);
+    switch (f) {
+        case Fmt::BOOT: unpack_boot(payload, outdir); break;
+        case Fmt::VENDOR_BOOT: unpack_vendor_boot(payload, outdir); break;
+        case Fmt::DTBO: unpack_dtbo(payload, outdir); break;
+        case Fmt::DTB: unpack_dtb(payload, outdir); break;
+        case Fmt::VBMETA: unpack_vbmeta(payload, outdir); break;
+        case Fmt::UIMAGE: unpack_uimage(payload, outdir); break;
+        case Fmt::ELF_BOOT: unpack_elf_boot(payload, outdir); break;
+        case Fmt::UNKNOWN:
+            throw FormatError(in.string() + ": " + describe_unknown(payload));
+    }
+
+    if (dhtb) {
+        Manifest m = Manifest::load(outdir / "manifest.txt");
+        m.set_bool("has_dhtb", true);
+        m.set_bool("dhtb_seandroid_footer", dhtb->has_seandroid_footer);
+        m.set_bool("dhtb_padding", dhtb->has_padding);
+        save_raw(m, outdir, "dhtb_trailing_extra", dhtb->trailing_extra, "dhtb_trailing_extra.bin");
+        m.save(outdir / "manifest.txt",
+               "abr manifest (DHTB-wrapped) -- edit then `abr repack " + outdir.string() +
+                   " -o out.img`");
+    }
+
+    std::cout << "unpacked " << (dhtb ? std::string("dhtb-wrapped ") : std::string()) << fmt_name(f)
+              << " -> " << outdir.string() << "/\n";
+    self_check(outdir, data);
+}
+
+void do_repack(const fs::path& dir, const fs::path& out, const std::string& avb_key_pem) {
+    Manifest m = Manifest::load(dir / "manifest.txt");
+    Fmt f = fmt_from_name(m.get("type"));
+    Bytes result = build_image(dir, avb_key_pem);
     write_file(out, result);
     std::cout << "repacked " << fmt_name(f) << " -> " << out.string() << " (" << result.size()
               << " bytes)\n";

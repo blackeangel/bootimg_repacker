@@ -65,7 +65,7 @@ DtboImage DtboImage::parse(const Bytes& image) {
     bool acpio = (magic == kAcpioTableMagic);
     if (magic != kDtTableMagic && !acpio)
         throw FormatError("not a dtbo/acpio image (bad magic)");
-    r.be32();  // total_size, recomputed on build()
+    uint32_t total_size = r.be32();  // recomputed on build()
     uint32_t header_size = r.be32();
     uint32_t entry_size = r.be32();
     uint32_t entry_count = r.be32();
@@ -82,6 +82,7 @@ DtboImage DtboImage::parse(const Bytes& image) {
     img.version = version;
     img.page_size = page_size;
     img.acpio = acpio;
+    uint64_t end_of_entries = std::min<uint64_t>(total_size, image.size());
 
     for (uint32_t i = 0; i < entry_count; ++i) {
         BinaryReader er(image);
@@ -95,11 +96,13 @@ DtboImage DtboImage::parse(const Bytes& image) {
 
         if (static_cast<uint64_t>(dt_offset) + dt_size > image.size())
             throw FormatError("dtbo entry " + std::to_string(i) + " points outside the image");
+        end_of_entries = std::max<uint64_t>(end_of_entries, uint64_t(dt_offset) + dt_size);
         Bytes raw(image.begin() + dt_offset, image.begin() + dt_offset + dt_size);
         uint32_t comp = (version == 1) ? (e.extra[0] & 0x0f) : 0;
         e.data = (comp == 1 || comp == 2) ? zlib_inflate_auto(raw) : std::move(raw);
         img.entries.push_back(std::move(e));
     }
+    img.consumed = static_cast<size_t>(end_of_entries);
     return img;
 }
 
