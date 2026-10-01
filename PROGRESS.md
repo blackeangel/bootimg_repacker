@@ -535,3 +535,131 @@ than the original ask enumerated. Rough priority, revisit as needed:
 7. **BLOB, NOOK/NOOKTAB, SIN (Sony's outer container, separate from the
    ELF format itself)** -- lower priority, older/niche device
    ecosystems; magic bytes are in androidbootimg.magic when it's time.
+
+## Round-tripping 14 real device images
+
+The user supplied 14 real dumps (`boot.7z.001-007`, "the lost files")
+and a ChatGPT-written behaviour spec with the caveat "but it's not
+exact -- think". The images are the ground truth; the spec was treated
+as a hint and cross-checked (below). `tests/tools/roundtrip_dir.py`
+unpacks and repacks every file and compares bytes.
+
+| File | What it is | Before | After |
+|---|---|---|---|
+| `TWRP Recovery Amlogic S9xx.img` | boot v0, page 2048, sha1 id | identical | identical |
+| `twrps905x4.img` | boot v0 | identical | identical |
+| `boot (2).img`, `boot-sign.img` | 0x4040-byte BFBF/SSSS vendor wrapper around a boot v0, AVBv1 signature inside the payload, 236-byte signature trailer | not recognised (magic is not at offset 0) | identical |
+| `boot (3).img` | boot v0, page 4096, `id` = SHA-1 that also covers an (empty) dt entry | DIFF at 0x240 (the id) | identical |
+| `boot (4).img` | boot v0 + AVBv1 `BootSignature` (2540-byte DER after the image, signed with the public AOSP test key) | DIFF: the DER blob was dropped | identical |
+| `boot.emmc.win` | TWRP backup: boot v0 zero-filled up to 16 MiB | DIFF: output 8 MB, fill dropped | identical |
+| `boot_32bit.img` | boot v1 + AVB hash footer | DIFF at the footer | identical |
+| `boot_lk2nd.img` | lk2nd bootloader with a boot v0 whose header word 10 is a CAF/QCDT `dt_size` (8192) | unpack failed: "unsupported boot header version: 8192" | identical |
+| `vendor_boot (2).img` | vendor_boot v4, 2 ramdisks, AVB hash footer | DIFF at the footer | identical |
+| `vendor_boot_b-magisk_patched-27000.img` | vendor_boot v4 with an *empty* ramdisk table, page 2048, v3-sized `header_size` (Magisk/Amlogic style) | DIFF at 0x830, +2048 bytes | identical |
+| `vendor_boot_ofox.img` | vendor_boot v4 + AVB hash footer | identical | identical |
+| `vendor_dlkm.img` | vbmeta-footer partition with hashtree + FEC data between host and vbmeta | identical | identical (kept so while fixing the footer layout) |
+| `recovery (2).img` | an **ext4 filesystem**, not a boot container | "unrecognized image format" | rejected with an explanation (filesystems are out of scope) |
+
+4 of 14 identical before, 13 of 14 after; the 14th is intentionally
+refused. Every file is now covered by a synthetic regression fixture
+(`tests/tools/fixtures.py`), so the quirks stay fixed without needing the
+real dumps.
+
+### What the real files taught us
+
+The recurring lesson matches the spec's own key rule ("keep what you do
+not understand and give it back") -- but it applied to far more than
+unknown *blocks*: it applied to header *fields*, to the bytes *around* the
+container and to how a hash was *computed*.
+
+- **Envelope** (`include/abr/envelope.hpp`): `[opaque prefix][container]
+  [opaque tail][fill]`. The prefix is found by scanning the first 64 KiB
+  for `ANDROID!`/`VNDRBOOT`; the tail is kept verbatim; a trailing run of
+  >= 64 identical bytes is recorded as `pad_byte`/`pad_to` and the file is
+  padded back to its original size after an edit. Nothing is dropped.
+  If the vendor wrapper/signature data is kept while the container was
+  edited, repack warns that it now describes the original image.
+- **Boot `id`**: the scheme is detected by trying candidates against the
+  stored value -- `sha1` (AOSP), `sha1_dt` (adds the CAF dt entry, even an
+  empty one), `sha256`, `sha256_dt`, else `raw` (kept verbatim, never
+  "corrected"). After an edit the id is recomputed with the same scheme.
+- **Header word 10** (offset 40): <= 4 is `header_version`; 5..8 is an
+  unsupported version (error); > 8 is a CAF/QCDT `dt_size` of a v0 header
+  (osm0sis' `hdr_ver_max = 8`). The dt blob follows `second`.
+- **Header fields kept although nothing parses them**: reserved words
+  (v3/v4), a non-standard `header_size`, a non-standard
+  `recovery_dtbo_offset`, non-zero data in the header page, and dumps whose
+  last page was trimmed (`missing_tail_padding`).
+- **vendor_boot v4** can declare no ramdisk table at all (one anonymous
+  blob), at page 2048, with a v3-sized `header_size`.
+- **AVB footer** (avbtool layout): `[host of original_image_size][zero pad
+  to 4096][vbmeta blob][zero fill][64-byte AVBf footer at the partition
+  end]`. The footer records the *unpadded* size, so a 2048-page host is
+  usually *not* 4096-aligned. Hashtree footers keep tree/FEC between host
+  and vbmeta, so `host_prefix` is kept as it was. The HASH descriptor digest
+  is `H(salt || host)`; all three real footers verified against their host.
+  After an edit the digests are refreshed; a signed footer (algorithm !=
+  NONE) refuses to be rebuilt without `--avb-key`; a stale digest in the
+  *source* is reported at unpack and left alone on an untouched repack.
+- **AVBv1 BootSignature** (AOSP `boot_signer`): DER `SEQUENCE { INTEGER 1,
+  X.509 cert, AlgorithmIdentifier sha256WithRSA, AuthenticatedAttributes
+  { PrintableString "/boot", INTEGER length }, OCTET STRING signature }` at
+  the page-aligned end of the image. Signed data = `image[0:length] ||
+  DER(AuthenticatedAttributes)`, SHA-256, RSA PKCS#1 v1.5. The one in
+  `boot (4).img` verifies with openssl against the public AOSP test key, so
+  re-signing is feasible. Today the blob is only preserved (as tail).
+- **BFBF/SSSS wrapper**: 0x4040-byte prefix (BFBF blocks at 0 and 0x100,
+  SSSS sub-header at 0x4000); payload = boot image + AVBv1 DER + zeros, then
+  a 236-byte trailer (148-byte signature + 88-byte `EEEE` TLV list). The
+  SHA-1 at 0x140 covers `file[0x4000:EOF]`; `payload_size` is at 0x30,
+  0x130 and 0x403c. The vendor RSA signature cannot be reproduced, so the
+  wrapper is kept verbatim (not regenerated) and `abr` says so on an edit.
+  The vendor that defined it is unidentified -- web searches found nothing.
+- **Unpack self-check**: `unpack` now rebuilds the image in memory and
+  compares it with the input, so a non-identical round trip is reported
+  when unpacking rather than discovered on a device. Known case it flags:
+  non-zero bytes in the page padding between components (abr zero-fills
+  padding; AIK does too).
+
+### Layering at repack
+
+Build the container -> `Envelope::assemble` (prefix + container + tail +
+fill) -> `reattach_avb_footer` (digests refreshed, vbmeta rebuilt, footer at
+the partition end) -> DHTB wrap (outermost, recomputes its own SHA-256).
+
+### Cross-check of the ChatGPT "UKA" specification
+
+Useful as a checklist; wrong in places, and much wider than `abr`:
+
+- *"boot v3-v4: header, kernel, ramdisk, **bootconfig (v4)**"* -- no.
+  boot v4 adds a `boot_signature` (GKI) block after the ramdisk; bootconfig
+  belongs to **vendor_boot** v4. abr implements both correctly.
+- *"ramdisk_name[**16**], board_id[16]"* -- the AOSP vendor ramdisk table
+  entry has `name[32]` and `board_id` = 16 x u32 (64 bytes), 108 bytes in
+  all; confirmed on `vendor_boot_ofox.img` and `vendor_boot (2).img`.
+- *"preserve unknown fields and tails"*, *"refuse to repack a
+  contradictory header / out-of-range offsets"*, *"mark a signature invalid
+  after a payload change"* -- right, and now actually enforced (see above).
+- Stage 1 also lists **CPIO** (newc/crc/odc/binary), **MBN**, **FIT/ITB**
+  and Qualcomm **ELF** loaders -- not in abr yet (abr's ELF is the Sony
+  boot-image ELF). Stage 2/3 (Rockchip, Amlogic upgrade packages, MediaTek
+  logo/md1img, Tegra BLOB/BCT, Samsung tar.md5, sparse) is a different and
+  much larger scope than "the boot-image family"; some of it already has a
+  sibling tool in the suite (`tar_repacker`, `md1img_repacker`). Needs the
+  user's decision before any of it is started here.
+
+### Updated roadmap (next first)
+
+1. **AVBv1 BootSignature**: detect the DER at the end of the image, report
+   target/length/verify in `info`, re-sign after an edit with a key given
+   on the command line (default: the public AOSP test key, as AIK does).
+   Self-contained RSA (bignum + PKCS#8/PEM parsing) so Windows/Android
+   static builds do not depend on OpenSSL; verify against `openssl`.
+2. **CPIO ramdisk as a directory tree** (newc, crc, odc, binary): AIK
+   parity and spec stage 1. Keep an index of the original member order and
+   header fields so an unedited ramdisk still round-trips byte-for-byte.
+3. Remaining AIK parity: PXA, OSIP/KRNL, RKCRC, blobpack, QCDT, ChromeOS
+   futility signing, LOKI/AMONET, BLOB/NOOK/SIN.
+4. Spec stage 1 leftovers: MBN, FIT/ITB. Spec stages 2/3: scope decision.
+5. Housekeeping: CI should run the quirk suite; `main.cpp` is ~1100 lines
+   and should be split per format.
