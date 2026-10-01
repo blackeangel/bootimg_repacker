@@ -619,7 +619,7 @@ container and to how a hash was *computed*.
   compares it with the input, so a non-identical round trip is reported
   when unpacking rather than discovered on a device. Known case it flags:
   non-zero bytes in the page padding between components (abr zero-fills
-  padding; AIK does too).
+  padding).
 
 ### Layering at repack
 
@@ -661,5 +661,5 @@ Useful as a checklist; wrong in places, and much wider than `abr`:
 3. Remaining AIK parity: PXA, OSIP/KRNL, RKCRC, blobpack, QCDT, ChromeOS
    futility signing, LOKI/AMONET, BLOB/NOOK/SIN.
 4. Spec stage 1 leftovers: MBN, FIT/ITB. Spec stages 2/3: scope decision.
-5. Housekeeping: CI should run the quirk suite; `main.cpp` is ~1100 lines
+5. Housekeeping: CI should run the quirk suite; `main.cpp` is ~1200 lines
    and should be split per format.
