@@ -789,6 +789,37 @@ Bytes repack_elf_boot(const Manifest& m, const fs::path& dir) {
 
 // ------------------------------------------------------------ info cmd --
 
+void print_envelope_info(const Envelope& e) {
+    if (!e.prefix.empty())
+        std::cout << "wrapper:        " << e.prefix.size()
+                  << " bytes before the image (kept verbatim)\n";
+    if (!e.tail.empty())
+        std::cout << "trailing:       " << e.tail.size()
+                  << " bytes after the image (kept verbatim)\n";
+    if (e.pad_to) {
+        char buf[8];
+        std::snprintf(buf, sizeof(buf), "0x%02x", e.pad_byte);
+        std::cout << "padding:        " << buf << " fill up to " << e.pad_to << " bytes\n";
+    }
+}
+
+void print_avb_footer_info(const AvbFooter& f, const Bytes& host) {
+    if (!f.present) return;
+    const VbmetaImage& v = f.v;
+    std::cout << "avb footer:     partition " << v.source_total_size << " bytes, protects the first "
+              << f.host_size << ", algorithm " << avb_algorithm_name(v.algorithm_type)
+              << (v.algorithm_type ? " (signed)" : " (unsigned)") << "\n";
+    for (auto& d : v.descriptors) std::cout << "  - " << d.describe() << "\n";
+    size_t bad = 0;
+    size_t checked = v.verify_hash_descriptors(host, &bad);
+    if (checked)
+        std::cout << "  hash check:   "
+                  << (bad ? "MISMATCH -- the image no longer matches its footer (modified "
+                            "without re-signing?)"
+                          : "OK -- every hash descriptor matches the image")
+                  << "\n";
+}
+
 void print_info(const fs::path& path) {
     Bytes raw = read_file(path);
     Bytes inner;
@@ -805,10 +836,12 @@ void print_info(const fs::path& path) {
     std::cout << "format: " << fmt_name(f) << "\n";
     switch (f) {
         case Fmt::BOOT: {
-            size_t off = find_magic(data, "ANDROID!", 8);
-            if (off) std::cout << "wrapper: " << off << " bytes before the boot image\n";
-            BootImage img = BootImage::parse(Bytes(data.begin() + static_cast<long>(off), data.end()));
+            AvbFooter footer = detect_avb_footer(data);
+            Bytes host(data.begin(), data.begin() + static_cast<long>(footer.host_size));
+            size_t off = find_magic(host, "ANDROID!", 8);
+            BootImage img = BootImage::parse(Bytes(host.begin() + static_cast<long>(off), host.end()));
             std::cout << "header_version: " << img.header_version << "\n";
+            if (img.header_version <= 2) std::cout << "page_size:      " << img.page_size << "\n";
             std::cout << "os_version:     " << img.os_version.to_string() << "\n";
             std::cout << "patch_level:    " << img.os_version.patch_level_string() << "\n";
             std::cout << "cmdline:        " << img.cmdline << "\n";
@@ -818,23 +851,25 @@ void print_info(const fs::path& path) {
                        << codec_name(detect_codec(img.ramdisk)) << ")\n";
             if (!img.second.empty()) std::cout << "second:         " << img.second.size() << " bytes\n";
             if (!img.dt.empty()) std::cout << "dt (QCDT):      " << img.dt.size() << " bytes\n";
-            if (img.header_version <= 2)
-                std::cout << "id scheme:      " << id_scheme_name(img.id_scheme) << "\n";
-            if (off + img.consumed < data.size())
-                std::cout << "trailing:       " << data.size() - off - img.consumed
-                          << " bytes after the image (kept on repack)\n";
             if (!img.recovery_dtbo.empty())
                 std::cout << "recovery_dtbo:  " << img.recovery_dtbo.size() << " bytes\n";
             if (!img.dtb.empty()) std::cout << "dtb:            " << img.dtb.size() << " bytes\n";
             if (!img.boot_signature.empty())
                 std::cout << "boot_signature: " << img.boot_signature.size() << " bytes\n";
+            if (img.header_version <= 2)
+                std::cout << "id scheme:      " << id_scheme_name(img.id_scheme) << "\n";
+            print_envelope_info(Envelope::capture(host, off, img.consumed));
+            print_avb_footer_info(footer, host);
             break;
         }
         case Fmt::VENDOR_BOOT: {
-            size_t off = find_magic(data, "VNDRBOOT", 8);
+            AvbFooter footer = detect_avb_footer(data);
+            Bytes host(data.begin(), data.begin() + static_cast<long>(footer.host_size));
+            size_t off = find_magic(host, "VNDRBOOT", 8);
             VendorBootImage img =
-                VendorBootImage::parse(Bytes(data.begin() + static_cast<long>(off), data.end()));
+                VendorBootImage::parse(Bytes(host.begin() + static_cast<long>(off), host.end()));
             std::cout << "header_version: " << img.header_version << "\n";
+            std::cout << "page_size:      " << img.page_size << "\n";
             std::cout << "cmdline:        " << img.cmdline << "\n";
             std::cout << "dtb:            " << img.dtb.size() << " bytes\n";
             std::cout << "bootconfig:     " << img.bootconfig.size() << " bytes\n";
@@ -845,16 +880,22 @@ void print_info(const fs::path& path) {
                           << " name=" << (e.name.empty() ? "-" : e.name) << " size=" << e.data.size()
                           << " (" << codec_name(detect_codec(e.data)) << ")\n";
             }
+            print_envelope_info(Envelope::capture(host, off, img.consumed));
+            print_avb_footer_info(footer, host);
             break;
         }
         case Fmt::DTBO: {
-            DtboImage img = DtboImage::parse(data);
+            AvbFooter footer = detect_avb_footer(data);
+            Bytes host(data.begin(), data.begin() + static_cast<long>(footer.host_size));
+            DtboImage img = DtboImage::parse(host);
             std::cout << "version:   " << img.version << (img.acpio ? " (ACPIO)" : " (DTBO)") << "\n";
             std::cout << "entries:   " << img.entries.size() << "\n";
             for (size_t i = 0; i < img.entries.size(); ++i)
                 std::cout << "  [" << i << "] id=0x" << std::hex << img.entries[i].id << std::dec
                           << " rev=" << img.entries[i].rev << " size=" << img.entries[i].data.size()
                           << "\n";
+            print_envelope_info(Envelope::capture(host, 0, img.consumed));
+            print_avb_footer_info(footer, host);
             break;
         }
         case Fmt::DTB: {

@@ -113,12 +113,11 @@ roundtrip_check vendor_boot_v4.img "vendor_boot v4 (2 typed/named fragments)" vb
 # silently ignoring the footer since VendorBootImage doesn't need it,
 # but repack was dropping it entirely instead of reproducing it.
 python3 - <<'PYEOF'
-import struct
+import hashlib, struct
 vb = open("vendor_boot_v4.img", "rb").read()
 descriptors = b""
 partition = b"vendor_boot"
-digest = b"\x11" * 32  # placeholder digest -- this test checks byte-for-byte
-                        # tail preservation through unpack+repack, not AVB semantics
+digest = hashlib.sha256(vb).digest()  # a real digest: abr verifies it and warns when stale
 d1 = struct.pack(">Q", len(vb)) + b"sha256".ljust(32, b"\x00")
 d1 += struct.pack(">III", len(partition), 0, len(digest)) + struct.pack(">I", 0) + b"\x00" * 60
 d1 += partition + digest
@@ -408,6 +407,182 @@ out[footer_pos:footer_pos + 64] = struct.pack(">4sIIQQQ28x", b"AVBf", 1, 0, len(
 open("host_with_footer.img", "wb").write(out)
 PYEOF
 roundtrip_check host_with_footer.img "vbmeta (AVB footer on a host image)" vbf
+
+# =========================================================================
+# Quirks found by round-tripping real device dumps. The fixtures come from
+# tests/tools/fixtures.py (built from the formats, not from abr's code) and
+# tests/tools/verify.py re-checks abr's output independently of abr.
+# =========================================================================
+TOOLS="$SCRIPT_DIR/tools"
+python3 "$TOOLS/fixtures.py" fx || { echo "error: could not generate quirk fixtures" >&2; exit 2; }
+
+pass() { echo "PASS: $1"; PASS=$((PASS + 1)); }
+fail() { echo "FAIL: $1"; FAIL=$((FAIL + 1)); }
+expect_line() {  # <unpacked dir> <exact manifest line> <label>
+    if grep -qx -- "$2" "$1/manifest.txt"; then pass "$3"; else fail "$3 (no '$2' in $1/manifest.txt)"; fi
+}
+expect_key() {  # <unpacked dir> <manifest key> <label>
+    if grep -q -- "^$2=" "$1/manifest.txt"; then pass "$3"; else fail "$3 (no '$2' in $1/manifest.txt)"; fi
+}
+# Replace the ramdisk of an unpacked image with new contents and repack it.
+edit_and_repack() {  # <unpacked dir> <out image>
+    head -c 3000 /dev/urandom >"$1/ramdisk.cpio"
+    "$ABR" repack "$1" -o "$2" >/dev/null 2>"$2.err"
+}
+# After editing the ramdisk, the boot `id` must follow the scheme the source
+# used, and the new ramdisk must really be in the rebuilt image.
+id_follows_edit() {  # <image> <scheme> <tag> <label>
+    "$ABR" unpack "$1" -o "ed_$3" >/dev/null 2>&1
+    edit_and_repack "ed_$3" "ed_$3.out"
+    "$ABR" unpack "ed_$3.out" -o "ed_${3}_re" >/dev/null 2>&1
+    if python3 "$TOOLS/verify.py" boot-id "ed_$3.out" "$2" >/dev/null &&
+        cmp -s "ed_$3/ramdisk.cpio" "ed_${3}_re/ramdisk.cpio"; then
+        pass "$4"
+    else
+        fail "$4"
+    fi
+}
+
+# ---- boot id: which hash produced it, and does an edit keep it consistent
+roundtrip_check fx/boot_v0_qcdt_sha1_dt.img "boot v0 + CAF dt blob (QCDT: dt_size in header word 10)" qcdt
+expect_line rt_qcdt "id_scheme=sha1_dt" "QCDT: id recognised as sha1 over kernel+ramdisk+second+dt"
+expect_key rt_qcdt dt_file "QCDT: dt blob extracted as its own file"
+id_follows_edit fx/boot_v0_qcdt_sha1_dt.img sha1_dt qcdt "QCDT: id recomputed (sha1_dt) after a ramdisk edit"
+
+roundtrip_check fx/boot_v0_nodt_sha1_dt.img "boot v0 (sha1 id that includes an empty dt entry)" nodt
+expect_line rt_nodt "id_scheme=sha1_dt" "empty-dt id recognised as sha1_dt, not mistaken for plain sha1"
+id_follows_edit fx/boot_v0_nodt_sha1_dt.img sha1_dt nodt "empty-dt: id recomputed (sha1_dt) after a ramdisk edit"
+
+roundtrip_check fx/boot_v0_sha256.img "boot v0 (sha256 id filling all 32 id bytes)" sha256id
+expect_line rt_sha256id "id_scheme=sha256" "sha256 id recognised"
+id_follows_edit fx/boot_v0_sha256.img sha256 sha256id "sha256: id recomputed after a ramdisk edit"
+
+roundtrip_check fx/boot_v0_rawid.img "boot v0 (unrecognised id, kept verbatim)" rawid
+expect_line rt_rawid "id_scheme=raw" "unrecognised id falls back to raw"
+"$ABR" unpack fx/boot_v0_rawid.img -o ed_raw >/dev/null 2>&1
+edit_and_repack ed_raw ed_raw.out
+if [ "$(python3 "$TOOLS/verify.py" boot-field fx/boot_v0_rawid.img id)" = \
+     "$(python3 "$TOOLS/verify.py" boot-field ed_raw.out id)" ]; then
+    pass "raw id is left alone after an edit (not overwritten with a guess)"
+else
+    fail "raw id changed after an edit"
+fi
+
+# ---- header fields that must survive although nothing parses them
+roundtrip_check fx/boot_v3_reserved_hdrsize.img "boot v3 (non-zero reserved words, non-standard header_size)" v3res
+expect_key rt_v3res reserved "v3: reserved words recorded"
+expect_line rt_v3res "header_size=1600" "v3: non-standard header_size recorded"
+roundtrip_check fx/boot_v1_dtbo_offset.img "boot v1 (recovery_dtbo_offset/header_size differ from the computed ones)" v1off
+expect_key rt_v1off recovery_dtbo_offset "v1: unusual recovery_dtbo_offset recorded"
+roundtrip_check fx/boot_v2_header_garbage.img "boot v2 (vendor data after the header struct, inside its page)" v2garb
+expect_key rt_v2garb header_padding_file "v2: non-zero header page padding kept"
+roundtrip_check fx/boot_v2_trimmed_tail.img "boot v2 (final page padding trimmed by whoever dumped it)" trim
+expect_key rt_trim missing_tail_padding "trimmed dump: missing final padding recorded"
+roundtrip_check fx/vendor_boot_v4_emptytable_p2048.img "vendor_boot v4 (empty ramdisk table, page_size 2048, v3-sized header_size)" vbempty
+expect_line rt_vbempty "ramdisk_table=false" "vendor_boot v4: empty ramdisk table recorded"
+expect_key rt_vbempty header_size "vendor_boot v4: non-standard header_size recorded"
+
+# ---- bytes around the container: tail, partition fill, vendor wrapper
+roundtrip_check fx/boot_v2_tail_padded.img "boot v2 (SEAndroid tail + zero fill up to the partition size)" tailpad
+expect_key rt_tailpad tail_file "tail after the image kept as a file"
+expect_key rt_tailpad pad_to "partition-size fill recorded"
+"$ABR" unpack fx/boot_v2_tail_padded.img -o ed_tail >/dev/null 2>&1
+edit_and_repack ed_tail ed_tail.out
+"$ABR" unpack ed_tail.out -o ed_tail_re >/dev/null 2>&1
+if [ "$(stat -c %s ed_tail.out)" = "$(stat -c %s fx/boot_v2_tail_padded.img)" ] &&
+    cmp -s ed_tail/ramdisk.cpio ed_tail_re/ramdisk.cpio &&
+    cmp -s rt_tailpad/tail.bin ed_tail_re/tail.bin; then
+    pass "an edited (smaller) image keeps its tail and is re-padded to the original partition size"
+else
+    fail "edited image lost its tail or its partition-size padding"
+fi
+roundtrip_check fx/boot_v4_prefixed_signed.img "boot v4 inside a BFBF/SSSS-style signed wrapper (prefix + trailer)" bfbf
+expect_key rt_bfbf prefix_file "wrapper before the boot image kept as a file"
+expect_key rt_bfbf tail_file "signature trailer after the image kept as a file"
+
+# ---- AVB footer: host not 4096-aligned, salted digest, edit, signing
+roundtrip_check fx/boot_v2_avbfooter_unaligned.img "boot v2 + AVB hash footer (host not 4096-aligned, salted digest)" avbun
+if python3 "$TOOLS/verify.py" avb-footer fx/boot_v2_avbfooter_unaligned.img >/dev/null &&
+    python3 "$TOOLS/verify.py" avb-footer rt_avbun.out >/dev/null; then
+    pass "AVB footer fixture and abr's rebuild both verify independently"
+else
+    fail "AVB footer fixture/rebuild does not verify"
+fi
+"$ABR" unpack fx/boot_v2_avbfooter_unaligned.img -o ed_avb >/dev/null 2>&1
+edit_and_repack ed_avb ed_avb.out
+if python3 "$TOOLS/verify.py" avb-footer ed_avb.out &&
+    [ "$(stat -c %s ed_avb.out)" = "$(stat -c %s fx/boot_v2_avbfooter_unaligned.img)" ] &&
+    ! cmp -s ed_avb.out fx/boot_v2_avbfooter_unaligned.img; then
+    pass "edited ramdisk: AVB hash descriptor refreshed, partition size unchanged"
+else
+    fail "edited ramdisk: AVB footer not refreshed correctly"
+fi
+
+# A signed footer cannot be regenerated without the key: that must be an
+# error, not a silently unverifiable image.
+"$ABR" unpack fx/boot_v2_avbfooter_unaligned.img -o ed_avbsig >/dev/null 2>&1
+sed -i 's/^avb_algorithm_type=0$/avb_algorithm_type=1/' ed_avbsig/manifest.txt
+head -c 3000 /dev/urandom >ed_avbsig/ramdisk.cpio
+if "$ABR" repack ed_avbsig -o ed_avbsig.out >/dev/null 2>ed_avbsig.err; then
+    fail "signed AVB footer repacked without a key"
+elif grep -q -- "--avb-key" ed_avbsig.err; then
+    pass "signed AVB footer + changed content without --avb-key is refused with an explanation"
+else
+    fail "signed AVB footer refusal message does not mention --avb-key"
+fi
+if "$ABR" repack ed_avbsig -o ed_avbsig.out --avb-key avb_test_key.pem >/dev/null 2>&1 &&
+    python3 "$TOOLS/verify.py" avb-footer ed_avbsig.out avb_test_key_pub.pem >/dev/null; then
+    pass "re-signed AVB footer: digest matches the edit and the RSA signature verifies (openssl)"
+else
+    fail "re-signed AVB footer does not verify"
+fi
+
+# A stale digest in the source must be reported, but an untouched repack
+# must still reproduce the source (it is not silently "fixed").
+python3 - <<'PYEOF'
+d = bytearray(open("fx/boot_v2_avbfooter_unaligned.img", "rb").read())
+d[5000] ^= 0xFF
+open("avb_stale.img", "wb").write(d)
+PYEOF
+"$ABR" unpack avb_stale.img -o rt_stale >/dev/null 2>stale.err
+"$ABR" repack rt_stale -o rt_stale.out >/dev/null 2>&1
+if grep -q "does not match its content" stale.err; then
+    pass "stale AVB hash descriptor in the source is reported"
+else
+    fail "stale AVB hash descriptor not reported"
+fi
+check avb_stale.img rt_stale.out "image with a stale AVB digest still round-trips byte-for-byte"
+
+# ---- reporting: info, self-check, things that are not boot images
+if "$ABR" info fx/boot_v2_avbfooter_unaligned.img | grep -q "hash check:   OK"; then
+    pass "info reports the AVB footer and its digest check"
+else
+    fail "info does not report the AVB footer digest check"
+fi
+if "$ABR" info fx/boot_v0_qcdt_sha1_dt.img | grep -q "id scheme:      sha1_dt"; then
+    pass "info reports the boot id scheme"
+else
+    fail "info does not report the boot id scheme"
+fi
+"$ABR" unpack fx/boot_v2_header_garbage.img -o sc_ok >sc_ok.out 2>&1
+if grep -q "reproduces this image byte-for-byte" sc_ok.out; then
+    pass "unpack self-check confirms an exact round trip"
+else
+    fail "unpack self-check did not confirm an exact round trip"
+fi
+"$ABR" unpack fx/boot_v2_dirty_padding.img -o sc_bad >sc_bad.out 2>&1
+if grep -q "does NOT reproduce" sc_bad.out; then
+    pass "unpack self-check flags an image abr cannot reproduce exactly (non-zero page padding)"
+else
+    fail "unpack self-check missed an image abr cannot reproduce exactly"
+fi
+if "$ABR" unpack fx/ext4_like.img -o rt_ext4 >/dev/null 2>ext4.err; then
+    fail "an ext4 image was accepted as a boot-family container"
+elif grep -q "ext2/3/4 filesystem" ext4.err; then
+    pass "an ext4 image is rejected with an explanatory message"
+else
+    fail "ext4 rejection message is not explanatory"
+fi
 
 echo ""
 echo "===== $PASS passed, $FAIL failed ====="
