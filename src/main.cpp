@@ -204,12 +204,23 @@ Bytes load_raw(const Manifest& m, const fs::path& dir, const std::string& prefix
 // as plain files (`prefix.bin`, `tail.bin`) plus `pad_byte`/`pad_to`, so the
 // rebuilt file is the original wrapper around the rebuilt container.
 
-void save_envelope(Manifest& m, const fs::path& dir, const Envelope& e) {
+// `core` is the container proper (host[core_off, core_off + core_len)). Its
+// hash is recorded when something is kept around it, so repack can tell
+// whether the container was edited -- see assemble_envelope().
+void save_envelope(Manifest& m, const fs::path& dir, const Envelope& e, const Bytes& host,
+                   size_t core_off, size_t core_len) {
     if (!e.prefix.empty()) save_raw(m, dir, "prefix", e.prefix, "prefix.bin");
     if (!e.tail.empty()) save_raw(m, dir, "tail", e.tail, "tail.bin");
     if (e.pad_to) {
         m.set_addr("pad_byte", e.pad_byte);
         m.set_u64("pad_to", e.pad_to);
+    }
+    if (!e.prefix.empty() || !e.tail.empty()) {
+        core_off = std::min(core_off, host.size());
+        core_len = std::min(core_len, host.size() - core_off);
+        hash::Sha256 h;
+        if (core_len) h.update(host.data() + core_off, core_len);
+        m.set_hex("core_sha256", h.finish());
     }
 }
 
@@ -225,8 +236,26 @@ Envelope load_envelope(const Manifest& m, const fs::path& dir) {
 // Notes for the user that should not abort anything.
 void warn(const std::string& msg) { std::cerr << "warning: " << msg << "\n"; }
 
+// A bare SEAndroid marker after the image is not a signature; anything else
+// kept around an edited container is, or may be.
+bool envelope_is_inert(const Envelope& e) {
+    static const char kMarker[] = "SEANDROIDENFORCE";
+    return e.prefix.empty() &&
+           (e.tail.empty() ||
+            (e.tail.size() == sizeof(kMarker) - 1 &&
+             std::memcmp(e.tail.data(), kMarker, sizeof(kMarker) - 1) == 0));
+}
+
 Bytes assemble_envelope(const Manifest& m, const fs::path& dir, const Bytes& core) {
     Envelope e = load_envelope(m, dir);
+    Bytes original = m.get_hex("core_sha256");
+    if (!original.empty() && !envelope_is_inert(e) && hash::sha256(core) != original) {
+        warn("the image was changed, but the " + std::to_string(e.prefix.size()) +
+             " bytes before it and the " + std::to_string(e.tail.size()) +
+             " bytes after it (vendor wrapper / signature data) are kept as they were; any "
+             "signature, size or checksum stored there still describes the ORIGINAL image, so a "
+             "bootloader that verifies it may reject the result");
+    }
     std::string note;
     Bytes out = e.assemble(core, &note);
     if (!note.empty()) warn(note);
@@ -413,7 +442,7 @@ void unpack_boot(const Bytes& whole, const fs::path& dir) {
     save_raw(m, dir, "header_padding", img.header_padding, "header_padding.bin");
 
     Envelope env = Envelope::capture(host, off, img.consumed);
-    save_envelope(m, dir, env);
+    save_envelope(m, dir, env, host, off, img.consumed);
     if (!env.prefix.empty() || !env.tail.empty()) {
         std::cout << "note: " << env.prefix.size() << " bytes before and " << env.tail.size()
                   << " bytes after the boot image are kept verbatim (prefix.bin / tail.bin)\n";
@@ -519,7 +548,7 @@ void unpack_vendor_boot(const Bytes& whole, const fs::path& dir) {
         save_component(m, dir, p, e.data, p + ".cpio");
     }
     Envelope env = Envelope::capture(host, off, img.consumed);
-    save_envelope(m, dir, env);
+    save_envelope(m, dir, env, host, off, img.consumed);
     save_avb_footer(m, dir, footer, host);
     m.save(dir / "manifest.txt", "abr vendor_boot manifest -- edit then `abr repack " +
                                       dir.string() + " -o out.img`");
@@ -586,7 +615,7 @@ void unpack_dtbo(const Bytes& whole, const fs::path& dir) {
         m.set_hex(p + "_extra", extra);
         save_raw(m, dir, p, e.data, p + ".dtb");
     }
-    save_envelope(m, dir, Envelope::capture(data, 0, img.consumed));
+    save_envelope(m, dir, Envelope::capture(data, 0, img.consumed), data, 0, img.consumed);
     save_avb_footer(m, dir, footer, data);
     m.save(dir / "manifest.txt",
            "abr dtbo manifest -- edit then `abr repack " + dir.string() + " -o out.img`");

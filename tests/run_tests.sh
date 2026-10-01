@@ -499,6 +499,25 @@ fi
 roundtrip_check fx/boot_v4_prefixed_signed.img "boot v4 inside a BFBF/SSSS-style signed wrapper (prefix + trailer)" bfbf
 expect_key rt_bfbf prefix_file "wrapper before the boot image kept as a file"
 expect_key rt_bfbf tail_file "signature trailer after the image kept as a file"
+"$ABR" repack rt_bfbf -o rt_bfbf.again >/dev/null 2>rt_bfbf.again.err
+if ! grep -q "kept as they were" rt_bfbf.again.err; then
+    pass "an unedited image inside a vendor wrapper repacks without a stale-signature warning"
+else
+    fail "unedited image inside a vendor wrapper triggered a stale-signature warning"
+fi
+"$ABR" unpack fx/boot_v4_prefixed_signed.img -o ed_bfbf >/dev/null 2>&1
+edit_and_repack ed_bfbf ed_bfbf.out
+if grep -q "kept as they were" ed_bfbf.out.err; then
+    pass "editing an image inside a vendor wrapper warns that the wrapper's signature/sizes are stale"
+else
+    fail "no stale-signature warning after editing an image inside a vendor wrapper"
+fi
+edit_and_repack ed_tail ed_tail.again 2>/dev/null
+if ! grep -q "kept as they were" ed_tail.again.err; then
+    pass "a bare SEANDROIDENFORCE tail is not treated as a signature (no warning)"
+else
+    fail "bare SEANDROIDENFORCE tail triggered a stale-signature warning"
+fi
 
 # ---- AVB footer: host not 4096-aligned, salted digest, edit, signing
 roundtrip_check fx/boot_v2_avbfooter_unaligned.img "boot v2 + AVB hash footer (host not 4096-aligned, salted digest)" avbun

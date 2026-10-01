@@ -22,11 +22,16 @@ tools" below.
 | dtb (raw/concatenated FDT) | **done + verified** |
 | vbmeta (AVB): vbmeta.img, vbmeta_system.img, footer-on-other-partitions | **done + verified**, incl. real RSA signing |
 | uboot: U-Boot legacy uImage | **done + verified** |
+| ELF boot images (Sony/Xperia) | **done + verified** against real elftool (commit `67157cf`) |
+| MTK sub-header, DHTB wrapper | **done + verified** against real mkmtkhdr/dhtbsign |
+| Everything around the container: opaque prefix (BFBF/SSSS-style wrappers), verbatim tail, partition-size fill, boot `id` schemes (sha1 / sha1+dt / sha256 / raw), QCDT `dt_size`, reserved words, odd `header_size`, header-page data, trimmed dumps, vendor_boot v4 with an empty ramdisk table | **done + verified** -- 13 of 14 real device dumps round-trip byte-for-byte (the 14th is an ext4 filesystem, out of scope and rejected with a clear message); see "Round-tripping 14 real device images" at the end |
+| AVB footer on boot / vendor_boot / dtbo: layout, digest check, digest refresh after an edit, `--avb-key` required for signed footers | **done + verified** (independent Python + openssl checks) |
+| AVBv1 `BootSignature` (pre-AVB `boot_signer`, DER blob after the image) | **preserved verbatim, not yet verified or regenerated** -- next up |
 | compression: gzip, lz4, lz4-legacy, zstd, xz, lzma(alone), bzip2, lzo | **done + verified, all algorithms** |
 | bundled SHA-1/256/512 (no-OpenSSL fallback) | **done**, self-test passes, catches its own transcription bug once already (see Verification below) |
 | manifest + CLI (`abr info/unpack/repack`) | **done** |
 | CMake: FetchContent-vendored static zlib/lz4/zstd/xz/bzip2 | **done + build-verified natively on Linux**, both dynamic-OpenSSL and `-DABR_STATIC_BINARY=ON` fully-static configurations |
-| Test suite (`tests/run_tests.sh`) | **done, 13/13 passing** -- see Verification |
+| Test suite (`tests/run_tests.sh`) | **done, 66/66 passing** -- see Verification |
 | CMake cross toolchains (mingw-w64, Android NDK) | **done + verified** (mingw reproduced locally; NDK only provable via CI, see below) |
 | GitHub Actions static build matrix (linux-x86_64, windows-x86_64, android-arm64) | **done + verified**: run 35313499827, all 3 jobs green, all 3 static binaries produced as artifacts (abr-linux-x86_64, abr-windows-x86_64, abr-android-arm64) |
 
@@ -35,7 +40,7 @@ tools" below.
 `tests/run_tests.sh` builds real reference images and checks that
 `abr unpack X && abr repack` reproduces each one **byte-for-byte**
 (not just "same decompressed content" -- see how below), then runs it.
-13/13 passing as of the last local run. What it actually checks:
+66/66 passing as of the last local run. What it actually checks:
 
 - **boot v4**: built with AOSP's own `mkbootimg.py` (vendored in
   `tests/reference/mkbootimg/`, Apache-2.0, unmodified except a stub
@@ -86,6 +91,32 @@ local AOSP checkout, wiring `mkdtboimg.py` into `run_tests.sh` the same
 way as `mkbootimg.py` would upgrade this from "verified by reading the
 source" to "verified against a real build," which is the stronger
 standard the rest of the suite meets.
+
+### Real-device quirk tests (added after the 14-image round trip)
+
+`tests/tools/fixtures.py` builds one small synthetic image per quirk
+that real devices exposed, **from the format specs, not from abr's
+code** (AOSP `bootimg.h` / `vendor_boot.h`, avbtool's layout), so the
+suite cross-checks abr instead of agreeing with it by construction.
+`tests/tools/verify.py` then re-checks abr's *output* independently:
+the boot `id` per hash scheme, every AVB HASH descriptor against the
+host bytes, and the vbmeta RSA signature through `openssl`.
+`tests/tools/roundtrip_dir.py <abr> <dir>` unpacks and repacks every
+image in a directory and prints IDENTICAL / DIFF / UNPACK-FAIL per file
+-- that is how the real device dumps were checked.
+
+Covered: QCDT `dt_size`, `sha1_dt` / `sha256` / `raw` ids and their
+recomputation after a ramdisk edit, reserved words + odd `header_size`,
+a non-standard `recovery_dtbo_offset`, vendor data in the header page,
+dumps with the last page's padding trimmed, vendor_boot v4 with an empty
+ramdisk table at page 2048, SEAndroid tail + zero fill up to the
+partition size (and that an edited image is padded back to it), a
+BFBF/SSSS-style prefix + signature trailer, an AVB hash footer on a host
+that is **not** 4096-aligned with a salted digest (digest refreshed after
+an edit, partition size unchanged), a signed footer refusing to be
+rebuilt without `--avb-key` and verifying with it, a stale digest being
+reported but not silently "fixed", the unpack self-check (positive and
+negative), `info`, and an ext4 image being rejected with an explanation.
 
 ### Design point this verification depends on: byte-identical passthrough
 
@@ -259,7 +290,7 @@ through `abr repack` for that part.)
   expected to happen in GitHub Actions (unrestricted runner network),
   driven/monitored from here via the GitHub API, not built locally.
 
-## AIK format parity (requested, large scope, sequenced -- not started)
+## AIK format parity (requested, large scope, sequenced -- in progress: MTK, DHTB, ELF done)
 
 User wants parity with what Android Image Kitchen (AIK) handles,
 explicitly comparing the end goal to Magisk: **one static binary, no
@@ -281,7 +312,8 @@ exactly this ecosystem of tools):
 | Rockchip RKCRC | Rockchip-specific CRC-wrapped image format | `neo-technologies/rkflashtool` (`rkcrc.c`) |
 | `androidbootimg.magic` | an XDA-posted `file`(1)/libmagic pattern file covering several of the above -- worth fetching as a cross-check for magic bytes once picking this up | `osm0sis @ xda-developers` (forum post, not a repo -- will need a web search, not a git clone) |
 
-None of this has been started. Suggested order, roughly by
+Done so far: MTK sub-header, DHTB, ELF (see the status table). The rest is
+still open. Suggested order, roughly by
 tractability and how well-defined/low-risk each format is (revisit if
 new information changes this):
 
@@ -403,15 +435,16 @@ That one real file was extremely productive:
   hash + property descriptor) after the vendor_boot content, which
   unpack correctly ignored (doesn't need it) but repack was silently
   dropping. Fixed generically for boot/vendor_boot/dtbo by reusing the
-  existing VbmetaImage footer handling (`save_avb_tail`/
-  `reattach_avb_tail` in main.cpp) rather than a vendor_boot-specific
+  existing VbmetaImage footer handling (`save_avb_footer`/
+  `reattach_avb_footer` in main.cpp, named `*_avb_tail` at the time) rather than a vendor_boot-specific
   patch -- see git log for the full writeup. Whole 67108864-byte file
   now round-trips byte-for-byte. Added a synthetic permanent regression
   test mirroring this (18 tests total at that point).
-- Known limitation, documented not fixed: an edited-and-repacked image
-  keeps stale AVB hash-descriptor digests (passthrough-by-design for
-  descriptors). Fine for algorithm_type=NONE as seen here; would matter
-  more for a strict independent verifier.
+- ~~Known limitation: an edited-and-repacked image keeps stale AVB
+  hash-descriptor digests.~~ **Resolved later in this session**: the
+  digests are now refreshed when the host changed (and a signed
+  footer demands `--avb-key`); see "Round-tripping 14 real device
+  images" below.
 
 Followed up on the user's "Продолжай... тяни исходники, переделывай
 под C++20" instruction to keep working through AIK format parity, per
@@ -472,7 +505,8 @@ synthetic fixtures for MTK/DHTB specifically.
 Reading `androidbootimg.magic` directly revealed more distinct formats
 than the original ask enumerated. Rough priority, revisit as needed:
 
-1. **ELF (Sony)** -- next up. Whole file is an ELF (32/64-bit,
+1. **ELF (Sony)** -- **done** (commit `67157cf`, verified against the real
+   elftool). Whole file is an ELF (32/64-bit,
    little-endian, EI_OSABI=0x61 as the Android-boot marker,
    e_machine identifies CPU arch), components stored as ELF segments.
    Sources fetched already: osm0sis/elftool (elfboot.h, elftool.cpp)
