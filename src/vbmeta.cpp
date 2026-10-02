@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "abr/vbmeta.hpp"
 
+#include "abr/rsa.hpp"
 #include "abr/sha.hpp"
 
-#ifdef ABR_WITH_OPENSSL
-#include <openssl/bio.h>
-#include <openssl/evp.h>
-#include <openssl/pem.h>
-#endif
-
 #include <algorithm>
+#include <optional>
 #include <cstring>
 #include <sstream>
 
@@ -45,42 +41,13 @@ Bytes digest(const Bytes& data, bool sha512) {
     return sha512 ? hash::sha512(data) : hash::sha256(data);
 }
 
-#ifdef ABR_WITH_OPENSSL
-Bytes rsa_sign_pkcs1(const std::string& pem, const Bytes& msg_digest, bool sha512) {
-    BIO* bio = BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()));
-    if (!bio) throw FormatError("BIO_new_mem_buf failed");
-    EVP_PKEY* pkey = PEM_read_bio_PrivateKey(bio, nullptr, nullptr, nullptr);
-    BIO_free(bio);
-    if (!pkey) throw FormatError("failed to parse AVB signing key (expected a PEM RSA private key)");
-
-    EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new(pkey, nullptr);
-    Bytes sig;
-    bool ok = false;
-    if (ctx && EVP_PKEY_sign_init(ctx) > 0 &&
-        EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_PADDING) > 0 &&
-        EVP_PKEY_CTX_set_signature_md(ctx, sha512 ? EVP_sha512() : EVP_sha256()) > 0) {
-        size_t siglen = 0;
-        if (EVP_PKEY_sign(ctx, nullptr, &siglen, msg_digest.data(), msg_digest.size()) > 0) {
-            sig.resize(siglen);
-            if (EVP_PKEY_sign(ctx, sig.data(), &siglen, msg_digest.data(), msg_digest.size()) > 0) {
-                sig.resize(siglen);
-                ok = true;
-            }
-        }
+RsaPrivateKey load_signing_key(const std::string& key_file_contents) {
+    try {
+        return rsa_parse_private_key(Bytes(key_file_contents.begin(), key_file_contents.end()));
+    } catch (const FormatError& e) {
+        throw FormatError(std::string("cannot use the AVB signing key: ") + e.what());
     }
-    if (ctx) EVP_PKEY_CTX_free(ctx);
-    EVP_PKEY_free(pkey);
-    if (!ok) throw FormatError("RSA signing failed (check that the key size matches algorithm_type)");
-    return sig;
 }
-#else
-Bytes rsa_sign_pkcs1(const std::string&, const Bytes&, bool) {
-    throw FormatError(
-        "this build was compiled without OpenSSL, so it cannot re-sign an AVB vbmeta "
-        "(pass no key to keep an unchanged passthrough signature, or rebuild with "
-        "ABR_WITH_OPENSSL and OpenSSL available)");
-}
-#endif
 
 Bytes build_avb_footer(uint64_t original_image_size, uint64_t vbmeta_offset,
                         uint64_t vbmeta_size) {
@@ -354,8 +321,30 @@ VbmetaImage parse_header_at(const Bytes& image, size_t header_start) {
     return v;
 }
 
-Bytes build_blob(const VbmetaImage& v, const std::string& private_key_pem) {
+Bytes build_blob(const VbmetaImage& v, const std::string& private_key_file,
+                 std::vector<std::string>* notes) {
     AlgoParams ap = algo_params(v.algorithm_type);
+
+    // Signing with a key also means publishing it: libavb verifies the
+    // signature with the public key stored in the auxiliary block, so that
+    // blob has to describe the key that signed, exactly as avbtool does.
+    std::optional<RsaPrivateKey> key;
+    Bytes public_key = v.public_key;
+    if (v.algorithm_type != 0 && !private_key_file.empty()) {
+        key = load_signing_key(private_key_file);
+        if (key->size_bytes() != ap.sig_size)
+            throw FormatError("signing key size does not match algorithm_type " +
+                               avb_algorithm_name(v.algorithm_type) + " (expected a " +
+                               std::to_string(ap.sig_size * 8) + "-bit RSA key, got " +
+                               std::to_string(key->n.bit_length()) + ")");
+        Bytes derived = avb_encode_public_key(key->public_key());
+        if (!public_key.empty() && public_key != derived && notes)
+            notes->push_back(
+                "the public key stored in this vbmeta was replaced by the one belonging to the "
+                "signing key you supplied; a bootloader that trusts only the original key will "
+                "reject the image");
+        public_key = std::move(derived);
+    }
 
     BinaryWriter aux;
     for (auto& d : v.descriptors) {
@@ -366,7 +355,7 @@ Bytes build_blob(const VbmetaImage& v, const std::string& private_key_pem) {
     uint64_t descriptors_size = aux.size();
     aux.align(8);
     uint64_t pubkey_offset = aux.size();
-    aux.bytes(v.public_key);
+    aux.bytes(public_key);
     aux.align(8);
     uint64_t pubkey_meta_offset = aux.size();
     aux.bytes(v.public_key_metadata);
@@ -388,7 +377,7 @@ Bytes build_blob(const VbmetaImage& v, const std::string& private_key_pem) {
     hdr.be64(ap.hash_size);
     hdr.be64(ap.sig_size);
     hdr.be64(pubkey_offset);
-    hdr.be64(v.public_key.size());
+    hdr.be64(public_key.size());
     hdr.be64(pubkey_meta_offset);
     hdr.be64(v.public_key_metadata.size());
     hdr.be64(0);
@@ -411,12 +400,8 @@ Bytes build_blob(const VbmetaImage& v, const std::string& private_key_pem) {
     Bytes h = digest(to_hash, ap.sha512);
 
     Bytes sig;
-    if (!private_key_pem.empty()) {
-        sig = rsa_sign_pkcs1(private_key_pem, h, ap.sha512);
-        if (sig.size() != ap.sig_size)
-            throw FormatError("signing key size does not match algorithm_type " +
-                               avb_algorithm_name(v.algorithm_type) + " (expected a " +
-                               std::to_string(ap.sig_size * 8) + "-bit RSA key)");
+    if (key) {
+        sig = rsa_pkcs1_sign(*key, ap.sha512 ? HashAlg::SHA512 : HashAlg::SHA256, h);
     } else if (h == v.hash && v.signature.size() == ap.sig_size) {
         sig = v.signature;  // untouched passthrough
     } else {
@@ -464,8 +449,9 @@ VbmetaImage VbmetaImage::parse(const Bytes& image) {
     throw FormatError("not a vbmeta image: no 'AVB0' header at offset 0 and no 'AVBf' footer found");
 }
 
-Bytes VbmetaImage::build(const std::string& private_key_pem) const {
-    Bytes blob = build_blob(*this, private_key_pem);
+Bytes VbmetaImage::build(const std::string& private_key_file,
+                         std::vector<std::string>* notes) const {
+    Bytes blob = build_blob(*this, private_key_file, notes);
     if (!has_footer) return blob;
 
     // Layout follows `avbtool add_*_footer`: the protected image (its

@@ -370,7 +370,10 @@ Bytes reattach_avb_footer(const Manifest& m, const fs::path& dir, Bytes host,
                 "vendor key the result will not verify on a locked device");
     }
     v.host_prefix = std::move(host);
-    return v.build(avb_key_pem);
+    std::vector<std::string> notes;
+    Bytes built = v.build(avb_key_pem, &notes);
+    for (auto& n : notes) warn(n);
+    return built;
 }
 
 // ------------------------------------------------------------- boot.img --
@@ -734,7 +737,10 @@ Bytes repack_vbmeta(const Manifest& m, const fs::path& dir, const std::string& a
         d.content = load_raw(m, dir, p);
         v.descriptors.push_back(std::move(d));
     }
-    return v.build(avb_key_pem);
+    std::vector<std::string> notes;
+    Bytes built = v.build(avb_key_pem, &notes);
+    for (auto& n : notes) warn(n);
+    return built;
 }
 
 // -------------------------------------------------------------- uimage --

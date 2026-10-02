@@ -13,8 +13,8 @@ set(CMAKE_POSITION_INDEPENDENT_CODE OFF)
 # safe to set unconditionally rather than only under a version guard.
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "" FORCE)
 
-option(ABR_WITH_OPENSSL
-       "Enable OpenSSL for AVB RSA re-signing (--avb-key). Hashing (boot id, AVB digest) always uses the bundled dependency-free SHA-1/256/512 and does not need this." ON)
+option(ABR_BUILD_TESTS
+       "Build abr_unit_tests, the driver tests/run_tests.sh uses to check the self-contained crypto (BigInt/RSA/DER). Off for cross builds." ON)
 option(ABR_VENDOR_DEPS
        "Fetch and statically build zlib/lz4/zstd/xz/bzip2 from source (the shipping default). Turn OFF to use system dev packages instead, for fast local iteration." ON)
 option(ABR_STATIC_BINARY
@@ -64,6 +64,9 @@ add_library(abr_core STATIC
   src/uimage.cpp
   src/manifest.cpp
   src/envelope.cpp
+  src/bigint.cpp
+  src/asn1.cpp
+  src/rsa.cpp
   src/legacy/mtk.cpp
   src/legacy/dhtb.cpp
   src/legacy/elf_boot.cpp
@@ -77,21 +80,6 @@ target_link_libraries(abr_core PUBLIC
   abr_bz2_iface
   abr_lzo_iface
 )
-
-if(ABR_WITH_OPENSSL)
-  if(ABR_STATIC_BINARY)
-    set(OPENSSL_USE_STATIC_LIBS TRUE)
-  endif()
-  find_package(OpenSSL QUIET)
-  if(OpenSSL_FOUND)
-    target_compile_definitions(abr_core PUBLIC ABR_WITH_OPENSSL=1)
-    target_link_libraries(abr_core PUBLIC OpenSSL::Crypto)
-    message(STATUS "bootimg_repacker: OpenSSL found -- AVB RSA re-signing (--avb-key) enabled")
-  else()
-    message(STATUS "bootimg_repacker: OpenSSL not found -- building without AVB RSA re-signing "
-                    "(everything else, including AVB passthrough repack, is unaffected)")
-  endif()
-endif()
 
 add_executable(abr src/main.cpp)
 target_link_libraries(abr PRIVATE abr_core)
@@ -108,6 +96,11 @@ if(ABR_STATIC_BINARY)
   else()
     target_link_options(abr PRIVATE -static)
   endif()
+endif()
+
+if(ABR_BUILD_TESTS)
+  add_executable(abr_unit_tests tests/unit/crypto_test.cpp)
+  target_link_libraries(abr_unit_tests PRIVATE abr_core)
 endif()
 
 install(TARGETS abr RUNTIME DESTINATION bin)

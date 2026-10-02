@@ -93,6 +93,14 @@ it has no key for.
 abr repack <dir> -o vbmeta.img --avb-key my_signing_key.pem
 ```
 
+The key may be a PEM file (`BEGIN PRIVATE KEY` or `BEGIN RSA PRIVATE KEY`)
+or raw DER such as Android's `.pk8`; RSA-2048/4096/8192, as selected by
+the image's `algorithm_type`. A key protected by a passphrase is refused
+with the one-line `openssl` command that removes the passphrase. The
+signature is computed inside `abr` (see below), the public key stored in
+the vbmeta is regenerated from the key you pass, and `abr` says so when
+that differs from the key the image had before.
+
 Without `--avb-key`, a signed vbmeta repacks by passthrough as long as
 nothing that affects its hash changed. If you *do* change something
 (a descriptor, flags, rollback index) on a signed vbmeta, you must
@@ -116,6 +124,17 @@ cmake --build build -j
 library dependencies (verify with `ldd build/abr` -> "not a dynamic
 executable"). Omit it for a normal dynamically-linked build during
 development, which is faster to iterate on.
+
+### Running the tests
+
+```sh
+cmake --build build -j          # also builds build/abr_unit_tests (-DABR_BUILD_TESTS=OFF to skip)
+./tests/run_tests.sh build/abr
+```
+
+The suite needs `python3`, `dtc`, `mkimage` and `openssl` on the PATH.
+They are used only as independent reference implementations to compare
+`abr` against -- none of them is needed to build or use `abr`.
 
 ### Cross-compiling
 
@@ -144,36 +163,53 @@ bug. `ANDROID_STL=c++_static` (set by the toolchain file) plus the
 vendored static compression libraries mean the binary needs nothing
 beyond what every Android system already provides.
 
-### Platform-specific limitation: AVB re-signing
+### Cryptography: nothing external
 
-AVB RSA re-signing (`--avb-key`) needs OpenSSL, which is only
-`find_package`'d (native Linux builds), not vendored/cross-built. The
-Windows and Android toolchain files disable it explicitly. On those
-two platforms, `--avb-key` isn't available -- everything else,
-including unsigned vbmeta rebuilds and passthrough repacking of an
-already-signed vbmeta, works identically on every platform, since all
-hashing (boot image `id`, AVB digests) uses a bundled dependency-free
-SHA-1/256/512 implementation regardless of this setting.
+`abr` links no crypto library. SHA-1/256/512, big-integer arithmetic,
+RSA PKCS#1 v1.5 signing and verification, and the small DER/PEM/X.509
+reader that key files need are all part of the binary (`src/bigint.cpp`,
+`src/rsa.cpp`, `src/asn1.cpp`, `src/sha.cpp`), so `--avb-key` works the
+same on Linux, Windows and Android and the binary stays a single file.
+PKCS#1 v1.5 is deterministic, so for a given key and image the signature
+is bit-for-bit what `openssl dgst -sign` or `avbtool` produce -- which
+is exactly how it is tested (next section).
 
-## What hasn't been independently verified
+## How it is verified
 
 Everything in the table above has a byte-identical round-trip test
 against a real reference tool (AOSP's `mkbootimg.py`, `dtc`, or
-`mkimage`) or, for AVB signing specifically, an independent signature
-check with `openssl pkeyutl -verify` -- see `tests/run_tests.sh` and
-`PROGRESS.md` for exactly what's covered and how. The quirks found on
-real device dumps are pinned by synthetic fixtures built from the format
-specs (`tests/tools/fixtures.py`) and re-checked by an independent
-verifier (`tests/tools/verify.py`). Two exceptions:
+`mkimage`); see `tests/run_tests.sh` and `PROGRESS.md` for exactly what
+is covered and how. The quirks found on real device dumps are pinned by
+synthetic fixtures built from the format specs (`tests/tools/fixtures.py`)
+and re-checked by an independent verifier (`tests/tools/verify.py`).
+
+AVB signing is judged by implementations that share no code with `abr`:
+
+- the BigInt arithmetic against Python's integers (tens of thousands of
+  vectors chosen to hit the rare carry/borrow paths of Knuth's division
+  and Montgomery multiplication);
+- RSA signatures byte-for-byte against `openssl dgst -sign` (1024/2048/
+  4096-bit keys x SHA-1/256/512 x PEM / PKCS#8 / `.pk8` / PKCS#1 DER),
+  and signature verification against signatures `openssl` made;
+- the AVB public-key blob (`n0inv`, modulus, R^2 mod n) against
+  `avbtool extract_public_key`;
+- images made by the real `avbtool` (`add_hash_footer`,
+  `make_vbmeta_image`, vendored in `tests/reference/avb/`): unpack+repack
+  reproduces them exactly, re-signing an unchanged vbmeta with the same key
+  reproduces avbtool's bytes, and an image `abr` edited and re-signed
+  passes `avbtool verify_image`.
+
+What has **not** been done: booting an `abr`-signed image on a device
+that enforces verified boot.
+
+Two smaller gaps:
 
 - **dtbo.img** has no external-oracle test in this repo (couldn't get
   a working `mkdtboimg.py` mirror reachable during development); the
   implementation was checked field-for-field by reading AOSP's actual
   current source instead. Worth upgrading if a mirror turns up.
-- **AVB RSA signing** produces a standards-compliant PKCS1v1.5
-  signature (confirmed via OpenSSL's own independent verifier), but
-  has not been checked against `avbtool verify_image` or booted on a
-  real device.
+- Chained vbmeta partitions are read and kept, but `abr` does not walk a
+  chain across several image files.
 
 ## Not implemented (yet)
 
@@ -194,11 +230,14 @@ verifier (`tests/tools/verify.py`). Two exceptions:
 
 GPL-3.0-or-later, see `LICENSE`. Two directories are vendored
 third-party code, used only by parts of `abr` (`third_party/minilzo`)
-or only by the test suite (`tests/reference/mkbootimg`), each with its
-own README explaining exactly what and why -- see those for details:
+or only by the test suite (`tests/reference/mkbootimg`,
+`tests/reference/avb`), each with its own README explaining exactly what
+and why -- see those for details:
 
 - `third_party/minilzo/`: LZO1X compress/decompress, GPL-2.0-or-later
   (compatible with, and combined here under, this project's own
   GPL-3.0-or-later).
 - `tests/reference/mkbootimg/`: AOSP's `mkbootimg.py` and friends,
   Apache-2.0, not linked into the `abr` binary at all.
+- `tests/reference/avb/`: AOSP's `avbtool.py`, MIT, used only as the
+  oracle for the AVB tests.

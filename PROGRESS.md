@@ -20,18 +20,19 @@ tools" below.
 | vendor_boot (header v3-v4): vendor_boot.img, vendor_boot-debug.img, vendor_kernel_boot.img | **done + verified** |
 | dtbo.img (+ ACPIO variant) | **done + verified** |
 | dtb (raw/concatenated FDT) | **done + verified** |
-| vbmeta (AVB): vbmeta.img, vbmeta_system.img, footer-on-other-partitions | **done + verified**, incl. real RSA signing |
+| vbmeta (AVB): vbmeta.img, vbmeta_system.img, footer-on-other-partitions | **done + verified**, incl. RSA signing (images made by the real `avbtool` round-trip exactly; images `abr` re-signed pass `avbtool verify_image`) |
 | uboot: U-Boot legacy uImage | **done + verified** |
 | ELF boot images (Sony/Xperia) | **done + verified** against real elftool (commit `67157cf`) |
 | MTK sub-header, DHTB wrapper | **done + verified** against real mkmtkhdr/dhtbsign |
 | Everything around the container: opaque prefix (BFBF/SSSS-style wrappers), verbatim tail, partition-size fill, boot `id` schemes (sha1 / sha1+dt / sha256 / raw), QCDT `dt_size`, reserved words, odd `header_size`, header-page data, trimmed dumps, vendor_boot v4 with an empty ramdisk table | **done + verified** -- 13 of 14 real device dumps round-trip byte-for-byte (the 14th is an ext4 filesystem, out of scope and rejected with a clear message); see "Round-tripping 14 real device images" at the end |
-| AVB footer on boot / vendor_boot / dtbo: layout, digest check, digest refresh after an edit, `--avb-key` required for signed footers | **done + verified** (independent Python + openssl checks) |
+| AVB footer on boot / vendor_boot / dtbo: layout, digest check, digest refresh after an edit, `--avb-key` required for signed footers | **done + verified** against the real `avbtool` (`add_hash_footer` output round-trips byte-for-byte; edited + re-signed output passes `verify_image`) and the independent Python/openssl checks |
 | AVBv1 `BootSignature` (pre-AVB `boot_signer`, DER blob after the image) | **preserved verbatim, not yet verified or regenerated** -- next up |
 | compression: gzip, lz4, lz4-legacy, zstd, xz, lzma(alone), bzip2, lzo | **done + verified, all algorithms** |
-| bundled SHA-1/256/512 (no-OpenSSL fallback) | **done**, self-test passes, catches its own transcription bug once already (see Verification below) |
+| bundled SHA-1/256/512 | **done**, self-test passes, catches its own transcription bug once already (see Verification below) |
+| self-contained RSA: BigInt (Knuth D, Montgomery), DER/PEM/X.509, PKCS#1 v1.5 sign/verify, PKCS#8/PKCS#1 key parsing, AVB public-key blob -- **no OpenSSL anywhere in the build** | **done + verified** (Python integers, `openssl dgst -sign`, `avbtool extract_public_key`; see "Self-contained crypto" below) |
 | manifest + CLI (`abr info/unpack/repack`) | **done** |
-| CMake: FetchContent-vendored static zlib/lz4/zstd/xz/bzip2 | **done + build-verified natively on Linux**, both dynamic-OpenSSL and `-DABR_STATIC_BINARY=ON` fully-static configurations |
-| Test suite (`tests/run_tests.sh`) | **done, 66/66 passing** -- see Verification |
+| CMake: FetchContent-vendored static zlib/lz4/zstd/xz/bzip2 | **done + build-verified natively on Linux**, both the dynamic and the `-DABR_STATIC_BINARY=ON` fully-static configurations |
+| Test suite (`tests/run_tests.sh`) | **done, 85/85 passing** -- see Verification |
 | CMake cross toolchains (mingw-w64, Android NDK) | **done + verified** (mingw reproduced locally; NDK only provable via CI, see below) |
 | GitHub Actions static build matrix (linux-x86_64, windows-x86_64, android-arm64) | **done + verified**: run 35313499827, all 3 jobs green, all 3 static binaries produced as artifacts (abr-linux-x86_64, abr-windows-x86_64, abr-android-arm64) |
 
@@ -40,7 +41,7 @@ tools" below.
 `tests/run_tests.sh` builds real reference images and checks that
 `abr unpack X && abr repack` reproduces each one **byte-for-byte**
 (not just "same decompressed content" -- see how below), then runs it.
-66/66 passing as of the last local run. What it actually checks:
+85/85 passing as of the last local run. What it actually checks:
 
 - **boot v4**: built with AOSP's own `mkbootimg.py` (vendored in
   `tests/reference/mkbootimg/`, Apache-2.0, unmodified except a stub
@@ -117,6 +118,48 @@ an edit, partition size unchanged), a signed footer refusing to be
 rebuilt without `--avb-key` and verifying with it, a stale digest being
 reported but not silently "fixed", the unpack self-check (positive and
 negative), `info`, and an ext4 image being rejected with an explanation.
+
+### Self-contained crypto, judged by three implementations that share no code with abr
+
+`abr` has no crypto library (see "Conventions"), so the arithmetic is
+checked against independent implementations -- all of it in
+`tests/run_tests.sh`, using `build/abr_unit_tests`:
+
+- **BigInt vs Python integers**: `tests/tools/gen_bigint_vectors.py [seed]`
+  emits add/sub/mul/divmod/modexp/shift/byte-round-trip vectors. Limbs are
+  drawn from 0, 1, 0x7fffffff, 0x80000000, 0xffffffff so the rare
+  "qhat one too large" and "add the divisor back" paths of Knuth's
+  algorithm D and the carry chains of Montgomery multiplication really
+  run; dividends are built as `q*d + r` with `r` at the edge of the divisor.
+  190k+ vectors over several seeds, 0 mismatches (the suite runs the default
+  seed, ~24k vectors).
+- **RSA vs `openssl dgst -sign`**: 1024/2048/4096-bit keys x SHA-1/256/512
+  x PEM PKCS#1 / PEM PKCS#8 / DER PKCS#8 (`.pk8`) / DER PKCS#1 = 36
+  signatures compared byte-for-byte (PKCS#1 v1.5 is deterministic).
+  Verification: accepts openssl's signature through a bare public key, a
+  PEM certificate and a DER certificate; rejects a flipped byte and the
+  wrong hash. A passphrase-protected key and an unreadable key file are
+  refused with a message that says what to do / what was expected.
+  8192-bit signing takes ~1.3 s.
+- **AVB public-key blob vs `avbtool extract_public_key`**: identical for
+  RSA-2048 and RSA-4096 (`key_num_bits`, `n0inv`, modulus, `R^2 mod n`).
+- **Images from the real avbtool** (`tests/reference/avb/avbtool.py`):
+  - `add_hash_footer` (SHA256_RSA2048, 4 MiB partition, salted, with a
+    property): unpack+repack is byte-identical; `info` reports the footer;
+    an edit without `--avb-key` is refused; with the key the result passes
+    `avbtool verify_image` (signature, embedded key, hash descriptor); a key of
+    the wrong size is refused; a different key replaces the embedded public
+    key, `abr` says so, and the image then verifies only with the new key.
+  - `make_vbmeta_image` (SHA256_RSA4096, rollback index, property, cmdline,
+    `--include_descriptors_from_image`): unpack+repack is byte-identical;
+    re-signing the unchanged vbmeta with the same key reproduces avbtool's
+    bytes exactly; with edited `flags` it is refused without a key and, with
+    the key, passes `verify_image` and shows the new flags in `info_image`.
+  Signing also regenerates the vbmeta's embedded public key from the signing
+  key (before this, the blob was passed through, so a re-signed image made
+  with a different key could never have verified).
+
+Not done: booting an `abr`-signed image on a device that enforces verified boot.
 
 ### Design point this verification depends on: byte-identical passthrough
 
@@ -212,16 +255,14 @@ through `abr repack` for that part.)
   - `ABR_VENDOR_DEPS=OFF` is kept as an escape hatch to use system dev
     packages instead, for fast local iteration -- not the shipping
     default.
-- **OpenSSL is optional and separate from "static build" entirely.**
-  Hashing (boot `id`, AVB digest) always uses the bundled
-  dependency-free SHA-1/256/512 (`src/sha.cpp`) -- zero dependency,
-  works identically cross-platform. OpenSSL (`ABR_WITH_OPENSSL`,
-  `find_package`, not vendored) is used *only* for AVB RSA re-signing
-  (`--avb-key`); everything else, including AVB passthrough repack and
-  unsigned rebuilds, works with zero crypto dependency. When
-  `ABR_STATIC_BINARY=ON`, `OPENSSL_USE_STATIC_LIBS` is set first, or
-  `find_package(OpenSSL)` resolves to the shared `libcrypto.so` and a
-  `-static` link fails outright (hit this, fixed it -- see git log).
+- **No crypto library at all.** Hashing (boot `id`, AVB digests) uses the
+  bundled SHA-1/256/512 (`src/sha.cpp`); AVB RSA signing/verification, the
+  big-integer arithmetic under it and the DER/PEM/X.509 reading of key files
+  are `src/bigint.cpp`, `src/rsa.cpp`, `src/asn1.cpp`. OpenSSL was used for
+  the first AVB signing and removed once those were verified (it had made
+  `--avb-key` unavailable in the Windows and Android builds, which cannot
+  `find_package` it). OpenSSL, Python and `avbtool` remain in the *test
+  suite* as independent oracles only.
 - **Android: bionic cannot be statically linked, and that's correct,
   not a bug.** `file` reporting "dynamically linked" on the Android
   arm64 binary is expected. "Static" for that target means
@@ -237,14 +278,10 @@ through `abr repack` for that part.)
   repo's history so far is a self-contained, working step for exactly
   this reason.
 - Reference/validation tools the user already relies on: Python
-  `avbtool`, `img2sdat`/`sdat2img`, `adb`/`fastboot`. This session used
-  `mkbootimg.py` + `dtc` + `mkimage` + `openssl` instead (all available
-  in-sandbox; `avbtool` itself wasn't fetched -- the Python `struct`-based
-  independent AVB parse + `openssl pkeyutl -verify` check in
-  `tests/run_tests.sh` covers the same ground for the signing-correctness
-  question specifically). Swapping in real `avbtool` later would still be
-  an upgrade for the "does a real avbtool accept this" question
-  specifically, if it becomes easy to fetch.
+  `avbtool`, `img2sdat`/`sdat2img`, `adb`/`fastboot`. `mkbootimg.py` + `dtc` +
+  `mkimage` + `openssl` were used first; real `avbtool.py` is now vendored
+  in `tests/reference/avb/` (MIT; provenance in its README) and is the
+  oracle for AVB footers, vbmeta images and public-key blobs.
 - Repo naming across the suite: `f2fs_unpacker`, `tar_repacker`,
   `md1img_repacker`, `utils`. This repo was renamed mid-session from
   `android-boot-repack` to `bootimg_repacker` to match.

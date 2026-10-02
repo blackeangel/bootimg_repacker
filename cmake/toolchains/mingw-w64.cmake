@@ -28,9 +28,7 @@ set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
 
-# OpenSSL is not vendored/cross-built for Windows in this project (see
-# PROGRESS.md) -- disable it here rather than let a stray host libcrypto.so
-# get found and silently produce a binary that can't actually load on
-# Windows. AVB RSA re-signing (--avb-key) is simply unavailable on this
-# build; everything else (including AVB passthrough repack) is unaffected.
-set(ABR_WITH_OPENSSL OFF CACHE BOOL "" FORCE)
+# The unit-test driver (abr_unit_tests) is only useful on the build host;
+# do not cross-compile it. AVB/boot-signature signing is self-contained
+# (src/bigint.cpp, src/rsa.cpp) and needs nothing from the target platform.
+set(ABR_BUILD_TESTS OFF CACHE BOOL "" FORCE)

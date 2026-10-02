@@ -102,14 +102,18 @@ struct VbmetaImage {
     // vbmeta blob itself (header + authentication + auxiliary data),
     // which is what vbmeta.img/vbmeta_system.img actually are.
     //
-    // private_key_pem, if non-empty, (re-)signs with that RSA key --
-    // required whenever algorithm_type != NONE and any descriptor,
-    // flags, rollback_index, or key material changed relative to what
-    // was parsed. Without a key, an unchanged hash lets the original
-    // signature bytes pass through; a changed hash throws FormatError
-    // rather than emitting a self-inconsistent (and therefore useless)
-    // signed blob.
-    Bytes build(const std::string& private_key_pem = "") const;
+    // private_key_file, if non-empty, holds the contents of an RSA private
+    // key (PEM, or PKCS#8/PKCS#1 DER such as a *.pk8) and (re-)signs with
+    // it -- required whenever algorithm_type != NONE and any descriptor,
+    // flags, rollback_index, or key material changed relative to what was
+    // parsed. The vbmeta's public-key blob is then regenerated from that
+    // key (as avbtool does); if that differs from the one already stored,
+    // a note is appended to `notes`. Without a key, an unchanged hash lets
+    // the original signature bytes pass through; a changed hash throws
+    // FormatError rather than emitting a self-inconsistent (and therefore
+    // useless) signed blob.
+    Bytes build(const std::string& private_key_file = "",
+                std::vector<std::string>* notes = nullptr) const;
 };
 
 }  // namespace abr

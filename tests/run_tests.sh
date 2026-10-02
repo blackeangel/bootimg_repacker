@@ -603,6 +603,189 @@ else
     fail "ext4 rejection message is not explanatory"
 fi
 
+# =========================================================================
+# Self-contained crypto (abr links no OpenSSL) and AVB signing judged by the
+# real avbtool. BigInt is checked against Python's integers, RSA against the
+# openssl command line, and every image abr re-signs against avbtool's own
+# verify_image -- three implementations that share no code with abr.
+# =========================================================================
+UNIT="$(dirname "$ABR")/abr_unit_tests"
+AVBTOOL="$REPO_ROOT/tests/reference/avb/avbtool.py"
+
+genkey() {  # <bits> <out.pem>: a PKCS#1 ("BEGIN RSA PRIVATE KEY") key, on OpenSSL 1.1 and 3.x
+    openssl genrsa -traditional -out "$2" "$1" >/dev/null 2>&1 || openssl genrsa -out "$2" "$1" >/dev/null 2>&1
+}
+avb_verify() {  # <image> <partition name> <public key.pem> [<other image> <its partition name>] -> avbtool's verdict
+    # avbtool resolves a descriptor's partition by file name next to the image,
+    # so a vbmeta that carries a hash descriptor for "boot" needs boot.img beside it.
+    local d; d="$(mktemp -d -p .)"
+    cp "$1" "$d/$2.img"
+    [ $# -ge 5 ] && cp "$4" "$d/$5.img"
+    python3 "$AVBTOOL" verify_image --image "$d/$2.img" --key "$3" >"$d/out" 2>&1
+    local rc=$?
+    rm -rf "$d"
+    return $rc
+}
+
+if [ -x "$UNIT" ]; then
+    if out=$(python3 "$TOOLS/gen_bigint_vectors.py" | "$UNIT" bigint 2>&1); then
+        pass "BigInt agrees with Python integers ($out)"
+    else
+        fail "BigInt disagrees with Python integers ($out)"
+    fi
+
+    head -c 70000 /dev/urandom >rsa_data.bin
+    rsa_total=0; rsa_bad=0
+    for bits in 1024 2048 4096; do
+        genkey $bits rk$bits.pem
+        openssl pkcs8 -topk8 -nocrypt -in rk$bits.pem -out rk${bits}_p8.pem
+        openssl pkcs8 -topk8 -nocrypt -in rk$bits.pem -outform DER -out rk$bits.pk8
+        openssl rsa -in rk$bits.pem -outform DER -out rk${bits}_p1.der >/dev/null 2>&1
+        for alg in sha1 sha256 sha512; do
+            openssl dgst -$alg -sign rk$bits.pem -out ref.sig rsa_data.bin
+            want=$(od -An -v -tx1 ref.sig | tr -d ' \n')
+            for k in rk$bits.pem rk${bits}_p8.pem rk$bits.pk8 rk${bits}_p1.der; do
+                rsa_total=$((rsa_total + 1))
+                [ "$("$UNIT" rsa-sign $k $alg rsa_data.bin)" = "$want" ] || { rsa_bad=$((rsa_bad + 1)); echo "  mismatch: $bits-bit $alg $k"; }
+            done
+        done
+    done
+    if [ $rsa_bad -eq 0 ]; then
+        pass "RSA PKCS#1 v1.5 signatures equal openssl's byte-for-byte ($rsa_total: 3 key sizes x 3 hashes x PEM/PKCS#8/pk8/DER)"
+    else
+        fail "RSA signatures differ from openssl's in $rsa_bad of $rsa_total cases"
+    fi
+
+    openssl rsa -in rk2048.pem -pubout -out rk2048_pub.pem >/dev/null 2>&1
+    openssl req -x509 -new -key rk2048.pem -subj "/CN=abr-test" -days 3650 -out rk2048_cert.pem >/dev/null 2>&1
+    openssl x509 -in rk2048_cert.pem -outform DER -out rk2048_cert.der
+    openssl dgst -sha256 -sign rk2048.pem -out rsa_ref.sig rsa_data.bin
+    cp rsa_ref.sig rsa_bad.sig
+    printf '\x55' | dd of=rsa_bad.sig bs=1 seek=100 conv=notrunc 2>/dev/null
+    if "$UNIT" rsa-verify rk2048_pub.pem sha256 rsa_data.bin rsa_ref.sig >/dev/null &&
+        "$UNIT" rsa-verify rk2048_cert.pem sha256 rsa_data.bin rsa_ref.sig >/dev/null &&
+        "$UNIT" rsa-verify rk2048_cert.der sha256 rsa_data.bin rsa_ref.sig >/dev/null &&
+        ! "$UNIT" rsa-verify rk2048_cert.pem sha256 rsa_data.bin rsa_bad.sig >/dev/null &&
+        ! "$UNIT" rsa-verify rk2048_cert.pem sha1 rsa_data.bin rsa_ref.sig >/dev/null; then
+        pass "RSA verify accepts openssl's signature via public key / PEM cert / DER cert, rejects a flipped byte and the wrong hash"
+    else
+        fail "RSA verify misbehaves"
+    fi
+
+    openssl pkcs8 -topk8 -v2 aes-128-cbc -passout pass:x -in rk2048.pem -out rk2048_enc.pem >/dev/null 2>&1
+    if "$UNIT" rsa-sign rk2048_enc.pem sha256 rsa_data.bin >/dev/null 2>rsa_enc.err; then
+        fail "a passphrase-protected key was accepted"
+    elif grep -q "passphrase" rsa_enc.err; then
+        pass "a passphrase-protected key is refused with an explanation"
+    else
+        fail "passphrase-protected key refusal is not explanatory"
+    fi
+
+    python3 -c "import random,sys; sys.stdout.buffer.write(bytes(random.Random(7).randrange(256) for _ in range(300)))" >rsa_garbage.bin
+    printf 'this is a text file, not a key\n' >rsa_garbage.txt
+    printf -- '-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n' >rsa_garbage.pem
+    garbage_ok=1
+    for g in rsa_garbage.bin rsa_garbage.txt rsa_garbage.pem; do
+        if "$UNIT" rsa-sign $g sha256 rsa_data.bin >/dev/null 2>rsa_garbage.err ||
+            ! grep -q "cannot read the file as an RSA private key" rsa_garbage.err; then
+            garbage_ok=0
+            echo "  $g: $(cat rsa_garbage.err)"
+        fi
+    done
+    if [ $garbage_ok -eq 1 ]; then
+        pass "unreadable key files (random bytes, text, a PEM with a bad body) are refused with a message that says what was expected"
+    else
+        fail "an unreadable key file gives an unhelpful message (or was accepted)"
+    fi
+else
+    echo "SKIP: BigInt/RSA unit checks (abr_unit_tests not built next to abr; configure with -DABR_BUILD_TESTS=ON)"
+fi
+
+if [ -x "$UNIT" ] && python3 "$AVBTOOL" version >/dev/null 2>&1; then
+    genkey 2048 av_k2048.pem
+    genkey 4096 av_k4096.pem
+    genkey 2048 av_k2048b.pem
+    for k in av_k2048 av_k4096 av_k2048b; do openssl rsa -in $k.pem -pubout -out ${k}_pub.pem >/dev/null 2>&1; done
+
+    # The public-key blob libavb reads from the vbmeta: avbtool vs abr.
+    python3 "$AVBTOOL" extract_public_key --key av_k2048.pem --output av_pk2048.bin
+    python3 "$AVBTOOL" extract_public_key --key av_k4096.pem --output av_pk4096.bin
+    if [ "$("$UNIT" avb-pubkey av_k2048.pem)" = "$(od -An -v -tx1 av_pk2048.bin | tr -d ' \n')" ] &&
+        [ "$("$UNIT" avb-pubkey av_k4096.pem)" = "$(od -An -v -tx1 av_pk4096.bin | tr -d ' \n')" ]; then
+        pass "AVB public-key blob (n0inv, modulus, R^2 mod n) equals avbtool extract_public_key (RSA-2048 and RSA-4096)"
+    else
+        fail "AVB public-key blob differs from avbtool's"
+    fi
+
+    # A signed hash footer written by the real avbtool.
+    cp fx/boot_v0_qcdt_sha1_dt.img av_boot.img
+    python3 "$AVBTOOL" add_hash_footer --image av_boot.img --partition_size 4194304 --partition_name boot \
+        --algorithm SHA256_RSA2048 --key av_k2048.pem --salt 00112233445566778899aabbccddeeff \
+        --prop foo:bar >/dev/null 2>&1
+    "$ABR" unpack av_boot.img -o av_u >av_u.out 2>&1
+    "$ABR" repack av_u -o av_u.out.img >/dev/null 2>&1
+    check av_boot.img av_u.out.img "avbtool-signed hash footer (RSA-2048, salted): unpack+repack is byte-identical to avbtool's output"
+    if "$ABR" info av_boot.img | grep -q "SHA256_RSA2048 (signed)" && "$ABR" info av_boot.img | grep -q "hash check:   OK"; then
+        pass "info reports the signed footer and its digest check"
+    else
+        fail "info does not report the signed footer"
+    fi
+
+    head -c 5000 /dev/urandom >av_u/ramdisk.cpio
+    if "$ABR" repack av_u -o av_edit_nokey.img >/dev/null 2>av_nokey.err; then
+        fail "an edited image with a signed AVB footer was repacked without a key"
+    elif grep -q -- "--avb-key" av_nokey.err; then
+        pass "signed footer + edit without --avb-key is refused (not silently left invalid)"
+    else
+        fail "refusal for a signed footer does not mention --avb-key"
+    fi
+    "$ABR" repack av_u -o av_edit.img --avb-key av_k2048.pem >/dev/null 2>&1
+    if avb_verify av_edit.img boot av_k2048_pub.pem; then
+        pass "edited image re-signed by abr passes avbtool verify_image (vbmeta signature, embedded key, hash descriptor)"
+    else
+        fail "avbtool verify_image rejects the image abr re-signed"
+    fi
+    if "$ABR" repack av_u -o av_wrongsize.img --avb-key av_k4096.pem >/dev/null 2>av_wrongsize.err; then
+        fail "a 4096-bit key was accepted for a SHA256_RSA2048 vbmeta"
+    elif grep -q "2048-bit" av_wrongsize.err; then
+        pass "a key of the wrong size for the algorithm is refused"
+    else
+        fail "wrong-size key refusal is not explanatory"
+    fi
+    "$ABR" repack av_u -o av_otherkey.img --avb-key av_k2048b.pem >/dev/null 2>av_otherkey.err
+    if grep -q "public key stored in this vbmeta was replaced" av_otherkey.err &&
+        avb_verify av_otherkey.img boot av_k2048b_pub.pem && ! avb_verify av_otherkey.img boot av_k2048_pub.pem; then
+        pass "signing with a different key replaces the embedded public key, says so, and verifies only with the new key"
+    else
+        fail "signing with a different key is inconsistent"
+    fi
+
+    # A signed vbmeta image written by avbtool, carrying the footer's descriptor.
+    python3 "$AVBTOOL" make_vbmeta_image --output av_vbmeta.img --algorithm SHA256_RSA4096 --key av_k4096.pem \
+        --rollback_index 7 --prop a:b --kernel_cmdline "androidboot.x=1" \
+        --include_descriptors_from_image av_boot.img >/dev/null 2>&1
+    "$ABR" unpack av_vbmeta.img -o av_vu >/dev/null 2>&1
+    "$ABR" repack av_vu -o av_vu.out.img >/dev/null 2>&1
+    check av_vbmeta.img av_vu.out.img "avbtool-made signed vbmeta (RSA-4096, 4 descriptors): unpack+repack is byte-identical"
+    "$ABR" repack av_vu -o av_vu_same.img --avb-key av_k4096.pem >/dev/null 2>&1
+    check av_vbmeta.img av_vu_same.img "re-signing an unchanged vbmeta with the same key reproduces avbtool's bytes exactly"
+    sed -i 's/^flags=0$/flags=2/' av_vu/manifest.txt
+    if "$ABR" repack av_vu -o av_vu_flags_nokey.img >/dev/null 2>&1; then
+        fail "a changed signed vbmeta was repacked without a key"
+    else
+        pass "a signed vbmeta whose flags changed is refused without a key"
+    fi
+    "$ABR" repack av_vu -o av_vu_flags.img --avb-key av_k4096.pem >/dev/null 2>&1
+    if avb_verify av_vu_flags.img vbmeta av_k4096_pub.pem av_boot.img boot &&
+        python3 "$AVBTOOL" info_image --image av_vu_flags.img | grep -q "^Flags:  *2"; then
+        pass "vbmeta with edited flags, re-signed by abr, passes avbtool verify_image and shows the new flags"
+    else
+        fail "avbtool rejects the vbmeta abr re-signed"
+    fi
+else
+    echo "SKIP: avbtool cross-checks (abr_unit_tests or tests/reference/avb/avbtool.py unavailable)"
+fi
+
 echo ""
 echo "===== $PASS passed, $FAIL failed ====="
 exit "$FAIL"

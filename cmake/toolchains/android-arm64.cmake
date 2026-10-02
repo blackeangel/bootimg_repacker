@@ -35,8 +35,7 @@ set(ANDROID_STL c++_static)        # statically link libc++; bionic libc itself 
 
 include(${ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake)
 
-# OpenSSL is not vendored/cross-built for Android in this project (see
-# PROGRESS.md) -- disabled here for the same reason as the mingw
-# toolchain file. AVB RSA re-signing (--avb-key) is unavailable on this
-# build; everything else, including AVB passthrough repack, still works.
-set(ABR_WITH_OPENSSL OFF CACHE BOOL "" FORCE)
+# The unit-test driver (abr_unit_tests) is only useful on the build host;
+# do not cross-compile it. AVB/boot-signature signing is self-contained
+# (src/bigint.cpp, src/rsa.cpp) and needs nothing from the target platform.
+set(ABR_BUILD_TESTS OFF CACHE BOOL "" FORCE)
