@@ -102,6 +102,7 @@ int run_bigint() {
 }  // namespace
 
 int main(int argc, char** argv) {
+    set_binary_stdio();
     try {
         if (argc < 2) return 2;
         std::string cmd = argv[1];

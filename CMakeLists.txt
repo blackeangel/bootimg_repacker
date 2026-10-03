@@ -1,8 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 project(bootimg_repacker LANGUAGES C CXX)
 
-set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_POSITION_INDEPENDENT_CODE OFF)
 
@@ -12,6 +10,58 @@ set(CMAKE_POSITION_INDEPENDENT_CODE OFF)
 # This is a no-op (unrecognized cache variable) on older CMake, so it's
 # safe to set unconditionally rather than only under a version guard.
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "" FORCE)
+
+# ---------------------------------------------------------------------------
+# C++ language level.
+#
+# abr is a C++26 project. CMake's own CXX_STANDARD cannot be used for that: a
+# release only maps "26" to a compiler flag once it knows the compiler, and
+# CMake 3.28 does not know GCC's -std=c++26 at all (GCC itself accepts it from
+# version 14; GCC 13 and older reject both -std=c++26 and -std=c++2c). So the
+# flag is probed here, which also works unchanged for the cross toolchains.
+#
+#   -DABR_CXX_STANDARD=26   (default) GCC >= 14, Clang >= 17 (Android NDK r27+
+#                           is Clang 18), MSVC with /std:c++latest
+#   -DABR_CXX_STANDARD=23   for a toolchain that cannot do 26 yet (GCC 13 ...);
+#                           nothing in abr needs a C++26-only feature, and the
+#                           test suite is the same.
+#
+# The vendored C libraries are untouched (the flag is C++-only).
+# ---------------------------------------------------------------------------
+set(ABR_CXX_STANDARD "26" CACHE STRING
+    "C++ standard to build abr with: 26 (baseline) or 23 (for compilers that cannot do 26 yet)")
+set_property(CACHE ABR_CXX_STANDARD PROPERTY STRINGS 26 23)
+
+include(CheckCXXCompilerFlag)
+if(MSVC)
+  set(_abr_std_candidates "/std:c++latest")
+elseif(ABR_CXX_STANDARD STREQUAL "26")
+  set(_abr_std_candidates "-std=gnu++26" "-std=gnu++2c")
+elseif(ABR_CXX_STANDARD STREQUAL "23")
+  set(_abr_std_candidates "-std=gnu++23" "-std=gnu++2b")
+else()
+  message(FATAL_ERROR "ABR_CXX_STANDARD must be 26 or 23, not '${ABR_CXX_STANDARD}'")
+endif()
+set(ABR_CXX_STD_FLAG "")
+foreach(_flag IN LISTS _abr_std_candidates)
+  string(MAKE_C_IDENTIFIER "ABR_ACCEPTS_${_flag}" _var)
+  check_cxx_compiler_flag("${_flag}" ${_var})
+  if(${_var})
+    set(ABR_CXX_STD_FLAG "${_flag}")
+    break()
+  endif()
+endforeach()
+if(NOT ABR_CXX_STD_FLAG)
+  message(FATAL_ERROR
+    "abr is built as C++${ABR_CXX_STANDARD}, and this compiler (${CMAKE_CXX_COMPILER_ID} "
+    "${CMAKE_CXX_COMPILER_VERSION}) accepts none of: ${_abr_std_candidates}.\n"
+    "Use GCC >= 14, Clang >= 17 (the Android NDK r27+ qualifies) or MSVC, e.g. "
+    "-DCMAKE_CXX_COMPILER=g++-14 (Ubuntu 24.04: apt install g++-14); or, if only an older "
+    "compiler is at hand, configure with -DABR_CXX_STANDARD=23.")
+endif()
+message(STATUS "abr: C++ language level ${ABR_CXX_STANDARD} via ${ABR_CXX_STD_FLAG}")
+add_library(abr_cxx_std INTERFACE)
+target_compile_options(abr_cxx_std INTERFACE "$<$<COMPILE_LANGUAGE:CXX>:${ABR_CXX_STD_FLAG}>")
 
 option(ABR_BUILD_TESTS
        "Build abr_unit_tests, the driver tests/run_tests.sh uses to check the self-contained crypto (BigInt/RSA/DER). Off for cross builds." ON)
@@ -75,6 +125,7 @@ add_library(abr_core STATIC
 )
 target_include_directories(abr_core PUBLIC include)
 target_link_libraries(abr_core PUBLIC
+  abr_cxx_std
   abr_zlib_iface
   abr_lz4_iface
   abr_zstd_iface
@@ -83,26 +134,45 @@ target_link_libraries(abr_core PUBLIC
   abr_lzo_iface
 )
 
-add_executable(abr src/main.cpp)
-target_link_libraries(abr PRIVATE abr_core)
+# Threads: abr runs independent work (decompressing / hashing / compressing the
+# components of an image) on several cores, see include/abr/parallel.hpp.
+# glibc >= 2.34, bionic and the macOS libc need no extra library; the MinGW
+# runtime keeps std::thread in winpthread, which -- statically linked -- must be
+# pulled in whole or its thread-exit (TLS destructor) hook is dropped.
+if(WIN32 AND NOT MSVC)
+  target_link_libraries(abr_core PUBLIC -Wl,--whole-archive winpthread -Wl,--no-whole-archive)
+else()
+  set(THREADS_PREFER_PTHREAD_FLAG ON)
+  find_package(Threads REQUIRED)
+  target_link_libraries(abr_core PUBLIC Threads::Threads)
+endif()
 
-if(ABR_STATIC_BINARY)
+# One place for what "static" means per platform.
+function(abr_link_statically target)
+  if(NOT ABR_STATIC_BINARY)
+    return()
+  endif()
   if(WIN32)
-    target_link_options(abr PRIVATE -static -static-libgcc -static-libstdc++)
+    target_link_options(${target} PRIVATE -static -static-libgcc -static-libstdc++)
   elseif(ANDROID)
     # Bionic itself is never statically linked (there is no static libc on
     # Android) -- ANDROID_STL=c++_static (set via the NDK toolchain file)
     # is what actually makes this "static" in the sense that matters:
     # no dependency on any .so beyond what every Android system provides.
-    target_link_options(abr PRIVATE -static-libstdc++)
+    target_link_options(${target} PRIVATE -static-libstdc++)
   else()
-    target_link_options(abr PRIVATE -static)
+    target_link_options(${target} PRIVATE -static)
   endif()
-endif()
+endfunction()
+
+add_executable(abr src/main.cpp)
+target_link_libraries(abr PRIVATE abr_core)
+abr_link_statically(abr)
 
 if(ABR_BUILD_TESTS)
   add_executable(abr_unit_tests tests/unit/crypto_test.cpp)
   target_link_libraries(abr_unit_tests PRIVATE abr_core)
+  abr_link_statically(abr_unit_tests)
 endif()
 
 install(TARGETS abr RUNTIME DESTINATION bin)

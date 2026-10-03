@@ -16,7 +16,7 @@ std::string trim(const std::string& s) {
 }  // namespace
 
 Manifest Manifest::load(const std::filesystem::path& path) {
-    std::ifstream f(path);
+    std::ifstream f(path, std::ios::binary);  // CR before LF is trimmed below; no text-mode surprises
     if (!f) throw FormatError("cannot open manifest: " + path.string());
     Manifest m;
     std::string line;
@@ -32,7 +32,9 @@ Manifest Manifest::load(const std::filesystem::path& path) {
 
 void Manifest::save(const std::filesystem::path& path, const std::string& header_comment) const {
     if (path.has_parent_path()) std::filesystem::create_directories(path.parent_path());
-    std::ofstream f(path, std::ios::trunc);
+    // Binary on purpose: the manifest has LF line ends on every platform (Windows text
+    // mode would write CRLF), so unpacked directories are identical wherever they were made.
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
     if (!f) throw FormatError("cannot write manifest: " + path.string());
     if (!header_comment.empty()) f << "# " << header_comment << "\n";
     for (auto& [k, v] : entries_) f << k << "=" << v << "\n";

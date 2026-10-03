@@ -44,8 +44,43 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 cd "$WORK"
 
+# A Windows build (abr.exe, cross-compiled) is run under wine, so every check
+# below exercises the real executable. Small wrapper scripts keep the rest of
+# the suite calling "$ABR" and "$UNIT" as plain commands.
+UNIT_DEFAULT="$(dirname "$ABR")/abr_unit_tests"
+case "$ABR" in
+    *.exe | *.EXE)
+        if ! command -v wine >/dev/null 2>&1; then
+            echo "error: $ABR is a Windows executable and wine is not installed" >&2
+            exit 2
+        fi
+        export WINEDEBUG="${WINEDEBUG:--all}"
+        mkdir -p "$WORK/winebin"
+        for pair in "$ABR:abr" "$(dirname "$ABR")/abr_unit_tests.exe:abr_unit_tests"; do
+            exe="${pair%:*}"
+            [ -f "$exe" ] || continue
+            printf '#!/bin/sh\nexec wine "%s" "$@"\n' "$exe" >"$WORK/winebin/${pair##*:}"
+            chmod +x "$WORK/winebin/${pair##*:}"
+        done
+        ABR="$WORK/winebin/abr"
+        UNIT_DEFAULT="$WORK/winebin/abr_unit_tests"
+        echo "note: running the Windows build under $(wine --version 2>/dev/null)"
+        ;;
+esac
+
 PASS=0
 FAIL=0
+# said <pattern> <command...>: run the command, succeed only if it succeeded and
+# its output (stdout + stderr) contains the pattern. Deliberately not
+# `command | grep -q`: under `pipefail`, grep -q quitting at its first match can
+# SIGPIPE a command that is still writing, turning a pass into a failure that
+# depends on timing.
+said() {
+    local pattern="$1" out
+    shift
+    out="$("$@" 2>&1)" || return 1
+    grep -q -- "$pattern" <<<"$out"
+}
 check() {
     if cmp -s "$1" "$2"; then
         echo "PASS: $3"
@@ -573,12 +608,12 @@ fi
 check avb_stale.img rt_stale.out "image with a stale AVB digest still round-trips byte-for-byte"
 
 # ---- reporting: info, self-check, things that are not boot images
-if "$ABR" info fx/boot_v2_avbfooter_unaligned.img | grep -q "hash check:   OK"; then
+if said "hash check:   OK" "$ABR" info fx/boot_v2_avbfooter_unaligned.img; then
     pass "info reports the AVB footer and its digest check"
 else
     fail "info does not report the AVB footer digest check"
 fi
-if "$ABR" info fx/boot_v0_qcdt_sha1_dt.img | grep -q "id scheme:      sha1_dt"; then
+if said "id scheme:      sha1_dt" "$ABR" info fx/boot_v0_qcdt_sha1_dt.img; then
     pass "info reports the boot id scheme"
 else
     fail "info does not report the boot id scheme"
@@ -609,7 +644,7 @@ fi
 # openssl command line, and every image abr re-signs against avbtool's own
 # verify_image -- three implementations that share no code with abr.
 # =========================================================================
-UNIT="$(dirname "$ABR")/abr_unit_tests"
+UNIT="$UNIT_DEFAULT"
 AVBTOOL="$REPO_ROOT/tests/reference/avb/avbtool.py"
 
 genkey() {  # <bits> <out.pem>: a PKCS#1 ("BEGIN RSA PRIVATE KEY") key, on OpenSSL 1.1 and 3.x
@@ -725,7 +760,7 @@ if [ -x "$UNIT" ] && python3 "$AVBTOOL" version >/dev/null 2>&1; then
     "$ABR" unpack av_boot.img -o av_u >av_u.out 2>&1
     "$ABR" repack av_u -o av_u.out.img >/dev/null 2>&1
     check av_boot.img av_u.out.img "avbtool-signed hash footer (RSA-2048, salted): unpack+repack is byte-identical to avbtool's output"
-    if "$ABR" info av_boot.img | grep -q "SHA256_RSA2048 (signed)" && "$ABR" info av_boot.img | grep -q "hash check:   OK"; then
+    if said "SHA256_RSA2048 (signed)" "$ABR" info av_boot.img && said "hash check:   OK" "$ABR" info av_boot.img; then
         pass "info reports the signed footer and its digest check"
     else
         fail "info does not report the signed footer"
@@ -818,7 +853,7 @@ a1_ok=1
 for v in v0 v0_qcdt v1 v2; do
     sign_py fx/avb1_$v.img a1_$v.img
     if ! python3 "$AVB1" verify a1_$v.img >/dev/null; then a1_ok=0; echo "  $v: the Python signer's own output does not verify"; fi
-    if ! "$ABR" info a1_$v.img 2>&1 | grep -q "signature VALID"; then a1_ok=0; echo "  $v: info does not report VALID"; fi
+    if ! said "signature VALID" "$ABR" info a1_$v.img; then a1_ok=0; echo "  $v: info does not report VALID"; fi
     "$ABR" unpack a1_$v.img -o a1u_$v >a1u_$v.log 2>&1
     "$ABR" repack a1u_$v -o a1_$v.out >/dev/null 2>&1
     cmp -s a1_$v.img a1_$v.out || { a1_ok=0; echo "  $v: unpack+repack is not byte-identical"; }
@@ -835,7 +870,7 @@ cp a1_v0.img a1_v0_bad.img
 printf '\x55' | dd of=a1_v0_bad.img bs=1 seek=3000 conv=notrunc 2>/dev/null
 "$ABR" unpack a1_v0_bad.img -o a1u_bad >a1u_bad.log 2>&1
 "$ABR" repack a1u_bad -o a1_v0_bad.out >/dev/null 2>&1
-if "$ABR" info a1_v0_bad.img 2>&1 | grep -q "signature INVALID" &&
+if said "signature INVALID" "$ABR" info a1_v0_bad.img &&
     grep -q "does not match its content" a1u_bad.log && cmp -s a1_v0_bad.img a1_v0_bad.out; then
     pass "a boot signature that no longer matches the image is reported INVALID at unpack and in info, and kept as it was"
 else
@@ -946,7 +981,7 @@ else
 fi
 if "$ABR" repack vbv3_dummy -o x.img --avb1-key aik/mykey >/dev/null 2>&1; then :; fi
 "$ABR" unpack vendor_boot_v3.img -o a1u_vb >/dev/null 2>&1
-if "$ABR" repack a1u_vb -o a1_vb.out --avb1-key aik/mykey 2>&1 | grep -q "only apply to boot and recovery images"; then
+if said "only apply to boot and recovery images" "$ABR" repack a1u_vb -o a1_vb.out --avb1-key aik/mykey; then
     pass "--avb1-key on a non-boot image is ignored with a warning"
 else
     fail "--avb1-key on a vendor_boot gives no warning"
@@ -960,7 +995,7 @@ python3 "$AVB1" sign fx/avb1_v0.img /boot a1_ec.pem a1_ec_cert.pem --ec >a1_ec.i
 "$ABR" repack a1u_ec -o a1_ec.out >/dev/null 2>&1
 printf 'abr-edit' >>a1u_ec/ramdisk.cpio
 "$ABR" repack a1u_ec -o a1_ec.edit >a1_ec.edit.log 2>&1
-if "$ABR" info a1_ec.img 2>&1 | grep -q "signature not checked" && cmp -s a1_ec.img a1_ec.out &&
+if said "signature not checked" "$ABR" info a1_ec.img && cmp -s a1_ec.img a1_ec.out &&
     python3 "$AVB1" verify a1_ec.edit >/dev/null && grep -q "whose private key abr does not have" a1_ec.edit.log; then
     pass "an ECDSA boot signature is reported as not checked, round-trips exactly, and is replaced by an RSA one after an edit (with a warning)"
 else
@@ -980,7 +1015,7 @@ if command -v javac >/dev/null 2>&1 && command -v java >/dev/null 2>&1 && [ -n "
     for v in v0 v0_qcdt v1 v2; do
         bs /boot fx/avb1_$v.img "$VK_PK8" "$VK_PEM" bs_$v.img || { bs_ok=0; echo "  $v: boot_signer failed"; continue; }
         cmp -s bs_$v.img a1_$v.img || { bs_ok=0; echo "  $v: boot_signer and the Python signer disagree"; }
-        "$ABR" info bs_$v.img 2>&1 | grep -q "signature VALID" || { bs_ok=0; echo "  $v: info does not report VALID for boot_signer's image"; }
+        said "signature VALID" "$ABR" info bs_$v.img || { bs_ok=0; echo "  $v: info does not report VALID for boot_signer's image"; }
         "$ABR" unpack bs_$v.img -o bsu_$v >/dev/null 2>&1
         "$ABR" repack bsu_$v -o bs_$v.out >/dev/null 2>&1
         cmp -s bs_$v.img bs_$v.out || { bs_ok=0; echo "  $v: round trip of boot_signer's image differs"; }

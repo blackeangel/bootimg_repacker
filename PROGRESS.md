@@ -281,6 +281,64 @@ implausibly small for the supposedly-already-compressed input; fixed
 by constructing the test boot.img's bytes directly instead of going
 through `abr repack` for that part.)
 
+## C++26 and the build toolchains (3 Oct 2026)
+
+Decision (the user, 2 Oct): the language is C++26, not C++20; multithreading
+where it makes sense. Facts established on the machine, not assumed:
+
+- **GCC 13.3 (Ubuntu 24.04's default) rejects both `-std=c++26` and
+  `-std=c++2c`.** GCC 14.2 accepts `c++26`, `c++2c`, `gnu++26`, `gnu++2c`;
+  Clang 18.1 and 20.1 accept `-std=c++26`. (An earlier note here said GCC 13
+  took `-std=c++2c`; that was wrong.)
+- **CMake 3.28 cannot map `CXX_STANDARD 26` to GCC's flag** ("CMake does not
+  know the flags" even for GCC 14) but does for Clang. So `CMakeLists.txt`
+  probes the flag itself (`ABR_CXX_STANDARD`, default 26: `-std=gnu++26`, then
+  `-std=gnu++2c`; MSVC `/std:c++latest`) and fails with an instruction when the
+  compiler has none. `-DABR_CXX_STANDARD=23` is the escape hatch.
+- Nothing in abr needs a C++26-only language or library feature, and saying so
+  is the honest position: the sources compile warning-free and pass 98/98 as
+  C++26 with g++-14 and clang-20 and as C++23 with g++-13. What C++26 buys us
+  today is the baseline itself (and the freedom to use C++23/26 library
+  facilities when a change is easier with them: `std::byteswap`, ...). Not
+  usable yet, on purpose: reflection and contracts (GCC 16 only), `#embed`
+  (GCC 15 / Clang 19), `std::execution` (no libstdc++ has it; and the C++17
+  parallel algorithms need TBB, which a static binary should not).
+- Portable library subset, because the NDK's libc++ and mingw's libstdc++ are
+  older than the host's: nothing newer than libstdc++ 13 / libc++ 18 (no
+  `std::print`, `std::ranges::to`, `std::move_only_function`).
+
+**Windows**: Ubuntu's mingw-w64 is GCC 13, so there is no C++26 there. New
+`cmake/toolchains/mingw-w64-clang.cmake`: Clang (20 tested) targeting
+`x86_64-w64-mingw32`, over the apt mingw-w64 headers/CRT and the *posix-model*
+libstdc++ 13 (`-nostdinc++` plus explicit include dirs, `ld.lld`, winpthread
+pulled in whole because a statically linked winpthread otherwise loses its
+thread-exit hook). Result: a static PE that imports only `KERNEL32.dll` and
+`msvcrt.dll`. `cmake/toolchains/mingw-w64.cmake` (plain GCC, now the `-posix`
+compilers: the default win32 thread model has no `std::thread`) is kept and
+builds C++23.
+
+**The Windows build had never been executed before.** It was only compiled in
+CI. `tests/run_tests.sh` now accepts an `.exe` and runs it under wine 9.0
+(wrapper scripts; the checks are unchanged). First run: 13 of 98 failed, all
+one cause -- text mode: the manifest was written with CRLF and every line of
+output ended in CRLF, so exact-match checks failed. Fixed in the program, not
+the tests: the manifest is read and written in binary mode (LF everywhere; the
+reader already trimmed CR), and `set_binary_stdio()` puts stdout/stderr in
+binary mode on Windows (the console still shows it correctly). Then 98/98 for
+both Windows builds (clang C++26 and GCC-posix C++23). wine is not Windows:
+what is still unproven is a real Windows machine, and non-ASCII paths (the ANSI
+code page applies to `argv`; a UTF-8 application manifest or `wmain` would fix
+that -- noted, not done).
+
+**A test-suite bug found on the way**: `cmd | grep -q` under `set -o pipefail`
+failed intermittently (grep exits at its first match, the still-writing
+`abr` gets SIGPIPE, the pipeline reports failure). It showed up only on some
+builds (timing). All such checks now go through `said <pattern> <command...>`.
+
+**Android**: the NDK's Clang (18 in r27d) takes `-std=c++26`; CI now uses NDK
+r29. Downloading the NDK is blocked from the development sandbox, so the
+Android build is proven only by CI, as before.
+
 ## Conventions inherited from the sibling tools (apply here too)
 
 - **License: GPL v3**, not MIT (corrected early this session -- see

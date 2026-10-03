@@ -9,9 +9,18 @@ on:
 permissions:
   contents: write
 
+# abr is C++26: GCC >= 14 and Clang >= 17 have the mode, the Ubuntu 24.04 default
+# GCC 13 does not (see CMakeLists.txt), so every job names its compiler.
 jobs:
   linux-x86_64:
+    name: linux-x86_64 (${{ matrix.cxx }})
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { cc: gcc-14,   cxx: g++-14,     package: true }
+          - { cc: clang-20, cxx: clang++-20, package: false }
     steps:
       - uses: actions/checkout@v4
 
@@ -19,13 +28,16 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq cmake ninja-build python3 python3-pip device-tree-compiler \
-            u-boot-tools openssl lz4 zstd liblzo2-dev default-jdk-headless libbcprov-java
+            u-boot-tools openssl lz4 zstd liblzo2-dev default-jdk-headless libbcprov-java \
+            g++-14 clang-20
           pip3 install --break-system-packages python-lzo
 
       - name: Configure
         run: >
           cmake -S . -B build -G Ninja
           -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_C_COMPILER=${{ matrix.cc }}
+          -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
           -DABR_STATIC_BINARY=ON
 
       - name: Build
@@ -35,7 +47,7 @@ jobs:
         if: failure()
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python3 .github/scripts/post_failure_log.py "linux-x86_64" build.log
+        run: python3 .github/scripts/post_failure_log.py "linux-x86_64 (${{ matrix.cxx }})" build.log
 
       - name: Test (byte-identical round trips against real reference tools)
         run: ./tests/run_tests.sh build/abr 2>&1 | tee test.log
@@ -44,7 +56,7 @@ jobs:
         if: failure()
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python3 .github/scripts/post_failure_log.py "linux-x86_64 test" test.log
+        run: python3 .github/scripts/post_failure_log.py "linux-x86_64 (${{ matrix.cxx }}) test" test.log
 
       - name: Verify static linking
         run: |
@@ -54,11 +66,13 @@ jobs:
             || { echo "expected a fully static binary"; exit 1; }
 
       - name: Package
+        if: matrix.package
         run: |
           mkdir -p dist
           cp build/abr dist/abr-linux-x86_64
 
       - uses: actions/upload-artifact@v4
+        if: matrix.package
         with:
           name: abr-linux-x86_64
           path: dist/abr-linux-x86_64
@@ -68,15 +82,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install mingw-w64 cross toolchain
+      # Clang + the distribution's mingw-w64 runtime: a C++26 compiler for
+      # Windows without downloading a toolchain (Ubuntu's mingw GCC is 13).
+      # wine runs the resulting .exe through the same test suite.
+      - name: Install the cross toolchain, wine and the test-suite oracles
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq cmake ninja-build mingw-w64
+          sudo apt-get install -y -qq cmake ninja-build clang-20 lld-20 mingw-w64 \
+            g++-mingw-w64-x86-64-posix wine64 python3 python3-pip device-tree-compiler \
+            u-boot-tools openssl lz4 zstd liblzo2-dev default-jdk-headless libbcprov-java
+          pip3 install --break-system-packages python-lzo
 
       - name: Configure
         run: >
           cmake -S . -B build-windows -G Ninja
-          -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/mingw-w64.cmake
+          -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/mingw-w64-clang.cmake
           -DCMAKE_BUILD_TYPE=Release
           -DABR_STATIC_BINARY=ON
 
@@ -88,6 +108,25 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python3 .github/scripts/post_failure_log.py "windows-x86_64" build.log
+
+      - name: Test (abr.exe under wine)
+        env:
+          WINEDEBUG: "-all"
+        run: ./tests/run_tests.sh build-windows/abr.exe 2>&1 | tee test.log
+
+      - name: Post test log on failure
+        if: failure()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 .github/scripts/post_failure_log.py "windows-x86_64 test" test.log
+
+      - name: Verify the executable is self-contained
+        run: |
+          x86_64-w64-mingw32-objdump -p build-windows/abr.exe | grep "DLL Name" | sort -u | tee dlls.txt
+          # Only the system DLLs every Windows has; no MinGW runtime DLL (libstdc++, libgcc, winpthread).
+          if grep -v -i -E "DLL Name: (KERNEL32|msvcrt|ADVAPI32|USER32|SHELL32|ucrtbase|api-ms-win-crt-[a-z-]+-l[0-9]-[0-9]-[0-9])\.dll" dlls.txt; then
+            echo "unexpected DLL dependency"; exit 1
+          fi
 
       - name: Package
         run: |
@@ -102,7 +141,7 @@ jobs:
   android-arm64:
     runs-on: ubuntu-24.04
     env:
-      NDK_VERSION: r27d
+      NDK_VERSION: r29
     steps:
       - uses: actions/checkout@v4
 

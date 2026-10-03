@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "abr/byte_io.hpp"
 
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#include <cstdio>
+#endif
+
 namespace abr {
 
 Bytes read_file(const std::filesystem::path& path) {
@@ -25,6 +31,14 @@ void write_file(const std::filesystem::path& path, const uint8_t* data, size_t s
 
 void write_file(const std::filesystem::path& path, const Bytes& data) {
     write_file(path, data.data(), data.size());
+}
+
+void set_binary_stdio() {
+#ifdef _WIN32
+    _setmode(_fileno(stdin), _O_BINARY);
+    _setmode(_fileno(stdout), _O_BINARY);
+    _setmode(_fileno(stderr), _O_BINARY);
+#endif
 }
 
 }  // namespace abr

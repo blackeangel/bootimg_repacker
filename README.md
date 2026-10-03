@@ -147,12 +147,18 @@ how it is tested against the real tool.
 
 ## Building
 
-Requires CMake >= 3.20 and a C++20 compiler. Dependencies (zlib, lz4,
-zstd, xz, bzip2) are fetched and built from source by default -- no
-system dev packages needed:
+Requires CMake >= 3.20 and a **C++26** compiler: GCC >= 14, Clang >= 17 (the
+Android NDK r27+ qualifies) or MSVC. Ubuntu 24.04's default GCC 13 is too old
+for the mode -- `apt install g++-14` and pass `-DCMAKE_CXX_COMPILER=g++-14`;
+configuring with a compiler that cannot do C++26 stops with exactly that hint.
+(Stuck with an older compiler? `-DABR_CXX_STANDARD=23` builds the same
+sources; nothing in `abr` needs a C++26-only feature, and the test results
+are identical.) Dependencies (zlib, lz4, zstd, xz, bzip2) are fetched and
+built from source by default -- no system dev packages needed:
 
 ```sh
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DABR_STATIC_BINARY=ON
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DABR_STATIC_BINARY=ON \
+      -DCMAKE_CXX_COMPILER=g++-14
 cmake --build build -j
 ./build/abr
 ```
@@ -169,6 +175,10 @@ cmake --build build -j          # also builds build/abr_unit_tests (-DABR_BUILD_
 ./tests/run_tests.sh build/abr
 ```
 
+Pass the Windows build instead and the suite runs the real `abr.exe` under
+`wine` (it makes small wrapper scripts, nothing else changes):
+`./tests/run_tests.sh build-windows/abr.exe`.
+
 The suite needs `python3`, `dtc`, `mkimage` and `openssl` on the PATH. The
 cross-check against the real AOSP `boot_signer` is skipped unless `javac`,
 `java` and BouncyCastle are present (Debian/Ubuntu: `apt install
@@ -179,11 +189,14 @@ They are used only as independent reference implementations to compare
 ### Cross-compiling
 
 ```sh
-# Windows (needs the mingw-w64 package)
+# Windows x86_64, C++26: clang + the distribution's mingw-w64 runtime
+#   sudo apt-get install clang-20 lld-20 mingw-w64 g++-mingw-w64-x86-64-posix
 cmake -S . -B build-windows -G Ninja \
-  -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/mingw-w64.cmake \
-  -DABR_STATIC_BINARY=ON
+  -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/mingw-w64-clang.cmake \
+  -DCMAKE_BUILD_TYPE=Release -DABR_STATIC_BINARY=ON
 cmake --build build-windows -j
+# (cmake/toolchains/mingw-w64.cmake is the plain mingw GCC variant; Ubuntu's is
+#  GCC 13, so it builds as C++23)
 
 # Android arm64-v8a (needs the Android NDK)
 cmake -S . -B build-android -G Ninja \
@@ -195,7 +208,9 @@ cmake --build build-android -j
 
 See `.github/workflows/build.yml` for the exact CI recipe (including
 where it gets the NDK from) and prebuilt binaries under this repo's
-Actions tab / Releases.
+Actions tab / Releases. CI builds Linux with both g++-14 and clang-20, runs
+the whole test suite on both, and runs the Windows `abr.exe` through the same
+suite under wine. The `.exe` imports only `KERNEL32.dll` and `msvcrt.dll`.
 
 **Note on "static" for Android:** bionic has no static libc, so an
 Android executable is never fully static -- that's expected, not a

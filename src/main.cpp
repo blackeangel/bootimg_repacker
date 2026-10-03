@@ -1278,6 +1278,7 @@ void usage() {
 }  // namespace
 
 int main(int argc, char** argv) {
+    set_binary_stdio();
     if (!hash::sha_selftest()) {
         std::cerr << "internal error: bundled SHA implementation failed its self-test; "
                      "refusing to run since boot ids and AVB hashes would be silently wrong\n";

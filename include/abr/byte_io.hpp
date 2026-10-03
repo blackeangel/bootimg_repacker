@@ -50,6 +50,10 @@ Bytes read_file(const std::filesystem::path& path);
 void write_file(const std::filesystem::path& path, const Bytes& data);
 void write_file(const std::filesystem::path& path, const uint8_t* data, size_t size);
 
+// Windows only (a no-op elsewhere): put stdin/stdout/stderr in binary mode, so a line ends in LF
+// as it does on every other platform instead of CRLF (the console still shows it correctly).
+void set_binary_stdio();
+
 // ---------------------------------------------------------------------
 // Alignment helpers
 // ---------------------------------------------------------------------
