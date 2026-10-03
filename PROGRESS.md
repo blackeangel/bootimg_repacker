@@ -26,13 +26,13 @@ tools" below.
 | MTK sub-header, DHTB wrapper | **done + verified** against real mkmtkhdr/dhtbsign |
 | Everything around the container: opaque prefix (BFBF/SSSS-style wrappers), verbatim tail, partition-size fill, boot `id` schemes (sha1 / sha1+dt / sha256 / raw), QCDT `dt_size`, reserved words, odd `header_size`, header-page data, trimmed dumps, vendor_boot v4 with an empty ramdisk table | **done + verified** -- 13 of 14 real device dumps round-trip byte-for-byte (the 14th is an ext4 filesystem, out of scope and rejected with a clear message); see "Round-tripping 14 real device images" at the end |
 | AVB footer on boot / vendor_boot / dtbo: layout, digest check, digest refresh after an edit, `--avb-key` required for signed footers | **done + verified** against the real `avbtool` (`add_hash_footer` output round-trips byte-for-byte; edited + re-signed output passes `verify_image`) and the independent Python/openssl checks |
-| AVBv1 `BootSignature` (pre-AVB `boot_signer`, DER blob after the image) | **preserved verbatim, not yet verified or regenerated** -- next up |
+| AVBv1 `BootSignature` (pre-AVB `boot_signer`, DER blob after the image): detect, verify (`info`, unpack warning), re-create after an edit with the AOSP test key or `--avb1-key/--avb1-cert` (AIK `name.pk8`+`name.x509.pem` naming too), add to an unsigned image | **done + verified** against the real AOSP `boot_signer` (compiled from its Java sources) and an independent Python/openssl signer: same bytes from the same key and image; abr-re-signed images pass `boot_signer -verify`; real-device AVBv1 images read VALID |
 | compression: gzip, lz4, lz4-legacy, zstd, xz, lzma(alone), bzip2, lzo | **done + verified, all algorithms** |
 | bundled SHA-1/256/512 | **done**, self-test passes, catches its own transcription bug once already (see Verification below) |
 | self-contained RSA: BigInt (Knuth D, Montgomery), DER/PEM/X.509, PKCS#1 v1.5 sign/verify, PKCS#8/PKCS#1 key parsing, AVB public-key blob -- **no OpenSSL anywhere in the build** | **done + verified** (Python integers, `openssl dgst -sign`, `avbtool extract_public_key`; see "Self-contained crypto" below) |
 | manifest + CLI (`abr info/unpack/repack`) | **done** |
 | CMake: FetchContent-vendored static zlib/lz4/zstd/xz/bzip2 | **done + build-verified natively on Linux**, both the dynamic and the `-DABR_STATIC_BINARY=ON` fully-static configurations |
-| Test suite (`tests/run_tests.sh`) | **done, 85/85 passing** -- see Verification |
+| Test suite (`tests/run_tests.sh`) | **done, 98/98 passing** -- see Verification |
 | CMake cross toolchains (mingw-w64, Android NDK) | **done + verified** (mingw reproduced locally; NDK only provable via CI, see below) |
 | GitHub Actions static build matrix (linux-x86_64, windows-x86_64, android-arm64) | **done + verified**: run 35313499827, all 3 jobs green, all 3 static binaries produced as artifacts (abr-linux-x86_64, abr-windows-x86_64, abr-android-arm64) |
 
@@ -41,7 +41,7 @@ tools" below.
 `tests/run_tests.sh` builds real reference images and checks that
 `abr unpack X && abr repack` reproduces each one **byte-for-byte**
 (not just "same decompressed content" -- see how below), then runs it.
-85/85 passing as of the last local run. What it actually checks:
+98/98 passing as of the last local run. What it actually checks:
 
 - **boot v4**: built with AOSP's own `mkbootimg.py` (vendored in
   `tests/reference/mkbootimg/`, Apache-2.0, unmodified except a stub
@@ -160,6 +160,65 @@ checked against independent implementations -- all of it in
   with a different key could never have verified).
 
 Not done: booting an `abr`-signed image on a device that enforces verified boot.
+
+### AVBv1 boot signature, judged by two implementations that share no code with abr
+
+The pre-AVB-2.0 signature of AOSP's `boot_signer` (what Android Image
+Kitchen calls AVBv1; layout in `include/abr/legacy/avb1.hpp`). Oracles:
+
+- **the real `boot_signer`**: `BootSignature.java` + `Utils.java` from AOSP
+  `system/extras/verity` (LineageOS mirror, commit `51de782c`; vendored in
+  `tests/reference/boot_signer/` with the public AOSP "verity" key pair),
+  compiled by the suite with `javac` against BouncyCastle (skipped, with a
+  message, when Java or `bcprov.jar` is missing);
+- **`tests/tools/avb1.py`**: DER assembled in Python, RSA from `openssl dgst
+  -sign`; also signs with ECDSA (`--ec`) to make images abr cannot judge.
+
+What `tests/run_tests.sh` checks (all four layouts: header v0, v0 with a
+Qualcomm dt blob where header word 10 is the dt size, v1 with a recovery
+dtbo, v2 with a dtb -- the signed length differs per layout):
+
+- the AOSP dev key embedded in abr is exactly the vendored `verity.pk8` +
+  `verity.x509.pem` (the suite regenerates `src/legacy/avb1_aosp_key.cpp`
+  with `tools/gen_aosp_verity_key.py` and compares);
+- an image signed by the Python signer or by the real `boot_signer` is
+  reported VALID by `info`, and unpack+repack is byte-identical; the two
+  signers also give identical bytes;
+- one flipped byte in the kernel: reported INVALID at unpack and in `info`,
+  and the image still round-trips unchanged;
+- after an edit: the image abr builds equals the one the independent signer
+  builds from the same edited core, equals what the real `boot_signer`
+  signs, passes `boot_signer -verify`, and no stale-signature warning is
+  printed;
+- a custom RSA-4096 key: `--avb1-key/--avb1-cert`, the AIK `name.pk8 +
+  name.x509.pem` form and a single PEM holding key and certificate all give
+  the same bytes, equal to the independent signer's and to `boot_signer`'s;
+  a certificate that does not belong to the key, and a key without any
+  certificate, are refused with an explanation;
+- an original signed by another key (+ a vendor trailer after the signature,
+  as on the BFBF devices): re-signed with the AOSP key **with a warning**,
+  the trailer stays at its offset (the signature changed size), and the
+  stale-trailer warning is shown;
+- unsigned stays unsigned; `avb1_signature=true` or `--avb1-key` adds a
+  signature; `--avb1-key` on a vendor_boot is ignored with a warning;
+- ECDSA-signed original: "not checked", exact round trip, replaced by an RSA
+  signature (with a warning) after an edit.
+
+Facts established while building this (against the real tool, not assumed):
+
+- The signed range starts at the `ANDROID!` magic, not at the file start
+  (matters under a BFBF prefix), covers the page-aligned image, and the
+  signed data is `image[0:length] || DER(attributes)`.
+- `getSignableImageSize` rejects header v3/v4; v0-v2 only. Its size is the
+  header page + page-aligned kernel/ramdisk/second [+ recovery dtbo, v1-v4
+  field at 1632] [+ dtb, v2 field at 1648] [+ the Qualcomm dt blob when
+  word 10 > 4], rounded up to a page.
+- RSA keys are always signed as `sha256WithRSA` with no NULL parameters
+  (`30 0b 06 09 2a864886f70d01010b`); the real tool also does ECDSA, which
+  abr can neither verify nor create ("not checked", kept verbatim).
+- Re-signing the unsigned part of a real vendor `boot.img` with the AOSP
+  key reproduced the stored 2540-byte signature byte for byte; the other two
+  real AVBv1 images (inside a BFBF wrapper) also read VALID.
 
 ### Design point this verification depends on: byte-identical passthrough
 
@@ -585,9 +644,9 @@ unpacks and repacks every file and compares bytes.
 |---|---|---|---|
 | `TWRP Recovery Amlogic S9xx.img` | boot v0, page 2048, sha1 id | identical | identical |
 | `twrps905x4.img` | boot v0 | identical | identical |
-| `boot (2).img`, `boot-sign.img` | 0x4040-byte BFBF/SSSS vendor wrapper around a boot v0, AVBv1 signature inside the payload, 236-byte signature trailer | not recognised (magic is not at offset 0) | identical |
+| `boot (2).img`, `boot-sign.img` | 0x4040-byte BFBF/SSSS vendor wrapper around a boot v0, AVBv1 signature inside the payload, 236-byte signature trailer | not recognised (magic is not at offset 0) | identical; the AVBv1 signature inside reads VALID |
 | `boot (3).img` | boot v0, page 4096, `id` = SHA-1 that also covers an (empty) dt entry | DIFF at 0x240 (the id) | identical |
-| `boot (4).img` | boot v0 + AVBv1 `BootSignature` (2540-byte DER after the image, signed with the public AOSP test key) | DIFF: the DER blob was dropped | identical |
+| `boot (4).img` | boot v0 + AVBv1 `BootSignature` (2540-byte DER after the image, signed with the public AOSP test key) | DIFF: the DER blob was dropped | identical; signature VALID, and re-signing reproduces it byte for byte |
 | `boot.emmc.win` | TWRP backup: boot v0 zero-filled up to 16 MiB | DIFF: output 8 MB, fill dropped | identical |
 | `boot_32bit.img` | boot v1 + AVB hash footer | DIFF at the footer | identical |
 | `boot_lk2nd.img` | lk2nd bootloader with a boot v0 whose header word 10 is a CAF/QCDT `dt_size` (8192) | unpack failed: "unsupported boot header version: 8192" | identical |
@@ -644,7 +703,8 @@ container and to how a hash was *computed*.
   the page-aligned end of the image. Signed data = `image[0:length] ||
   DER(AuthenticatedAttributes)`, SHA-256, RSA PKCS#1 v1.5. The one in
   `boot (4).img` verifies with openssl against the public AOSP test key, so
-  re-signing is feasible. Today the blob is only preserved (as tail).
+  re-signing is feasible -- and `abr` now does it (see "AVBv1 boot
+  signature, judged by two implementations" above).
 - **BFBF/SSSS wrapper**: 0x4040-byte prefix (BFBF blocks at 0 and 0x100,
   SSSS sub-header at 0x4000); payload = boot image + AVBv1 DER + zeros, then
   a 236-byte trailer (148-byte signature + 88-byte `EEEE` TLV list). The
@@ -687,11 +747,8 @@ Useful as a checklist; wrong in places, and much wider than `abr`:
 
 ### Updated roadmap (next first)
 
-1. **AVBv1 BootSignature**: detect the DER at the end of the image, report
-   target/length/verify in `info`, re-sign after an edit with a key given
-   on the command line (default: the public AOSP test key, as AIK does).
-   Self-contained RSA (bignum + PKCS#8/PEM parsing) so Windows/Android
-   static builds do not depend on OpenSSL; verify against `openssl`.
+1. ~~**AVBv1 BootSignature**~~ -- **done** (detect, verify, re-sign with the
+   AOSP test key or `--avb1-key/--avb1-cert`; self-contained RSA).
 2. **CPIO ramdisk as a directory tree** (newc, crc, odc, binary): AIK
    parity and spec stage 1. Keep an index of the original member order and
    header fields so an unedited ramdisk still round-trips byte-for-byte.

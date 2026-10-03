@@ -244,6 +244,24 @@ def build_all(out):
     put("boot_v2_avbfooter_unaligned.img",
         avb_footer_image(host, b"boot", 2 << 20, salt=blob(32)))
 
+    # --- AVBv1 (boot_signer): unsigned bases the tests sign ---------------
+    # One per way the signed length is computed: plain v0, v0 with a QCDT
+    # blob (word 10 = its size), v1 (+ recovery dtbo) and v2 (+ dtb).
+    kernel_s, ramdisk_s = blob(24000), gz(blob(40000))
+    dtbo_s, dtb_s, dt_s = blob(2500), blob(1700), blob(3100)
+    put("avb1_v0.img", boot_v012(
+        0, kernel_s, ramdisk_s, cmdline="androidboot.hardware=avb1",
+        id_bytes=boot_id(hashlib.sha1, 0, kernel_s, ramdisk_s, b"")))
+    put("avb1_v0_qcdt.img", boot_v012(
+        0, kernel_s, ramdisk_s, dt=dt_s, cmdline="androidboot.hardware=avb1",
+        id_bytes=boot_id(hashlib.sha1, 0, kernel_s, ramdisk_s, b"", dt=dt_s)))
+    put("avb1_v1.img", boot_v012(
+        1, kernel_s, ramdisk_s, dtbo=dtbo_s, cmdline="androidboot.hardware=avb1",
+        id_bytes=boot_id(hashlib.sha1, 1, kernel_s, ramdisk_s, b"", dtbo=dtbo_s)))
+    put("avb1_v2.img", boot_v012(
+        2, kernel_s, ramdisk_s, dtbo=dtbo_s, dtb=dtb_s, cmdline="androidboot.hardware=avb1",
+        id_bytes=boot_id(hashlib.sha1, 2, kernel_s, ramdisk_s, b"", dtbo=dtbo_s, dtb=dtb_s)))
+
     # --- a filesystem, not a boot image ---------------------------------
     ext4 = bytearray(2 << 20)
     ext4[0x438:0x43A] = b"\x53\xef"

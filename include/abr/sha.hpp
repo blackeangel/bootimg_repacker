@@ -1,13 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// abr::hash -- self-contained SHA-1/SHA-256/SHA-512 (FIPS 180-4). No
-// external dependency, so it's always available regardless of whether
-// OpenSSL was found at build time -- which matters for statically-linked
-// cross-compiled builds (Windows/Android) where cross-building OpenSSL
-// is impractical. This is what boot id / AVB vbmeta hashing actually use;
-// OpenSSL (when present) is only used for AVB RSA *signing*, which
-// genuinely does need a real, audited bignum/RSA implementation rather
-// than hand-rolled code.
+// abr::hash -- self-contained SHA-1/SHA-256/SHA-512 (FIPS 180-4). abr links
+// no crypto library: this is what the boot `id`, the AVB digests and the
+// RSA signatures (src/rsa.cpp, over src/bigint.cpp) are all built on, the
+// same on Linux, Windows and Android. OpenSSL, avbtool and boot_signer are
+// used by the test suite only, as independent oracles.
 //
 // Implemented from the FIPS 180-4 specification; round constants
 // cross-checked against multiple independent public-domain reference

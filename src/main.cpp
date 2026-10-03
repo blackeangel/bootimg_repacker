@@ -5,12 +5,14 @@
 //   abr info    <image>
 //   abr unpack  <image> [-o <outdir>]
 //   abr repack  <dir>   -o <image> [--avb-key <private_key.pem>]
+//                       [--avb1-key <key[.pk8]> [--avb1-cert <cert.pem|der>]]
 //
 // Format is auto-detected from magic bytes; see detect_format() below.
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -21,6 +23,7 @@
 #include "abr/dtb.hpp"
 #include "abr/dtbo.hpp"
 #include "abr/envelope.hpp"
+#include "abr/legacy/avb1.hpp"
 #include "abr/legacy/dhtb.hpp"
 #include "abr/legacy/elf_boot.hpp"
 #include "abr/legacy/mtk.hpp"
@@ -121,6 +124,13 @@ Fmt fmt_from_name(const std::string& s) {
     if (s == "elf_boot") return Fmt::ELF_BOOT;
     return Fmt::UNKNOWN;
 }
+
+// What the command line can add to a repack: keys for the signatures abr
+// regenerates when the content changed.
+struct RepackOptions {
+    std::string avb_key_pem;               // --avb-key: AVB 2.0 signing key (file contents)
+    std::optional<Signer> avb1_signer;     // --avb1-key/--avb1-cert: AVBv1 boot signature
+};
 
 // ------------------------------------------------------- component I/O --
 
@@ -236,22 +246,38 @@ Envelope load_envelope(const Manifest& m, const fs::path& dir) {
 // Notes for the user that should not abort anything.
 void warn(const std::string& msg) { std::cerr << "warning: " << msg << "\n"; }
 
-// A bare SEAndroid marker after the image is not a signature; anything else
-// kept around an edited container is, or may be.
-bool envelope_is_inert(const Envelope& e) {
+// A tail that is only zero fill and/or a bare SEAndroid marker is not a
+// signature; anything else kept around an edited container is, or may be.
+// `from` skips that many leading bytes of the tail (a signature abr has just
+// regenerated for the new image).
+bool tail_is_inert(const Bytes& tail, size_t from = 0) {
     static const char kMarker[] = "SEANDROIDENFORCE";
-    return e.prefix.empty() &&
-           (e.tail.empty() ||
-            (e.tail.size() == sizeof(kMarker) - 1 &&
-             std::memcmp(e.tail.data(), kMarker, sizeof(kMarker) - 1) == 0));
+    size_t i = from;
+    while (i < tail.size() && tail[i] == 0) ++i;
+    if (i == tail.size()) return true;
+    return tail.size() - i == sizeof(kMarker) - 1 &&
+           std::memcmp(tail.data() + i, kMarker, sizeof(kMarker) - 1) == 0;
 }
 
-Bytes assemble_envelope(const Manifest& m, const fs::path& dir, const Bytes& core) {
-    Envelope e = load_envelope(m, dir);
+bool envelope_is_inert(const Envelope& e, size_t tail_from = 0) {
+    return e.prefix.empty() && tail_is_inert(e.tail, tail_from);
+}
+
+// Did the rebuilt container differ from the one that was unpacked? (False
+// when the manifest recorded no hash, i.e. nothing was kept around it.)
+bool core_changed(const Manifest& m, const Bytes& core) {
     Bytes original = m.get_hex("core_sha256");
-    if (!original.empty() && !envelope_is_inert(e) && hash::sha256(core) != original) {
+    return !original.empty() && hash::sha256(core) != original;
+}
+
+// `regenerated`: leading bytes of e.tail that were just rebuilt for `core` (an
+// AVBv1 signature) and are therefore not stale.
+Bytes assemble_envelope(const Manifest& m, const Envelope& e, const Bytes& core, bool changed,
+                        size_t regenerated = 0) {
+    (void)m;
+    if (changed && !envelope_is_inert(e, regenerated)) {
         warn("the image was changed, but the " + std::to_string(e.prefix.size()) +
-             " bytes before it and the " + std::to_string(e.tail.size()) +
+             " bytes before it and the " + std::to_string(e.tail.size() - regenerated) +
              " bytes after it (vendor wrapper / signature data) are kept as they were; any "
              "signature, size or checksum stored there still describes the ORIGINAL image, so a "
              "bootloader that verifies it may reject the result");
@@ -260,6 +286,10 @@ Bytes assemble_envelope(const Manifest& m, const fs::path& dir, const Bytes& cor
     Bytes out = e.assemble(core, &note);
     if (!note.empty()) warn(note);
     return out;
+}
+
+Bytes assemble_envelope(const Manifest& m, const fs::path& dir, const Bytes& core) {
+    return assemble_envelope(m, load_envelope(m, dir), core, core_changed(m, core));
 }
 
 // ------------------------------------------------- trailing AVB footer --
@@ -376,6 +406,80 @@ Bytes reattach_avb_footer(const Manifest& m, const fs::path& dir, Bytes host,
     return built;
 }
 
+// -------------------------------------------- AVBv1 boot signature --
+//
+// AOSP's boot_signer appends a DER BootSignature (abr/legacy/avb1.hpp) right
+// after the page-aligned boot image, i.e. at the start of the envelope's
+// tail. An untouched image keeps it byte for byte; once the image changes the
+// old signature (which covers the old bytes) is worthless, so it is created
+// anew, as Android Image Kitchen does.
+
+std::string verdict_text(const Verification& v) {
+    switch (v.verdict) {
+        case SignatureVerdict::Valid: return "signature VALID";
+        case SignatureVerdict::Invalid: return "signature INVALID (" + v.detail + ")";
+        case SignatureVerdict::Unsupported: return "signature not checked (" + v.detail + ")";
+    }
+    return "";
+}
+
+// Re-creates the signature for `core` (the rebuilt image, from its magic) when
+// the manifest has `avb1_signature=true` -- unpack writes it when the source
+// carried a signature -- or --avb1-key was given. Returns how many leading
+// bytes of e.tail are the new signature (0: the tail was left alone).
+size_t refresh_avb1_signature(const Manifest& m, Envelope& e, Bytes& core, uint32_t page_size,
+                              bool image_changed, const RepackOptions& opt) {
+    if (!m.get_bool("avb1_signature", false) && !opt.avb1_signer) return 0;
+    auto existing = parse_boot_signature(e.tail, 0);
+    // An untouched image keeps its signature as it is (byte-identical round
+    // trip) -- unless the caller explicitly asked to sign with a given key.
+    if (existing && !image_changed && !opt.avb1_signer) return 0;
+
+    // Bootloaders look for the signature right after the page-aligned image.
+    if (page_size && core.size() % page_size != 0)
+        core.resize(core.size() + page_size - core.size() % page_size, 0);
+
+    const std::string target = m.get("avb1_target", existing ? existing->target : "/boot");
+    Signer signer;
+    if (opt.avb1_signer) {
+        signer = *opt.avb1_signer;
+    } else {
+        signer = aosp_test_signer();
+        if (existing && !is_aosp_test_certificate(existing->certificate))
+            warn("the original boot signature was made by \"" +
+                 certificate_subject(existing->certificate) +
+                 "\", whose private key abr does not have. The new signature uses the public "
+                 "AOSP test key (what Android Image Kitchen does); a bootloader that trusts only "
+                 "the original key will reject the image. Use --avb1-key/--avb1-cert to sign with "
+                 "your own key.");
+    }
+    Bytes der = build_boot_signature(core, target, signer);
+    std::cout << (existing ? "re-created" : "added") << " the AVBv1 boot signature (target "
+              << target << ", signed by "
+              << (signer.is_aosp_test_key ? std::string("the public AOSP test key")
+                                          : signer.subject)
+              << ")\n";
+
+    const size_t old_size = existing ? existing->der_size : 0;
+    Bytes rest(e.tail.begin() + static_cast<long>(old_size), e.tail.end());
+    if (existing && der.size() != old_size) {
+        // Whatever followed the old signature after a zero gap (a vendor
+        // trailer at the next page, say) keeps its distance from the start
+        // of the signature when the new one has a different size.
+        size_t zeros = 0;
+        while (zeros < rest.size() && rest[zeros] == 0) ++zeros;
+        if (zeros > 0 && zeros < rest.size()) {
+            const size_t keep = old_size + zeros;
+            const size_t new_zeros = keep > der.size() ? keep - der.size() : 0;
+            rest.erase(rest.begin(), rest.begin() + static_cast<long>(zeros));
+            rest.insert(rest.begin(), new_zeros, 0);
+        }
+    }
+    e.tail = std::move(der);
+    e.tail.insert(e.tail.end(), rest.begin(), rest.end());
+    return e.tail.size() - rest.size();
+}
+
 // ------------------------------------------------------------- boot.img --
 
 std::string hex_words(const std::array<uint32_t, 4>& w) {
@@ -450,13 +554,25 @@ void unpack_boot(const Bytes& whole, const fs::path& dir) {
         std::cout << "note: " << env.prefix.size() << " bytes before and " << env.tail.size()
                   << " bytes after the boot image are kept verbatim (prefix.bin / tail.bin)\n";
     }
+    if (auto sig = parse_boot_signature(env.tail, 0)) {
+        Verification v = verify_boot_signature(*sig, host.data() + off, host.size() - off);
+        m.set_bool("avb1_signature", true);  // remove this line to keep the old blob untouched
+        m.set("avb1_target", sig->target);
+        m.set("avb1_info",  // informational, ignored on read
+              "signed by " + certificate_subject(sig->certificate) +
+                  (is_aosp_test_certificate(sig->certificate) ? " (public AOSP test key)" : "") +
+                  "; covers " + std::to_string(sig->length) + " bytes; " + verdict_text(v));
+        if (v.verdict == SignatureVerdict::Invalid)
+            warn("the AVBv1 boot signature in this image does not match its content (" + v.detail +
+                 ")");
+    }
     save_avb_footer(m, dir, footer, host);
 
     m.save(dir / "manifest.txt", "abr boot manifest -- edit then `abr repack " + dir.string() +
                                       " -o out.img`");
 }
 
-Bytes repack_boot(const Manifest& m, const fs::path& dir, const std::string& avb_key_pem) {
+Bytes repack_boot(const Manifest& m, const fs::path& dir, const RepackOptions& opt) {
     BootImage img;
     img.header_version = m.get_u32("header_version", 4);
     if (img.header_version <= 2) {
@@ -499,8 +615,13 @@ Bytes repack_boot(const Manifest& m, const fs::path& dir, const std::string& avb
     img.header_padding = load_raw(m, dir, "header_padding");
     img.recompute_id();  // follows id_scheme; `raw` keeps the id found in the source
 
-    Bytes host = assemble_envelope(m, dir, img.build());
-    return reattach_avb_footer(m, dir, std::move(host), avb_key_pem);
+    Bytes core = img.build();
+    Envelope env = load_envelope(m, dir);
+    const bool changed = core_changed(m, core);
+    const size_t regenerated = refresh_avb1_signature(
+        m, env, core, img.header_version <= 2 ? img.page_size : 4096, changed, opt);
+    Bytes host = assemble_envelope(m, env, core, changed, regenerated);
+    return reattach_avb_footer(m, dir, std::move(host), opt.avb_key_pem);
 }
 
 // ------------------------------------------------------- vendor_boot.img --
@@ -557,7 +678,7 @@ void unpack_vendor_boot(const Bytes& whole, const fs::path& dir) {
                                       dir.string() + " -o out.img`");
 }
 
-Bytes repack_vendor_boot(const Manifest& m, const fs::path& dir, const std::string& avb_key_pem) {
+Bytes repack_vendor_boot(const Manifest& m, const fs::path& dir, const RepackOptions& opt) {
     VendorBootImage img;
     img.header_version = m.get_u32("header_version", 4);
     img.page_size = m.get_u32("page_size", 4096);
@@ -588,7 +709,7 @@ Bytes repack_vendor_boot(const Manifest& m, const fs::path& dir, const std::stri
         img.ramdisk_fragments.push_back(std::move(e));
     }
     Bytes host = assemble_envelope(m, dir, img.build());
-    return reattach_avb_footer(m, dir, std::move(host), avb_key_pem);
+    return reattach_avb_footer(m, dir, std::move(host), opt.avb_key_pem);
 }
 
 // ------------------------------------------------------------ dtbo.img --
@@ -624,7 +745,7 @@ void unpack_dtbo(const Bytes& whole, const fs::path& dir) {
            "abr dtbo manifest -- edit then `abr repack " + dir.string() + " -o out.img`");
 }
 
-Bytes repack_dtbo(const Manifest& m, const fs::path& dir, const std::string& avb_key_pem) {
+Bytes repack_dtbo(const Manifest& m, const fs::path& dir, const RepackOptions& opt) {
     DtboImage img;
     img.version = m.get_u32("version", 0);
     img.page_size = m.get_u32("page_size", 2048);
@@ -643,7 +764,7 @@ Bytes repack_dtbo(const Manifest& m, const fs::path& dir, const std::string& avb
         img.entries.push_back(std::move(e));
     }
     Bytes host = assemble_envelope(m, dir, img.build());
-    return reattach_avb_footer(m, dir, std::move(host), avb_key_pem);
+    return reattach_avb_footer(m, dir, std::move(host), opt.avb_key_pem);
 }
 
 // --------------------------------------------------------------- dtb --
@@ -710,7 +831,7 @@ void unpack_vbmeta(const Bytes& data, const fs::path& dir) {
                " -o out.img` (pass --avb-key key.pem to re-sign)");
 }
 
-Bytes repack_vbmeta(const Manifest& m, const fs::path& dir, const std::string& avb_key_pem) {
+Bytes repack_vbmeta(const Manifest& m, const fs::path& dir, const RepackOptions& opt) {
     VbmetaImage v;
     v.required_libavb_version_major = m.get_u32("required_libavb_version_major", 1);
     v.required_libavb_version_minor = m.get_u32("required_libavb_version_minor", 0);
@@ -738,7 +859,7 @@ Bytes repack_vbmeta(const Manifest& m, const fs::path& dir, const std::string& a
         v.descriptors.push_back(std::move(d));
     }
     std::vector<std::string> notes;
-    Bytes built = v.build(avb_key_pem, &notes);
+    Bytes built = v.build(opt.avb_key_pem, &notes);
     for (auto& n : notes) warn(n);
     return built;
 }
@@ -838,6 +959,25 @@ void print_envelope_info(const Envelope& e) {
     }
 }
 
+void print_avb1_info(const Envelope& env, const Bytes& host, size_t image_off, size_t image_len) {
+    auto sig = parse_boot_signature(env.tail, 0);
+    if (!sig) return;
+    Verification v = verify_boot_signature(*sig, host.data() + image_off, host.size() - image_off);
+    std::cout << "boot signature: AVBv1 (boot_signer), target " << sig->target << "\n"
+              << "  signer:       " << certificate_subject(sig->certificate)
+              << (is_aosp_test_certificate(sig->certificate)
+                      ? "  [public AOSP test key: abr can re-sign it]"
+                      : "")
+              << "\n"
+              << "  covers:       " << sig->length << " bytes"
+              << (sig->length == image_len
+                      ? " (the whole image)"
+                      : " -- but the image is " + std::to_string(image_len) + " bytes")
+              << "\n"
+              << "  signature:    " << signature_algorithm_name(sig->algorithm_oid) << ", "
+              << verdict_text(v) << "\n";
+}
+
 void print_avb_footer_info(const AvbFooter& f, const Bytes& host) {
     if (!f.present) return;
     const VbmetaImage& v = f.v;
@@ -893,7 +1033,9 @@ void print_info(const fs::path& path) {
                 std::cout << "boot_signature: " << img.boot_signature.size() << " bytes\n";
             if (img.header_version <= 2)
                 std::cout << "id scheme:      " << id_scheme_name(img.id_scheme) << "\n";
-            print_envelope_info(Envelope::capture(host, off, img.consumed));
+            Envelope env = Envelope::capture(host, off, img.consumed);
+            print_envelope_info(env);
+            print_avb1_info(env, host, off, img.consumed);
             print_avb_footer_info(footer, host);
             break;
         }
@@ -984,21 +1126,24 @@ void print_info(const fs::path& path) {
 
 // Rebuilds the file described by an unpacked directory (everything `repack`
 // does except writing the result).
-Bytes build_image(const fs::path& dir, const std::string& avb_key_pem) {
+Bytes build_image(const fs::path& dir, const RepackOptions& opt) {
     Manifest m = Manifest::load(dir / "manifest.txt");
     Fmt f = fmt_from_name(m.get("type"));
     Bytes result;
     switch (f) {
-        case Fmt::BOOT: result = repack_boot(m, dir, avb_key_pem); break;
-        case Fmt::VENDOR_BOOT: result = repack_vendor_boot(m, dir, avb_key_pem); break;
-        case Fmt::DTBO: result = repack_dtbo(m, dir, avb_key_pem); break;
+        case Fmt::BOOT: result = repack_boot(m, dir, opt); break;
+        case Fmt::VENDOR_BOOT: result = repack_vendor_boot(m, dir, opt); break;
+        case Fmt::DTBO: result = repack_dtbo(m, dir, opt); break;
         case Fmt::DTB: result = repack_dtb(m, dir); break;
-        case Fmt::VBMETA: result = repack_vbmeta(m, dir, avb_key_pem); break;
+        case Fmt::VBMETA: result = repack_vbmeta(m, dir, opt); break;
         case Fmt::UIMAGE: result = repack_uimage(m, dir); break;
         case Fmt::ELF_BOOT: result = repack_elf_boot(m, dir); break;
         case Fmt::UNKNOWN:
             throw FormatError("manifest.txt has no (or an unrecognized) 'type=' field");
     }
+
+    if (opt.avb1_signer && f != Fmt::BOOT)
+        warn("--avb1-key/--avb1-cert only apply to boot and recovery images; ignored here");
 
     if (m.get_bool("has_dhtb", false)) {
         legacy::DhtbInfo dhtb;
@@ -1024,7 +1169,7 @@ size_t first_difference(const Bytes& a, const Bytes& b) {
 // the user is told, at once, where it is not.
 void self_check(const fs::path& outdir, const Bytes& original) {
     try {
-        Bytes rebuilt = build_image(outdir, "");
+        Bytes rebuilt = build_image(outdir, RepackOptions{});
         if (rebuilt == original) {
             std::cout << "round-trip: an untouched repack reproduces this image byte-for-byte\n";
             return;
@@ -1077,13 +1222,37 @@ void do_unpack(const fs::path& in, const fs::path& outdir) {
     self_check(outdir, data);
 }
 
-void do_repack(const fs::path& dir, const fs::path& out, const std::string& avb_key_pem) {
+void do_repack(const fs::path& dir, const fs::path& out, const RepackOptions& opt) {
     Manifest m = Manifest::load(dir / "manifest.txt");
     Fmt f = fmt_from_name(m.get("type"));
-    Bytes result = build_image(dir, avb_key_pem);
+    Bytes result = build_image(dir, opt);
     write_file(out, result);
     std::cout << "repacked " << fmt_name(f) << " -> " << out.string() << " (" << result.size()
               << " bytes)\n";
+}
+
+// --avb1-key is a key file, or -- as in Android Image Kitchen -- a base name N
+// with N.pk8 and N.x509.pem (or .der) beside each other.
+Signer load_avb1_signer(const std::string& key_arg, const std::string& cert_arg) {
+    if (key_arg.empty()) throw FormatError("--avb1-cert needs --avb1-key");
+    fs::path key_path = key_arg;
+    fs::path cert_path = cert_arg;
+    if (!fs::exists(key_path)) {
+        fs::path pk8 = key_arg + ".pk8";
+        if (!fs::exists(pk8))
+            throw FormatError("cannot find the AVBv1 signing key '" + key_arg + "' (nor '" +
+                              key_arg + ".pk8')");
+        key_path = pk8;
+        if (cert_arg.empty())
+            for (const char* ext : {".x509.pem", ".x509.der", ".x509.crt"})
+                if (fs::exists(key_arg + ext)) {
+                    cert_path = key_arg + ext;
+                    break;
+                }
+    }
+    Bytes key = read_file(key_path);
+    Bytes cert = cert_path.empty() ? Bytes() : read_file(cert_path);
+    return make_signer(key, cert);
 }
 
 void usage() {
@@ -1091,7 +1260,12 @@ void usage() {
         "abr -- Android boot-family image unpacker/repacker\n\n"
         "  abr info   <image>\n"
         "  abr unpack <image> [-o <outdir>]\n"
-        "  abr repack <dir> -o <image> [--avb-key <private_key.pem>]\n\n"
+        "  abr repack <dir> -o <image> [--avb-key <private_key.pem>]\n"
+        "                              [--avb1-key <key> [--avb1-cert <cert.pem|cert.der>]]\n\n"
+        "  --avb-key    signing key for AVB 2.0 (vbmeta / footers): PEM or DER (.pk8)\n"
+        "  --avb1-key   key for the old boot_signer signature of a boot image (the public AOSP\n"
+        "               test key is used when omitted); <key> may be a PEM/DER file or, as in\n"
+        "               Android Image Kitchen, a base name N with N.pk8 and N.x509.pem\n\n"
         "Supported: boot.img/init_boot.img/boot-debug.img/boot-test-harness.img,\n"
         "recovery.img/recovery-two-step.img (header v0-v4), vendor_boot.img/\n"
         "vendor_boot-debug.img/vendor_kernel_boot.img (header v3-v4), dtbo.img,\n"
@@ -1132,18 +1306,28 @@ int main(int argc, char** argv) {
             if (args.empty()) { usage(); return 1; }
             fs::path dir = args[0];
             fs::path out;
-            std::string avb_key_pem;
+            RepackOptions opt;
+            std::string avb1_key, avb1_cert;
             for (size_t i = 1; i < args.size(); ++i) {
                 if ((args[i] == "-o" || args[i] == "--output") && i + 1 < args.size())
                     out = args[++i];
                 else if (args[i] == "--avb-key" && i + 1 < args.size()) {
                     Bytes key_bytes = read_file(args[++i]);
-                    avb_key_pem.assign(reinterpret_cast<const char*>(key_bytes.data()),
-                                        key_bytes.size());
+                    opt.avb_key_pem.assign(reinterpret_cast<const char*>(key_bytes.data()),
+                                           key_bytes.size());
+                } else if (args[i] == "--avb1-key" && i + 1 < args.size())
+                    avb1_key = args[++i];
+                else if (args[i] == "--avb1-cert" && i + 1 < args.size())
+                    avb1_cert = args[++i];
+                else if (args[i].rfind("-", 0) == 0) {
+                    std::cerr << "repack: unknown option " << args[i] << "\n";
+                    return 1;
                 }
             }
             if (out.empty()) { std::cerr << "repack: -o <output image> is required\n"; return 1; }
-            do_repack(dir, out, avb_key_pem);
+            if (!avb1_key.empty() || !avb1_cert.empty())
+                opt.avb1_signer = load_avb1_signer(avb1_key, avb1_cert);
+            do_repack(dir, out, opt);
         } else {
             usage();
             return 1;

@@ -786,6 +786,234 @@ else
     echo "SKIP: avbtool cross-checks (abr_unit_tests or tests/reference/avb/avbtool.py unavailable)"
 fi
 
+# =========================================================================
+# AVBv1 boot signature -- the pre-AVB-2.0 signature AOSP's boot_signer
+# appends after a boot image (what Android Image Kitchen calls AVBv1).
+# Judged by two implementations that share no code with abr:
+#   tests/tools/avb1.py   DER assembled in Python, RSA from `openssl`;
+#   the real boot_signer  compiled from AOSP's own Java sources (needs a JDK
+#                         and BouncyCastle; skipped without them).
+# PKCS#1 v1.5 is deterministic, so "same key, same image" must give the same
+# bytes from all three.
+# =========================================================================
+AVB1="$TOOLS/avb1.py"
+BS_DIR="$REPO_ROOT/tests/reference/boot_signer"
+VK_PK8="$BS_DIR/verity.pk8"
+VK_PEM="$BS_DIR/verity.x509.pem"
+openssl pkcs8 -inform DER -nocrypt -in "$VK_PK8" -out verity_key.pem 2>/dev/null
+
+if python3 "$REPO_ROOT/tools/gen_aosp_verity_key.py" "$VK_PK8" "$VK_PEM" >gen_aosp_key.cpp 2>/dev/null &&
+    cmp -s gen_aosp_key.cpp "$REPO_ROOT/src/legacy/avb1_aosp_key.cpp"; then
+    pass "the AOSP dev key embedded in abr is exactly the vendored verity.pk8 + verity.x509.pem"
+else
+    fail "src/legacy/avb1_aosp_key.cpp does not match tests/reference/boot_signer/verity.* (rerun tools/gen_aosp_verity_key.py)"
+fi
+
+sign_py() {  # <in.img> <out.img> [key.pem cert.pem]: image + signature built by avb1.py
+    python3 "$AVB1" sign "$1" /boot "${3:-verity_key.pem}" "${4:-$VK_PEM}" >"$2"
+}
+
+# --- an image signed by the independent signer is understood, and left alone ---
+a1_ok=1
+for v in v0 v0_qcdt v1 v2; do
+    sign_py fx/avb1_$v.img a1_$v.img
+    if ! python3 "$AVB1" verify a1_$v.img >/dev/null; then a1_ok=0; echo "  $v: the Python signer's own output does not verify"; fi
+    if ! "$ABR" info a1_$v.img 2>&1 | grep -q "signature VALID"; then a1_ok=0; echo "  $v: info does not report VALID"; fi
+    "$ABR" unpack a1_$v.img -o a1u_$v >a1u_$v.log 2>&1
+    "$ABR" repack a1u_$v -o a1_$v.out >/dev/null 2>&1
+    cmp -s a1_$v.img a1_$v.out || { a1_ok=0; echo "  $v: unpack+repack is not byte-identical"; }
+    grep -q "^avb1_signature=true" a1u_$v/manifest.txt || { a1_ok=0; echo "  $v: manifest lacks avb1_signature"; }
+done
+if [ $a1_ok -eq 1 ]; then
+    pass "AVBv1-signed v0 / v0+QCDT / v1 / v2 images: info says VALID, unpack+repack is byte-identical"
+else
+    fail "AVBv1-signed images are not handled correctly"
+fi
+
+# --- a damaged image is reported, and still round-trips ---
+cp a1_v0.img a1_v0_bad.img
+printf '\x55' | dd of=a1_v0_bad.img bs=1 seek=3000 conv=notrunc 2>/dev/null
+"$ABR" unpack a1_v0_bad.img -o a1u_bad >a1u_bad.log 2>&1
+"$ABR" repack a1u_bad -o a1_v0_bad.out >/dev/null 2>&1
+if "$ABR" info a1_v0_bad.img 2>&1 | grep -q "signature INVALID" &&
+    grep -q "does not match its content" a1u_bad.log && cmp -s a1_v0_bad.img a1_v0_bad.out; then
+    pass "a boot signature that no longer matches the image is reported INVALID at unpack and in info, and kept as it was"
+else
+    fail "an invalid AVBv1 signature is not reported / not kept"
+fi
+
+# --- edited image: re-signed, equal to what the independent signer builds ---
+a1_ok=1
+for v in v0 v0_qcdt v1 v2; do
+    printf 'abr-edit' >>a1u_$v/ramdisk.cpio
+    "$ABR" repack a1u_$v -o a1_$v.edit >a1_$v.edit.log 2>&1
+    sign_py a1_$v.edit a1_$v.resigned
+    cmp -s a1_$v.edit a1_$v.resigned || { a1_ok=0; echo "  $v: differs from the independent signer's image"; }
+    python3 "$AVB1" verify a1_$v.edit >/dev/null || { a1_ok=0; echo "  $v: independent verifier rejects it"; }
+    grep -q "re-created the AVBv1 boot signature" a1_$v.edit.log || { a1_ok=0; echo "  $v: no note about re-signing"; }
+    grep -q "^warning" a1_$v.edit.log && { a1_ok=0; echo "  $v: unexpected warning: $(grep '^warning' a1_$v.edit.log)"; }
+done
+if [ $a1_ok -eq 1 ]; then
+    pass "edited AVBv1 images (v0, v0+QCDT, v1, v2) are re-signed: identical to the independent signer's output, no stale-signature warning"
+else
+    fail "re-signing after an edit is wrong"
+fi
+
+# --- a signer other than the AOSP test key: --avb1-key / --avb1-cert, AIK-style names, combined PEM ---
+openssl genrsa -traditional -out a1_key.pem 4096 >/dev/null 2>&1 || openssl genrsa -out a1_key.pem 4096 >/dev/null 2>&1
+openssl req -x509 -new -key a1_key.pem -subj "/CN=abr avb1 test/O=abr" -days 3650 -out a1_cert.pem >/dev/null 2>&1
+mkdir -p aik
+openssl pkcs8 -topk8 -nocrypt -outform DER -in a1_key.pem -out aik/mykey.pk8
+cp a1_cert.pem aik/mykey.x509.pem
+cat a1_key.pem a1_cert.pem >a1_combined.pem
+cp fx/avb1_v1.img a1_plain_v1.img
+"$ABR" unpack a1_plain_v1.img -o a1u_custom >/dev/null 2>&1
+printf 'abr-edit' >>a1u_custom/ramdisk.cpio
+"$ABR" repack a1u_custom -o a1_custom_flags.img --avb1-key a1_key.pem --avb1-cert a1_cert.pem >/dev/null 2>&1
+"$ABR" repack a1u_custom -o a1_custom_aik.img --avb1-key aik/mykey >/dev/null 2>&1
+"$ABR" repack a1u_custom -o a1_custom_combined.img --avb1-key a1_combined.pem >/dev/null 2>&1
+sign_py a1_custom_flags.img a1_custom_expected.img a1_key.pem a1_cert.pem
+if cmp -s a1_custom_flags.img a1_custom_expected.img &&
+    cmp -s a1_custom_flags.img a1_custom_aik.img && cmp -s a1_custom_flags.img a1_custom_combined.img &&
+    python3 "$AVB1" verify a1_custom_flags.img a1_cert.pem >/dev/null; then
+    pass "--avb1-key/--avb1-cert (RSA-4096): equal to the independent signer; the AIK 'name.pk8 + name.x509.pem' form and a combined PEM give the same bytes"
+else
+    fail "signing with a custom key is wrong"
+fi
+if "$ABR" repack a1u_custom -o x.img --avb1-key a1_key.pem --avb1-cert "$VK_PEM" 2>a1_mismatch.err; then
+    fail "a certificate that does not belong to the key was accepted"
+elif grep -q "does not belong to this private key" a1_mismatch.err; then
+    pass "a certificate that does not match the private key is refused"
+else
+    fail "key/certificate mismatch refusal is not explanatory"
+fi
+if "$ABR" repack a1u_custom -o x.img --avb1-key a1_key.pem 2>a1_nocert.err; then
+    fail "a key without any certificate was accepted"
+elif grep -q -- "--avb1-cert" a1_nocert.err; then
+    pass "a key without a certificate is refused with the way to supply one"
+else
+    fail "missing-certificate refusal is not explanatory"
+fi
+
+# --- vendor trailer after the signature keeps its place when the signature changes size ---
+size=$(python3 "$AVB1" size fx/avb1_v1.img)
+sign_py fx/avb1_v1.img a1_v1_custom.img a1_key.pem a1_cert.pem
+python3 - "$size" <<'PYEOF'
+import sys
+size = int(sys.argv[1])
+d = open("a1_v1_custom.img", "rb").read()
+assert len(d) < size + 2048
+d += b"\0" * (size + 2048 - len(d)) + b"EEEE" + bytes(range(96))
+open("a1_trailer.img", "wb").write(d)
+PYEOF
+"$ABR" unpack a1_trailer.img -o a1u_trailer >a1u_trailer.log 2>&1
+sed -i 's/^cmdline=.*/cmdline=androidboot.edited=1/' a1u_trailer/manifest.txt
+"$ABR" repack a1u_trailer -o a1_trailer.out >a1_trailer.log 2>&1
+if python3 - "$size" <<'PYEOF'
+import sys
+size = int(sys.argv[1])
+d = open("a1_trailer.out", "rb").read()
+t = b"EEEE" + bytes(range(96))
+sys.exit(0 if d[size + 2048:size + 2048 + len(t)] == t and len(d) == size + 2048 + len(t) else 1)
+PYEOF
+then
+    ok_trailer=1
+else
+    ok_trailer=0
+fi
+if [ $ok_trailer -eq 1 ] && python3 "$AVB1" verify a1_trailer.out >/dev/null &&
+    grep -q "whose private key abr does not have" a1_trailer.log &&
+    grep -q "kept as they were" a1_trailer.log; then
+    pass "foreign signer + vendor trailer: re-signed with the AOSP test key (with a warning), trailer still where it was, stale-trailer warning shown"
+else
+    fail "foreign signer / trailer handling is wrong ($(grep -h '^warning' a1_trailer.log | head -2))"
+fi
+
+# --- adding a signature to an unsigned image; options that do not apply ---
+"$ABR" unpack fx/avb1_v0.img -o a1u_unsigned >/dev/null 2>&1
+"$ABR" repack a1u_unsigned -o a1_unsigned.out >/dev/null 2>&1
+echo 'avb1_signature=true' >>a1u_unsigned/manifest.txt
+"$ABR" repack a1u_unsigned -o a1_added.out >/dev/null 2>&1
+"$ABR" unpack fx/avb1_v0.img -o a1u_unsigned2 >/dev/null 2>&1
+"$ABR" repack a1u_unsigned2 -o a1_added_key.out --avb1-key aik/mykey >/dev/null 2>&1
+sign_py fx/avb1_v0.img a1_added_expected.img
+sign_py fx/avb1_v0.img a1_added_key_expected.img a1_key.pem a1_cert.pem
+if cmp -s fx/avb1_v0.img a1_unsigned.out && cmp -s a1_added.out a1_added_expected.img &&
+    cmp -s a1_added_key.out a1_added_key_expected.img; then
+    pass "an unsigned image stays unsigned; avb1_signature=true or --avb1-key adds a signature (equal to the independent signer's)"
+else
+    fail "adding an AVBv1 signature is wrong"
+fi
+if "$ABR" repack vbv3_dummy -o x.img --avb1-key aik/mykey >/dev/null 2>&1; then :; fi
+"$ABR" unpack vendor_boot_v3.img -o a1u_vb >/dev/null 2>&1
+if "$ABR" repack a1u_vb -o a1_vb.out --avb1-key aik/mykey 2>&1 | grep -q "only apply to boot and recovery images"; then
+    pass "--avb1-key on a non-boot image is ignored with a warning"
+else
+    fail "--avb1-key on a vendor_boot gives no warning"
+fi
+
+# --- ECDSA-signed originals: not judged, kept, re-signed (with the AOSP RSA key) after an edit ---
+openssl ecparam -name prime256v1 -genkey -noout -out a1_ec.pem >/dev/null 2>&1
+openssl req -x509 -new -key a1_ec.pem -subj "/CN=abr ec test" -days 3650 -out a1_ec_cert.pem >/dev/null 2>&1
+python3 "$AVB1" sign fx/avb1_v0.img /boot a1_ec.pem a1_ec_cert.pem --ec >a1_ec.img
+"$ABR" unpack a1_ec.img -o a1u_ec >a1u_ec.log 2>&1
+"$ABR" repack a1u_ec -o a1_ec.out >/dev/null 2>&1
+printf 'abr-edit' >>a1u_ec/ramdisk.cpio
+"$ABR" repack a1u_ec -o a1_ec.edit >a1_ec.edit.log 2>&1
+if "$ABR" info a1_ec.img 2>&1 | grep -q "signature not checked" && cmp -s a1_ec.img a1_ec.out &&
+    python3 "$AVB1" verify a1_ec.edit >/dev/null && grep -q "whose private key abr does not have" a1_ec.edit.log; then
+    pass "an ECDSA boot signature is reported as not checked, round-trips exactly, and is replaced by an RSA one after an edit (with a warning)"
+else
+    fail "ECDSA-signed boot image handling is wrong"
+fi
+
+# --- the real boot_signer, compiled from AOSP's sources ---
+BCPROV=""
+for j in "${BCPROV_JAR:-}" /usr/share/java/bcprov.jar /usr/share/java/bcprov-*.jar; do
+    if [ -n "$j" ] && [ -f "$j" ]; then BCPROV="$j"; break; fi
+done
+if command -v javac >/dev/null 2>&1 && command -v java >/dev/null 2>&1 && [ -n "$BCPROV" ] &&
+    mkdir -p bsclasses && javac -cp "$BCPROV" -d bsclasses "$BS_DIR/BootSignature.java" "$BS_DIR/Utils.java" >/dev/null 2>&1; then
+    bs() { java -cp "$BCPROV:bsclasses" com.android.verity.BootSignature "$@" >/dev/null 2>&1; }
+
+    bs_ok=1
+    for v in v0 v0_qcdt v1 v2; do
+        bs /boot fx/avb1_$v.img "$VK_PK8" "$VK_PEM" bs_$v.img || { bs_ok=0; echo "  $v: boot_signer failed"; continue; }
+        cmp -s bs_$v.img a1_$v.img || { bs_ok=0; echo "  $v: boot_signer and the Python signer disagree"; }
+        "$ABR" info bs_$v.img 2>&1 | grep -q "signature VALID" || { bs_ok=0; echo "  $v: info does not report VALID for boot_signer's image"; }
+        "$ABR" unpack bs_$v.img -o bsu_$v >/dev/null 2>&1
+        "$ABR" repack bsu_$v -o bs_$v.out >/dev/null 2>&1
+        cmp -s bs_$v.img bs_$v.out || { bs_ok=0; echo "  $v: round trip of boot_signer's image differs"; }
+    done
+    if [ $bs_ok -eq 1 ]; then
+        pass "images signed by the real boot_signer (v0, v0+QCDT, v1, v2): same bytes as the Python signer, info says VALID, round trip identical"
+    else
+        fail "images signed by the real boot_signer are not handled correctly"
+    fi
+
+    bs_ok=1
+    for v in v0 v0_qcdt v1 v2; do
+        bs -verify a1_$v.edit || { bs_ok=0; echo "  $v: boot_signer -verify rejects abr's re-signed image"; }
+        n=$(python3 "$AVB1" size a1_$v.edit)
+        head -c "$n" a1_$v.edit >core_$v.img
+        bs /boot core_$v.img "$VK_PK8" "$VK_PEM" core_$v.signed || { bs_ok=0; echo "  $v: boot_signer failed on the edited core"; continue; }
+        cmp -s core_$v.signed a1_$v.edit || { bs_ok=0; echo "  $v: abr's signature differs from boot_signer's"; }
+    done
+    PK8_CUSTOM=aik/mykey.pk8
+    bs /boot core_v1.img "$PK8_CUSTOM" a1_cert.pem core_v1_custom.signed || bs_ok=0
+    head -c "$(python3 "$AVB1" size a1_custom_flags.img)" a1_custom_flags.img >core_custom.img
+    bs /boot core_custom.img "$PK8_CUSTOM" a1_cert.pem core_custom.signed || bs_ok=0
+    cmp -s core_custom.signed a1_custom_flags.img || { bs_ok=0; echo "  custom key: abr differs from boot_signer"; }
+    bs -verify a1_custom_flags.img || { bs_ok=0; echo "  custom key: boot_signer -verify rejects abr's image"; }
+    if [ $bs_ok -eq 1 ]; then
+        pass "abr's re-signed images (AOSP key and a custom RSA-4096 key) are byte-identical to the real boot_signer's and pass its -verify"
+    else
+        fail "abr's signatures differ from the real boot_signer's"
+    fi
+else
+    echo "SKIP: real boot_signer cross-check (needs javac, java and BouncyCastle bcprov.jar; set BCPROV_JAR to point at it)"
+fi
+
 echo ""
 echo "===== $PASS passed, $FAIL failed ====="
 exit "$FAIL"

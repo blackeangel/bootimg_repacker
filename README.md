@@ -41,7 +41,7 @@ of a bare "unknown format".
 ```sh
 abr info   <image>
 abr unpack <image> [-o <outdir>]
-abr repack <dir> -o <image> [--avb-key <private_key.pem>]
+abr repack <dir> -o <image> [--avb-key <private_key.pem>] [--avb1-key <key> [--avb1-cert <cert>]]
 ```
 
 `unpack` writes a human-readable, human-editable `manifest.txt` plus
@@ -80,7 +80,10 @@ this in the manifest / as side files and writes it back:
 - an AVB footer: laid out the way `avbtool` does, with the digest checked
   at unpack time and **refreshed after you edit the image** (a signed
   footer needs `--avb-key`; without it `abr` refuses rather than emit an
-  image that fails verification).
+  image that fails verification);
+- an AVBv1 boot signature (the `boot_signer` blob after the image):
+  checked at unpack time and **re-created after you edit the image**
+  (see below).
 
 If you edit an image that sits inside a vendor wrapper or signature
 trailer, `abr` warns: the wrapper is kept as it was, so a signature or
@@ -108,6 +111,40 @@ supply a key -- `abr` will refuse to emit a self-inconsistent signed
 blob rather than silently producing one that fails verification. Or
 set `algorithm_type=0` in the manifest for an unsigned rebuild instead.
 
+### Re-signing a boot image (AVBv1 boot signature)
+
+Boot and recovery images of the Android 4.4-8 era (header v0-v2) often end
+with a *boot signature*: the DER blob AOSP's `boot_signer` appends after the
+image, which bootloaders such as LK check ("verified boot 1.0"; Android
+Image Kitchen calls it AVBv1). `abr` finds it, judges it, and keeps it
+exact:
+
+- `abr info` shows the target (`/boot` or `/recovery`), how many bytes it
+  covers, who signed it, and whether it **verifies** (RSA keys; an ECDSA
+  signature is reported as "not checked" and kept as it is);
+- an image you do not touch round-trips byte for byte -- even one whose
+  signature is already invalid, which `abr` reports at unpack;
+- once you edit something, the old signature cannot match any more, so
+  `abr` **re-creates it** over the new image and says so. Without options
+  it signs with AOSP's public test key (the Android Image Kitchen default)
+  and **warns** when the original was signed by somebody else, because the
+  device will not trust a test-key signature. To sign with your own key:
+
+```sh
+abr repack <dir> -o boot.img --avb1-key my.pk8 --avb1-cert my.x509.pem
+abr repack <dir> -o boot.img --avb1-key my          # my.pk8 + my.x509.pem, as AIK names them
+```
+
+The key is an RSA private key (PEM, or DER such as `.pk8`); the certificate
+(PEM or DER) goes into the signature and must belong to the key, which
+`abr` checks. A PEM file holding both works too. An unsigned image stays
+unsigned; give `--avb1-key` (or put `avb1_signature=true` in the manifest)
+to add a signature.
+
+The signature is what `boot_signer` would write byte for byte: the same
+bytes from the same key and image (PKCS#1 v1.5 is deterministic), which is
+how it is tested against the real tool.
+
 ## Building
 
 Requires CMake >= 3.20 and a C++20 compiler. Dependencies (zlib, lz4,
@@ -132,7 +169,10 @@ cmake --build build -j          # also builds build/abr_unit_tests (-DABR_BUILD_
 ./tests/run_tests.sh build/abr
 ```
 
-The suite needs `python3`, `dtc`, `mkimage` and `openssl` on the PATH.
+The suite needs `python3`, `dtc`, `mkimage` and `openssl` on the PATH. The
+cross-check against the real AOSP `boot_signer` is skipped unless `javac`,
+`java` and BouncyCastle are present (Debian/Ubuntu: `apt install
+default-jdk-headless libbcprov-java`).
 They are used only as independent reference implementations to compare
 `abr` against -- none of them is needed to build or use `abr`.
 
@@ -199,6 +239,17 @@ AVB signing is judged by implementations that share no code with `abr`:
   reproduces avbtool's bytes, and an image `abr` edited and re-signed
   passes `avbtool verify_image`.
 
+The AVBv1 boot signature is judged the same way, by two implementations
+that share no code with `abr`: `tests/tools/avb1.py` (DER assembled in
+Python, RSA from `openssl`) and the **real `boot_signer`**, compiled from
+AOSP's own Java sources (`tests/reference/boot_signer/`). The same key and
+image must give the same bytes from all three; images signed by either
+reference read as VALID and round-trip exactly; images `abr` re-signed
+(AOSP key and a custom RSA-4096 key, header v0, v0+QCDT, v1, v2) pass
+`boot_signer -verify`. Checked once on real device dumps too: three real
+AVBv1 images report VALID, and re-signing the unsigned part of a vendor
+`boot.img` with the AOSP key reproduced its stored signature exactly.
+
 What has **not** been done: booting an `abr`-signed image on a device
 that enforces verified boot.
 
@@ -213,9 +264,6 @@ Two smaller gaps:
 
 ## Not implemented (yet)
 
-- **AVBv1 `BootSignature`** (the pre-AVB `boot_signer` DER blob after the
-  image): preserved byte-for-byte, but not verified or re-generated after
-  an edit. Next on the list.
 - **cpio ramdisk as a directory tree**: the ramdisk is extracted as one
   decompressed `ramdisk.cpio`; unpacking/packing its files is planned.
 - The rest of the Android Image Kitchen format list: PXA, OSIP/KRNL,
@@ -228,11 +276,11 @@ Two smaller gaps:
 
 ## License
 
-GPL-3.0-or-later, see `LICENSE`. Two directories are vendored
+GPL-3.0-or-later, see `LICENSE`. A few directories are vendored
 third-party code, used only by parts of `abr` (`third_party/minilzo`)
 or only by the test suite (`tests/reference/mkbootimg`,
-`tests/reference/avb`), each with its own README explaining exactly what
-and why -- see those for details:
+`tests/reference/avb`, `tests/reference/boot_signer`), each with its own
+README explaining exactly what and why -- see those for details:
 
 - `third_party/minilzo/`: LZO1X compress/decompress, GPL-2.0-or-later
   (compatible with, and combined here under, this project's own
@@ -241,3 +289,8 @@ and why -- see those for details:
   Apache-2.0, not linked into the `abr` binary at all.
 - `tests/reference/avb/`: AOSP's `avbtool.py`, MIT, used only as the
   oracle for the AVB tests.
+- `tests/reference/boot_signer/`: AOSP's `boot_signer` (Java sources, with
+  its public "verity" test key pair), Apache-2.0, used only as the oracle
+  for the AVBv1 tests. `src/legacy/avb1_aosp_key.cpp` embeds the same
+  public test key (Apache-2.0, generated by `tools/gen_aosp_verity_key.py`;
+  it is the default signer of Android Image Kitchen and protects nothing).

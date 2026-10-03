@@ -16,6 +16,8 @@ compile_commands.json
 third_party/deps/
 *.pem
 *.key
+# ...except AOSP's public "verity" test certificate, a test oracle (not a secret)
+!tests/reference/boot_signer/verity.x509.pem
 .gh_token
 
 # Python bytecode (vendored reference scripts get imported by the tests)

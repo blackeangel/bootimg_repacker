@@ -70,6 +70,8 @@ add_library(abr_core STATIC
   src/legacy/mtk.cpp
   src/legacy/dhtb.cpp
   src/legacy/elf_boot.cpp
+  src/legacy/avb1.cpp
+  src/legacy/avb1_aosp_key.cpp
 )
 target_include_directories(abr_core PUBLIC include)
 target_link_libraries(abr_core PUBLIC
