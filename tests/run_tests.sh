@@ -66,6 +66,22 @@ case "$ABR" in
         UNIT_DEFAULT="$WORK/winebin/abr_unit_tests"
         echo "note: running the Windows build under $(wine --version 2>/dev/null)"
         ;;
+    *)
+        # ABR_RUNNER runs the binaries under an emulator, e.g. an arm64 build on an
+        # x86-64 machine: ABR_RUNNER="qemu-aarch64 -cpu max" tests/run_tests.sh build-arm64/abr
+        if [ -n "${ABR_RUNNER:-}" ]; then
+            mkdir -p "$WORK/runbin"
+            for pair in "$ABR:abr" "$(dirname "$ABR")/abr_unit_tests:abr_unit_tests"; do
+                exe="${pair%:*}"
+                [ -f "$exe" ] || continue
+                printf '#!/bin/sh\nexec %s "%s" "$@"\n' "$ABR_RUNNER" "$exe" >"$WORK/runbin/${pair##*:}"
+                chmod +x "$WORK/runbin/${pair##*:}"
+            done
+            ABR="$WORK/runbin/abr"
+            UNIT_DEFAULT="$WORK/runbin/abr_unit_tests"
+            echo "note: running abr under: $ABR_RUNNER"
+        fi
+        ;;
 esac
 
 PASS=0
@@ -667,6 +683,28 @@ if [ -x "$UNIT" ]; then
         pass "BigInt agrees with Python integers ($out)"
     else
         fail "BigInt disagrees with Python integers ($out)"
+    fi
+
+    # SHA-1/-256/-512 against Python's hashlib on the lengths where the padding
+    # falls differently (0..129 bytes, block boundaries, 55/56) and with the input
+    # fed in different chunk sizes -- once with whatever the CPU offers (x86 SHA-NI,
+    # ARMv8 SHA1/SHA2) and once forced to the portable code, so both implementations
+    # are judged on every machine.
+    if python3 "$TOOLS/gen_sha_vectors.py" sha_blob.bin sha_expect.txt; then
+        sha_auto=$("$UNIT" sha-check sha_blob.bin sha_expect.txt 2>&1) && sha_auto_ok=1 || sha_auto_ok=0
+        sha_port=$(ABR_SHA_IMPL=portable "$UNIT" sha-check sha_blob.bin sha_expect.txt 2>&1) && sha_port_ok=1 || sha_port_ok=0
+        if [ $sha_auto_ok -eq 1 ]; then
+            pass "SHA-1/256/512 agree with hashlib, hardware-selected implementation ($sha_auto)"
+        else
+            fail "SHA-1/256/512 disagree with hashlib, hardware-selected implementation ($sha_auto)"
+        fi
+        if [ $sha_port_ok -eq 1 ] && [ "$(ABR_SHA_IMPL=portable "$UNIT" sha-impl)" = "portable" ]; then
+            pass "SHA-1/256/512 agree with hashlib, portable implementation ($sha_port)"
+        else
+            fail "SHA-1/256/512 disagree with hashlib, portable implementation ($sha_port)"
+        fi
+    else
+        fail "could not generate the SHA test vectors"
     fi
 
     head -c 70000 /dev/urandom >rsa_data.bin

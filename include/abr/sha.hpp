@@ -6,10 +6,18 @@
 // same on Linux, Windows and Android. OpenSSL, avbtool and boot_signer are
 // used by the test suite only, as independent oracles.
 //
+// Hashing is where an unpack spends most of its time (every component is
+// hashed several times: boot id, replay check, envelope, AVB digest, signature
+// verification), so SHA-1 and SHA-256 use the CPU's own instructions when it
+// has them -- x86-64 SHA-NI, ARMv8 SHA1/SHA2 -- chosen at run time, with a
+// portable implementation (and the same results) everywhere else. The
+// binary stays a single file that runs on any CPU of its architecture.
+//
 // Implemented from the FIPS 180-4 specification; round constants
 // cross-checked against multiple independent public-domain reference
 // implementations (see PROGRESS.md) and verified against the standard
-// NIST test vectors for "abc" in sha_selftest().
+// NIST test vectors for "abc" in sha_selftest(). tests/run_tests.sh compares
+// every implementation with Python's hashlib on inputs of all awkward lengths.
 #pragma once
 
 #include <cstdint>
@@ -27,7 +35,6 @@ public:
     Bytes finish();  // 20 bytes
 
 private:
-    void process_block(const uint8_t block[64]);
     uint32_t h_[5];
     uint8_t buffer_[64];
     size_t buffer_len_ = 0;
@@ -42,7 +49,6 @@ public:
     Bytes finish();  // 32 bytes
 
 private:
-    void process_block(const uint8_t block[64]);
     uint32_t h_[8];
     uint8_t buffer_[64];
     size_t buffer_len_ = 0;
@@ -67,6 +73,19 @@ private:
 Bytes sha1(const Bytes& data);
 Bytes sha256(const Bytes& data);
 Bytes sha512(const Bytes& data);
+Bytes sha1(const uint8_t* data, size_t len);
+Bytes sha256(const uint8_t* data, size_t len);
+Bytes sha512(const uint8_t* data, size_t len);
+
+// What computes SHA-1 / SHA-256 in this process: "portable", "x86 SHA-NI",
+// "ARMv8 SHA1/SHA2" (or a mix, e.g. "ARMv8 SHA2 + portable SHA-1"). Decided
+// once from the CPU; setting the environment variable ABR_SHA_IMPL=portable
+// forces the portable code.
+const char* implementation_name();
+
+// For tests: true switches to the portable code, false back to what the CPU
+// offers. Not thread-safe against concurrent hashing.
+void force_portable(bool on);
 
 // Hashes the FIPS 180-4 / NIST test vector "abc" with all three
 // algorithms and returns true iff every digest matches the published

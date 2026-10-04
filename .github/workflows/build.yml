@@ -138,6 +138,49 @@ jobs:
           name: abr-windows-x86_64
           path: dist/abr-windows-x86_64.exe
 
+  # The arm64 code (ARMv8 SHA instructions, NEON, the 64-bit ARM ABI) is run for
+  # real: a static aarch64 build executed under qemu-user through the same suite.
+  linux-arm64-qemu:
+    name: linux-arm64 (g++-14, qemu-user)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the cross toolchain, qemu and the test-suite oracles
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cmake ninja-build g++-14-aarch64-linux-gnu qemu-user python3 \
+            python3-pip device-tree-compiler u-boot-tools openssl lz4 zstd liblzo2-dev \
+            default-jdk-headless libbcprov-java
+          pip3 install --break-system-packages python-lzo
+
+      - name: Configure
+        run: >
+          cmake -S . -B build-arm64 -G Ninja
+          -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/aarch64-linux-gnu.cmake
+          -DCMAKE_BUILD_TYPE=Release
+          -DABR_STATIC_BINARY=ON
+
+      - name: Build
+        run: cmake --build build-arm64 -j 2>&1 | tee build.log
+
+      - name: Post build log on failure
+        if: failure()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 .github/scripts/post_failure_log.py "linux-arm64-qemu" build.log
+
+      - name: Test (the arm64 binary under qemu-user, with the ARMv8 SHA instructions)
+        env:
+          ABR_RUNNER: qemu-aarch64 -cpu max
+        run: ./tests/run_tests.sh build-arm64/abr 2>&1 | tee test.log
+
+      - name: Post test log on failure
+        if: failure()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 .github/scripts/post_failure_log.py "linux-arm64-qemu test" test.log
+
   android-arm64:
     runs-on: ubuntu-24.04
     env:

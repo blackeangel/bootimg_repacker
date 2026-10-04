@@ -339,6 +339,63 @@ builds (timing). All such checks now go through `said <pattern> <command...>`.
 r29. Downloading the NDK is blocked from the development sandbox, so the
 Android build is proven only by CI, as before.
 
+## Hashing speed: SHA-NI / ARMv8 (4 Oct 2026)
+
+Why: the profile of an unpack (callgrind, `twrps905x4.img`, before any change)
+was 77% `Sha256::process_block`, 12% SHA-1, under 10% decompression. Threads
+would have parallelised a minority of the time; the hashing itself was the
+lever. (Note for later profiling: valgrind does not emulate the SHA
+instructions and hides them from CPUID, so a callgrind profile always shows
+the portable code.)
+
+What `src/sha.cpp` does now:
+
+- SHA-1 and SHA-256 compress whole blocks straight from the caller's buffer
+  (no per-block copy into an internal buffer) through a function chosen once:
+  x86-64 **SHA-NI** (`sha1rnds4`, `sha256rnds2`, message schedule with
+  `msg1/msg2`), ARMv8 **SHA1/SHA2** (`vsha1cq` ..., `vsha256hq` ...), else a
+  fully unrolled portable version (literal round numbers, 16-word schedule
+  window, variables rotated by renaming). The instructions are used through
+  per-function `target` attributes, not global `-m` flags, so the binary still
+  runs on a CPU without them. Detection: CPUID (SSSE3, SSE4.1, SHA) on x86;
+  `getauxval(AT_HWCAP)` on Linux/Android and `IsProcessorFeaturePresent` on
+  Windows for arm64. SHA-512 is unchanged (no mainstream CPU has it).
+- `ABR_SHA_IMPL=portable` forces the portable code; `abr_unit_tests sha-impl`
+  prints what runs; `sha-bench [MiB]` prints MB/s for every implementation.
+
+Measured (this machine, one core, 128 MiB buffer; same on g++-14 and
+clang-20, and under wine for the Windows builds):
+
+| | before | portable now | SHA-NI |
+|---|---|---|---|
+| SHA-256 | 240 MB/s | 275-300 | 1400 |
+| SHA-1 | 175 MB/s | 700 | 1560 |
+| SHA-512 | 360 MB/s | 360-400 | (unchanged) |
+
+Unpack of real images, warm cache, whole command including the self-check
+(previous commit built beside it for an honest A/B): `twrps905x4.img` (33 MB,
+gzip kernel + ramdisk) 1.70 s -> 0.85 s; `vendor_boot_ofox.img` (67 MB)
+3.36 s -> 1.45 s; `vendor_boot (2).img` (25 MB) 0.92 s -> 0.37 s. What is left
+is mostly zlib inflate and memory traffic -- which is where threads can still
+help (next section).
+
+How it is verified: 3024 known-answer vectors per implementation, computed
+with Python's `hashlib` (`tests/tools/gen_sha_vectors.py`: every length
+0..129, the 55/56 and 63/64/65 boundaries, 191..257, 4095..4097, 64 KiB +-1,
+1 MiB + 7; each fed in 7 different `update()` chunkings), run for the
+hardware-selected implementation **and** for `ABR_SHA_IMPL=portable`, so both
+are judged on every machine. Run and passing: x86 SHA-NI and portable (g++-14,
+clang-20, g++-13/C++23, both Windows builds under wine); the **ARMv8
+implementation under qemu-user** (`-cpu max`), hardware and portable, 3024/3024
+each. The whole suite on the arm64 build under qemu-user: 100/100 (5 minutes
+emulated). qemu's speeds say nothing about real ARM cores (TCG emulates the
+SHA instructions slowly), only that the results are right.
+
+`cmake/toolchains/aarch64-linux-gnu.cmake` (GCC cross compiler, static glibc)
+exists for exactly this, and `tests/run_tests.sh` takes `ABR_RUNNER="qemu-aarch64
+-cpu max"` to run any non-native build through an emulator; CI has an arm64 job
+that does it on every push.
+
 ## Conventions inherited from the sibling tools (apply here too)
 
 - **License: GPL v3**, not MIT (corrected early this session -- see

@@ -177,7 +177,10 @@ cmake --build build -j          # also builds build/abr_unit_tests (-DABR_BUILD_
 
 Pass the Windows build instead and the suite runs the real `abr.exe` under
 `wine` (it makes small wrapper scripts, nothing else changes):
-`./tests/run_tests.sh build-windows/abr.exe`.
+`./tests/run_tests.sh build-windows/abr.exe`. Any other emulator works through
+`ABR_RUNNER`; an arm64 build runs under qemu-user, which exercises the ARMv8
+code paths (the SHA1/SHA2 instructions) without a device:
+`ABR_RUNNER="qemu-aarch64 -cpu max" ./tests/run_tests.sh build-arm64/abr`.
 
 The suite needs `python3`, `dtc`, `mkimage` and `openssl` on the PATH. The
 cross-check against the real AOSP `boot_signer` is skipped unless `javac`,
@@ -197,6 +200,13 @@ cmake -S . -B build-windows -G Ninja \
 cmake --build build-windows -j
 # (cmake/toolchains/mingw-w64.cmake is the plain mingw GCC variant; Ubuntu's is
 #  GCC 13, so it builds as C++23)
+
+# Linux aarch64 (glibc, static), to build and *run* the arm64 code under qemu-user
+#   sudo apt-get install g++-14-aarch64-linux-gnu qemu-user
+cmake -S . -B build-arm64 -G Ninja \
+  -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/aarch64-linux-gnu.cmake \
+  -DCMAKE_BUILD_TYPE=Release -DABR_STATIC_BINARY=ON
+cmake --build build-arm64 -j
 
 # Android arm64-v8a (needs the Android NDK)
 cmake -S . -B build-android -G Ninja \
@@ -228,6 +238,18 @@ same on Linux, Windows and Android and the binary stays a single file.
 PKCS#1 v1.5 is deterministic, so for a given key and image the signature
 is bit-for-bit what `openssl dgst -sign` or `avbtool` produce -- which
 is exactly how it is tested (next section).
+
+Hashing is where an unpack spends most of its time (every component is
+hashed several times: boot id, replay check, AVB digest, signature check), so
+SHA-1 and SHA-256 use the CPU's own instructions -- x86-64 SHA-NI, ARMv8
+SHA1/SHA2 -- picked at run time, with a portable implementation that gives
+identical digests everywhere else; the binary stays one file that runs on any
+CPU of its architecture. On the development machine that is 240 -> 1400 MB/s
+for SHA-256 and 175 -> 1560 MB/s for SHA-1 (portable code: 275 and 700 MB/s),
+and unpacking a 67 MB `vendor_boot` went from 3.4 s to 1.4 s.
+`ABR_SHA_IMPL=portable` forces the portable code; `abr_unit_tests sha-impl`
+says which one runs. Both implementations are checked against Python's
+`hashlib` on every awkward length and chunking by the test suite.
 
 ## How it is verified
 
