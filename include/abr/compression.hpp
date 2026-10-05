@@ -44,7 +44,12 @@ Codec detect_codec(const Bytes& data);
 Bytes decompress(Codec codec, const Bytes& data);
 
 // Compresses `data` with `codec`. `level` is codec-specific; -1 selects
-// a sensible per-codec default. Codec::NONE returns `data` unchanged.
+// a sensible per-codec default (lz4_legacy: HC level 12, what Android's
+// `lz4 -l -12` uses). Codec::NONE returns `data` unchanged.
+//
+// May use several threads (abr/parallel.hpp): the independent 8 MiB blocks of
+// an lz4_legacy stream, the workers of a zstd frame. The output is the same for
+// any number of threads.
 Bytes compress(Codec codec, const Bytes& data, int level = -1);
 
 }  // namespace abr

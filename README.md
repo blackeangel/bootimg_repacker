@@ -1,6 +1,6 @@
 # bootimg_repacker (`abr`)
 
-A C++20 unpacker/repacker for the Android boot-family image formats,
+A C++26 unpacker/repacker for the Android boot-family image formats,
 statically linked, for Linux, Windows, and Android (arm64-v8a).
 
 ## Supported formats
@@ -26,9 +26,9 @@ vendor_boot / dtbo, and the vendor data described below.
 
 Compression: gzip, lz4 (frame and the Android/GKI "legacy" block
 format), zstd, xz, LZMA (headerless "alone" stream), bzip2, and LZO
-(wrapped in the lzop container framing that the Linux kernel's own
-decompressor expects, since raw LZO1X has no header of its own to
-detect or frame blocks with).
+(in the lzop file format -- the framing the Linux kernel's own
+decompressor expects, and the one `lzop` itself reads -- since raw LZO1X
+has no header of its own to detect or frame blocks with).
 
 Format is auto-detected from magic bytes; you don't need to tell `abr`
 what kind of file it's looking at. Things that are not boot-family
@@ -42,6 +42,7 @@ of a bare "unknown format".
 abr info   <image>
 abr unpack <image> [-o <outdir>]
 abr repack <dir> -o <image> [--avb-key <private_key.pem>] [--avb1-key <key> [--avb1-cert <cert>]]
+# with any of them: -j N (or -jN, --threads N) = the most threads to use, 0 = automatic, 1 = none
 ```
 
 `unpack` writes a human-readable, human-editable `manifest.txt` plus
@@ -60,6 +61,39 @@ compressed bytes are kept on the side and replayed verbatim if the
 extracted file comes back unchanged -- only an actual edit triggers
 recompression. See `tests/run_tests.sh` for this being checked against
 real images built with AOSP's own `mkbootimg.py`, `dtc`, and `mkimage`.
+
+### Threads and compression levels
+
+`abr` uses several cores where that pays: the components of an image (kernel,
+ramdisk, each vendor ramdisk fragment, ...) are decoded, hashed and written
+side by side; when an edited component has to be compressed again, the
+independent 8 MiB blocks of an LZ4 "legacy" ramdisk and the jobs of a zstd
+frame are compressed side by side. `-j N` (or `-jN`, `--threads N`, or the
+environment variable `ABR_THREADS`) sets the most threads it may use. The
+default is the number of hardware threads, at most 16; `-j1` runs everything
+on the main thread.
+
+**The result never depends on the number of threads.** The work is split by
+the data (fixed block sizes, a fixed number of components), never by the
+thread count, and results are joined in order; the test suite repacks with
+`-j1` and with several threads and demands identical bytes, for every codec.
+The same program on a 2-core and on a 32-core machine writes the same image.
+
+What it buys is honest and modest, because most of the time is not
+parallel: an unmodified image is never recompressed (the original compressed
+bytes are replayed), and hashing -- the bulk of an unpack -- already runs on
+the CPU's SHA instructions. Recompression is where threads help: on a 2-core
+machine, repacking OrangeFox's `vendor_boot` after editing its 63 MB LZ4
+ramdisk takes 10.0 s with `-j1` and 5.4 s with `-j2`. gzip, xz, lzma and bzip2
+are written by a single stream each, so they gain nothing from more threads
+(the other components of the image still run beside them).
+
+When a component has to be compressed again, `abr` uses the codec's usual
+setting. `<component>_level=N` in the manifest (`ramdisk_level=9`,
+`ramdisk1_level=6`, ...) overrides it, with the codec's own meaning of the
+number. For LZ4 legacy the default is the densest level (HC 12), which is what
+Android's build uses (`lz4 -l -12`): a faster setting makes an edited ramdisk
+enough larger to overflow a tightly sized `vendor_boot` partition.
 
 ### What `abr` keeps so a round trip stays exact
 
@@ -182,7 +216,10 @@ Pass the Windows build instead and the suite runs the real `abr.exe` under
 code paths (the SHA1/SHA2 instructions) without a device:
 `ABR_RUNNER="qemu-aarch64 -cpu max" ./tests/run_tests.sh build-arm64/abr`.
 
-The suite needs `python3`, `dtc`, `mkimage` and `openssl` on the PATH. The
+The suite needs `python3`, `dtc`, `mkimage` and `openssl` on the PATH. When
+`gzip`, `lz4`, `zstd`, `xz`, `bzip2` and `lzop` are installed it also feeds
+what `abr` compressed to those programs (a missing one skips only that
+check). The
 cross-check against the real AOSP `boot_signer` is skipped unless `javac`,
 `java` and BouncyCastle are present (Debian/Ubuntu: `apt install
 default-jdk-headless libbcprov-java`).
@@ -259,6 +296,16 @@ against a real reference tool (AOSP's `mkbootimg.py`, `dtc`, or
 is covered and how. The quirks found on real device dumps are pinned by
 synthetic fixtures built from the format specs (`tests/tools/fixtures.py`)
 and re-checked by an independent verifier (`tests/tools/verify.py`).
+
+Compression is judged by the real tools. For every codec the suite builds a
+boot image with `abr`, slices the ramdisk out of it with a separate script
+(`tests/tools/verify.py`, not `abr`) and has the real `gzip`, `lz4`, `zstd`,
+`xz`, `bzip2` or `lzop` decompress it, on data that mixes text with a
+stretch that cannot be compressed and ends off any block boundary. The same
+image is built with `-j1` and with several thread counts, and the bytes must be
+identical. (This is how the LZO writer's two faults were found: its header was
+not a valid lzop header, and it wrote blocks longer than the data they
+contained, which the kernel's decompressor rejects as a corrupt file.)
 
 AVB signing is judged by implementations that share no code with `abr`:
 

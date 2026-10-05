@@ -196,12 +196,15 @@ int run_sha_bench(size_t mib) {
 
 }  // namespace
 
+int run_par_tests();  // par_test.cpp
+
 int main(int argc, char** argv) {
     set_binary_stdio();
     try {
         if (argc < 2) return 2;
         std::string cmd = argv[1];
         if (cmd == "bigint") return run_bigint();
+        if (cmd == "par") return run_par_tests();
         if (cmd == "sha-impl") {
             std::cout << hash::implementation_name() << "\n";
             return hash::sha_selftest() ? 0 : 1;

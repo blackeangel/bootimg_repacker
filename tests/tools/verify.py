@@ -6,6 +6,7 @@ bootimg.h, avbtool) and not from abr's code.
     verify.py boot-id <image> <scheme>            sha1|sha1_dt|sha256|sha256_dt
     verify.py avb-footer <image> [pubkey.pem]     every HASH descriptor, size, layout
     verify.py boot-field <image> <field>          print one header field (v0-v2)
+    verify.py ramdisk <image> <out>               slice the ramdisk out of a boot image (v0-v4)
 
 Exit status 0 = verified, 1 = mismatch (details on stderr), 2 = usage.
 """
@@ -85,6 +86,22 @@ def cmd_boot_field(path, field):
     print(len(v) if isinstance(v, bytes) else v)
 
 
+def boot_ramdisk(d):
+    if d[:8] != b"ANDROID!":
+        fail("no ANDROID! magic at offset 0")
+    if struct.unpack_from("<I", d, 40)[0] in (3, 4):  # v3/v4: 4096-byte pages, sizes at 8 and 12
+        ksz, rsz = struct.unpack_from("<2I", d, 8)
+        pos = 4096 + -(-ksz // 4096) * 4096
+        return d[pos:pos + rsz]
+    return parse_boot_012(d)["ramdisk"]
+
+
+def cmd_ramdisk(path, out):
+    # The codec tests decompress this with the real gzip/lz4/zstd/xz/bzip2/lzop,
+    # so the slicing has to be independent of abr.
+    Path(out).write_bytes(boot_ramdisk(Path(path).read_bytes()))
+
+
 # ------------------------------------------------------------ AVB ----
 
 def cmd_avb_footer(path, pubkey=None):
@@ -153,6 +170,8 @@ def main(argv):
             return cmd_boot_id(argv[2], argv[3])
         if argv[1] == "boot-field" and len(argv) == 4:
             return cmd_boot_field(argv[2], argv[3])
+        if argv[1] == "ramdisk" and len(argv) == 4:
+            return cmd_ramdisk(argv[2], argv[3])
         if argv[1] == "avb-footer" and len(argv) in (3, 4):
             return cmd_avb_footer(argv[2], argv[3] if len(argv) == 4 else None)
     except IndexError:

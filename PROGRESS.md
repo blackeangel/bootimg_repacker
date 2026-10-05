@@ -27,12 +27,13 @@ tools" below.
 | Everything around the container: opaque prefix (BFBF/SSSS-style wrappers), verbatim tail, partition-size fill, boot `id` schemes (sha1 / sha1+dt / sha256 / raw), QCDT `dt_size`, reserved words, odd `header_size`, header-page data, trimmed dumps, vendor_boot v4 with an empty ramdisk table | **done + verified** -- 13 of 14 real device dumps round-trip byte-for-byte (the 14th is an ext4 filesystem, out of scope and rejected with a clear message); see "Round-tripping 14 real device images" at the end |
 | AVB footer on boot / vendor_boot / dtbo: layout, digest check, digest refresh after an edit, `--avb-key` required for signed footers | **done + verified** against the real `avbtool` (`add_hash_footer` output round-trips byte-for-byte; edited + re-signed output passes `verify_image`) and the independent Python/openssl checks |
 | AVBv1 `BootSignature` (pre-AVB `boot_signer`, DER blob after the image): detect, verify (`info`, unpack warning), re-create after an edit with the AOSP test key or `--avb1-key/--avb1-cert` (AIK `name.pk8`+`name.x509.pem` naming too), add to an unsigned image | **done + verified** against the real AOSP `boot_signer` (compiled from its Java sources) and an independent Python/openssl signer: same bytes from the same key and image; abr-re-signed images pass `boot_signer -verify`; real-device AVBv1 images read VALID |
-| compression: gzip, lz4, lz4-legacy, zstd, xz, lzma(alone), bzip2, lzo | **done + verified, all algorithms** |
+| compression: gzip, lz4, lz4-legacy (HC 12, as Android builds it), zstd, xz, lzma(alone), bzip2, lzo (genuine lzop framing) | **done + verified, all algorithms**, each also read back by the real `gzip`/`lz4`/`zstd`/`xz`/`bzip2`/`lzop` |
+| multithreading (`-j N`): components of an image, LZ4 legacy blocks, zstd workers | **done + verified**: bytes identical for any thread count (suite, every codec), `abr::par` unit-tested, TSan/ASan-clean; see "Threads, and what the codecs taught us" |
 | bundled SHA-1/256/512 | **done**, self-test passes, catches its own transcription bug once already (see Verification below) |
 | self-contained RSA: BigInt (Knuth D, Montgomery), DER/PEM/X.509, PKCS#1 v1.5 sign/verify, PKCS#8/PKCS#1 key parsing, AVB public-key blob -- **no OpenSSL anywhere in the build** | **done + verified** (Python integers, `openssl dgst -sign`, `avbtool extract_public_key`; see "Self-contained crypto" below) |
 | manifest + CLI (`abr info/unpack/repack`) | **done** |
 | CMake: FetchContent-vendored static zlib/lz4/zstd/xz/bzip2 | **done + build-verified natively on Linux**, both the dynamic and the `-DABR_STATIC_BINARY=ON` fully-static configurations |
-| Test suite (`tests/run_tests.sh`) | **done, 98/98 passing** -- see Verification |
+| Test suite (`tests/run_tests.sh`) | **done, 116/116 passing** on g++-14, clang-20, g++-13 (C++23), both Windows builds under wine and arm64 under qemu-user -- see Verification |
 | CMake cross toolchains (mingw-w64, Android NDK) | **done + verified** (mingw reproduced locally; NDK only provable via CI, see below) |
 | GitHub Actions static build matrix (linux-x86_64, windows-x86_64, android-arm64) | **done + verified**: run 35313499827, all 3 jobs green, all 3 static binaries produced as artifacts (abr-linux-x86_64, abr-windows-x86_64, abr-android-arm64) |
 
@@ -254,10 +255,16 @@ until a `dst_len == 0` terminator). That's what's implemented
 (`lzo_compress`/`lzo_decompress` in `src/compression.cpp`), using
 miniLZO (`third_party/minilzo/`, vendored directly rather than
 FetchContent'd -- see its README for why) for the actual LZO1X
-compress/decompress calls. The encoder always writes the minimal
-header form; the decoder tolerates the newer/optional fields
-(filter info, mtime_high, a filename) a real lzop file could have,
-matching the kernel decompressor's own leniency.
+compress/decompress calls. Since 4 Oct the encoder writes what
+`lzop -c < file` writes (version 1.04 layout, LZO1X-1, 256 KiB blocks, an
+Adler-32 of each block's uncompressed data, incompressible blocks stored as
+they are); its first version wrote a minimal header laid out the way the
+kernel's parser reads it, which the real `lzop` rejects, and wrote
+incompressible blocks longer than their data, which the kernel rejects (see
+"Threads, and what the codecs taught us"). The decoder tolerates the
+newer/optional fields (filter info, mtime_high, a filename, one or two checksum
+words per block) a real lzop file could have, matching the kernel
+decompressor's own leniency.
 
 Verified in both directions independently of `abr`'s own code, using
 `python-lzo` (real liblzo2, not miniLZO) -- see the `lzo` section of
@@ -395,6 +402,182 @@ SHA instructions slowly), only that the results are right.
 exists for exactly this, and `tests/run_tests.sh` takes `ABR_RUNNER="qemu-aarch64
 -cpu max"` to run any non-native build through an emulator; CI has an arm64 job
 that does it on every push.
+
+## Threads, and what the codecs taught us (4 Oct 2026)
+
+Decision (the user, 2 Oct): multithreading where it makes sense. So: find out
+where the time goes, parallelise only that, and make the output independent of
+the thread count.
+
+### Where threads help, and where they cannot
+
+| work | parallel? | notes |
+|---|---|---|
+| the components of one image (kernel, ramdisk, each vendor fragment, dtb, ...): decode + hash + write on unpack, load + recompress on repack | yes, one job per component, biggest first | `save_components` / `load_components` in `src/main.cpp` |
+| LZ4 legacy compression | yes, per 8 MiB block | the format is a run of independent blocks. At HC level 12 a block compresses at 3-20 MB/s depending on the data, so this is the one place where editing a ramdisk takes seconds |
+| zstd compression | yes, the library's own workers | `ZSTD_c_nbWorkers`, counted in the same thread budget (`par::Lease`); needs libzstd built with `ZSTD_MULTITHREAD_SUPPORT`, now on |
+| gzip / xz / lzma / bzip2 compression | no | one stream each. A block-parallel gzip (pigz style: raw deflate blocks, dictionary priming, sync flush, `crc32_combine`) is possible but writes different bytes than a plain zlib would; not done |
+| decompression | no, inside one stream (components overlap) | LZ4 is GB/s anyway; gzip inflate is a serial chain |
+| SHA of one buffer | no | a serial chain; the hashes of different components overlap because components are jobs |
+
+**The rule: the result never depends on the number of threads.** Work is split
+by the data (fixed 8 MiB LZ4 blocks, one job per component), never by the
+thread count; results are joined in index order; zstd is always asked for at
+least one worker (`nbWorkers = 0` writes a different, equally valid frame than
+`>= 1`, and `-j1` must not be the odd one out); an exception from the lowest
+failing index is the one rethrown, as a serial run would meet it first. The
+suite repacks every codec with `-j1`, `-j4` (and `-j2`/`-j8` for the two that
+use threads) and demands identical bytes. Mutation-checked: making `-j1` ask zstd
+for 0 workers makes the suite fail.
+
+### `abr::par` (`include/abr/parallel.hpp`, `src/parallel.cpp`)
+
+One pool for the process: at most `max_threads() - 1` workers, started when
+there is something for them to do. `for_each(n, fn)` puts its jobs on a shared
+list and works on them itself; **a thread that has to wait for its own jobs
+runs jobs of any region that still has an unstarted one** ("help while
+waiting"). That is what makes nesting work (the ramdisk job of an image
+compressing its own LZ4 blocks borrows every idle thread, never holds one just
+by waiting, and can never wait for work nobody is running); the running jobs
+never outnumber `max_threads()`. `Lease` is for code that starts threads of its
+own (libzstd): it takes places out of the same budget and gives them back.
+`-j N` / `--threads N` / `ABR_THREADS`; default = hardware threads, at most 16;
+`-j1` runs everything on the main thread.
+
+How it got there (so nobody repeats it): the first design was fork/join with
+helper threads per region and a global budget of extra threads. On the real
+case that motivated all this -- OrangeFox's `vendor_boot` with two ramdisk
+fragments, one of them edited -- `-j2` was *exactly as slow as `-j1`*, three
+times over, each time for a different reason: (1) the outer job held its slot
+while it waited for the inner region, so the inner one found the budget empty;
+(2) the main thread sat idle in the join while the worker ran the heavy job;
+(3) an inner region that started with an empty budget never asked again once a
+slot was free. Patching those got 10.0 s -> 6.1 s; replacing the budget by one
+pool with help-while-waiting got 10.0 s -> 5.4 s with much less machinery and
+no special cases. Checked by `abr_unit_tests par` (every index once; the error of
+the lowest failing index; nested regions; the cap on running threads; leases;
+300 rounds of tiny nested regions; a 120 s watchdog turns a deadlock into a
+failure), run for limits 1, 2, 3, 8 and 2 again: 25 repeats without a failure,
+pinned to a single core, and clean under ThreadSanitizer and ASan+UBSan.
+
+### Measured (2-core sandbox, warm cache, best of 5, previous commit built beside it)
+
+`unpack` of real device images (the whole command, including the self-check):
+
+| image | previous commit | now `-j1` | now `-j2` |
+|---|---|---|---|
+| `twrps905x4.img` (33 MB) | 0.85 s | 0.86 s | 0.73 s |
+| `vendor_boot_ofox.img` (67 MB) | 1.64 s | 1.60 s | 1.18 s |
+| `vendor_boot (2).img` (25 MB) | 0.32 s | 0.31 s | 0.26 s |
+| `boot (3).img` (15 MB) | 0.32 s | 0.31 s | 0.30 s |
+
+`-j1` costs nothing against the commit before threads; `-j2` gives 14-28% on
+the big images, which is what the serial parts (reading, one stream's inflate)
+allow. Recompressing an edited ramdisk is where threads matter:
+
+| edit | `-j1` | `-j2` |
+|---|---|---|
+| OrangeFox `vendor_boot`, 63 MB LZ4 ramdisk edited | 10.0 s | 5.4 s |
+| 63 MB ramdisk -> lz4_legacy (HC 12), 37.4 MB out | 9.2 s | 4.9 s |
+| same -> zstd (level 3) | 0.58 s | 0.44 s |
+| same -> gzip / bzip2 / lz4 frame / lzo | 2.5 / 5.3 / 0.4 / 0.5 s | no change |
+
+(`-j3` and `-j8` on two cores: the same bytes, no faster.) More cores should
+help the LZ4/zstd rows further; this machine has two, so that is not measured.
+
+### What measuring and the real tools turned up
+
+- **LZ4 legacy was written at the fast setting**, not at what Android uses
+  (`lz4 -l -12`, the densest HC level). An edited OrangeFox ramdisk came out
+  larger than the 64 MiB `vendor_boot` partition allows; at HC 12 it fits
+  (67108864 bytes exactly as before). The default is now HC 12, parallel per
+  block; `<component>_level=N` in the manifest overrides it for any codec.
+- **LZO had two faults, found by feeding its output to the real `lzop`**: the
+  header was not a valid lzop header (version fields laid out the way the
+  kernel's parser reads them, and the checksum started from 0 instead of 1),
+  and incompressible blocks were written *longer* than the data they held
+  (`src_len > dst_len`), which the kernel's `unlzo` rejects as a corrupt file --
+  2 of 7 blocks in a test ramdisk with a random stretch. The encoder now writes
+  what `lzop -c < file` writes (version 1.04 layout, LZO1X-1, 256 KiB blocks, an
+  Adler-32 of each block's uncompressed data) and stores incompressible blocks
+  as they are; the decoder counts the per-block checksum words from the flags
+  instead of assuming one. `lzop -d` and `lzop -t` accept the output, including
+  the empty and one-byte inputs.
+- `std::call_once` does not link with clang + mingw-w64 (undefined
+  `std::__once_callable`); a function-local static does the same job.
+- A statically linked glibc older than 2.34 needs libpthread pulled in whole for
+  `std::thread` (added to `CMakeLists.txt` when `libpthread.a` exists).
+- Not done, on purpose: gzip at its default level (6) where AIK uses 9;
+  zlib-ng for deflate/inflate speed (measured, see the Rust section); the gzip
+  header's OS byte is zlib's per-platform value (3 on Unix, 10 on Windows), so a
+  *recompressed* gzip stream differs between a Linux and a Windows build while an
+  untouched image is unaffected -- worth fixing with `deflateSetHeader` if byte
+  equality across platforms ever matters.
+
+### Rust 1.99.0 instead of C++26? (asked 2 Oct; answered 5 Oct)
+
+Two readings of the question, both answered with measurements, not opinion.
+The sandbox has Rust **1.95.0** (rustup's static.rust-lang.org is not reachable
+from here, so 1.99.0 could not be installed; four releases later the
+compiler, std and LLVM backend are not different in ways that matter below).
+Same inputs (128 MiB buffer; the 63 MB ramdisk of `twrps905x4.img` as gzip),
+same idle machine, back to back, best of 5 (2 for the deflate rows): the
+real `abr_core` with zlib 1.3.2, the same C++ program linked against
+**zlib-ng 2.3.3 in zlib-compatible mode** (a C library, built from the git tag),
+and a small Rust program (`sha2` 0.10.9; `flate2` 1.1.10 with the pure-Rust
+`zlib-rs`):
+
+| | C++ + zlib 1.3.2 | C++ + zlib-ng 2.3.3 | Rust 1.95 + zlib-rs |
+|---|---|---|---|
+| SHA-256 (SHA-NI in all three) | 1454 MB/s | 1459 | 1433 |
+| gunzip, 63 MB out | 224 MB/s | 358 | 354 |
+| gzip -6 | 27 MB/s | 67 | 62 |
+| gzip -9 | 6.2 MB/s | 20.8 | 21.7 |
+| cold `cargo build --release` of the 2-crate program | | | 19 s wall, 2 cores |
+
+1. **Would a rewrite make abr run faster?** Not by being Rust. Hashing is the
+   same CPU instructions in either language (first row). The one real
+   difference, deflate/inflate (1.6x to 3.4x), is a difference of
+   *libraries*: zlib-ng, a C library, is exactly as fast as zlib-rs, the Rust
+   one (second and third columns). C++ gets it by swapping zlib for zlib-ng.
+   Everything else is codec libraries that are C either way -- zstd, xz, lz4
+   (HC), bzip2, minilzo; I know of no pure-Rust LZ4 HC or LZO that I would
+   trust to write what Android's tools write, so a Rust abr would link the
+   same C libraries through `-sys` crates.
+   Whether to swap zlib for zlib-ng was weighed and **not done**: the gain is
+   real but small where a person feels it (inflating a 25 MB gzip ramdisk is
+   ~0.1 s of a ~0.85 s unpack; gzip recompression after an edit would drop from
+   ~2.3 s to ~1 s for a 63 MB ramdisk at the default level), while the costs
+   are not zero: recompressed gzip streams would differ from zlib's (harmless,
+   but a change), zlib-ng picks its code at run time by CPU feature, so
+   "same bytes on every machine" would have to be shown for its deflate paths
+   (not assumed), and it must build for the mingw-clang, NDK and aarch64
+   targets (the NDK one provable only in CI). Option for later, if gzip
+   speed ever matters.
+2. **Would it speed up writing/rewriting code?** I do not expect so. The
+   language-neutral test suite (shell + Python + the real tools) is what makes
+   any rewrite verifiable at all, and it already exists; it would not get
+   shorter. Rust's compile-fix loop (borrow checker) costs iterations for
+   every new parser; C++ with sanitizers costs them at test time instead.
+   Build time is not an argument either way (19 s for two crates).
+3. **What Rust would genuinely give**: memory safety for parsers fed with
+   untrusted images (a boot image is attacker-controlled input to anyone who
+   unpacks images they did not build), `rayon` instead of `abr::par`
+   (well-tested nested fork/join; our 250 lines are tested too, but they are
+   ours), and cargo for cross builds. What it would cost: re-deriving ~7.9k
+   lines of C++ together with every real-device quirk found so far; losing
+   code sharing with the sibling C++ tools (`f2fs_unpacker`, `tar_repacker`,
+   `md1img_repacker`, `utils`), or living with two languages in one build; and
+   delaying the remaining AIK-parity work (cpio tree, PXA, ...).
+4. **A cheaper way to most of the safety**: ASan/UBSan/TSan builds of the
+   suite in CI and libFuzzer targets for the parsers. All of it works in C++
+   today.
+
+Recommendation: stay on C++26; do not rewrite now. Revisit after the AIK-parity
+feature freeze, and then only as a measured port with the existing suite as the
+acceptance test (differential runs of the C++ and Rust binaries on every image).
+If speed is the goal, the next lever is the deflate library (zlib-ng), not the
+language.
 
 ## Conventions inherited from the sibling tools (apply here too)
 

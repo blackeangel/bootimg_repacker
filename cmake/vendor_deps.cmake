@@ -65,7 +65,11 @@ set(ZSTD_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
 set(ZSTD_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(ZSTD_BUILD_CONTRIB OFF CACHE BOOL "" FORCE)
 set(ZSTD_LEGACY_SUPPORT OFF CACHE BOOL "" FORCE)
-set(ZSTD_MULTITHREAD_SUPPORT OFF CACHE BOOL "" FORCE)
+# zstd can compress one frame on several threads (ZSTD_c_nbWorkers). The output
+# for nbWorkers >= 1 does not depend on how many workers there are, which is what
+# lets abr use it without making its output depend on the machine -- see
+# src/compression.cpp and the thread-count checks in tests/run_tests.sh.
+set(ZSTD_MULTITHREAD_SUPPORT ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(zstd_vendor)
 target_include_directories(libzstd_static PUBLIC $<BUILD_INTERFACE:${zstd_vendor_SOURCE_DIR}/lib>)
 add_library(abr_zstd_iface INTERFACE)

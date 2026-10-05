@@ -8,7 +8,10 @@
 //                       [--avb1-key <key[.pk8]> [--avb1-cert <cert.pem|der>]]
 //
 // Format is auto-detected from magic bytes; see detect_format() below.
+#include <algorithm>
+#include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
@@ -28,6 +31,7 @@
 #include "abr/legacy/elf_boot.hpp"
 #include "abr/legacy/mtk.hpp"
 #include "abr/manifest.hpp"
+#include "abr/parallel.hpp"
 #include "abr/sha.hpp"
 #include "abr/uimage.hpp"
 #include "abr/vbmeta.hpp"
@@ -149,25 +153,77 @@ struct RepackOptions {
 // component has one (common on MTK-based devices' kernel/ramdisk),
 // recording its declared type name so repack can re-add an identical
 // header -- this applies uniformly to every component that goes
-// through save_component/load_component (boot's kernel/ramdisk,
+// through save_components/load_components (boot's kernel/ramdisk,
 // vendor_boot's ramdisk fragments) since any of them could have one.
-void save_component(Manifest& m, const fs::path& dir, const std::string& prefix, const Bytes& raw,
-                     const std::string& filename) {
-    if (raw.empty()) return;
-    Bytes after_mtk;
-    auto mtk = strip_mtk_header(raw, after_mtk);
-    if (mtk) m.set(prefix + "_mtk_name", mtk->name);
-    const Bytes& working = mtk ? after_mtk : raw;
+//
+// The components of one image are independent, so they are decoded, hashed
+// and written on several threads (abr/parallel.hpp); only the manifest, which
+// is an ordered list, is filled in afterwards, one component after another.
 
-    Codec c = detect_codec(working);
-    Bytes plain = decompress(c, working);
+struct DecodedComponent {
+    bool present = false;                // false: the component was empty, nothing is recorded
+    std::optional<std::string> mtk_name;
+    std::optional<Bytes> stripped;       // the stored bytes without their MTK sub-header, when it had one
+    Codec codec = Codec::NONE;
+    Bytes plain;                         // decompressed
+    Bytes plain_hash;                    // SHA-256 of `plain`
+
+    // The stored (still compressed) bytes, as they go to .abr_raw.
+    const Bytes& stored(const Bytes& raw) const { return stripped ? *stripped : raw; }
+};
+
+DecodedComponent decode_component(const Bytes& raw) {
+    DecodedComponent d;
+    if (raw.empty()) return d;
+    d.present = true;
+    Bytes after_mtk;
+    if (auto mtk = strip_mtk_header(raw, after_mtk)) {
+        d.mtk_name = mtk->name;
+        d.stripped = std::move(after_mtk);
+    }
+    const Bytes& working = d.stored(raw);
+    d.codec = detect_codec(working);
+    d.plain = decompress(d.codec, working);
+    d.plain_hash = hash::sha256(d.plain);
+    return d;
+}
+
+struct ComponentSource {
+    const Bytes* raw;       // the component as found in the image
+    std::string filename;   // its file in the unpack directory
+};
+
+// Decodes every component and writes its files (the decompressed content, and
+// the original bytes under .abr_raw/). Results come back in input order.
+std::vector<DecodedComponent> save_components(const fs::path& dir,
+                                              const std::vector<ComponentSource>& sources) {
+    std::vector<size_t> order(sources.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    // Biggest first: the longest job should not be the one left for last.
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        return sources[a].raw->size() > sources[b].raw->size();
+    });
+    const bool any = !order.empty() && !sources[order[0]].raw->empty();
+    if (any) fs::create_directories(dir / ".abr_raw");
+
+    std::vector<DecodedComponent> out(sources.size());
+    par::for_each(sources.size(), [&](size_t k) {
+        const size_t i = order[k];
+        out[i] = decode_component(*sources[i].raw);
+        if (!out[i].present) return;
+        write_file(dir / sources[i].filename, out[i].plain);
+        write_file(dir / ".abr_raw" / (sources[i].filename + ".raw"), out[i].stored(*sources[i].raw));
+    });
+    return out;
+}
+
+void record_component(Manifest& m, const std::string& prefix, const std::string& filename,
+                      const DecodedComponent& d) {
+    if (!d.present) return;
+    if (d.mtk_name) m.set(prefix + "_mtk_name", *d.mtk_name);
     m.set(prefix + "_file", filename);
-    m.set(prefix + "_compression", std::string(codec_name(c)));
-    write_file(dir / filename, plain);
-    m.set_hex(prefix + "_orig_hash", hash::sha256(plain));
-    fs::path raw_dir = dir / ".abr_raw";
-    fs::create_directories(raw_dir);
-    write_file(raw_dir / (filename + ".raw"), working);  // stored *without* the MTK header
+    m.set(prefix + "_compression", std::string(codec_name(d.codec)));
+    m.set_hex(prefix + "_orig_hash", d.plain_hash);
 }
 
 Bytes load_component(const Manifest& m, const fs::path& dir, const std::string& prefix) {
@@ -188,10 +244,36 @@ Bytes load_component(const Manifest& m, const fs::path& dir, const std::string& 
     }
     if (!have_result) {
         auto c = codec_from_name(m.get(prefix + "_compression", "none"));
-        result = compress(c.value_or(Codec::NONE), plain);
+        // Optional `<prefix>_level=N` in the manifest picks the compression level
+        // (codec-specific; absent or -1: the codec's default).
+        const int level = static_cast<int>(std::strtol(m.get(prefix + "_level", "-1").c_str(), nullptr, 10));
+        result = compress(c.value_or(Codec::NONE), plain, level);
     }
     if (m.has(prefix + "_mtk_name")) result = add_mtk_header(result, m.get(prefix + "_mtk_name"));
     return result;
+}
+
+// load_component() for several components at once, on several threads (the
+// recompression of an edited one is where the time goes). In input order.
+std::vector<Bytes> load_components(const Manifest& m, const fs::path& dir,
+                                   const std::vector<std::string>& prefixes) {
+    std::vector<uintmax_t> size(prefixes.size(), 0);
+    std::vector<size_t> order(prefixes.size());
+    for (size_t i = 0; i < prefixes.size(); ++i) {
+        order[i] = i;
+        std::error_code ec;
+        if (m.has(prefixes[i] + "_file")) {
+            auto n = fs::file_size(dir / m.get(prefixes[i] + "_file"), ec);
+            if (!ec) size[i] = n;
+        }
+    }
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return size[a] > size[b]; });
+    std::vector<Bytes> out(prefixes.size());
+    par::for_each(prefixes.size(), [&](size_t k) {
+        const size_t i = order[k];
+        out[i] = load_component(m, dir, prefixes[i]);
+    });
+    return out;
 }
 
 // Plain, uncompressed passthrough for blobs that are never themselves
@@ -539,9 +621,14 @@ void unpack_boot(const Bytes& whole, const fs::path& dir) {
     m.set("cmdline", img.cmdline);
     if (img.missing_tail_padding) m.set_u64("missing_tail_padding", img.missing_tail_padding);
 
-    save_component(m, dir, "kernel", img.kernel, "kernel");
-    save_component(m, dir, "ramdisk", img.ramdisk, "ramdisk.cpio");
-    save_component(m, dir, "second", img.second, "second");
+    {
+        auto parts = save_components(dir, {{&img.kernel, "kernel"},
+                                           {&img.ramdisk, "ramdisk.cpio"},
+                                           {&img.second, "second"}});
+        record_component(m, "kernel", "kernel", parts[0]);
+        record_component(m, "ramdisk", "ramdisk.cpio", parts[1]);
+        record_component(m, "second", "second", parts[2]);
+    }
     save_raw(m, dir, "dt", img.dt, "dt.img");
     save_raw(m, dir, "recovery_dtbo", img.recovery_dtbo, "recovery_dtbo.img");
     save_raw(m, dir, "dtb", img.dtb, "dtb");
@@ -605,9 +692,12 @@ Bytes repack_boot(const Manifest& m, const fs::path& dir, const RepackOptions& o
     img.cmdline = m.get("cmdline");
     img.missing_tail_padding = m.get_u64("missing_tail_padding", 0);
 
-    img.kernel = load_component(m, dir, "kernel");
-    img.ramdisk = load_component(m, dir, "ramdisk");
-    img.second = load_component(m, dir, "second");
+    {
+        auto parts = load_components(m, dir, {"kernel", "ramdisk", "second"});
+        img.kernel = std::move(parts[0]);
+        img.ramdisk = std::move(parts[1]);
+        img.second = std::move(parts[2]);
+    }
     img.dt = load_raw(m, dir, "dt");
     img.recovery_dtbo = load_raw(m, dir, "recovery_dtbo");
     img.dtb = load_raw(m, dir, "dtb");
@@ -651,6 +741,12 @@ void unpack_vendor_boot(const Bytes& whole, const fs::path& dir) {
     save_raw(m, dir, "header_padding", img.header_padding, "header_padding.bin");
 
     m.set_u32("ramdisk_count", static_cast<uint32_t>(img.ramdisk_fragments.size()));
+    std::vector<ComponentSource> fragment_sources;
+    for (size_t i = 0; i < img.ramdisk_fragments.size(); ++i) {
+        const std::string p = "ramdisk" + std::to_string(i);
+        fragment_sources.push_back({&img.ramdisk_fragments[i].data, p + ".cpio"});
+    }
+    auto fragment_parts = save_components(dir, fragment_sources);
     for (size_t i = 0; i < img.ramdisk_fragments.size(); ++i) {
         auto& e = img.ramdisk_fragments[i];
         std::string p = "ramdisk" + std::to_string(i);
@@ -669,7 +765,7 @@ void unpack_vendor_boot(const Bytes& whole, const fs::path& dir) {
             }
             m.set_hex(p + "_board_id", b);
         }
-        save_component(m, dir, p, e.data, p + ".cpio");
+        record_component(m, p, p + ".cpio", fragment_parts[i]);
     }
     Envelope env = Envelope::capture(host, off, img.consumed);
     save_envelope(m, dir, env, host, off, img.consumed);
@@ -696,6 +792,9 @@ Bytes repack_vendor_boot(const Manifest& m, const fs::path& dir, const RepackOpt
     img.header_padding = load_raw(m, dir, "header_padding");
 
     uint32_t count = m.get_u32("ramdisk_count", 0);
+    std::vector<std::string> fragment_prefixes;
+    for (uint32_t i = 0; i < count; ++i) fragment_prefixes.push_back("ramdisk" + std::to_string(i));
+    std::vector<Bytes> fragment_data = load_components(m, dir, fragment_prefixes);
     for (uint32_t i = 0; i < count; ++i) {
         std::string p = "ramdisk" + std::to_string(i);
         VendorRamdiskEntry e;
@@ -705,7 +804,7 @@ Bytes repack_vendor_boot(const Manifest& m, const fs::path& dir, const RepackOpt
         for (size_t j = 0; j < e.board_id.size() && j * 4 + 3 < b.size(); ++j)
             e.board_id[j] = uint32_t(b[j * 4]) | (uint32_t(b[j * 4 + 1]) << 8) |
                              (uint32_t(b[j * 4 + 2]) << 16) | (uint32_t(b[j * 4 + 3]) << 24);
-        e.data = load_component(m, dir, p);
+        e.data = std::move(fragment_data[i]);
         img.ramdisk_fragments.push_back(std::move(e));
     }
     Bytes host = assemble_envelope(m, dir, img.build());
@@ -914,13 +1013,18 @@ void unpack_elf_boot(const Bytes& data, const fs::path& dir) {
     m.set_bool("is_64bit", img.is_64bit);
     m.set_u32("machine", img.machine);
     m.set_u32("segment_count", static_cast<uint32_t>(img.segments.size()));
+    std::vector<ComponentSource> segment_sources;
+    for (size_t i = 0; i < img.segments.size(); ++i)
+        segment_sources.push_back(
+            {&img.segments[i].data, "segment" + std::to_string(i) + "_" + img.segments[i].role + ".bin"});
+    auto segment_parts = save_components(dir, segment_sources);
     for (size_t i = 0; i < img.segments.size(); ++i) {
         auto& s = img.segments[i];
         std::string p = "segment" + std::to_string(i);
         m.set(p + "_role", s.role);
         m.set_u32(p + "_flags", s.flags);
         m.set_addr(p + "_addr", s.addr);
-        save_component(m, dir, p, s.data, p + "_" + s.role + ".bin");
+        record_component(m, p, segment_sources[i].filename, segment_parts[i]);
     }
     m.save(dir / "manifest.txt",
            "abr elf_boot manifest -- edit then `abr repack " + dir.string() + " -o out.img`");
@@ -931,13 +1035,16 @@ Bytes repack_elf_boot(const Manifest& m, const fs::path& dir) {
     img.is_64bit = m.get_bool("is_64bit", false);
     img.machine = static_cast<uint16_t>(m.get_u32("machine", 40));
     uint32_t count = m.get_u32("segment_count", 0);
+    std::vector<std::string> segment_prefixes;
+    for (uint32_t i = 0; i < count; ++i) segment_prefixes.push_back("segment" + std::to_string(i));
+    std::vector<Bytes> segment_data = load_components(m, dir, segment_prefixes);
     for (uint32_t i = 0; i < count; ++i) {
         std::string p = "segment" + std::to_string(i);
         legacy::ElfSegment s;
         s.role = m.get(p + "_role", "kernel");
         s.flags = m.get_u32(p + "_flags", 0);
         s.addr = static_cast<uint32_t>(m.get_addr(p + "_addr", 0));
-        s.data = load_component(m, dir, p);
+        s.data = std::move(segment_data[i]);
         img.segments.push_back(std::move(s));
     }
     return img.build();
@@ -1258,10 +1365,12 @@ Signer load_avb1_signer(const std::string& key_arg, const std::string& cert_arg)
 void usage() {
     std::cout <<
         "abr -- Android boot-family image unpacker/repacker\n\n"
-        "  abr info   <image>\n"
-        "  abr unpack <image> [-o <outdir>]\n"
-        "  abr repack <dir> -o <image> [--avb-key <private_key.pem>]\n"
+        "  abr [-j N] info   <image>\n"
+        "  abr [-j N] unpack <image> [-o <outdir>]\n"
+        "  abr [-j N] repack <dir> -o <image> [--avb-key <private_key.pem>]\n"
         "                              [--avb1-key <key> [--avb1-cert <cert.pem|cert.der>]]\n\n"
+        "  -j N         threads to use (default: the number of cores, at most 16; 1 = one\n"
+        "               thread; also ABR_THREADS=N). The result never depends on it.\n"
         "  --avb-key    signing key for AVB 2.0 (vbmeta / footers): PEM or DER (.pk8)\n"
         "  --avb1-key   key for the old boot_signer signature of a boot image (the public AOSP\n"
         "               test key is used when omitted); <key> may be a PEM/DER file or, as in\n"
@@ -1273,6 +1382,35 @@ void usage() {
         "Also transparently handled: a trailing AVB hash footer on boot/\n"
         "vendor_boot/dtbo; a DHTB wrapper (with SEAndroid footer/padding) around\n"
         "any of them; a MediaTek (MTK) sub-header on the kernel and/or ramdisk.\n";
+}
+
+// -j N, -jN, --threads N and --threads=N, wherever they stand on the command
+// line: the most threads abr may use (0 = automatic, 1 = none besides the main
+// thread). Removes them from `v`; returns an error text, empty when fine.
+std::string take_threads_option(std::vector<std::string>& v) {
+    for (size_t i = 0; i < v.size();) {
+        const std::string a = v[i];
+        std::string value;
+        size_t used = 1;
+        if (a == "-j" || a == "--threads") {
+            if (i + 1 >= v.size()) return a + " needs a number";
+            value = v[i + 1];
+            used = 2;
+        } else if (a.rfind("--threads=", 0) == 0) {
+            value = a.substr(10);
+        } else if (a.size() > 2 && a.compare(0, 2, "-j") == 0 && std::isdigit(static_cast<unsigned char>(a[2]))) {
+            value = a.substr(2);
+        } else {
+            ++i;
+            continue;
+        }
+        if (value.empty() || value.size() > 4 ||
+            !std::all_of(value.begin(), value.end(), [](char c) { return c >= '0' && c <= '9'; }))
+            return "the number of threads must be a whole number (0 = automatic), not '" + value + "'";
+        par::set_max_threads(static_cast<unsigned>(std::stoul(value)));
+        v.erase(v.begin() + static_cast<long>(i), v.begin() + static_cast<long>(i + used));
+    }
+    return "";
 }
 
 }  // namespace
@@ -1289,8 +1427,17 @@ int main(int argc, char** argv) {
             usage();
             return 1;
         }
-        std::string cmd = argv[1];
-        std::vector<std::string> args(argv + 2, argv + argc);
+        std::vector<std::string> args(argv + 1, argv + argc);
+        if (std::string err = take_threads_option(args); !err.empty()) {
+            std::cerr << "error: " << err << "\n";
+            return 1;
+        }
+        if (args.empty()) {
+            usage();
+            return 1;
+        }
+        const std::string cmd = args.front();
+        args.erase(args.begin());
 
         if (cmd == "info") {
             if (args.empty()) { usage(); return 1; }

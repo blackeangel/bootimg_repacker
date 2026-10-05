@@ -655,6 +655,159 @@ else
 fi
 
 # =========================================================================
+# Threads and codecs. What abr runs on several threads -- the 8 MiB blocks of
+# an LZ4 legacy stream, the workers of a zstd frame, the components of an image
+# -- must come out byte-for-byte the same whatever the thread count (-j1 = no
+# extra thread), and every codec must write a stream the real tool reads: the
+# ramdisk is sliced out of the repacked boot image by tests/tools/verify.py (not
+# by abr) and handed to gzip, lz4, zstd, xz, bzip2 or lzop.
+# =========================================================================
+python3 - <<'PYEOF'
+import random
+r = random.Random(7)
+words = [bytes(r.choices(b"abcdefghijklmnopqrstuvwxyz", k=r.randint(3, 9))) for _ in range(300)]
+def text(n):  # compressible, but not trivially so
+    return b" ".join(r.choices(words, k=n // 4 + 16))[:n]
+open("thr_text.bin", "wb").write(text(300000))
+# text, an incompressible stretch longer than an LZO block (256 KiB), text again, and a
+# tail that is aligned to no block size
+open("thr_mixed.bin", "wb").write(text(100000) + r.randbytes(600000) + text(100000) + r.randbytes(12345))
+# more than one LZ4 legacy block (8 MiB each), so there is something to run side by side
+open("thr_big.bin", "wb").write(text(9000000))
+PYEOF
+
+thr_dir() {  # <codec> <payload> <dir>: a boot v4 tree whose ramdisk abr has to compress with <codec>
+    mkdir -p "$3"
+    cat >"$3/manifest.txt" <<EOF
+type=boot
+header_version=4
+os_version=14.0.0
+os_patch_level=2024-05
+cmdline=test
+kernel_file=kernel
+kernel_compression=none
+ramdisk_file=ramdisk.cpio
+ramdisk_compression=$1
+EOF
+    printf 'kernel' >"$3/kernel"
+    cp "$2" "$3/ramdisk.cpio"
+}
+thr_decoder() {  # <codec>: the real tool's command (stdin -> stdout), if it is installed
+    case "$1" in
+        gzip) command -v gzip >/dev/null 2>&1 && echo "gzip -dc" ;;
+        lz4 | lz4_legacy) command -v lz4 >/dev/null 2>&1 && echo "lz4 -dc" ;;
+        zstd) command -v zstd >/dev/null 2>&1 && echo "zstd -dc -q" ;;
+        xz) command -v xz >/dev/null 2>&1 && echo "xz -dc" ;;
+        lzma) command -v xz >/dev/null 2>&1 && echo "xz --format=lzma -dc" ;;
+        bzip2) command -v bzip2 >/dev/null 2>&1 && echo "bzip2 -dc" ;;
+        lzo) command -v lzop >/dev/null 2>&1 && echo "lzop -dc" ;;
+    esac
+}
+thr_codec_check() {  # <codec> <payload> <label> <thread counts...>
+    local codec="$1" payload="$2" label="$3" dir first="" j js dec tool
+    dir="thr_${codec}_$(basename "$payload" .bin)"
+    shift 3
+    js="$(printf -- '-j%s ' "$@")"
+    js="${js% }"
+    thr_dir "$codec" "$payload" "$dir"
+    for j in "$@"; do
+        if ! "$ABR" -j"$j" repack "$dir" -o "$dir.j$j.img" >/dev/null 2>"$dir.err"; then
+            fail "$label: repack -j$j failed ($(head -c 200 "$dir.err"))"
+            return
+        fi
+        if [ -z "$first" ]; then
+            first="$dir.j$j.img"
+        elif ! cmp -s "$first" "$dir.j$j.img"; then
+            fail "$label: -j$j gives different bytes than the first run"
+            return
+        fi
+    done
+    dec="$(thr_decoder "$codec")"
+    if [ -z "$dec" ]; then
+        pass "$label: same bytes for ${js// /, } (the real decompressor is not installed: content not checked)"
+        return
+    fi
+    tool="${dec%% *}"
+    python3 "$TOOLS/verify.py" ramdisk "$first" "$dir.rd" || { fail "$label: could not slice the ramdisk out of the image"; return; }
+    # shellcheck disable=SC2086
+    if $dec <"$dir.rd" >"$dir.dec" 2>"$dir.dec.err" && cmp -s "$dir.dec" "$payload"; then
+        pass "$label: same bytes for ${js// /, }, and the real $tool reads the ramdisk back"
+    else
+        fail "$label: the real $tool does not read back what abr wrote ($(head -c 200 "$dir.dec.err"))"
+    fi
+}
+
+for codec in gzip lz4_legacy lz4 zstd xz lzma bzip2 lzo; do
+    thr_codec_check "$codec" thr_mixed.bin "$codec ramdisk (text, incompressible stretch, odd tail)" 1 4
+done
+thr_codec_check lz4_legacy thr_big.bin "lz4_legacy ramdisk of two blocks" 1 2 8
+thr_codec_check zstd thr_big.bin "zstd ramdisk of 9 MB" 1 2 8
+
+# The compression level of a component can be chosen in the manifest (<prefix>_level).
+thr_dir gzip thr_text.bin thr_level
+for lvl in 1 9; do
+    sed -i '/^ramdisk_level=/d' thr_level/manifest.txt
+    echo "ramdisk_level=$lvl" >>thr_level/manifest.txt
+    "$ABR" repack thr_level -o "thr_level_$lvl.img" >/dev/null 2>&1
+    python3 "$TOOLS/verify.py" ramdisk "thr_level_$lvl.img" "thr_level_$lvl.rd"
+done
+if [ -s thr_level_1.rd ] && [ -s thr_level_9.rd ] &&
+    [ "$(($(wc -c <thr_level_1.rd)))" -gt "$(($(wc -c <thr_level_9.rd)))" ] &&
+    gzip -dc <thr_level_1.rd | cmp -s - thr_text.bin && gzip -dc <thr_level_9.rd | cmp -s - thr_text.bin; then
+    pass "ramdisk_level=1 and =9 in the manifest give a larger and a smaller gzip stream, both valid"
+else
+    fail "ramdisk_level in the manifest is not honoured ($(wc -c <thr_level_1.rd 2>/dev/null) vs $(wc -c <thr_level_9.rd 2>/dev/null) bytes)"
+fi
+
+# An image with several components that are all recompressed at once (the case
+# the threads help most): vendor_boot v4 with two edited ramdisk fragments.
+"$ABR" unpack vendor_boot_v4.img -o thr_vb >/dev/null
+head -c 400000 thr_text.bin >thr_vb/ramdisk0.cpio
+head -c 250000 thr_mixed.bin >thr_vb/ramdisk1.cpio
+"$ABR" -j1 repack thr_vb -o thr_vb.j1.img >/dev/null 2>&1
+"$ABR" -j4 repack thr_vb -o thr_vb.j4.img >/dev/null 2>&1
+check thr_vb.j1.img thr_vb.j4.img "vendor_boot v4, two edited fragments recompressed: -j1 and -j4 give the same bytes"
+"$ABR" unpack thr_vb.j4.img -o thr_vb_back >/dev/null 2>&1
+if cmp -s thr_vb_back/ramdisk0.cpio <(head -c 400000 thr_text.bin) && cmp -s thr_vb_back/ramdisk1.cpio <(head -c 250000 thr_mixed.bin); then
+    pass "vendor_boot v4, two edited fragments: both come back as edited"
+else
+    fail "vendor_boot v4, two edited fragments: contents differ after the round trip"
+fi
+
+# -j / --threads: accepted in every spelling and position without changing the
+# result; refused, with a message, when it is not a number.
+thr_ref="$("$ABR" info boot_v4.img 2>&1)"
+thr_opt_bad=""
+for form in "-j2" "-j 2" "--threads 2" "--threads=2" "-j0" "-j1" "-j16"; do
+    # shellcheck disable=SC2086
+    [ "$("$ABR" $form info boot_v4.img 2>&1)" = "$thr_ref" ] || thr_opt_bad="$thr_opt_bad [$form]"
+done
+[ "$("$ABR" info boot_v4.img -j3 2>&1)" = "$thr_ref" ] || thr_opt_bad="$thr_opt_bad [trailing -j3]"
+[ "$(ABR_THREADS=3 "$ABR" info boot_v4.img 2>&1)" = "$thr_ref" ] || thr_opt_bad="$thr_opt_bad [ABR_THREADS]"
+if [ -z "$thr_opt_bad" ]; then
+    pass "-j N, -jN, --threads N, --threads=N (before or after the command) and ABR_THREADS are accepted"
+else
+    fail "thread options changed the result or were refused:$thr_opt_bad"
+fi
+thr_opt_bad=""
+for form in "-j abc" "--threads=" "--threads=2x" "-j 99999" "-j -1" "-j"; do
+    # shellcheck disable=SC2086
+    if "$ABR" $form info boot_v4.img >/dev/null 2>thr_opt.err; then
+        thr_opt_bad="$thr_opt_bad [accepted: $form]"
+    elif ! grep -q "number" thr_opt.err; then
+        thr_opt_bad="$thr_opt_bad [no explanation for: $form]"
+    fi
+done
+if "$ABR" info boot_v4.img -j >/dev/null 2>thr_opt.err || ! grep -q "needs a number" thr_opt.err; then
+    thr_opt_bad="$thr_opt_bad [-j without a value at the end]"
+fi
+if [ -z "$thr_opt_bad" ]; then
+    pass "a thread count that is not a number is refused with an explanation"
+else
+    fail "bad thread counts are not handled:$thr_opt_bad"
+fi
+
+# =========================================================================
 # Self-contained crypto (abr links no OpenSSL) and AVB signing judged by the
 # real avbtool. BigInt is checked against Python's integers, RSA against the
 # openssl command line, and every image abr re-signs against avbtool's own
@@ -705,6 +858,14 @@ if [ -x "$UNIT" ]; then
         fi
     else
         fail "could not generate the SHA test vectors"
+    fi
+
+    # abr::par, the thread helper: every job once, the error of the lowest failing
+    # job, nested regions, the cap on running threads, leases -- for several limits.
+    if out=$("$UNIT" par 2>&1); then
+        pass "thread helper abr::par ($(tail -n 1 <<<"$out"))"
+    else
+        fail "thread helper abr::par: $(tail -n 3 <<<"$out" | tr '\n' ' ')"
     fi
 
     head -c 70000 /dev/urandom >rsa_data.bin

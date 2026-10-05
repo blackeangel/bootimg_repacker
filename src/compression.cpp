@@ -4,6 +4,7 @@
 #include <bzlib.h>
 #include <lz4.h>
 #include <lz4frame.h>
+#include <lz4hc.h>
 #include <lzma.h>
 #include <zlib.h>
 #include <zstd.h>
@@ -12,6 +13,9 @@
 
 #include <algorithm>
 #include <cstring>
+#include <vector>
+
+#include "abr/parallel.hpp"
 
 namespace abr {
 
@@ -138,20 +142,39 @@ Bytes lz4_frame_decompress(const Bytes& in) {
 
 // ---------------------------------------------------------- lz4 legacy --
 
-Bytes lz4_legacy_compress(const Bytes& in) {
+// The blocks are independent of one another, so they are compressed on all the
+// threads we may use and joined in order: the bytes are the same whatever the
+// thread count. Android builds its ramdisks with `lz4 -l -12` (the
+// slowest, densest HC setting), which is the default here too -- a faster
+// setting makes an edited ramdisk noticeably larger, enough to stop a tightly
+// sized vendor_boot partition from fitting.
+constexpr int kLz4LegacyDefaultLevel = 12;
+
+Bytes lz4_legacy_compress(const Bytes& in, int level) {
+    if (level < 0) level = kLz4LegacyDefaultLevel;
+    level = std::min(level, static_cast<int>(LZ4HC_CLEVEL_MAX));
+
+    const size_t blocks = (in.size() + kLz4LegacyBlockSize - 1) / kLz4LegacyBlockSize;
+    std::vector<Bytes> parts(blocks);
+    par::for_each(blocks, [&](size_t i) {
+        const size_t pos = i * kLz4LegacyBlockSize;
+        const int chunk = static_cast<int>(std::min(kLz4LegacyBlockSize, in.size() - pos));
+        Bytes cbuf(static_cast<size_t>(LZ4_compressBound(chunk)));
+        const char* src = reinterpret_cast<const char*>(in.data() + pos);
+        char* dst = reinterpret_cast<char*>(cbuf.data());
+        const int cap = static_cast<int>(cbuf.size());
+        const int csize = level >= LZ4HC_CLEVEL_MIN ? LZ4_compress_HC(src, dst, chunk, cap, level)
+                                                       : LZ4_compress_default(src, dst, chunk, cap);
+        if (csize <= 0) fail("LZ4 compression failed");
+        cbuf.resize(static_cast<size_t>(csize));
+        parts[i] = std::move(cbuf);
+    });
+
     BinaryWriter w;
     w.bytes(kLz4LegacyMagic, sizeof(kLz4LegacyMagic));
-    size_t pos = 0;
-    Bytes cbuf(LZ4_compressBound(static_cast<int>(kLz4LegacyBlockSize)));
-    while (pos < in.size()) {
-        int chunk = static_cast<int>(std::min(kLz4LegacyBlockSize, in.size() - pos));
-        int csize = LZ4_compress_default(reinterpret_cast<const char*>(in.data() + pos),
-                                          reinterpret_cast<char*>(cbuf.data()), chunk,
-                                          static_cast<int>(cbuf.size()));
-        if (csize <= 0) fail("LZ4_compress_default failed");
-        w.le32(static_cast<uint32_t>(csize));
-        w.bytes(cbuf.data(), static_cast<size_t>(csize));
-        pos += static_cast<size_t>(chunk);
+    for (const Bytes& part : parts) {
+        w.le32(static_cast<uint32_t>(part.size()));
+        w.bytes(part.data(), part.size());
     }
     return w.take();
 }
@@ -180,10 +203,34 @@ Bytes lz4_legacy_decompress(const Bytes& in) {
 
 // --------------------------------------------------------------- zstd --
 
+// Compresses on worker threads: the zstd library splits the input into jobs of
+// a size it derives from the level (not from the thread count), so for any
+// number of workers >= 1 the frame is byte-for-byte the same -- it differs only
+// from the single-threaded (nbWorkers = 0) one. Always asking for at least one
+// worker is what keeps abr's output independent of the machine, even with -j1.
 Bytes zstd_compress(const Bytes& in, int level) {
     if (level < 0) level = ZSTD_CLEVEL_DEFAULT;
+    ZSTD_CCtx* cctx = ZSTD_createCCtx();
+    if (!cctx) fail("ZSTD_createCCtx failed");
+    struct Guard {
+        ZSTD_CCtx* c;
+        ~Guard() { ZSTD_freeCCtx(c); }
+    } guard{cctx};
+
+    ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, level);
+    // The calling thread only waits while the workers compress, so its own place
+    // in the budget goes to them: N extra threads from the budget = N + 1 workers.
+    par::Lease lease(par::max_threads() - 1);
+    const int workers = static_cast<int>(lease.threads()) + 1;
+    const bool threaded = !ZSTD_isError(ZSTD_CCtx_setParameter(cctx, ZSTD_c_nbWorkers, workers));
+
     Bytes out(ZSTD_compressBound(in.size()));
-    size_t n = ZSTD_compress(out.data(), out.size(), in.data(), in.size(), level);
+    size_t n = ZSTD_compress2(cctx, out.data(), out.size(), in.data(), in.size());
+    if (ZSTD_isError(n) && threaded) {
+        // Typically the system would not give us threads: do it on this one.
+        ZSTD_CCtx_setParameter(cctx, ZSTD_c_nbWorkers, 0);
+        n = ZSTD_compress2(cctx, out.data(), out.size(), in.data(), in.size());
+    }
     if (ZSTD_isError(n)) fail(std::string("ZSTD_compress failed: ") + ZSTD_getErrorName(n));
     out.resize(n);
     return out;
@@ -327,46 +374,73 @@ Bytes bzip2_decompress(const Bytes& in) {
 
 // Raw LZO1X has no magic/header of its own -- it's just a compressed
 // byte stream, with nothing to auto-detect or to tell a decompressor
-// how big the blocks are. The Linux kernel's own lib/decompress_unlzo.c
-// (what actually decompresses an LZO-compressed kernel/ramdisk/initramfs
-// on a real device) expects the "lzop" file format's header and framing
-// specifically, so that's what's implemented here: not full lzop-tool
-// compatibility, just what that kernel decompressor actually parses.
-// Ported from lib/decompress_unlzo.c's parse_header()/unlzo() (see
-// third_party/minilzo/README.md); this project's encoder always emits
-// the minimal form (no filter, no filename, header version < 0x0940),
-// while the decoder tolerates the newer/optional fields a real lzop
-// file could still have, matching the kernel's own leniency.
+// how big the blocks are. So it travels in the "lzop" file format, which is
+// also what the Linux kernel's lib/decompress_unlzo.c (the code that actually
+// unpacks an LZO-compressed kernel/ramdisk/initramfs on a device) parses.
+// The encoder writes the same header and framing `lzop -c < file` does
+// (version 1.04 layout, LZO1X-1, 256 KiB blocks, one Adler-32 per block of the
+// *uncompressed* data) so the stream is accepted by the real `lzop` as well as
+// by the kernel; the decoder is ported from decompress_unlzo.c's
+// parse_header()/unlzo() (see third_party/minilzo/README.md) and tolerates what
+// else a real lzop file may carry.
 constexpr size_t kLzoBlockSize = 256 * 1024;  // kernel's LZO_BLOCK_SIZE; also its declared max
 
+// lzop header flags (lzop.h)
+constexpr uint32_t kLzopAdler32D = 0x00000001;  // Adler-32 of each block's uncompressed data
+constexpr uint32_t kLzopAdler32C = 0x00000002;  // ... of its compressed data
+constexpr uint32_t kLzopStdin = 0x00000004;
+constexpr uint32_t kLzopStdout = 0x00000008;
+constexpr uint32_t kLzopCrc32D = 0x00000100;
+constexpr uint32_t kLzopCrc32C = 0x00000200;
+constexpr uint32_t kLzopHasFilter = 0x00000800;
+constexpr uint32_t kLzopOsUnix = 0x03000000;
+
+void lzo_init_once() {
+    // A function-local static is initialised once, thread-safely (std::call_once
+    // would pull in libstdc++ symbols the clang + mingw-w64 link does not have).
+    static const int rc = lzo_init();
+    if (rc != LZO_E_OK) fail("lzo_init failed: rc=" + std::to_string(rc));
+}
+
 Bytes lzo_compress(const Bytes& in) {
-    lzo_init();
+    lzo_init_once();
     BinaryWriter w;
     w.bytes(kLzopMagic, sizeof(kLzopMagic));
-    w.be16(0x0100);       // version (kept below 0x0940 so no extra 'level' byte is needed)
-    w.be16(0x0100);       // library version
-    w.be16(0x0100);       // version needed to extract
+    w.be16(0x1040);       // version: lzop 1.04
+    w.be16(LZO_VERSION);  // version of the LZO library that compressed it
+    w.be16(0x0940);       // version needed to extract: the first with this header layout
     w.u8(1);              // method: M_LZO1X_1
-    w.be32(0x00000002);   // flags: F_ADLER32_C (one checksum, of the compressed block)
-    w.be32(0);            // mode
+    w.u8(5);              // level
+    w.be32(kLzopOsUnix | kLzopAdler32D | kLzopStdin | kLzopStdout);  // what `lzop -c < file` sets
+    w.be32(0x81a4);       // mode: regular file, 0644
     w.be32(0);            // mtime_low
+    w.be32(0);            // mtime_high
     w.u8(0);              // filename_length (no filename)
     uint32_t hchk = static_cast<uint32_t>(
-        adler32(0, w.data().data() + sizeof(kLzopMagic), w.size() - sizeof(kLzopMagic)));
-    w.be32(hchk);          // header checksum
+        adler32(1, w.data().data() + sizeof(kLzopMagic), w.size() - sizeof(kLzopMagic)));
+    w.be32(hchk);          // header checksum (Adler-32, as the flags carry no F_H_CRC32)
 
     Bytes wrkmem(LZO1X_1_MEM_COMPRESS);
-    Bytes cbuf(in.size() + in.size() / 16 + 64 + 3);
+    Bytes cbuf(kLzoBlockSize + kLzoBlockSize / 16 + 64 + 3);
     size_t pos = 0;
     while (pos < in.size()) {
         size_t chunk = std::min(kLzoBlockSize, in.size() - pos);
         lzo_uint out_len = 0;
         int rc = lzo1x_1_compress(in.data() + pos, chunk, cbuf.data(), &out_len, wrkmem.data());
         if (rc != LZO_E_OK) fail("lzo1x_1_compress failed: rc=" + std::to_string(rc));
-        w.be32(static_cast<uint32_t>(chunk));    // dst_len: uncompressed size of this block
-        w.be32(static_cast<uint32_t>(out_len));  // src_len: compressed size of this block
-        w.be32(static_cast<uint32_t>(adler32(0, cbuf.data(), static_cast<uInt>(out_len))));
-        w.bytes(cbuf.data(), out_len);
+        w.be32(static_cast<uint32_t>(chunk));  // dst_len: uncompressed size of this block
+        if (out_len < chunk) {
+            w.be32(static_cast<uint32_t>(out_len));  // src_len: compressed size of this block
+            w.be32(static_cast<uint32_t>(adler32(1, in.data() + pos, static_cast<uInt>(chunk))));
+            w.bytes(cbuf.data(), out_len);
+        } else {
+            // Incompressible: stored as it is, which a reader recognises by
+            // src_len == dst_len. (A "compressed" block longer than the original
+            // is what the kernel calls a corrupt file.)
+            w.be32(static_cast<uint32_t>(chunk));
+            w.be32(static_cast<uint32_t>(adler32(1, in.data() + pos, static_cast<uInt>(chunk))));
+            w.bytes(in.data() + pos, chunk);
+        }
         pos += chunk;
     }
     w.be32(0);  // dst_len == 0 marks end of stream
@@ -374,7 +448,7 @@ Bytes lzo_compress(const Bytes& in) {
 }
 
 Bytes lzo_decompress(const Bytes& in) {
-    lzo_init();
+    lzo_init_once();
     BinaryReader r(in);
     if (!r.starts_with(reinterpret_cast<const char*>(kLzopMagic), sizeof(kLzopMagic)))
         fail("not an lzop/LZO stream (bad magic)");
@@ -383,13 +457,19 @@ Bytes lzo_decompress(const Bytes& in) {
     r.skip(5);  // library_version(2) + version_needed(2) + method(1)
     if (version >= 0x0940) r.skip(1);  // level
     uint32_t flags = r.be32();
-    if (flags & 0x00000800u) r.skip(4);  // filter info, only present with HEADER_HAS_FILTER
+    if (flags & kLzopHasFilter) r.skip(4);  // filter info, only present with HEADER_HAS_FILTER
     r.skip(4);                           // mode
     r.skip(4);                           // mtime_low
     if (version >= 0x0940) r.skip(4);    // mtime_high
     uint8_t fname_len = r.u8();
     r.skip(fname_len);
     r.skip(4);  // header checksum -- not validated, matching decompress_unlzo.c
+
+    // Checksum words after each block's sizes: the uncompressed data's always
+    // (when the flags ask for one), the compressed data's only when the block
+    // was compressed. lzop writes just the first; the kernel skips exactly one.
+    const size_t d_words = ((flags & kLzopAdler32D) ? 1 : 0) + ((flags & kLzopCrc32D) ? 1 : 0);
+    const size_t c_words = ((flags & kLzopAdler32C) ? 1 : 0) + ((flags & kLzopCrc32C) ? 1 : 0);
 
     Bytes out;
     Bytes scratch(kLzoBlockSize);
@@ -398,7 +478,9 @@ Bytes lzo_decompress(const Bytes& in) {
         if (dst_len == 0) break;  // end-of-stream marker
         if (dst_len > kLzoBlockSize) fail("lzo block's uncompressed size exceeds the max block size");
         uint32_t src_len = r.be32();
-        r.skip(4);  // block checksum -- not validated, matching decompress_unlzo.c
+        if (src_len > dst_len) fail("lzo block is longer compressed than uncompressed (corrupt stream)");
+        r.skip(4 * d_words);                        // checksums -- not validated, as in decompress_unlzo.c
+        if (src_len < dst_len) r.skip(4 * c_words);
         Bytes block = r.bytes(src_len);
         if (src_len == dst_len) {
             out.insert(out.end(), block.begin(), block.end());  // stored uncompressed
@@ -474,7 +556,7 @@ Bytes compress(Codec codec, const Bytes& data, int level) {
     switch (codec) {
         case Codec::NONE: return data;
         case Codec::GZIP: return gzip_compress(data, level);
-        case Codec::LZ4_LEGACY: return lz4_legacy_compress(data);
+        case Codec::LZ4_LEGACY: return lz4_legacy_compress(data, level);
         case Codec::LZ4: return lz4_frame_compress(data, level);
         case Codec::ZSTD: return zstd_compress(data, level);
         case Codec::XZ: return xz_compress(data, level);

@@ -64,7 +64,7 @@ add_library(abr_cxx_std INTERFACE)
 target_compile_options(abr_cxx_std INTERFACE "$<$<COMPILE_LANGUAGE:CXX>:${ABR_CXX_STD_FLAG}>")
 
 option(ABR_BUILD_TESTS
-       "Build abr_unit_tests, the driver tests/run_tests.sh uses to check the self-contained crypto (BigInt/RSA/DER). Off for cross builds." ON)
+       "Build abr_unit_tests, the driver tests/run_tests.sh uses to check the self-contained crypto (BigInt/RSA/DER/SHA) and the thread helper. Off for cross builds." ON)
 option(ABR_VENDOR_DEPS
        "Fetch and statically build zlib/lz4/zstd/xz/bzip2 from source (the shipping default). Turn OFF to use system dev packages instead, for fast local iteration." ON)
 option(ABR_STATIC_BINARY
@@ -105,6 +105,7 @@ endif()
 add_library(abr_core STATIC
   src/byte_io.cpp
   src/compression.cpp
+  src/parallel.cpp
   src/sha.cpp
   src/boot_image.cpp
   src/vendor_boot.cpp
@@ -145,6 +146,16 @@ else()
   set(THREADS_PREFER_PTHREAD_FLAG ON)
   find_package(Threads REQUIRED)
   target_link_libraries(abr_core PUBLIC Threads::Threads)
+  if(ABR_STATIC_BINARY AND UNIX AND NOT ANDROID AND NOT APPLE)
+    # A static glibc older than 2.34 keeps pthread in libpthread.a, whose weak
+    # references a plain -static link leaves unresolved (std::thread then fails
+    # at run time with "Enable multithreading to use std::thread"). Newer glibc
+    # and musl ship an empty libpthread.a, so pulling it in whole is harmless.
+    find_library(ABR_STATIC_PTHREAD NAMES libpthread.a)
+    if(ABR_STATIC_PTHREAD)
+      target_link_libraries(abr_core PUBLIC -Wl,--whole-archive ${ABR_STATIC_PTHREAD} -Wl,--no-whole-archive)
+    endif()
+  endif()
 endif()
 
 # One place for what "static" means per platform.
@@ -170,7 +181,7 @@ target_link_libraries(abr PRIVATE abr_core)
 abr_link_statically(abr)
 
 if(ABR_BUILD_TESTS)
-  add_executable(abr_unit_tests tests/unit/crypto_test.cpp)
+  add_executable(abr_unit_tests tests/unit/crypto_test.cpp tests/unit/par_test.cpp)
   target_link_libraries(abr_unit_tests PRIVATE abr_core)
   abr_link_statically(abr_unit_tests)
 endif()
