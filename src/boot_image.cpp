@@ -89,6 +89,25 @@ constexpr uint32_t kHeaderSizeV4 = 1584;
 // osm0sis' unpackbootimg treats anything above 8 as a size, so do we.
 constexpr uint32_t kMaxHeaderVersionWord = 8;
 
+uint32_t le32_at(const Bytes& b, size_t off) {
+    return uint32_t(b[off]) | (uint32_t(b[off + 1]) << 8) | (uint32_t(b[off + 2]) << 16) |
+           (uint32_t(b[off + 3]) << 24);
+}
+
+// A flash page size: a power of two from 2 KiB to 128 KiB (what mkbootimg's own list holds).
+bool plausible_page_size(uint32_t v) { return v >= 2048 && v <= 131072 && (v & (v - 1)) == 0; }
+
+// In a standard v0-v2 header the page size is the word at offset 36. A PXA header
+// (osm0sis/pxa-mkbootimg, AIK's "AOSP-PXA") has `unknown` there -- an address such as
+// 0x02000000 -- and the page size one word later. Neither v3/v4 nor the CAF flavour of v0
+// can be mistaken for it: their word at 36 is zero or a real page size, their word at 40 a
+// header version or a dt size that is no page size.
+bool looks_like_pxa(const Bytes& image) {
+    if (image.size() < 48) return false;
+    return !plausible_page_size(le32_at(image, 36)) && plausible_page_size(le32_at(image, 44)) &&
+           le32_at(image, 40) > kMaxHeaderVersionWord;
+}
+
 uint32_t standard_header_size(uint32_t version) {
     switch (version) {
         case 1: return kHeaderSizeV1;
@@ -126,9 +145,10 @@ BootImage BootImage::parse(const Bytes& image) {
     // Word 10 sits at byte offset 40 in *every* header layout (v0-v2 and
     // v3-v4 both place 8 leading 4-byte fields before it).
     if (image.size() < 44) throw FormatError("boot image too small to contain a header");
+    const bool pxa = looks_like_pxa(image);
     BinaryReader peek(image);
     peek.seek(40);
-    uint32_t version_word = peek.le32();
+    uint32_t version_word = pxa ? 0 : peek.le32();  // (a PXA header has tags_addr there)
 
     BootImage img;
     uint32_t dt_size = 0;
@@ -149,7 +169,55 @@ BootImage BootImage::parse(const Bytes& image) {
         r.seek(static_cast<size_t>(std::min<uint64_t>(align_up(r.pos(), page), image.size())));
     };
 
-    if (header_version <= 2) {
+    // Whatever sits between the end of the header struct and the end of its page is padding
+    // by definition -- unless a vendor stashed something there, in which case it must survive
+    // a repack.
+    auto keep_header_padding = [&](size_t struct_end, uint32_t page) {
+        size_t page_end =
+            static_cast<size_t>(std::min<uint64_t>(align_up(struct_end, page), image.size()));
+        for (size_t i = struct_end; i < page_end; ++i)
+            if (image[i] != 0) {
+                img.header_padding.assign(image.begin() + static_cast<long>(struct_end),
+                                          image.begin() + static_cast<long>(page_end));
+                break;
+            }
+    };
+
+    if (pxa) {
+        img.pxa = true;
+        uint32_t kernel_size = r.le32();
+        img.kernel_addr = r.le32();
+        uint32_t ramdisk_size = r.le32();
+        img.ramdisk_addr = r.le32();
+        uint32_t second_size = r.le32();
+        img.second_addr = r.le32();
+        dt_size = r.le32();
+        img.pxa_unknown = r.le32();
+        img.tags_addr = r.le32();
+        img.page_size = r.le32();
+        img.board_name = r.asciiz(kPxaNameSize);
+        std::string part1 = r.asciiz(kBootArgsSize);
+        for (auto& w : img.id) w = r.le32();
+        std::string part2 = r.asciiz(kBootExtraArgsSize);
+        img.cmdline = part1 + part2;
+        if (!part2.empty() && part1.size() != kBootArgsSize)
+            img.cmdline_split = static_cast<uint32_t>(part1.size());
+
+        keep_header_padding(r.pos(), img.page_size);
+        to_page(img.page_size);
+        img.kernel = r.bytes(kernel_size);
+        to_page(img.page_size);
+        img.ramdisk = r.bytes(ramdisk_size);
+        to_page(img.page_size);
+        img.second = r.bytes(second_size);
+        to_page(img.page_size);
+        if (dt_size) {
+            img.dt = r.bytes(dt_size);
+            to_page(img.page_size);
+        }
+        img.consumed = r.pos();
+        img.id_scheme = img.detect_id_scheme();
+    } else if (header_version <= 2) {
         uint32_t kernel_size = r.le32();
         img.kernel_addr = r.le32();
         uint32_t ramdisk_size = r.le32();
@@ -165,6 +233,8 @@ BootImage BootImage::parse(const Bytes& image) {
         for (auto& w : img.id) w = r.le32();
         std::string part2 = r.asciiz(kBootExtraArgsSize);
         img.cmdline = part1 + part2;
+        if (!part2.empty() && part1.size() != kBootArgsSize)
+            img.cmdline_split = static_cast<uint32_t>(part1.size());
 
         uint32_t recovery_dtbo_size = 0;
         uint64_t recovery_dtbo_offset = 0;
@@ -182,21 +252,7 @@ BootImage BootImage::parse(const Bytes& image) {
 
         if (img.page_size == 0) throw FormatError("boot image page_size is zero");
 
-        // Whatever sits between the end of the header struct and the end of
-        // its page is padding by definition -- unless a vendor stashed
-        // something there, in which case it must survive a repack.
-        {
-            size_t struct_end = r.pos();
-            size_t page_end = static_cast<size_t>(
-                std::min<uint64_t>(align_up(struct_end, img.page_size), image.size()));
-            for (size_t i = struct_end; i < page_end; ++i)
-                if (image[i] != 0) {
-                    img.header_padding.assign(image.begin() + static_cast<long>(struct_end),
-                                              image.begin() + static_cast<long>(page_end));
-                    break;
-                }
-        }
-
+        keep_header_padding(r.pos(), img.page_size);
         to_page(img.page_size);
         img.kernel = r.bytes(kernel_size);
         to_page(img.page_size);
@@ -237,18 +293,7 @@ BootImage BootImage::parse(const Bytes& image) {
         if (header_version == 4) signature_size = r.le32();
         img.page_size = 4096;
 
-        {
-            size_t struct_end = r.pos();
-            size_t page_end =
-                static_cast<size_t>(std::min<uint64_t>(align_up(struct_end, 4096), image.size()));
-            for (size_t i = struct_end; i < page_end; ++i)
-                if (image[i] != 0) {
-                    img.header_padding.assign(image.begin() + static_cast<long>(struct_end),
-                                              image.begin() + static_cast<long>(page_end));
-                    break;
-                }
-        }
-
+        keep_header_padding(r.pos(), 4096);
         to_page(4096);
         img.kernel = r.bytes(kernel_size);
         to_page(4096);
@@ -280,7 +325,36 @@ Bytes BootImage::build() const {
     BinaryWriter w;
     w.bytes(reinterpret_cast<const uint8_t*>(kBootMagic), kBootMagicSize);
 
-    if (header_version <= 2) {
+    if (pxa) {
+        const uint32_t page_sz = page_size ? page_size : 2048;
+        w.le32(static_cast<uint32_t>(kernel.size()));
+        w.le32(kernel_addr);
+        w.le32(static_cast<uint32_t>(ramdisk.size()));
+        w.le32(ramdisk_addr);
+        w.le32(static_cast<uint32_t>(second.size()));
+        w.le32(second_addr);
+        w.le32(static_cast<uint32_t>(dt.size()));
+        w.le32(pxa_unknown);
+        w.le32(tags_addr);
+        w.le32(page_sz);
+        w.asciiz(board_name, kPxaNameSize);
+        const size_t split = cmdline_split ? cmdline_split : kBootArgsSize;
+        w.asciiz(cmdline.substr(0, std::min(cmdline.size(), split)), kBootArgsSize);
+        for (auto v : id) w.le32(v);
+        w.asciiz(cmdline.size() > split ? cmdline.substr(split) : std::string(), kBootExtraArgsSize);
+        if (!header_padding.empty()) w.bytes(header_padding);
+        w.align(page_sz);
+        w.bytes(kernel);
+        w.align(page_sz);
+        w.bytes(ramdisk);
+        w.align(page_sz);
+        w.bytes(second);
+        w.align(page_sz);
+        if (!dt.empty()) {
+            w.bytes(dt);
+            w.align(page_sz);
+        }
+    } else if (header_version <= 2) {
         uint32_t page_sz = page_size ? page_size : 2048;
         w.le32(static_cast<uint32_t>(kernel.size()));
         w.le32(kernel_addr);
@@ -295,9 +369,9 @@ Bytes BootImage::build() const {
                                                    : header_version);
         w.le32(os_version.pack());
         w.asciiz(board_name, kBootNameSize);
-        std::string part1 = cmdline.substr(0, std::min(cmdline.size(), kBootArgsSize));
-        std::string part2 =
-            cmdline.size() > kBootArgsSize ? cmdline.substr(kBootArgsSize) : std::string();
+        const size_t split = cmdline_split ? cmdline_split : kBootArgsSize;
+        std::string part1 = cmdline.substr(0, std::min(cmdline.size(), split));
+        std::string part2 = cmdline.size() > split ? cmdline.substr(split) : std::string();
         w.asciiz(part1, kBootArgsSize);
         for (auto v : id) w.le32(v);
         w.asciiz(part2, kBootExtraArgsSize);

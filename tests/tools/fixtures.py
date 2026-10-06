@@ -61,7 +61,7 @@ def boot_id(hash_ctor, version, kernel, ramdisk, second, dt=None, dtbo=b"", dtb=
 
 def boot_v012(version, kernel, ramdisk, second=b"", dt=b"", dtbo=b"", dtb=b"", *, page=2048,
               cmdline="", name="", os_version=0, id_bytes=b"", dtbo_offset=None,
-              hdr_size=None, dtb_addr=0, dirty_padding=False, hdr_garbage=b""):
+              hdr_size=None, dtb_addr=0, dirty_padding=False, hdr_garbage=b"", split=512):
     """boot.img header v0/v1/v2. A non-empty `dt` on a v0 header is the
     Qualcomm/CAF layout: word 10 holds the dt size instead of the version."""
     word10 = len(dt) if (version == 0 and dt) else version
@@ -70,9 +70,10 @@ def boot_v012(version, kernel, ramdisk, second=b"", dt=b"", dtbo=b"", dtb=b"", *
     hdr += struct.pack("<10I", len(kernel), 0x8000, len(ramdisk), 0x1000000, len(second),
                        0xF00000, 0x100, page, word10, os_version)
     hdr += name.encode().ljust(16, b"\0")
-    hdr += cmd[:512].ljust(512, b"\0")
+    first, extra = split_cmdline(cmdline, split)
+    hdr += first
     hdr += id_bytes.ljust(32, b"\0")
-    hdr += cmd[512:].ljust(1024, b"\0")
+    hdr += extra
     if version >= 1:
         pages = lambda n: -(-n // page)
         off = dtbo_offset
@@ -96,6 +97,38 @@ def boot_v012(version, kernel, ramdisk, second=b"", dt=b"", dtbo=b"", dtb=b"", *
             padded = p + b"\xa5" * (len(padded) - len(p))  # vendor garbage in the page padding
         out += padded
     return out
+
+
+def split_cmdline(cmdline, split):
+    """How mkbootimg divides a long command line between the two header fields:
+    AOSP's mkbootimg.py fills the whole 512-byte field (split=512), the old C
+    mkbootimg keeps a NUL at its end (split=511)."""
+    cmd = cmdline.encode()
+    return cmd[:split].ljust(512, b"\0"), cmd[split:].ljust(1024, b"\0")
+
+
+def boot_pxa(kernel, ramdisk, second=b"", dt=b"", *, page=2048, unknown=0x03000000, cmdline="",
+             name="", id_bytes=b"", split=511, hdr_garbage=b"", signature=b""):
+    """Marvell PXA1088/PXA1908 boot image (osm0sis/pxa-mkbootimg's bootimg.h): a v0 header
+    with `unknown` after dt_size, so tags_addr/page_size sit at 40/44, the board name has
+    24 bytes and the id is at 584. Pages: kernel, ramdisk, second, dt, then an optional
+    256-byte (or 272 with a SEANDROIDENFORCE marker) vendor signature."""
+    first, extra = split_cmdline(cmdline, split)
+    hdr = b"ANDROID!"
+    hdr += struct.pack("<10I", len(kernel), 0x10008000, len(ramdisk), 0x11000000, len(second),
+                       0x10F00000, len(dt), unknown, 0x10000100, page)
+    hdr += name.encode().ljust(24, b"\0")
+    hdr += first
+    hdr += id_bytes.ljust(32, b"\0")
+    hdr += extra
+    assert len(hdr) == 1640
+    hdr += hdr_garbage
+    out = page_pad(hdr, page)
+    for part in (kernel, ramdisk, second):
+        out += page_pad(part, page)
+    if dt:
+        out += page_pad(dt, page)
+    return out + signature
 
 
 def boot_v34(version, kernel, ramdisk, *, cmdline="", os_version=0, reserved=(0, 0, 0, 0),
@@ -207,6 +240,31 @@ def build_all(out):
         id_bytes=boot_id(hashlib.sha1, 1, kernel, ramdisk, second, dtbo=dtbo)))
     put("boot_v2_header_garbage.img", boot_v012(
         2, kernel, ramdisk, dtb=dtb, hdr_garbage=b"VENDOR-DATA-IN-HEADER-PAGE"))
+
+    # --- a command line longer than the first field: where it is cut -------
+    long_cmd = "androidboot.hardware=qcom " + "x" * 700
+    put("boot_v0_cmdline512.img", boot_v012(
+        0, kernel, ramdisk, cmdline=long_cmd, split=512,
+        id_bytes=boot_id(hashlib.sha1, 0, kernel, ramdisk, second)))
+    put("boot_v0_cmdline511.img", boot_v012(
+        0, kernel, ramdisk, cmdline=long_cmd, split=511,
+        id_bytes=boot_id(hashlib.sha1, 0, kernel, ramdisk, second)))
+
+    # --- Marvell PXA headers (Samsung J1, Core Prime, Tab 4 ...) ------------
+    pdt, psecond = blob(7000), blob(5000)
+    put("boot_pxa_030_dt.img", boot_pxa(
+        kernel, ramdisk, dt=pdt, unknown=0x03000000, cmdline="console=ttyS0,115200n8", name="SM-G531F",
+        id_bytes=boot_id(hashlib.sha1, 0, kernel, ramdisk, b"", dt=pdt)))
+    put("boot_pxa_020_p4096_second.img", boot_pxa(
+        kernel, ramdisk, second=psecond, unknown=0x02000000, page=4096, cmdline="androidboot.selinux=permissive",
+        name="SM-T230", id_bytes=boot_id(hashlib.sha1, 0, kernel, ramdisk, psecond)))
+    put("boot_pxa_028_longcmd.img", boot_pxa(
+        kernel, ramdisk, unknown=0x02800000, cmdline=long_cmd, split=511, name="SM-J110F",
+        id_bytes=boot_id(hashlib.sha1, 0, kernel, ramdisk, b"")))
+    put("boot_pxa_signed.img", boot_pxa(
+        kernel, ramdisk, unknown=0x03000000, cmdline="x", name="SM-G388F",
+        id_bytes=boot_id(hashlib.sha1, 0, kernel, ramdisk, b""),
+        signature=b"SEANDROIDENFORCE" + blob(256)))
 
     # --- trimmed final padding ------------------------------------------
     full = boot_v012(2, kernel, ramdisk, dtb=dtb, page=2048)

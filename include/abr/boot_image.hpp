@@ -24,6 +24,7 @@ namespace abr {
 constexpr char kBootMagic[] = "ANDROID!";
 constexpr size_t kBootMagicSize = 8;
 constexpr size_t kBootNameSize = 16;
+constexpr size_t kPxaNameSize = 24;  // the PXA header's board name is 8 bytes longer
 constexpr size_t kBootArgsSize = 512;
 constexpr size_t kBootExtraArgsSize = 1024;
 constexpr uint32_t kBootImageV4SignatureSize = 4096;
@@ -76,6 +77,10 @@ struct BootImage {
     OsVersion os_version{};
     std::string cmdline;  // logical concatenation of cmdline+extra_cmdline (v0-v2) or the
                            // single cmdline field (v3-v4); see split logic in boot_image.cpp
+    // v0-v2: where a cmdline longer than the first field continues in extra_cmdline. AOSP's
+    // mkbootimg.py fills all 512 bytes of the first field (0 here); the old C mkbootimg keeps
+    // a NUL at the end of it and so splits after 511 bytes. Recorded from the image.
+    uint32_t cmdline_split = 0;
 
     // --- v4 only ---
     // signature_size is derived from boot_signature.size() at build() time.
@@ -89,6 +94,13 @@ struct BootImage {
     Bytes dtb;             // v2 only (v3/v4 boot.img carries no dtb; that lives in vendor_boot)
     Bytes boot_signature;  // v4 only; GKI boot_signature blob (up to 4096/16384 bytes, AVB
                             // footer for the whole file is separate and handled by VbmetaImage)
+
+    // Marvell PXA1088/PXA1908 boot images (Samsung Galaxy J1, Core Prime, Tab 4 ...) have a v0
+    // header with one more word, `unknown`, behind dt_size: from there on every field sits four
+    // bytes further, the board name has 24 bytes, there is no os_version, and the header is 1640
+    // bytes. parse() recognises it by the position of the page size (see looks_like_pxa()).
+    bool pxa = false;
+    uint32_t pxa_unknown = 0x03000000;  // 0x02000000, 0x02800000 and 0x03000000 are seen
 
     // v0 only. Qualcomm/CAF ("QCDT") images reuse the header_version word
     // as `dt_size` and append a device-tree blob after `second`. A header

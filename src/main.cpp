@@ -589,6 +589,10 @@ void unpack_boot(const Bytes& whole, const fs::path& dir) {
     Manifest m;
     m.set("type", "boot");
     m.set_u32("header_version", img.header_version);
+    if (img.pxa) {  // Marvell PXA1088/PXA1908: a v0 header with an extra word
+        m.set_bool("pxa", true);
+        m.set_addr("pxa_unknown", img.pxa_unknown);
+    }
     if (img.header_version <= 2) {
         m.set_u32("page_size", img.page_size);
         m.set_addr("kernel_addr", img.kernel_addr);
@@ -623,6 +627,7 @@ void unpack_boot(const Bytes& whole, const fs::path& dir) {
     m.set("os_version", img.os_version.to_string());
     m.set("os_patch_level", img.os_version.patch_level_string());
     m.set("cmdline", img.cmdline);
+    if (img.cmdline_split) m.set_u32("cmdline_split", img.cmdline_split);
     if (img.missing_tail_padding) m.set_u64("missing_tail_padding", img.missing_tail_padding);
 
     {
@@ -666,6 +671,8 @@ void unpack_boot(const Bytes& whole, const fs::path& dir) {
 Bytes repack_boot(const Manifest& m, const fs::path& dir, const RepackOptions& opt) {
     BootImage img;
     img.header_version = m.get_u32("header_version", 4);
+    img.pxa = m.get_bool("pxa", false);
+    if (img.pxa) img.pxa_unknown = static_cast<uint32_t>(m.get_addr("pxa_unknown", 0x03000000));
     if (img.header_version <= 2) {
         img.page_size = m.get_u32("page_size", 2048);
         img.kernel_addr = static_cast<uint32_t>(m.get_addr("kernel_addr", 0x00008000));
@@ -694,6 +701,7 @@ Bytes repack_boot(const Manifest& m, const fs::path& dir, const RepackOptions& o
     auto ov = OsVersion::parse(m.get("os_version"), m.get("os_patch_level"));
     if (ov) img.os_version = *ov;
     img.cmdline = m.get("cmdline");
+    img.cmdline_split = m.get_u32("cmdline_split", 0);
     img.missing_tail_padding = m.get_u64("missing_tail_padding", 0);
 
     {
@@ -1127,6 +1135,11 @@ void print_info(const fs::path& path) {
             size_t off = find_magic(host, "ANDROID!", 8);
             BootImage img = BootImage::parse(Bytes(host.begin() + static_cast<long>(off), host.end()));
             std::cout << "header_version: " << img.header_version << "\n";
+            if (img.pxa) {
+                char word[16];
+                std::snprintf(word, sizeof word, "0x%08x", img.pxa_unknown);
+                std::cout << "variant:        Marvell PXA header (unknown=" << word << ")\n";
+            }
             if (img.header_version <= 2) std::cout << "page_size:      " << img.page_size << "\n";
             std::cout << "os_version:     " << img.os_version.to_string() << "\n";
             std::cout << "patch_level:    " << img.os_version.patch_level_string() << "\n";

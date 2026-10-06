@@ -623,6 +623,78 @@ else
 fi
 check avb_stale.img rt_stale.out "image with a stale AVB digest still round-trips byte-for-byte"
 
+# ---- Marvell PXA headers, and where a long command line is cut
+roundtrip_check fx/boot_pxa_030_dt.img "boot PXA (Marvell, unknown=0x03000000) with a dt blob" pxa030
+expect_line rt_pxa030 "pxa=true" "PXA: recognised as the Marvell header variant"
+expect_line rt_pxa030 "pxa_unknown=0x3000000" "PXA: the 'unknown' word is kept"
+expect_line rt_pxa030 "id_scheme=sha1_dt" "PXA: id recognised as SHA-1 over kernel+ramdisk+second+dt"
+expect_key rt_pxa030 dt_file "PXA: dt blob extracted as its own file"
+roundtrip_check fx/boot_pxa_020_p4096_second.img "boot PXA, page 4096, second stage, no dt" pxa020
+expect_line rt_pxa020 "id_scheme=sha1" "PXA: id without a dt entry is plain SHA-1"
+roundtrip_check fx/boot_pxa_028_longcmd.img "boot PXA, command line cut after 511 bytes" pxa028
+expect_line rt_pxa028 "cmdline_split=511" "PXA: a command line cut after 511 bytes (old C mkbootimg) is recorded"
+roundtrip_check fx/boot_pxa_signed.img "boot PXA with a vendor signature after the image" pxas
+roundtrip_check fx/boot_v0_cmdline512.img "boot v0: long command line cut at 512 (AOSP mkbootimg.py)" cmd512
+roundtrip_check fx/boot_v0_cmdline511.img "boot v0: long command line cut at 511 (old C mkbootimg)" cmd511
+expect_line rt_cmd511 "cmdline_split=511" "v0: the cut after 511 bytes is recorded"
+if grep -q "^cmdline_split=" rt_cmd512/manifest.txt; then
+    fail "v0: a cut at 512 is the default and needs no record"
+else
+    pass "v0: a cut at 512 is the default and needs no record"
+fi
+id_follows_edit fx/boot_pxa_030_dt.img sha1_dt pxa "PXA: after a ramdisk edit the id follows its scheme (checked independently) and the new ramdisk is in the image"
+if said "PXA variant (030)" "$ABR" identify fx/boot_pxa_030_dt.img; then
+    pass "identify: the PXA fixture is named like AIK's magic file names it"
+else
+    fail "identify: PXA fixture"
+fi
+
+# The real pxa-mkbootimg / pxa-unpackbootimg (osm0sis/pxa-mkbootimg; gcc -o pxa-mkbootimg
+# mkbootimg.c libmincrypt/sha.c -I.) as an independent builder and reader.
+# PXA_MKBOOTIMG=/path/to/pxa-mkbootimg [PXA_UNPACKBOOTIMG=/path/to/pxa-unpackbootimg]
+if [ -n "${PXA_MKBOOTIMG:-}" ] && [ -x "$PXA_MKBOOTIMG" ]; then
+    pxa_ok=1
+    mvalue() { grep "^$2=" "$1/manifest.txt" | head -1 | cut -d= -f2-; }
+    head -c 1500000 /dev/urandom >pxa_k.bin
+    head -c 700000 /dev/urandom >pxa_r.bin
+    head -c 60000 /dev/urandom >pxa_dt.bin
+    long_cmd="androidboot.hardware=pxa1908 $(head -c 700 /dev/zero | tr '\0' x)"
+    for variant in "02000000 2048 plain short" "02800000 4096 dt long" "03000000 2048 dt short" "03000000 16384 plain long"; do
+        set -- $variant
+        unk=$1 ps=$2 kind=$3 cmd=$4
+        args=(--kernel pxa_k.bin --ramdisk pxa_r.bin --base 10000000 --pagesize "$ps" --unknown "$unk" --board SM-J110F)
+        [ "$kind" = dt ] && args+=(--dt pxa_dt.bin)
+        if [ "$cmd" = long ]; then args+=(--cmdline "$long_cmd"); else args+=(--cmdline "console=ttyS0 androidboot.selinux=permissive"); fi
+        "$PXA_MKBOOTIMG" "${args[@]}" -o pxa_real.img >/dev/null 2>&1 || { pxa_ok=0; echo "  pxa-mkbootimg failed for $variant"; continue; }
+        rm -rf pxa_u
+        "$ABR" unpack pxa_real.img -o pxa_u >/dev/null 2>&1 || { pxa_ok=0; echo "  abr cannot unpack the real tool's image ($variant)"; continue; }
+        "$ABR" repack pxa_u -o pxa_re.img >/dev/null 2>&1
+        cmp -s pxa_real.img pxa_re.img || { pxa_ok=0; echo "  untouched repack differs ($variant)"; }
+        head -c 123457 /dev/urandom >pxa_u/ramdisk.cpio
+        "$ABR" repack pxa_u -o pxa_ed.img >/dev/null 2>&1
+        a2=(--kernel pxa_u/kernel --ramdisk pxa_u/ramdisk.cpio --base 0 --pagesize "$(mvalue pxa_u page_size)"
+            --unknown "$(mvalue pxa_u pxa_unknown | sed 's/^0x//')" --kernel_offset "$(mvalue pxa_u kernel_addr | sed 's/^0x//')"
+            --ramdisk_offset "$(mvalue pxa_u ramdisk_addr | sed 's/^0x//')" --second_offset "$(mvalue pxa_u second_addr | sed 's/^0x//')"
+            --tags_offset "$(mvalue pxa_u tags_addr | sed 's/^0x//')" --board "$(mvalue pxa_u board_name)" --cmdline "$(mvalue pxa_u cmdline)")
+        [ -f pxa_u/dt.img ] && a2+=(--dt pxa_u/dt.img)
+        "$PXA_MKBOOTIMG" "${a2[@]}" -o pxa_ref.img >/dev/null 2>&1
+        cmp -s pxa_ed.img pxa_ref.img || { pxa_ok=0; echo "  edited image differs from the real tool's ($variant)"; }
+        if [ -n "${PXA_UNPACKBOOTIMG:-}" ] && [ -x "$PXA_UNPACKBOOTIMG" ]; then
+            rm -rf pxa_x
+            mkdir pxa_x
+            "$PXA_UNPACKBOOTIMG" -i pxa_ed.img -o pxa_x >/dev/null 2>&1
+            cmp -s pxa_x/pxa_ed.img-ramdisk pxa_u/ramdisk.cpio || { pxa_ok=0; echo "  pxa-unpackbootimg does not read the edited ramdisk back ($variant)"; }
+        fi
+    done
+    if [ $pxa_ok -eq 1 ]; then
+        pass "PXA: images from the real pxa-mkbootimg round-trip exactly, and abr's edited images equal the real tool's (and read back)"
+    else
+        fail "PXA: abr and the real pxa-mkbootimg disagree"
+    fi
+else
+    echo "SKIP: real pxa-mkbootimg cross-check (set PXA_MKBOOTIMG, and optionally PXA_UNPACKBOOTIMG, to the compiled osm0sis/pxa-mkbootimg tools)"
+fi
+
 # ---- reporting: info, self-check, things that are not boot images
 if said "hash check:   OK" "$ABR" info fx/boot_v2_avbfooter_unaligned.img; then
     pass "info reports the AVB footer and its digest check"

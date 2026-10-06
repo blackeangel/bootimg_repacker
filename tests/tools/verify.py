@@ -25,9 +25,33 @@ def fail(msg):
 
 # ------------------------------------------------------------ boot id ----
 
+def _page_size(v):
+    return 2048 <= v <= 131072 and v & (v - 1) == 0
+
+
+def parse_boot_pxa(d):
+    """Marvell PXA header: v0 with `unknown` behind dt_size (osm0sis/pxa-mkbootimg bootimg.h)."""
+    (ksz, _ka, rsz, _ra, ssz, _sa, dt_size, unknown, _ta, page) = struct.unpack_from("<10I", d, 8)
+    f = {"version": 0, "page": page, "dt_size": dt_size, "id": d[584:616], "unknown": unknown,
+         "dtbo": b"", "dtb": b""}
+    pos = page
+
+    def take(n):
+        nonlocal pos
+        data = d[pos:pos + n]
+        pos += -(-n // page) * page
+        return data
+
+    f["kernel"], f["ramdisk"], f["second"] = take(ksz), take(rsz), take(ssz)
+    f["dt"] = take(dt_size) if dt_size else b""
+    return f
+
+
 def parse_boot_012(d):
     if d[:8] != b"ANDROID!":
         fail("no ANDROID! magic at offset 0")
+    if not _page_size(struct.unpack_from("<I", d, 36)[0]) and _page_size(struct.unpack_from("<I", d, 44)[0]):
+        return parse_boot_pxa(d)
     (ksz, _ka, rsz, _ra, ssz, _sa, _ta, page, word10, _osv) = struct.unpack_from("<10I", d, 8)
     version = word10 if word10 <= 8 else 0
     dt_size = word10 if word10 > 8 else 0
