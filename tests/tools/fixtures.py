@@ -292,6 +292,22 @@ def build_all(out):
     trailer = blob(148) + b"\0" * 8 + b"EEEE" + blob(76)
     put("boot_v4_prefixed_signed.img", bytes(prefix) + inner + b"\0" * 4096 + trailer)
 
+    # --- Barnes & Noble signing headers: a fixed-size block in front ----------
+    # (AIK keeps the first 1 MiB -- 256 KiB on the tablets -- as master_boot.key.)
+    nook_host = boot_v012(0, kernel, ramdisk, cmdline="console=ttyO2,115200n8 init=/init",
+                          id_bytes=boot_id(hashlib.sha1, 0, kernel, ramdisk, b""))
+    put("boot_v0_nook.img",
+        (b"\0" * 64 + b"Green Loader" + blob((1 << 20) - 64 - 12)) + nook_host)
+    put("boot_v0_nooktab.img",
+        (b"\0" * 48 + b"BauwksBoot" + blob((256 << 10) - 48 - 10)) + nook_host)
+
+    # --- LG Bump: sixteen constant bytes after the image ----------------------
+    bump = bytes([0x41, 0xA9, 0xE4, 0x67, 0x74, 0x4D, 0x1D, 0x1B,
+                  0xA4, 0x29, 0xF2, 0xEC, 0xEA, 0x65, 0x52, 0x79])
+    put("boot_v0_bump.img", nook_host + bump)
+    put("boot_v0_bump_filled.img", (nook_host + bump).ljust(1 << 20, b"\0"))
+    put("boot_v0_bump_seandroid.img", nook_host + b"SEANDROIDENFORCE" + bump)
+
     # --- AVB footer: unaligned host (page 2048, odd page count) ---------
     k = kernel
     host = boot_v012(2, k, ramdisk, dtb=dtb, page=2048, cmdline="avb")

@@ -18,6 +18,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "abr/boot_image.hpp"
@@ -48,6 +49,20 @@ namespace {
 
 enum class Fmt { BOOT, VENDOR_BOOT, DTBO, DTB, VBMETA, UIMAGE, ELF_BOOT, UNKNOWN };
 
+// Where the "ANDROID!" container starts: within the first kMagicSearchLimit bytes (a vendor
+// wrapper in front of it), or -- Barnes & Noble Nook images -- right behind the fixed-size
+// signature header ("master_boot.key": 1 MiB, 256 KiB on the tablets), which is further away
+// than that.
+size_t find_container(const Bytes& d, const char* magic) {
+    size_t at = find_magic(d, magic, 8);
+    if (at != std::string::npos) return at;
+    const Identity id = identify(d);
+    if ((id.kind == Kind::NOOK || id.kind == Kind::NOOKTAB) && id.payload_offset &&
+        id.payload_offset + 8 <= d.size() && std::memcmp(d.data() + id.payload_offset, magic, 8) == 0)
+        return id.payload_offset;
+    return std::string::npos;
+}
+
 Fmt detect_format(const Bytes& d) {
     if (d.size() >= 8 && std::memcmp(d.data(), "ANDROID!", 8) == 0) return Fmt::BOOT;
     if (d.size() >= 8 && std::memcmp(d.data(), "VNDRBOOT", 8) == 0) return Fmt::VENDOR_BOOT;
@@ -64,7 +79,7 @@ Fmt detect_format(const Bytes& d) {
     // for one): the container's magic is not at offset 0 but close to it.
     // This is only consulted once nothing else matched, so a stray
     // "ANDROID!" deep inside some other format cannot hijack it.
-    size_t a = find_magic(d, "ANDROID!", 8);
+    size_t a = find_container(d, "ANDROID!");
     size_t v = find_magic(d, "VNDRBOOT", 8);
     if (a != std::string::npos && (v == std::string::npos || a < v)) return Fmt::BOOT;
     if (v != std::string::npos) return Fmt::VENDOR_BOOT;
@@ -332,21 +347,40 @@ Envelope load_envelope(const Manifest& m, const fs::path& dir) {
 // Notes for the user that should not abort anything.
 void warn(const std::string& msg) { std::cerr << "warning: " << msg << "\n"; }
 
-// A tail that is only zero fill and/or a bare SEAndroid marker is not a
-// signature; anything else kept around an edited container is, or may be.
-// `from` skips that many leading bytes of the tail (a signature abr has just
-// regenerated for the new image).
+// A tail that is only zero fill and/or the constant footers a bootloader looks for -- Samsung's
+// "SEANDROIDENFORCE", LG's Bump magic -- is not a signature of the image: they do not depend on
+// its content, so they stay valid when it is edited. Anything else kept around an edited
+// container is, or may be, a signature. `from` skips that many leading bytes of the tail (a
+// signature abr has just regenerated for the new image).
 bool tail_is_inert(const Bytes& tail, size_t from = 0) {
-    static const char kMarker[] = "SEANDROIDENFORCE";
+    static const std::string_view kMarkers[] = {
+        std::string_view("SEANDROIDENFORCE"),
+        std::string_view(reinterpret_cast<const char*>(kBumpMagic), sizeof kBumpMagic),
+    };
     size_t i = from;
-    while (i < tail.size() && tail[i] == 0) ++i;
-    if (i == tail.size()) return true;
-    return tail.size() - i == sizeof(kMarker) - 1 &&
-           std::memcmp(tail.data() + i, kMarker, sizeof(kMarker) - 1) == 0;
+    while (i < tail.size()) {
+        if (tail[i] == 0) {
+            ++i;
+            continue;
+        }
+        bool known = false;
+        for (std::string_view marker : kMarkers) {
+            if (tail.size() - i >= marker.size() &&
+                std::memcmp(tail.data() + i, marker.data(), marker.size()) == 0) {
+                i += marker.size();
+                known = true;
+                break;
+            }
+        }
+        if (!known) return false;
+    }
+    return true;
 }
 
-bool envelope_is_inert(const Envelope& e, size_t tail_from = 0) {
-    return e.prefix.empty() && tail_is_inert(e.tail, tail_from);
+// The prefix is inert when it is the Nook signature header: AIK keeps it as master_boot.key and
+// puts it back in front of whatever image it builds.
+bool envelope_is_inert(const Manifest& m, const Envelope& e, size_t tail_from = 0) {
+    return (e.prefix.empty() || m.has("prefix_kind")) && tail_is_inert(e.tail, tail_from);
 }
 
 // Did the rebuilt container differ from the one that was unpacked? (False
@@ -360,8 +394,7 @@ bool core_changed(const Manifest& m, const Bytes& core) {
 // AVBv1 signature) and are therefore not stale.
 Bytes assemble_envelope(const Manifest& m, const Envelope& e, const Bytes& core, bool changed,
                         size_t regenerated = 0) {
-    (void)m;
-    if (changed && !envelope_is_inert(e, regenerated)) {
+    if (changed && !envelope_is_inert(m, e, regenerated)) {
         warn("the image was changed, but the " + std::to_string(e.prefix.size()) +
              " bytes before it and the " + std::to_string(e.tail.size() - regenerated) +
              " bytes after it (vendor wrapper / signature data) are kept as they were; any "
@@ -581,7 +614,7 @@ void unpack_boot(const Bytes& whole, const fs::path& dir) {
     AvbFooter footer = detect_avb_footer(whole);
     Bytes host(whole.begin(), whole.begin() + static_cast<long>(footer.host_size));
 
-    size_t off = find_magic(host, "ANDROID!", 8);
+    size_t off = find_container(host, "ANDROID!");
     if (off == std::string::npos) throw FormatError("no 'ANDROID!' magic found");
     Bytes image(host.begin() + static_cast<long>(off), host.end());
     BootImage img = BootImage::parse(image);
@@ -646,6 +679,9 @@ void unpack_boot(const Bytes& whole, const fs::path& dir) {
 
     Envelope env = Envelope::capture(host, off, img.consumed);
     save_envelope(m, dir, env, host, off, img.consumed);
+    if (const Identity id = identify(host);
+        (id.kind == Kind::NOOK || id.kind == Kind::NOOKTAB) && off == id.payload_offset)
+        m.set("prefix_kind", id.aik_type());  // a constant header: nothing to go stale after an edit
     if (!env.prefix.empty() || !env.tail.empty()) {
         std::cout << "note: " << env.prefix.size() << " bytes before and " << env.tail.size()
                   << " bytes after the boot image are kept verbatim (prefix.bin / tail.bin)\n";
@@ -1132,7 +1168,7 @@ void print_info(const fs::path& path) {
         case Fmt::BOOT: {
             AvbFooter footer = detect_avb_footer(data);
             Bytes host(data.begin(), data.begin() + static_cast<long>(footer.host_size));
-            size_t off = find_magic(host, "ANDROID!", 8);
+            size_t off = find_container(host, "ANDROID!");
             BootImage img = BootImage::parse(Bytes(host.begin() + static_cast<long>(off), host.end()));
             std::cout << "header_version: " << img.header_version << "\n";
             if (img.pxa) {

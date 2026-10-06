@@ -570,6 +570,57 @@ else
     fail "bare SEANDROIDENFORCE tail triggered a stale-signature warning"
 fi
 
+# ---- constant signing blocks: Nook headers in front, the Bump magic behind
+roundtrip_check fx/boot_v0_nook.img "boot v0 behind a Nook signing header (1 MiB master_boot.key)" nook
+expect_line rt_nook "prefix_kind=NOOK" "Nook header recognised as a constant block"
+roundtrip_check fx/boot_v0_nooktab.img "boot v0 behind a Nook tablet signing header (256 KiB)" nooktab
+expect_line rt_nooktab "prefix_kind=NOOKTAB" "Nook tablet header recognised as a constant block"
+for pair in nook:1048576 nooktab:262144; do
+    t=${pair%%:*}
+    hdr=${pair##*:}
+    "$ABR" unpack "fx/boot_v0_$t.img" -o "ed_$t" >/dev/null 2>&1
+    edit_and_repack "ed_$t" "ed_$t.out"
+    "$ABR" unpack "ed_$t.out" -o "ed_${t}_re" >/dev/null 2>&1
+    if cmp -s <(head -c "$hdr" "fx/boot_v0_$t.img") <(head -c "$hdr" "ed_$t.out") &&
+        cmp -s "ed_$t/ramdisk.cpio" "ed_${t}_re/ramdisk.cpio" &&
+        ! grep -q "kept as they were" "ed_$t.out.err"; then
+        pass "an edited image behind a Nook header ($t): header put back unchanged, no stale-signature warning"
+    else
+        fail "an edited image behind a Nook header ($t) lost the header or warned about it"
+    fi
+done
+if said "NOOK signing (green loader)" "$ABR" identify -b fx/boot_v0_nook.img; then
+    pass "identify names the Nook wrapper"
+else
+    fail "identify did not name the Nook wrapper"
+fi
+
+roundtrip_check fx/boot_v0_bump.img "boot v0 + LG Bump footer" bump1
+roundtrip_check fx/boot_v0_bump_filled.img "boot v0 + LG Bump footer + zero fill to the partition size" bump2
+roundtrip_check fx/boot_v0_bump_seandroid.img "boot v0 + SEAndroid marker + LG Bump footer" bump3
+for pair in bump:bump1 bump_filled:bump2 bump_seandroid:bump3; do
+    t=${pair%%:*}
+    rt=${pair##*:}
+    "$ABR" unpack "fx/boot_v0_$t.img" -o "ed_$t" >/dev/null 2>&1
+    edit_and_repack "ed_$t" "ed_$t.out"
+    "$ABR" unpack "ed_$t.out" -o "ed_${t}_re" >/dev/null 2>&1
+    before=$(stat -c %s "fx/boot_v0_$t.img")
+    after=$(stat -c %s "ed_$t.out")
+    ok=1
+    ! grep -q "kept as they were" "ed_$t.out.err" || ok=0
+    cmp -s "rt_$rt/tail.bin" "ed_${t}_re/tail.bin" || ok=0
+    if [ "$t" = bump_filled ]; then  # still padded to the partition size
+        [ "$after" = "$before" ] || ok=0
+    else
+        [ "$after" -lt "$before" ] || ok=0
+    fi
+    if [ "$ok" = 1 ]; then
+        pass "an edited image keeps its constant footer ($t), no stale-signature warning"
+    else
+        fail "an edited image with a constant footer ($t) warned or lost the footer"
+    fi
+done
+
 # ---- AVB footer: host not 4096-aligned, salted digest, edit, signing
 roundtrip_check fx/boot_v2_avbfooter_unaligned.img "boot v2 + AVB hash footer (host not 4096-aligned, salted digest)" avbun
 if python3 "$TOOLS/verify.py" avb-footer fx/boot_v2_avbfooter_unaligned.img >/dev/null &&
