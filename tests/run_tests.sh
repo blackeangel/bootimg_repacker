@@ -1248,6 +1248,42 @@ else
     echo "SKIP: real boot_signer cross-check (needs javac, java and BouncyCastle bcprov.jar; set BCPROV_JAR to point at it)"
 fi
 
+# =========================================================================
+# Identification: the signatures of Android Image Kitchen's androidbootimg.magic,
+# written down as code. tests/tools/magic_samples.py makes one sample per rule
+# (and the awkward combinations) and knows what each must be called. When
+# ABR_AIK_MAGIC points at AIK's magic file and `file` is installed, abr is
+# compared with file(1) itself as well (the file is not part of this repository).
+# =========================================================================
+if [ -n "${ABR_AIK_MAGIC:-}" ] && [ ! -f "$ABR_AIK_MAGIC" ]; then
+    echo "warning: ABR_AIK_MAGIC=$ABR_AIK_MAGIC is not a file; comparing with the built-in table only" >&2
+    ABR_AIK_MAGIC=""
+fi
+if python3 "$TOOLS/magic_samples.py" check "$ABR" "${ABR_AIK_MAGIC:-}" >idcheck.out 2>&1; then
+    pass "identify: every signature of AIK's androidbootimg.magic is recognised as file(1) names it ($(tail -n1 idcheck.out))"
+else
+    fail "identify: abr and AIK's signature table disagree"
+    cat idcheck.out
+fi
+python3 "$TOOLS/magic_samples.py" write idsamples
+if [ "$("$ABR" identify idsamples/loki_rec)" = "idsamples/loki_rec: AOSP bootimg, LOKI header (recovery)" ]; then
+    pass "identify: without -b the file name is printed in front of the label"
+else
+    fail "identify: output format"
+fi
+for kind in blob:SIGNBLOB chromeos:ChromeOS sin2:Sony osip:OSIP krnl:Rockchip; do
+    sample="${kind%%:*}"
+    word="${kind##*:}"
+    rm -rf id_out
+    out="$("$ABR" unpack "idsamples/$sample" -o id_out 2>&1)"
+    rc=$?
+    if [ $rc -ne 0 ] && grep -q -- "$word" <<<"$out" && [ ! -e id_out ]; then
+        pass "unpack: a $sample image is named in the refusal, and no output directory is left behind"
+    else
+        fail "unpack: a $sample image should be refused by name, leaving no directory (rc=$rc: $out)"
+    fi
+done
+
 echo ""
 echo "===== $PASS passed, $FAIL failed ====="
 exit "$FAIL"

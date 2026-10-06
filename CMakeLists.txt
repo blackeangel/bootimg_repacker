@@ -115,6 +115,7 @@ add_library(abr_core STATIC
   src/uimage.cpp
   src/manifest.cpp
   src/envelope.cpp
+  src/identify.cpp
   src/bigint.cpp
   src/asn1.cpp
   src/rsa.cpp

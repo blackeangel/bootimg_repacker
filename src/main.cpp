@@ -26,6 +26,7 @@
 #include "abr/dtb.hpp"
 #include "abr/dtbo.hpp"
 #include "abr/envelope.hpp"
+#include "abr/identify.hpp"
 #include "abr/legacy/avb1.hpp"
 #include "abr/legacy/dhtb.hpp"
 #include "abr/legacy/elf_boot.hpp"
@@ -100,6 +101,9 @@ std::string describe_unknown(const Bytes& d) {
         return "this is a ZIP archive, not a boot-family image";
     if (d.size() >= 6 && std::memcmp(d.data(), "070701", 6) == 0)
         return "this is a raw cpio archive (a ramdisk), not a boot-family image";
+    // Not something abr unpacks, but something Android Image Kitchen's signature file names:
+    // say what it is rather than "unrecognized".
+    if (std::string note = identify(d).unsupported_note(); !note.empty()) return note;
     return "unrecognized image format (no boot/vendor_boot/dtbo/dtb/vbmeta/uImage/ELF signature "
            "found in the first 64 KiB)";
 }
@@ -1223,9 +1227,13 @@ void print_info(const fs::path& path) {
                            << ")\n";
             break;
         }
-        case Fmt::UNKNOWN:
-            std::cout << "(unrecognized format)\n";
+        case Fmt::UNKNOWN: {
+            const Identity id = identify(data);
+            std::cout << "(unrecognized format"
+                      << (id.kind == Kind::UNKNOWN ? std::string() : ": " + id.label) << ")\n";
+            if (std::string note = id.unsupported_note(); !note.empty()) std::cout << note << "\n";
             break;
+        }
     }
 }
 
@@ -1294,13 +1302,14 @@ void self_check(const fs::path& outdir, const Bytes& original) {
 
 void do_unpack(const fs::path& in, const fs::path& outdir) {
     Bytes data = read_file(in);
-    fs::create_directories(outdir);
 
     Bytes inner;
     auto dhtb = strip_dhtb(data, inner);
     const Bytes& payload = dhtb ? inner : data;
 
     Fmt f = detect_format(payload);
+    if (f == Fmt::UNKNOWN) throw FormatError(in.string() + ": " + describe_unknown(payload));
+    fs::create_directories(outdir);
     switch (f) {
         case Fmt::BOOT: unpack_boot(payload, outdir); break;
         case Fmt::VENDOR_BOOT: unpack_vendor_boot(payload, outdir); break;
@@ -1368,7 +1377,9 @@ void usage() {
         "  abr [-j N] info   <image>\n"
         "  abr [-j N] unpack <image> [-o <outdir>]\n"
         "  abr [-j N] repack <dir> -o <image> [--avb-key <private_key.pem>]\n"
-        "                              [--avb1-key <key> [--avb1-cert <cert.pem|cert.der>]]\n\n"
+        "                              [--avb1-key <key> [--avb1-cert <cert.pem|cert.der>]]\n"
+        "  abr identify [-b] <file>...    what it is, worded like Android Image Kitchen's\n"
+        "                                 `file -m androidbootimg.magic` (-b: the label only)\n\n"
         "  -j N         threads to use (default: the number of cores, at most 16; 1 = one\n"
         "               thread; also ABR_THREADS=N). The result never depends on it.\n"
         "  --avb-key    signing key for AVB 2.0 (vbmeta / footers): PEM or DER (.pk8)\n"
@@ -1450,6 +1461,26 @@ int main(int argc, char** argv) {
                 if ((args[i] == "-o" || args[i] == "--output") && i + 1 < args.size())
                     outdir = args[++i];
             do_unpack(in, outdir);
+        } else if (cmd == "identify") {
+            bool brief = false;
+            std::vector<std::string> files;
+            for (const std::string& a : args) {
+                if (a == "-b" || a == "--brief") brief = true;
+                else files.push_back(a);
+            }
+            if (files.empty()) { usage(); return 1; }
+            int status = 0;
+            for (const std::string& f : files) {
+                try {
+                    const Identity id = identify(read_file(f));
+                    if (!brief) std::cout << f << ": ";
+                    std::cout << id.label << "\n";
+                } catch (const std::exception& e) {
+                    std::cerr << "error: " << f << ": " << e.what() << "\n";
+                    status = 1;
+                }
+            }
+            return status;
         } else if (cmd == "repack") {
             if (args.empty()) { usage(); return 1; }
             fs::path dir = args[0];
