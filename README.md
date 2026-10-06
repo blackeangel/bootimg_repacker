@@ -11,7 +11,7 @@ build-time contents:
 
 | Format | Files it covers |
 |---|---|
-| boot (header v0-v4) | `boot.img`, `init_boot.img`, `boot-debug.img`, `boot-test-harness.img`, `recovery.img`, `recovery-two-step.img` |
+| boot (header v0-v4, and Marvell's PXA variant of v0) | `boot.img`, `init_boot.img`, `boot-debug.img`, `boot-test-harness.img`, `recovery.img`, `recovery-two-step.img`, the Samsung Galaxy J1 / Core Prime / Tab 4 boot images |
 | vendor_boot (header v3-v4) | `vendor_boot.img`, `vendor_boot-debug.img`, `vendor_kernel_boot.img` |
 | dtbo | `dtbo.img` (and the ACPIO variant) |
 | dtb | raw or concatenated Flattened Device Tree blobs |
@@ -21,7 +21,9 @@ build-time contents:
 
 Also handled transparently, wherever it appears around those: a
 MediaTek (MTK) sub-header on the kernel and/or ramdisk, a DHTB wrapper
-(with its SEAndroid footer/padding), an AVB hash footer on boot /
+(with its SEAndroid footer/padding), the Barnes & Noble Nook signing header
+in front of an image (1 MiB, 256 KiB on the tablets), LG's Bump and
+Samsung's SEAndroid footers behind it, an AVB hash footer on boot /
 vendor_boot / dtbo, and the vendor data described below.
 
 Compression: gzip, lz4 (frame and the Android/GKI "legacy" block
@@ -42,6 +44,7 @@ of a bare "unknown format".
 abr info   <image>
 abr unpack <image> [-o <outdir>]
 abr repack <dir> -o <image> [--avb-key <private_key.pem>] [--avb1-key <key> [--avb1-cert <cert>]]
+abr identify [-b] <file>...   # what is it? worded like Android Image Kitchen's `file -m androidbootimg.magic`
 # with any of them: -j N (or -jN, --threads N) = the most threads to use, 0 = automatic, 1 = none
 ```
 
@@ -61,6 +64,24 @@ compressed bytes are kept on the side and replayed verbatim if the
 extracted file comes back unchanged -- only an actual edit triggers
 recompression. See `tests/run_tests.sh` for this being checked against
 real images built with AOSP's own `mkbootimg.py`, `dtc`, and `mkimage`.
+
+### `abr identify`
+
+Android Image Kitchen decides what it is looking at by running `file` with
+its own signature file (`androidbootimg.magic`) and cutting the answer
+apart with `awk`. `abr` has the same signatures as code, so the same
+question needs no other program: `abr identify boot.img` prints the label
+(`AOSP bootimg`, `AOSP-PXA bootimg`, `NOOK signing (green loader)`,
+`MTK bootimg, KERNEL, ...`, `AVBv2 signing footer`, ...), `-b` leaves the
+file name off. Formats that `abr` recognises but cannot unpack yet (a
+signing blob, a ChromeOS kernel, Sony SIN, Intel OSIP, Rockchip KRNL) are
+named in the refusal, together with the AIK tool that opens them, instead
+of "unrecognized format"; a refused `unpack` leaves no empty directory
+behind. The test suite compares 98 synthetic samples with the built-in
+expectation table and, when `ABR_AIK_MAGIC` points at AIK's magic file and
+`file` is installed, with `file(1)` itself (the magic file is not shipped
+here). It deliberately differs from `file(1)` in four documented ways; see
+the header of `include/abr/identify.hpp`.
 
 ### Threads and compression levels
 
@@ -117,12 +138,18 @@ this in the manifest / as side files and writes it back:
   image that fails verification);
 - an AVBv1 boot signature (the `boot_signer` blob after the image):
   checked at unpack time and **re-created after you edit the image**
-  (see below).
+  (see below);
+- where a **long command line** was cut between the header's two fields:
+  AOSP's `mkbootimg.py` fills all 512 bytes of the first one, the old C
+  `mkbootimg` keeps a NUL at its end and continues after 511 (`cmdline_split`);
+- a **Marvell PXA** header (`pxa=true`, and its `unknown` word).
 
 If you edit an image that sits inside a vendor wrapper or signature
 trailer, `abr` warns: the wrapper is kept as it was, so a signature or
 checksum in it no longer matches. It cannot re-create vendor signatures
-it has no key for.
+it has no key for. Constant additions are not signatures and do not warn:
+zero fill, a `SEANDROIDENFORCE` marker, LG's Bump magic, and the Nook
+header in front of the image.
 
 ### Re-signing a vbmeta
 
@@ -297,6 +324,12 @@ is covered and how. The quirks found on real device dumps are pinned by
 synthetic fixtures built from the format specs (`tests/tools/fixtures.py`)
 and re-checked by an independent verifier (`tests/tools/verify.py`).
 
+The Marvell PXA header is judged by osm0sis's `pxa-mkbootimg` and
+`pxa-unpackbootimg` (compiled from their sources, not vendored, used when
+`PXA_MKBOOTIMG` / `PXA_UNPACKBOOTIMG` are set): 240 images made by the real tool
+unpack and repack byte-for-byte, and 34 edited ones come out equal to what the
+tool builds from the same pieces.
+
 Compression is judged by the real tools. For every codec the suite builds a
 boot image with `abr`, slices the ramdisk out of it with a separate script
 (`tests/tools/verify.py`, not `abr`) and has the real `gzip`, `lz4`, `zstd`,
@@ -350,9 +383,11 @@ Two smaller gaps:
 
 - **cpio ramdisk as a directory tree**: the ramdisk is extracted as one
   decompressed `ramdisk.cpio`; unpacking/packing its files is planned.
-- The rest of the Android Image Kitchen format list: PXA, OSIP/KRNL,
-  RKCRC, blobpack, QCDT tooling, ChromeOS `futility` signing, LOKI/AMONET,
-  BLOB/NOOK/SIN. See `PROGRESS.md` for the plan.
+- The rest of the Android Image Kitchen format list: OSIP and KRNL
+  (RKCRC) images, blobpack, QCDT tooling, ChromeOS `futility` signing,
+  LOKI/AMONET, Sony SIN. `abr identify` already names all of them; what
+  is missing is unpacking and packing them. See `PROGRESS.md` for the
+  plan.
 - U-Boot's newer FIT (Flattened Image Tree) format -- only the older
   legacy `mkimage` container is supported.
 - Filesystems (ext4, F2FS, EROFS, SquashFS) and sparse images: out of
