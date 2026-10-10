@@ -64,7 +64,7 @@ add_library(abr_cxx_std INTERFACE)
 target_compile_options(abr_cxx_std INTERFACE "$<$<COMPILE_LANGUAGE:CXX>:${ABR_CXX_STD_FLAG}>")
 
 option(ABR_BUILD_TESTS
-       "Build abr_unit_tests, the driver tests/run_tests.sh uses to check the self-contained crypto (BigInt/RSA/DER/SHA) and the thread helper. Off for cross builds." ON)
+       "Build abr_unit_tests, the driver tests/run_tests.sh uses to check the self-contained crypto (BigInt/RSA/DER/SHA), the thread helper and the cpio/ramdisk-directory code. Off for cross builds." ON)
 option(ABR_VENDOR_DEPS
        "Fetch and statically build zlib/lz4/zstd/xz/bzip2 from source (the shipping default). Turn OFF to use system dev packages instead, for fast local iteration." ON)
 option(ABR_STATIC_BINARY
@@ -115,6 +115,8 @@ add_library(abr_core STATIC
   src/uimage.cpp
   src/manifest.cpp
   src/envelope.cpp
+  src/cpio.cpp
+  src/ramdisk_tree.cpp
   src/identify.cpp
   src/bigint.cpp
   src/asn1.cpp
@@ -182,7 +184,7 @@ target_link_libraries(abr PRIVATE abr_core)
 abr_link_statically(abr)
 
 if(ABR_BUILD_TESTS)
-  add_executable(abr_unit_tests tests/unit/crypto_test.cpp tests/unit/par_test.cpp)
+  add_executable(abr_unit_tests tests/unit/crypto_test.cpp tests/unit/par_test.cpp tests/unit/cpio_test.cpp)
   target_link_libraries(abr_unit_tests PRIVATE abr_core)
   abr_link_statically(abr_unit_tests)
 endif()
