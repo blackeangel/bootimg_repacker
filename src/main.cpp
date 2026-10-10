@@ -619,10 +619,11 @@ Bytes assemble_envelope(const Manifest& m, const Envelope& e, const Bytes& core,
     }
     std::string outgrown;
     Bytes out = e.assemble(core, &outgrown);
-    // Bigger than the partition it was padded to: build_image() tries again with a denser compression
-    // (which may cure it). On that second try, and where nothing was compressed, it is only said.
+    // Bigger than the partition it was padded to: if something was compressed at a setting that has a
+    // denser one, build_image() tries again with that (which may cure it). Otherwise, and on that second
+    // try, it is only said.
     if (!outgrown.empty()) {
-        if (!opt.dense) throw DoesNotFit(outgrown);
+        if (!opt.dense && g_denser_would_help) throw DoesNotFit(outgrown);
         warn(outgrown);
     }
     return out;
@@ -1551,7 +1552,8 @@ Bytes build_image_once(const fs::path& dir, const RepackOptions& opt) {
 // has to be compressed again and the usual setting is less dense than the one the image was made with
 // (an OrangeFox vendor_boot: `zstd -19`, which abr's default level 3 does not match). Then the build is
 // tried once more with everything that is compressed again as dense as the codecs allow; what the first
-// try said is dropped, so it is not said twice.
+// try said is dropped, so it is not said twice. Where nothing was compressed at a setting that has a
+// denser one, a second try would build the very same image: the first try's words and error stand.
 Bytes build_image(const fs::path& dir, const RepackOptions& opt) {
     if (opt.dense) return build_image_once(dir, opt);
     Deferral held;
@@ -1561,17 +1563,19 @@ Bytes build_image(const fs::path& dir, const RepackOptions& opt) {
         held.flush();
         return image;
     } catch (const DoesNotFit& first) {
-        const bool denser = g_denser_would_help.load();
+        if (!g_denser_would_help) {
+            held.flush();
+            throw;
+        }
         held.discard();
-        if (denser)
-            note(std::string(first.what()) + "; compressing what was edited again, as densely as the codecs allow");
+        note(std::string(first.what()) + "; compressing what was edited again, as densely as the codecs allow");
         RepackOptions again = opt;
         again.dense = true;
         try {
             return build_image_once(dir, again);
         } catch (const DoesNotFit& second) {
-            if (!denser) throw;
-            throw DoesNotFit(std::string(second.what()) + " -- not even with what was edited compressed as densely as the codecs allow");
+            throw DoesNotFit(std::string(second.what()) +
+                             " -- not even with what was edited compressed as densely as the codecs allow");
         }
     } catch (...) {
         held.flush();  // what led up to the error is worth reading

@@ -2310,6 +2310,211 @@ else
     fail "ramdisk directory: unpack of fragments of several archives depends on the number of threads"
 fi
 
+# =========================================================================
+# An edit that makes the image too big for its partition. What was edited has to be compressed
+# again, and abr's usual setting for that is less dense than the one a build that cares about
+# size used: the real OrangeFox vendor_boot has its ramdisk at `zstd -19` (22.6 MB; level 3 makes
+# it 28.2 MB), and with one file added at abr's usual level the image outgrows its 64 MiB
+# partition by 9 KB. So the image is built once more, with everything that is compressed again
+# at the densest setting the decoders still read (gzip 9, zstd 19, xz 9, lz4 12). A codec that
+# has no denser setting gets no second try: the refusal (or the warning, where the image is only
+# padded) is what it always was.
+# =========================================================================
+python3 - "$TOOLS" <<'PYEOF'
+import random, sys
+sys.path.insert(0, sys.argv[1])
+import cpio_gen as g
+
+r = random.Random(11)
+words = [bytes(r.choices(b"abcdefghijklmnopqrstuvwxyz", k=r.randint(3, 9))) for _ in range(300)]
+text = b" ".join(r.choices(words, k=2000000 // 4 + 16))[:2000000]
+open("fit_noise.bin", "wb").write(r.randbytes(300000))  # nothing shrinks this
+# An mkbootfs ramdisk: the usual small tree and 2 MB of text in 20 files. Level 19 of zstd finds
+# a fifth more in it than level 3 does.
+files = [("res", g.S_DIR | 0o755, b"", (0, 0))]
+files += [("res/t%02d.txt" % i, g.S_REG | 0o644, text[i * 100000:(i + 1) * 100000], (0, 0)) for i in range(20)]
+open("fit_rd.cpio", "wb").write(g.mkbootfs(g.tree(files)))
+PYEOF
+
+fit_size() { if [ -f "$1" ]; then wc -c <"$1" | tr -d ' '; else echo 0; fi; }
+fit_log_count() { grep -c -- "$1" "$2"; }  # how many lines of the log say it (grep -c exits 1 on 0: only the count is used)
+fit_avb_ok() {  # <image> <partition name> <size>: the size of the partition, abr's and avbtool's verdicts on the descriptor
+    local d rc
+    d="$(mktemp -d -p .)"
+    cp "$1" "$d/$2.img"
+    python3 "$AVBTOOL" verify_image --image "$d/$2.img" >"$d/out" 2>&1
+    rc=$?
+    rm -rf "$d"
+    [ $rc -eq 0 ] && [ "$(fit_size "$1")" = "$3" ] && said "hash check:   OK" "$ABR" info "$1"
+}
+fit_zstd_reads() {  # <image> <expected plain ramdisk>: the real zstd decodes the ramdisk (true where it is not installed)
+    command -v zstd >/dev/null 2>&1 || return 0
+    python3 "$TOOLS/verify.py" ramdisk "$1" "$1.rd" || return 1
+    zstd -dc -q <"$1.rd" >"$1.rd.plain" 2>/dev/null && cmp -s "$1.rd.plain" "$2"
+}
+
+# The same image twice: with its ramdisk at zstd level 19 (as a build that wanted it small made it)
+# and at abr's usual level.
+thr_dir zstd fit_rd.cpio fit_dense
+echo "ramdisk_level=19" >>fit_dense/manifest.txt
+thr_dir zstd fit_rd.cpio fit_usual
+"$ABR" repack fit_dense -o fit_dense.img >/dev/null 2>&1
+"$ABR" repack fit_usual -o fit_usual.img >/dev/null 2>&1
+fit_dense_size=$(fit_size fit_dense.img)
+fit_usual_size=$(fit_size fit_usual.img)
+# avbtool keeps 64 KiB for the vbmeta blob and one block for the footer: the smallest partition it
+# takes this image into is that much bigger. The usual-level image must still not fit it.
+fit_part=$((fit_dense_size + 69632 + 4096))
+if [ "$fit_usual_size" -le $((fit_part + 4096)) ]; then
+    fail "fixture for the fit tests: the usual level (${fit_usual_size} bytes) is not clearly bigger than the dense one (${fit_dense_size}) plus avbtool's reserve"
+fi
+
+# ---- boot v4 with an AVB hash footer that has no room to spare: the file is put into the directory
+if python3 "$AVBTOOL" version >/dev/null 2>&1; then
+    cp fit_dense.img fit_avb.img
+    python3 "$AVBTOOL" add_hash_footer --image fit_avb.img --partition_size "$fit_part" --partition_name boot >/dev/null 2>&1
+    rd_unpack fit_avb.img fit_avb_u
+    printf 'abr test\n' >fit_avb_u/ramdisk/abr_test_file
+    "$ABR" -j4 repack fit_avb_u -o fit_avb_j4.img >fit_avb_j4.log 2>&1
+    fit_rc=$?
+    rd_ck "the repack worked" test "$fit_rc" = 0
+    rd_ck "the image is the size of the partition" test "$(fit_size fit_avb_j4.img)" = "$fit_part"
+    rd_ck "abr's hash check and avbtool's verify_image accept it" fit_avb_ok fit_avb_j4.img boot "$fit_part"
+    rd_ck "the second try is announced once, with the partition size" test "$(fit_log_count "no longer fits the original partition size ($fit_part bytes); compressing what was edited again, as densely as the codecs allow" fit_avb_j4.log)" = 1
+    rd_ck "what the first try said is not said again (the ramdisk is built from the directory)" test "$(fit_log_count "the ramdisk is built from the directory ramdisk/" fit_avb_j4.log)" = 1
+    rd_ck "what the first try said is not said again (the new file)" test "$(fit_log_count "abr_test_file" fit_avb_j4.log)" = 1
+    rd_ck "no warning" test "$(fit_log_count '^warning' fit_avb_j4.log)" = 0
+    rd_unpack fit_avb_j4.img fit_avb_re
+    rd_ck "the file is in the image" test "$(cat fit_avb_re/ramdisk/abr_test_file 2>/dev/null)" = "abr test"
+    rd_ck "nothing else in the directory changed" rd_same_tree_x fit_avb_u/ramdisk fit_avb_re/ramdisk abr_test_file
+    rd_ck "GNU cpio agrees with the directory" rd_oracle fit_avb_re
+    rd_ck "the real zstd reads the ramdisk" fit_zstd_reads fit_avb_j4.img fit_avb_re/ramdisk.cpio
+    "$ABR" -j1 repack fit_avb_u -o fit_avb_j1.img >/dev/null 2>&1
+    rd_ck "-j1 and -j4 give the same bytes" cmp -s fit_avb_j1.img fit_avb_j4.img
+    rd_done "dense boot v4 with a tight AVB hash footer: an edit that does not fit at the usual level is compressed again and fits"
+
+    # An untouched image is replayed byte for byte, and says nothing about any of this.
+    rd_unpack fit_avb.img fit_avb_same
+    "$ABR" repack fit_avb_same -o fit_avb_same.img >fit_avb_same.log 2>&1
+    rd_ck "an untouched repack is identical" cmp -s fit_avb.img fit_avb_same.img
+    rd_ck "and says nothing about a second try" test "$(fit_log_count 'densely' fit_avb_same.log)" = 0
+    rd_done "dense boot v4 with a tight AVB hash footer: an untouched repack is identical and no second try is announced"
+
+    # More than the partition holds at any setting: refused, the error says both tries were made.
+    rd_unpack fit_avb.img fit_big_u
+    cp fit_noise.bin fit_big_u/ramdisk/noise.bin
+    "$ABR" repack fit_big_u -o fit_big.img >fit_big.log 2>&1
+    fit_rc=$?
+    rd_ck "refused" test "$fit_rc" -ne 0
+    rd_ck "no image is left behind" test ! -e fit_big.img
+    rd_ck "the error says what does not fit" test "$(fit_log_count "no longer fits the original partition size ($fit_part bytes) -- not even with what was edited compressed as densely as the codecs allow" fit_big.log)" = 1
+    rd_ck "the second try was announced once" test "$(fit_log_count 'compressing what was edited again' fit_big.log)" = 1
+    rd_done "dense boot v4 with a tight AVB hash footer: an edit that does not fit even at the densest setting is refused, and the message says so"
+
+    # A codec with no denser setting (lz4 legacy is at its densest by default): no second try, no word about one.
+    thr_dir lz4_legacy fit_rd.cpio fit_lz4
+    "$ABR" repack fit_lz4 -o fit_lz4.img >/dev/null 2>&1
+    fit_lz4_part=$(($(fit_size fit_lz4.img) + 69632 + 4096))
+    cp fit_lz4.img fit_lz4_avb.img
+    python3 "$AVBTOOL" add_hash_footer --image fit_lz4_avb.img --partition_size "$fit_lz4_part" --partition_name boot >/dev/null 2>&1
+    rd_unpack fit_lz4_avb.img fit_lz4_u
+    cp fit_noise.bin fit_lz4_u/ramdisk/noise.bin
+    "$ABR" repack fit_lz4_u -o fit_lz4_big.img >fit_lz4_big.log 2>&1
+    fit_rc=$?
+    rd_ck "refused" test "$fit_rc" -ne 0
+    rd_ck "no image is left behind" test ! -e fit_lz4_big.img
+    rd_ck "the usual error" test "$(fit_log_count "no longer fits the original partition size ($fit_lz4_part bytes)" fit_lz4_big.log)" = 1
+    rd_ck "no talk of a denser compression" test "$(fit_log_count 'densely\|again' fit_lz4_big.log)" = 0
+    printf 'abr test\n' >fit_lz4_u/ramdisk/abr_test_file
+    rm -f fit_lz4_u/ramdisk/noise.bin
+    "$ABR" repack fit_lz4_u -o fit_lz4_ok.img >fit_lz4_ok.log 2>&1
+    rd_ck "a small edit fits" fit_avb_ok fit_lz4_ok.img boot "$fit_lz4_part"
+    rd_ck "and needs no second try" test "$(fit_log_count 'densely\|again' fit_lz4_ok.log)" = 0
+    rd_done "lz4_legacy ramdisk in a tight AVB partition: an edit that does not fit is refused as before, without a second try"
+else
+    echo "SKIP: tight-partition tests with an AVB footer (avbtool not usable)"
+fi
+
+# ---- boot v4 padded with zeros up to its partition (a raw partition dump): the same, with a warning at worst
+python3 - "$fit_dense_size" "$fit_usual_size" <<'PYEOF'
+import sys
+dense, usual = int(sys.argv[1]), int(sys.argv[2])
+pad = (dense + (usual - dense) // 2) // 4096 * 4096
+data = open("fit_dense.img", "rb").read()
+open("fit_pad.img", "wb").write(data + b"\0" * (pad - len(data)))
+open("fit_pad.size", "w").write(str(pad))
+PYEOF
+fit_pad=$(cat fit_pad.size)
+rd_unpack fit_pad.img fit_pad_u
+rd_ck "the padding is in the manifest" grep -q "^pad_to=$fit_pad\$" fit_pad_u/manifest.txt
+printf 'abr test\n' >fit_pad_u/ramdisk/abr_test_file
+"$ABR" repack fit_pad_u -o fit_pad_out.img >fit_pad_out.log 2>&1
+fit_rc=$?
+rd_ck "the repack worked" test "$fit_rc" = 0
+rd_ck "the image is the size of the partition" test "$(fit_size fit_pad_out.img)" = "$fit_pad"
+rd_ck "the second try is announced once" test "$(fit_log_count "compressing what was edited again, as densely as the codecs allow" fit_pad_out.log)" = 1
+rd_ck "no warning" test "$(fit_log_count '^warning' fit_pad_out.log)" = 0
+rd_unpack fit_pad_out.img fit_pad_re
+rd_ck "the file is in the image" test "$(cat fit_pad_re/ramdisk/abr_test_file 2>/dev/null)" = "abr test"
+rd_ck "nothing else in the directory changed" rd_same_tree_x fit_pad_u/ramdisk fit_pad_re/ramdisk abr_test_file
+rd_done "dense boot v4 padded to its partition size: an edit that does not fit at the usual level is compressed again and fits"
+
+rd_unpack fit_pad.img fit_padbig_u
+cp fit_noise.bin fit_padbig_u/ramdisk/noise.bin
+"$ABR" repack fit_padbig_u -o fit_padbig.img >fit_padbig.log 2>&1
+fit_rc=$?
+rd_ck "written all the same (the padding cannot be kept)" test "$fit_rc" = 0
+rd_ck "bigger than the partition" test "$(fit_size fit_padbig.img)" -gt "$fit_pad"
+rd_ck "the second try was announced once" test "$(fit_log_count 'compressing what was edited again' fit_padbig.log)" = 1
+rd_ck "one warning, about the size" test "$(fit_log_count '^warning: rebuilt image is' fit_padbig.log)" = 1
+rd_done "dense boot v4 padded to its partition size: an edit that does not fit at any setting is written with a warning, as before"
+
+thr_dir lz4_legacy fit_rd.cpio fit_lz4p
+"$ABR" repack fit_lz4p -o fit_lz4p.img >/dev/null 2>&1
+python3 -c 'import sys; open("fit_lz4pad.img", "wb").write(open("fit_lz4p.img", "rb").read() + b"\0" * 8192)'
+
+rd_unpack fit_lz4pad.img fit_lz4pad_u
+cp fit_noise.bin fit_lz4pad_u/ramdisk/noise.bin
+"$ABR" repack fit_lz4pad_u -o fit_lz4pad_out.img >fit_lz4pad_out.log 2>&1
+fit_rc=$?
+rd_ck "written all the same" test "$fit_rc" = 0
+rd_ck "bigger than the partition" test "$(fit_size fit_lz4pad_out.img)" -gt "$(fit_size fit_lz4pad.img)"
+rd_ck "one warning, about the size" test "$(fit_log_count '^warning: rebuilt image is' fit_lz4pad_out.log)" = 1
+rd_ck "no talk of a denser compression" test "$(fit_log_count 'densely\|again' fit_lz4pad_out.log)" = 0
+rd_done "lz4_legacy ramdisk padded to its partition size: an edit that does not fit is written with the warning it always had, without a second try"
+
+# ---- vendor_boot v4: ramdisk fragment 0 at zstd 19 in a tight partition (the shape of the OrangeFox image)
+if python3 "$AVBTOOL" version >/dev/null 2>&1; then
+    rd_unpack vendor_boot_v4.img fit_vb
+    cp fit_rd.cpio fit_vb/ramdisk0.cpio
+    sed -i 's/^ramdisk0_compression=.*/ramdisk0_compression=zstd/' fit_vb/manifest.txt
+    cp -a fit_vb fit_vb_dense
+    echo "ramdisk0_level=19" >>fit_vb_dense/manifest.txt
+    "$ABR" repack fit_vb_dense -o fit_vb_dense.img >/dev/null 2>&1
+    "$ABR" repack fit_vb -o fit_vb_usual.img >/dev/null 2>&1
+    fit_vb_part=$((($(fit_size fit_vb_dense.img) + 4095) / 4096 * 4096 + 69632 + 4096))
+    if [ "$(fit_size fit_vb_usual.img)" -le $((fit_vb_part + 4096)) ]; then
+        fail "fixture for the fit tests: vendor_boot at the usual level is not clearly bigger than at the dense one"
+    fi
+    cp fit_vb_dense.img fit_vb_avb.img
+    python3 "$AVBTOOL" add_hash_footer --image fit_vb_avb.img --partition_size "$fit_vb_part" --partition_name vendor_boot >/dev/null 2>&1
+    rd_unpack fit_vb_avb.img fit_vb_u
+    printf 'abr test\n' >fit_vb_u/ramdisk0/abr_test_file
+    "$ABR" repack fit_vb_u -o fit_vb_out.img >fit_vb_out.log 2>&1
+    fit_rc=$?
+    rd_ck "the repack worked" test "$fit_rc" = 0
+    rd_ck "the image is the size of the partition, abr's hash check and avbtool's verify_image accept it" fit_avb_ok fit_vb_out.img vendor_boot "$fit_vb_part"
+    rd_ck "the second try is announced once" test "$(fit_log_count 'compressing what was edited again' fit_vb_out.log)" = 1
+    rd_ck "no warning" test "$(fit_log_count '^warning' fit_vb_out.log)" = 0
+    rd_unpack fit_vb_out.img fit_vb_re
+    rd_ck "the file is in fragment 0" test "$(cat fit_vb_re/ramdisk0/abr_test_file 2>/dev/null)" = "abr test"
+    rd_ck "fragment 1 is the same as it was" cmp -s fit_vb_u/ramdisk1.cpio fit_vb_re/ramdisk1.cpio
+    "$ABR" -j1 repack fit_vb_u -o fit_vb_j1.img >/dev/null 2>&1
+    "$ABR" -j4 repack fit_vb_u -o fit_vb_j4.img >/dev/null 2>&1
+    rd_ck "-j1 and -j4 give the same bytes" cmp -s fit_vb_j1.img fit_vb_j4.img
+    rd_done "dense vendor_boot v4 with a tight AVB hash footer: an edit to fragment 0 is compressed again and fits"
+fi
+
 # ---- images of your own: ABR_REAL_IMAGES=<directory> tests/run_tests.sh <abr> checks every file of it the way
 # the fixtures above are checked -- an untouched repack is identical, every ramdisk archive is a directory that
 # GNU cpio agrees with, and a file put into a directory lands in the image. (Files abr does not take, an ext4
@@ -2339,7 +2544,6 @@ if [ -n "${ABR_REAL_IMAGES:-}" ] && [ -d "$ABR_REAL_IMAGES" ]; then
             "$ABR" repack "$rw.edit" -o "$rw.edit.img" >/dev/null 2>&1 && "$ABR" unpack "$rw.edit.img" -o "$rw.edit_re" >/dev/null 2>&1
             rd_ck "$first: a file put into the directory is in the image" test "$(cat "$rw.edit_re/$first/abr_test_file" 2>/dev/null)" = "abr test"
             rd_ck "$first: nothing else changed" rd_same_tree_x "$rw/$first" "$rw.edit_re/$first" abr_test_file
-            rd_ck "the image is the same size or larger by a little" test "$(wc -c <"$rw.edit.img")" -ge "$(wc -c <"$img")"
         fi
         rd_done "real image $rb: ${prefixes:+ramdisk directories (${prefixes//$'\n'/, }), }untouched repack identical$RD_GNU"
     done

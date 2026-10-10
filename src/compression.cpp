@@ -275,6 +275,10 @@ Bytes xz_compress(const Bytes& in, int level) {
     size_t out_pos = 0;
     lzma_ret rc = lzma_easy_buffer_encode(preset, LZMA_CHECK_CRC32, nullptr, in.data(), in.size(),
                                            out.data(), &out_pos, out.size());
+    if (rc == LZMA_MEM_ERROR || rc == LZMA_MEMLIMIT_ERROR)
+        fail("xz preset " + std::to_string(preset) + " needs about " +
+             std::to_string(lzma_easy_encoder_memusage(preset) >> 20) +
+             " MiB of memory, which this system does not give; name a lower preset with <component>_level= in manifest.txt");
     if (rc != LZMA_OK) fail("lzma_easy_buffer_encode failed: rc=" + std::to_string(rc));
     out.resize(out_pos);
     return out;

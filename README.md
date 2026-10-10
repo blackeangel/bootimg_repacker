@@ -174,6 +174,31 @@ number. For LZ4 legacy the default is the densest level (HC 12), which is what
 Android's build uses (`lz4 -l -12`): a faster setting makes an edited ramdisk
 enough larger to overflow a tightly sized `vendor_boot` partition.
 
+**An edit that no longer fits its partition.** Other codecs are written at
+their usual setting too (gzip 6, zstd 3, xz 6), and a build that cares about
+size may have used a denser one: OrangeFox's `vendor_boot` has its `ramdisk0`
+at `zstd -19` (22.6 MB; level 3 makes the same content 28.2 MB), and with one
+file added at level 3 the image plus its AVB metadata is 9 KB bigger than the
+64 MiB partition. So when the rebuilt image is bigger than the partition it
+came out of -- more than the AVB footer's partition size allows, or more than
+the fill it was padded to -- and something was compressed again at a setting
+that has a denser one, `abr` says so and builds the image once more with
+everything it compresses again at the densest setting the decoders still read:
+gzip 9, zstd 19 (an 8 MiB window, what `zstd -19` writes), xz 9, lz4 frame 12.
+```
+note: image plus AVB metadata (67117760 bytes) no longer fits the original partition size (67108864 bytes); compressing what was edited again, as densely as the codecs allow
+```
+What the first try said is dropped, so every message appears once; the result
+does not depend on `-j`; components that were not edited keep their original
+bytes; a `<component>_level=N` in the manifest is never overridden. The second
+try costs time -- level 19 is slow (24 s against 1 s for `zstd` on that
+ramdisk, two threads) -- and only runs when the first one did not fit. If even
+the densest setting is too big the error says so ("... -- not even with what
+was edited compressed as densely as the codecs allow"). Where nothing has a
+denser setting (LZ4 legacy and bzip2 are at their densest, lzma and lzo have no
+setting) there is no second try: an AVB footer that no longer fits is refused,
+a padded image is written bigger with a warning, as it always was.
+
 ### What `abr` keeps so a round trip stays exact
 
 Real images carry more than the format documents. `abr` records all of

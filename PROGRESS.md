@@ -36,7 +36,7 @@ tools" below.
 | self-contained RSA: BigInt (Knuth D, Montgomery), DER/PEM/X.509, PKCS#1 v1.5 sign/verify, PKCS#8/PKCS#1 key parsing, AVB public-key blob -- **no OpenSSL anywhere in the build** | **done + verified** (Python integers, `openssl dgst -sign`, `avbtool extract_public_key`; see "Self-contained crypto" below) |
 | manifest + CLI (`abr info/unpack/repack`) | **done** |
 | CMake: FetchContent-vendored static zlib/lz4/zstd/xz/bzip2 | **done + build-verified natively on Linux**, both the dynamic and the `-DABR_STATIC_BINARY=ON` fully-static configurations |
-| Test suite (`tests/run_tests.sh`) | **done, 153/153 passing** locally on g++-14 (with the optional `pxa-*` oracle and AIK's magic file); CI runs the matrix (g++-14, clang-20, Windows under wine, arm64 under qemu-user) -- see Verification |
+| Test suite (`tests/run_tests.sh`) | **done, 246/246 passing** locally on g++-14 (with the optional `pxa-*` oracle and AIK's magic file); CI runs the matrix (g++-14, clang-20, Windows under wine, arm64 under qemu-user) -- see Verification |
 | CMake cross toolchains (mingw-w64, Android NDK) | **done + verified** (mingw reproduced locally; NDK only provable via CI, see below) |
 | GitHub Actions static build matrix (linux-x86_64, windows-x86_64, android-arm64) | **done + verified**: run 35313499827, all 3 jobs green, all 3 static binaries produced as artifacts (abr-linux-x86_64, abr-windows-x86_64, abr-android-arm64) |
 
@@ -823,14 +823,72 @@ exits 2 on a dangling one -- use `--no-dereference`; `producer | grep -q` or
 `| head` can SIGPIPE the producer under `pipefail` -- capture first; a Windows
 build printed `\` in paths, so the CLI prints `/` everywhere in these messages.
 
+## An edit that no longer fits its partition (done)
+
+An image made with a denser compressor than abr's usual setting outgrows its
+partition as soon as the edited component is compressed again. The real case:
+OrangeFox's `vendor_boot` (64 MiB) has `ramdisk0` at `zstd -19` (22,564,936
+bytes for 97,479,936; `zstd -3` writes 28,201,208 for the same content). With a
+file added at abr's level 3 the image plus its AVB metadata is 67,117,760 bytes,
+8,896 more than the partition holds.
+
+`repack` now builds the image the usual way and, when it does not fit, builds it
+once more with everything that is compressed again at `dense_level(codec)`
+(`include/abr/compression.hpp`): gzip 9, zstd 19 (windowLog 23 = 8 MiB, what
+`zstd -19` writes, read by any zstd decoder), xz 9, lz4 frame 12; `-1` where the
+usual setting already is the densest (LZ4 legacy HC 12, bzip2 9) or the codec has
+no setting (lzma-alone, lzo). The OrangeFox edit then comes out at 67,108,864
+bytes -- the partition -- with a valid AVB footer (38 s on two cores, most of it
+level 19).
+
+How it is wired (`src/main.cpp`): `DoesNotFit` (a `FormatError`, `byte_io.hpp`)
+is thrown by the AVB footer layout (`src/vbmeta.cpp`) and by
+`assemble_envelope()` when the image outgrew the fill it was padded to;
+`build_image()` catches it, and retries only when `g_denser_would_help` says that
+something was compressed at a setting with a denser one (set in
+`load_component()`; a `<component>_level=` in the manifest is never overridden).
+Otherwise a second try would build the same image: the first try's error (or,
+for a padded image, its warning) stands, exactly as before. Messages of the
+first try are held back (`Deferral`) and dropped when a second try follows, so
+each appears once. If even the dense build is too big the error says
+"... -- not even with what was edited compressed as densely as the codecs allow".
+
+Why the result does not depend on `-j`: zstd derives its job size from the level,
+not from the worker count, and abr always asks for at least one worker (see
+`zstd_compress`); the tests compare `-j1` with `-j4` on the retried images.
+
+Measured: `zstd -19 -T2` on that ramdisk takes 24 s (1 s at level 3), so the
+second try is paid for only when the first did not fit. xz preset 9 needs about
+674 MiB to compress; if the system refuses, the error names the preset and the
+memory and says to put a lower one in `<component>_level=`.
+
+Tests (8 checks in the "too big for its partition" part of `tests/run_tests.sh`,
+and OrangeFox itself through `ABR_REAL_IMAGES`): a boot v4 whose ramdisk (an
+mkbootfs archive with 2 MB of text) was written at zstd 19, in a partition made
+by the real `avbtool add_hash_footer` as small as it allows (its reserve is
+69,632 bytes: partition = dense image + 73,728, which the level-3 image does not
+fit) -- the file put into `ramdisk/` is in the result, the image is exactly the
+partition, `avbtool verify_image` and abr's hash check accept it, the real `zstd`
+reads the ramdisk, the note appears once, `-j1` = `-j4`; the same padded with
+zeros instead of an AVB footer; the same for vendor_boot v4 fragment 0; 300 KB
+of noise added: refused with the "not even" message and no image left behind
+(AVB), or written with one warning (padded); the same with an LZ4 legacy ramdisk:
+the old refusal / warning, with no word of a second try; an untouched repack
+replays the original bytes and says nothing. As a negative control the retry
+was switched off once: exactly the retry-dependent checks failed.
+
+Found on the way: the RSA-verify check corrupted a signature byte with a fixed
+value (0x55), which left the signature unchanged one run in 256 -- an XOR now;
+and the GNU `cpio` oracle needs the package installed in the CI jobs (added to
+the `apt-get` lists of the linux, windows/wine and arm64/qemu jobs).
+
 ## Next steps (in order)
 
 1. Remaining AIK parity, easiest first: KRNL (+ `rkcrc`), AMONET, BLOB,
    OSIP, LOKI, QCDT creation, ChromeOS signing. The stages 2 and 3 of the
    user's own spec need a scope decision before anything is built.
 2. Housekeeping: AIK-like default levels as an opt-in, gzip OS-byte
-   determinism, UTF-8 `wmain` on Windows, a fit-aware retry when an edited
-   image overflows its partition, `zlib-ng` for faster gzip, splitting
+   determinism, UTF-8 `wmain` on Windows, `zlib-ng` for faster gzip, splitting
    `main.cpp`.
 3. Run the CI matrix on every push (the workflow only runs on `main`, pull
    requests and manual dispatch: dispatch it with
