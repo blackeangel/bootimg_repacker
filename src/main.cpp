@@ -15,7 +15,10 @@
 #include <cstring>
 #include <filesystem>
 #include <iostream>
+#include <mutex>
 #include <optional>
+#include <map>
+#include <set>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -34,6 +37,7 @@
 #include "abr/legacy/mtk.hpp"
 #include "abr/manifest.hpp"
 #include "abr/parallel.hpp"
+#include "abr/ramdisk_tree.hpp"
 #include "abr/sha.hpp"
 #include "abr/uimage.hpp"
 #include "abr/vbmeta.hpp"
@@ -153,7 +157,24 @@ Fmt fmt_from_name(const std::string& s) {
 struct RepackOptions {
     std::string avb_key_pem;               // --avb-key: AVB 2.0 signing key (file contents)
     std::optional<Signer> avb1_signer;     // --avb1-key/--avb1-cert: AVBv1 boot signature
+    std::string ramdisk_from;              // --ramdisk-from: "tree" or "cpio" when both could be meant
 };
+
+struct UnpackOptions {
+    bool tree = true;       // write the ramdisk as a directory tree as well (see ramdisk_tree.hpp)
+    bool keep_cpio = true;  // ... and keep ramdisk.cpio (--tree-only drops it)
+};
+
+// Messages for the user. Components are loaded on several threads, so these are serialised.
+std::mutex g_message_mutex;
+void warn(const std::string& msg) {
+    std::lock_guard<std::mutex> lock(g_message_mutex);
+    std::cerr << "warning: " << msg << "\n";
+}
+void note(const std::string& msg) {
+    std::lock_guard<std::mutex> lock(g_message_mutex);
+    std::cout << "note: " << msg << "\n";
+}
 
 // ------------------------------------------------------- component I/O --
 
@@ -245,23 +266,172 @@ void record_component(Manifest& m, const std::string& prefix, const std::string&
     m.set_hex(prefix + "_orig_hash", d.plain_hash);
 }
 
-Bytes load_component(const Manifest& m, const fs::path& dir, const std::string& prefix) {
-    std::string key = prefix + "_file";
-    if (!m.has(key)) return {};
-    std::string filename = m.get(key);
-    Bytes plain = read_file(dir / filename);
+// A ramdisk that is a cpio archive is also written as a directory (ramdisk_tree.hpp): the file
+// stays what the image held, byte for byte, the directory is what a person edits. The manifest
+// records the directory and the hash of the archive it builds, so that repack can tell whether it
+// was edited. When an archive cannot be a directory, it stays a file only and the reason is said.
+struct TreeJob {
+    std::string prefix;    // "ramdisk", "ramdisk0", ...: also the name of the directory
+    std::string filename;  // the archive's file, "ramdisk.cpio"
+    const DecodedComponent* decoded;
+};
 
-    Bytes result;
-    bool have_result = false;
-    Bytes stored_hash = m.get_hex(prefix + "_orig_hash");
-    if (!stored_hash.empty()) {
-        fs::path raw_path = dir / ".abr_raw" / (filename + ".raw");
-        if (hash::sha256(plain) == stored_hash && fs::exists(raw_path)) {
-            result = read_file(raw_path);
-            have_result = true;
+// How many cpio archives one after the other (see ramdisk_tree.hpp) the unpack recorded for `prefix`.
+size_t recorded_volumes(const Manifest& m, const std::string& prefix) {
+    const long n = std::strtol(m.get(prefix + "_tree_volumes", "1").c_str(), nullptr, 10);
+    return static_cast<size_t>(std::clamp<long>(n, 1, 256));
+}
+
+void save_ramdisk_trees(Manifest& m, const fs::path& dir, const std::vector<TreeJob>& jobs,
+                        const UnpackOptions& uo) {
+    // What an earlier unpack into this directory left is replaced; a directory of the same name
+    // that is anything else is somebody's, and is never touched (the library refuses to write over it).
+    std::map<std::string, size_t> earlier;  // the ramdisks an earlier unpack made, and how many archives each had
+    try {
+        const Manifest old = Manifest::load(dir / "manifest.txt");
+        for (const TreeJob& j : jobs)
+            if (old.has(j.prefix + "_tree")) earlier[j.prefix] = recorded_volumes(old, j.prefix);
+    } catch (const std::exception&) {
+    }
+
+    std::vector<const TreeJob*> todo;
+    for (const TreeJob& j : jobs) {
+        if (!j.decoded->present) continue;
+        if (const auto owned = earlier.find(j.prefix); owned != earlier.end()) {
+            std::error_code ec;
+            bool removed = false;
+            for (size_t i = 0; i < owned->second; ++i) {
+                const fs::path tree = dir / ramdisk_volume_name(j.prefix, i);
+                if (fs::exists(fs::symlink_status(tree, ec))) {
+                    fs::remove_all(tree, ec);
+                    removed = true;
+                }
+                fs::remove(dir / ramdisk_volume_meta(j.prefix, i), ec);
+            }
+            if (removed && !uo.tree)
+                note("the directory " + (dir / j.prefix).generic_string() + " of an earlier unpack was removed");
+        }
+        if (uo.tree) todo.push_back(&j);
+    }
+
+    std::vector<RamdiskTree> results(todo.size());
+    std::vector<std::string> failures(todo.size());
+    par::for_each(todo.size(), [&](size_t k) {
+        const TreeJob& j = *todo[k];
+        try {
+            results[k] = extract_ramdisk_tree(j.decoded->plain, dir, j.prefix);
+        } catch (const std::exception& e) {
+            failures[k] = e.what();
+        }
+    });
+
+    for (size_t k = 0; k < todo.size(); ++k) {
+        const TreeJob& j = *todo[k];
+        const RamdiskTree& t = results[k];
+        std::error_code ec;
+        if (!failures[k].empty()) {
+            note(j.filename + " stays a file only, the directory could not be written: " + failures[k]);
+            continue;
+        }
+        if (!t.created) {
+            if (!t.reason.empty()) note(j.filename + " stays a file only, it cannot be a directory: " + t.reason);
+            continue;
+        }
+        m.set(j.prefix + "_tree", j.prefix);
+        if (t.volumes > 1) m.set(j.prefix + "_tree_volumes", std::to_string(t.volumes));
+        m.set_hex(j.prefix + "_tree_hash", t.rebuilt_sha256);
+        // (with slashes whatever the system, so that "out/ramdisk/" is not "out\ramdisk/" on Windows)
+        std::string where = (dir / j.prefix).generic_string() + "/";
+        std::string metas = j.prefix + ".meta";
+        for (size_t i = 1; i < t.volumes; ++i) {
+            where += ", " + (dir / ramdisk_volume_name(j.prefix, i)).generic_string() + "/";
+            metas += ", " + ramdisk_volume_meta(j.prefix, i);
+        }
+        std::cout << "ramdisk: " << t.entries << " entries"
+                  << (t.volumes > 1 ? " in " + std::to_string(t.volumes) + " cpio archives one after the other" : std::string())
+                  << " -> " << where << " (+ " << metas << ")\n";
+        if (!t.exact)
+            warn("the directory " + j.prefix + "/ does not give " + j.filename + " back exactly (" +
+                 t.difference + "); the file is exact. An edit of the directory rebuilds the archive from it.");
+        if (!uo.keep_cpio) {
+            if (t.exact) fs::remove(dir / j.filename, ec);
+            else note(j.filename + " is kept: the directory alone would not give it back exactly");
         }
     }
-    if (!have_result) {
+}
+
+// What goes into the image for one component. For a ramdisk that also exists as a directory (see
+// ramdisk_tree.hpp) there are two places it may have been edited, and which one counts is decided
+// by what changed since unpacking, not by file times: the file by the hash of its contents, the
+// directory by the hash of the archive that is built from it. Nothing changed: the bytes the image
+// had are replayed. One changed: that one wins. Both: abr cannot merge them and says so, unless
+// --ramdisk-from names the one to use.
+Bytes load_component(const Manifest& m, const fs::path& dir, const std::string& prefix,
+                     const RepackOptions& opt) {
+    const std::string key = prefix + "_file";
+    if (!m.has(key)) return {};
+    const std::string filename = m.get(key);
+    const fs::path file = dir / filename;
+    const fs::path raw_path = dir / ".abr_raw" / (filename + ".raw");
+    const Bytes stored_hash = m.get_hex(prefix + "_orig_hash");
+    const bool has_tree_entry = m.has(prefix + "_tree");
+    if (opt.ramdisk_from == "tree" && !has_tree_entry && prefix.rfind("ramdisk", 0) == 0)
+        warn("--ramdisk-from tree: " + filename + " has no directory in this unpack, the file is used");
+
+    std::optional<Bytes> from_file;
+    Bytes file_hash;
+    if (fs::exists(file)) {
+        from_file = read_file(file);
+        file_hash = hash::sha256(*from_file);
+    }
+    const bool file_changed = from_file && (stored_hash.empty() || file_hash != stored_hash);
+
+    std::optional<Bytes> from_tree;
+    Bytes tree_hash;
+    bool tree_changed = false;
+    std::string tree_name;
+    PackReport report;  // what building from the directories had to say (notes are said only if it is used)
+    if (has_tree_entry && opt.ramdisk_from != "cpio") {
+        tree_name = m.get(prefix + "_tree");
+        // The directories of all the archives (see ramdisk_tree.hpp): one that is gone leaves its archive
+        // out, and only when every one is gone is the directory as good as not there.
+        const size_t volumes = recorded_volumes(m, prefix);
+        bool any_directory = false;
+        for (size_t i = 0; i < volumes; ++i) any_directory = any_directory || fs::is_directory(dir / ramdisk_volume_name(tree_name, i));
+        if (any_directory) {
+            Bytes rebuilt = pack_ramdisk_tree(dir, tree_name, volumes, &report);
+            for (const std::string& w : report.warnings) warn(w);
+            tree_hash = hash::sha256(rebuilt);
+            tree_changed = tree_hash != m.get_hex(prefix + "_tree_hash");
+            if (tree_changed || opt.ramdisk_from == "tree" || !from_file) from_tree = std::move(rebuilt);
+        } else if (opt.ramdisk_from == "tree") {
+            throw FormatError("--ramdisk-from tree: the directory " + (dir / tree_name).generic_string() + " is missing");
+        }
+    }
+    if (tree_changed && file_changed && opt.ramdisk_from.empty())
+        throw FormatError("both " + filename + " and the directory " + tree_name +
+                          "/ have been changed since unpacking, and abr cannot merge the two. Undo one "
+                          "of them, or say which one to use: --ramdisk-from tree  or  --ramdisk-from cpio");
+
+    const bool use_tree = from_tree && (opt.ramdisk_from == "tree" || tree_changed || !from_file);
+    if (!use_tree && !from_file) from_file = read_file(file);  // neither is there: the usual error
+    const Bytes& plain = use_tree ? *from_tree : *from_file;
+    const bool original = !stored_hash.empty() && (use_tree ? tree_hash : file_hash) == stored_hash;
+
+    Bytes result;
+    if (original && fs::exists(raw_path)) {
+        result = read_file(raw_path);  // untouched: the very bytes the image had
+    } else {
+        if (use_tree) {
+            for (const std::string& n : report.notes) note(n);
+            std::string from;  // "ramdisk/", "ramdisk/ and ramdisk.vol2/", "ramdisk/, ramdisk.vol2/ and ramdisk.vol3/"
+            for (size_t i = 0; i < report.built.size(); ++i)
+                from += (i == 0 ? "" : i + 1 == report.built.size() ? " and " : ", ") + report.built[i] + "/";
+            const std::string size = std::to_string(plain.size()) + " bytes";
+            note("the " + prefix + " is built from the director" + (report.built.size() > 1 ? "ies " : "y ") + from + " (" +
+                 (report.built.size() > 1 ? std::to_string(report.built.size()) + " cpio archives one after the other, " : std::string()) +
+                 size + ")");
+        }
         auto c = codec_from_name(m.get(prefix + "_compression", "none"));
         // Optional `<prefix>_level=N` in the manifest picks the compression level
         // (codec-specific; absent or -1: the codec's default).
@@ -275,7 +445,7 @@ Bytes load_component(const Manifest& m, const fs::path& dir, const std::string& 
 // load_component() for several components at once, on several threads (the
 // recompression of an edited one is where the time goes). In input order.
 std::vector<Bytes> load_components(const Manifest& m, const fs::path& dir,
-                                   const std::vector<std::string>& prefixes) {
+                                   const std::vector<std::string>& prefixes, const RepackOptions& opt) {
     std::vector<uintmax_t> size(prefixes.size(), 0);
     std::vector<size_t> order(prefixes.size());
     for (size_t i = 0; i < prefixes.size(); ++i) {
@@ -290,7 +460,7 @@ std::vector<Bytes> load_components(const Manifest& m, const fs::path& dir,
     std::vector<Bytes> out(prefixes.size());
     par::for_each(prefixes.size(), [&](size_t k) {
         const size_t i = order[k];
-        out[i] = load_component(m, dir, prefixes[i]);
+        out[i] = load_component(m, dir, prefixes[i], opt);
     });
     return out;
 }
@@ -343,9 +513,6 @@ Envelope load_envelope(const Manifest& m, const fs::path& dir) {
     e.pad_to = m.get_u64("pad_to", 0);
     return e;
 }
-
-// Notes for the user that should not abort anything.
-void warn(const std::string& msg) { std::cerr << "warning: " << msg << "\n"; }
 
 // A tail that is only zero fill and/or the constant footers a bootloader looks for -- Samsung's
 // "SEANDROIDENFORCE", LG's Bump magic -- is not a signature of the image: they do not depend on
@@ -610,7 +777,7 @@ std::string hex_words(const std::array<uint32_t, 4>& w) {
     return tmp.get("x");
 }
 
-void unpack_boot(const Bytes& whole, const fs::path& dir) {
+void unpack_boot(const Bytes& whole, const fs::path& dir, const UnpackOptions& uo) {
     AvbFooter footer = detect_avb_footer(whole);
     Bytes host(whole.begin(), whole.begin() + static_cast<long>(footer.host_size));
 
@@ -670,6 +837,7 @@ void unpack_boot(const Bytes& whole, const fs::path& dir) {
         record_component(m, "kernel", "kernel", parts[0]);
         record_component(m, "ramdisk", "ramdisk.cpio", parts[1]);
         record_component(m, "second", "second", parts[2]);
+        save_ramdisk_trees(m, dir, {{"ramdisk", "ramdisk.cpio", &parts[1]}}, uo);
     }
     save_raw(m, dir, "dt", img.dt, "dt.img");
     save_raw(m, dir, "recovery_dtbo", img.recovery_dtbo, "recovery_dtbo.img");
@@ -741,7 +909,7 @@ Bytes repack_boot(const Manifest& m, const fs::path& dir, const RepackOptions& o
     img.missing_tail_padding = m.get_u64("missing_tail_padding", 0);
 
     {
-        auto parts = load_components(m, dir, {"kernel", "ramdisk", "second"});
+        auto parts = load_components(m, dir, {"kernel", "ramdisk", "second"}, opt);
         img.kernel = std::move(parts[0]);
         img.ramdisk = std::move(parts[1]);
         img.second = std::move(parts[2]);
@@ -764,7 +932,7 @@ Bytes repack_boot(const Manifest& m, const fs::path& dir, const RepackOptions& o
 
 // ------------------------------------------------------- vendor_boot.img --
 
-void unpack_vendor_boot(const Bytes& whole, const fs::path& dir) {
+void unpack_vendor_boot(const Bytes& whole, const fs::path& dir, const UnpackOptions& uo) {
     AvbFooter footer = detect_avb_footer(whole);
     Bytes host(whole.begin(), whole.begin() + static_cast<long>(footer.host_size));
     size_t off = find_magic(host, "VNDRBOOT", 8);
@@ -815,6 +983,12 @@ void unpack_vendor_boot(const Bytes& whole, const fs::path& dir) {
         }
         record_component(m, p, p + ".cpio", fragment_parts[i]);
     }
+    std::vector<TreeJob> tree_jobs;
+    for (size_t i = 0; i < fragment_parts.size(); ++i) {
+        const std::string p = "ramdisk" + std::to_string(i);
+        tree_jobs.push_back({p, p + ".cpio", &fragment_parts[i]});
+    }
+    save_ramdisk_trees(m, dir, tree_jobs, uo);
     Envelope env = Envelope::capture(host, off, img.consumed);
     save_envelope(m, dir, env, host, off, img.consumed);
     save_avb_footer(m, dir, footer, host);
@@ -842,7 +1016,7 @@ Bytes repack_vendor_boot(const Manifest& m, const fs::path& dir, const RepackOpt
     uint32_t count = m.get_u32("ramdisk_count", 0);
     std::vector<std::string> fragment_prefixes;
     for (uint32_t i = 0; i < count; ++i) fragment_prefixes.push_back("ramdisk" + std::to_string(i));
-    std::vector<Bytes> fragment_data = load_components(m, dir, fragment_prefixes);
+    std::vector<Bytes> fragment_data = load_components(m, dir, fragment_prefixes, opt);
     for (uint32_t i = 0; i < count; ++i) {
         std::string p = "ramdisk" + std::to_string(i);
         VendorRamdiskEntry e;
@@ -1078,14 +1252,14 @@ void unpack_elf_boot(const Bytes& data, const fs::path& dir) {
            "abr elf_boot manifest -- edit then `abr repack " + dir.string() + " -o out.img`");
 }
 
-Bytes repack_elf_boot(const Manifest& m, const fs::path& dir) {
+Bytes repack_elf_boot(const Manifest& m, const fs::path& dir, const RepackOptions& opt) {
     legacy::ElfBootImage img;
     img.is_64bit = m.get_bool("is_64bit", false);
     img.machine = static_cast<uint16_t>(m.get_u32("machine", 40));
     uint32_t count = m.get_u32("segment_count", 0);
     std::vector<std::string> segment_prefixes;
     for (uint32_t i = 0; i < count; ++i) segment_prefixes.push_back("segment" + std::to_string(i));
-    std::vector<Bytes> segment_data = load_components(m, dir, segment_prefixes);
+    std::vector<Bytes> segment_data = load_components(m, dir, segment_prefixes, opt);
     for (uint32_t i = 0; i < count; ++i) {
         std::string p = "segment" + std::to_string(i);
         legacy::ElfSegment s;
@@ -1301,7 +1475,7 @@ Bytes build_image(const fs::path& dir, const RepackOptions& opt) {
         case Fmt::DTB: result = repack_dtb(m, dir); break;
         case Fmt::VBMETA: result = repack_vbmeta(m, dir, opt); break;
         case Fmt::UIMAGE: result = repack_uimage(m, dir); break;
-        case Fmt::ELF_BOOT: result = repack_elf_boot(m, dir); break;
+        case Fmt::ELF_BOOT: result = repack_elf_boot(m, dir, opt); break;
         case Fmt::UNKNOWN:
             throw FormatError("manifest.txt has no (or an unrecognized) 'type=' field");
     }
@@ -1349,7 +1523,7 @@ void self_check(const fs::path& outdir, const Bytes& original) {
     }
 }
 
-void do_unpack(const fs::path& in, const fs::path& outdir) {
+void do_unpack(const fs::path& in, const fs::path& outdir, const UnpackOptions& uo) {
     Bytes data = read_file(in);
 
     Bytes inner;
@@ -1360,8 +1534,8 @@ void do_unpack(const fs::path& in, const fs::path& outdir) {
     if (f == Fmt::UNKNOWN) throw FormatError(in.string() + ": " + describe_unknown(payload));
     fs::create_directories(outdir);
     switch (f) {
-        case Fmt::BOOT: unpack_boot(payload, outdir); break;
-        case Fmt::VENDOR_BOOT: unpack_vendor_boot(payload, outdir); break;
+        case Fmt::BOOT: unpack_boot(payload, outdir, uo); break;
+        case Fmt::VENDOR_BOOT: unpack_vendor_boot(payload, outdir, uo); break;
         case Fmt::DTBO: unpack_dtbo(payload, outdir); break;
         case Fmt::DTB: unpack_dtb(payload, outdir); break;
         case Fmt::VBMETA: unpack_vbmeta(payload, outdir); break;
@@ -1424,9 +1598,10 @@ void usage() {
     std::cout <<
         "abr -- Android boot-family image unpacker/repacker\n\n"
         "  abr [-j N] info   <image>\n"
-        "  abr [-j N] unpack <image> [-o <outdir>]\n"
+        "  abr [-j N] unpack <image> [-o <outdir>] [--no-tree | --tree-only]\n"
         "  abr [-j N] repack <dir> -o <image> [--avb-key <private_key.pem>]\n"
         "                              [--avb1-key <key> [--avb1-cert <cert.pem|cert.der>]]\n"
+        "                              [--ramdisk-from tree|cpio]\n"
         "  abr identify [-b] <file>...    what it is, worded like Android Image Kitchen's\n"
         "                                 `file -m androidbootimg.magic` (-b: the label only)\n\n"
         "  -j N         threads to use (default: the number of cores, at most 16; 1 = one\n"
@@ -1434,7 +1609,13 @@ void usage() {
         "  --avb-key    signing key for AVB 2.0 (vbmeta / footers): PEM or DER (.pk8)\n"
         "  --avb1-key   key for the old boot_signer signature of a boot image (the public AOSP\n"
         "               test key is used when omitted); <key> may be a PEM/DER file or, as in\n"
-        "               Android Image Kitchen, a base name N with N.pk8 and N.x509.pem\n\n"
+        "               Android Image Kitchen, a base name N with N.pk8 and N.x509.pem\n"
+        "  A ramdisk is unpacked twice: ramdisk.cpio (exactly what the image held) and, when it\n"
+        "  can be one, the directory ramdisk/ with ramdisk.meta (owners, modes, order). Edit\n"
+        "  either; repack takes the one that changed (--ramdisk-from decides if both did).\n"
+        "  --no-tree    unpack: write ramdisk.cpio only\n"
+        "  --tree-only  unpack: write the directory only (ramdisk.cpio is dropped when the\n"
+        "               directory gives it back exactly)\n\n"
         "Supported: boot.img/init_boot.img/boot-debug.img/boot-test-harness.img,\n"
         "recovery.img/recovery-two-step.img (header v0-v4), vendor_boot.img/\n"
         "vendor_boot-debug.img/vendor_kernel_boot.img (header v3-v4), dtbo.img,\n"
@@ -1506,10 +1687,24 @@ int main(int argc, char** argv) {
             if (args.empty()) { usage(); return 1; }
             fs::path in = args[0];
             fs::path outdir = in.stem();
-            for (size_t i = 1; i < args.size(); ++i)
+            UnpackOptions uo;
+            for (size_t i = 1; i < args.size(); ++i) {
                 if ((args[i] == "-o" || args[i] == "--output") && i + 1 < args.size())
                     outdir = args[++i];
-            do_unpack(in, outdir);
+                else if (args[i] == "--no-tree")
+                    uo.tree = false;
+                else if (args[i] == "--tree-only")
+                    uo.keep_cpio = false;
+                else {
+                    std::cerr << "unpack: unknown option " << args[i] << "\n";
+                    return 1;
+                }
+            }
+            if (!uo.tree && !uo.keep_cpio) {
+                std::cerr << "unpack: --no-tree and --tree-only contradict each other\n";
+                return 1;
+            }
+            do_unpack(in, outdir, uo);
         } else if (cmd == "identify") {
             bool brief = false;
             std::vector<std::string> files;
@@ -1547,6 +1742,14 @@ int main(int argc, char** argv) {
                     avb1_key = args[++i];
                 else if (args[i] == "--avb1-cert" && i + 1 < args.size())
                     avb1_cert = args[++i];
+                else if (args[i] == "--ramdisk-from" && i + 1 < args.size()) {
+                    opt.ramdisk_from = args[++i];
+                    if (opt.ramdisk_from != "tree" && opt.ramdisk_from != "cpio") {
+                        std::cerr << "repack: --ramdisk-from takes 'tree' or 'cpio', not '" << opt.ramdisk_from
+                                  << "'\n";
+                        return 1;
+                    }
+                }
                 else if (args[i].rfind("-", 0) == 0) {
                     std::cerr << "repack: unknown option " << args[i] << "\n";
                     return 1;
