@@ -54,6 +54,10 @@ void write_file(const std::filesystem::path& path, const uint8_t* data, size_t s
 // as it does on every other platform instead of CRLF (the console still shows it correctly).
 void set_binary_stdio();
 
+// Windows only: gives a file the System attribute, which is how Cygwin and MSYS2 mark the files that
+// stand for their symbolic links. A no-op elsewhere. False when Windows refused (the file is still there).
+bool mark_system_file(const std::filesystem::path& path);
+
 // ---------------------------------------------------------------------
 // Alignment helpers
 // ---------------------------------------------------------------------

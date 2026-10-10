@@ -5,6 +5,13 @@
 #include <fcntl.h>
 #include <io.h>
 #include <cstdio>
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 #endif
 
 namespace abr {
@@ -38,6 +45,17 @@ void set_binary_stdio() {
     _setmode(_fileno(stdin), _O_BINARY);
     _setmode(_fileno(stdout), _O_BINARY);
     _setmode(_fileno(stderr), _O_BINARY);
+#endif
+}
+
+bool mark_system_file(const std::filesystem::path& path) {
+#ifdef _WIN32
+    const DWORD now = GetFileAttributesW(path.c_str());
+    if (now == INVALID_FILE_ATTRIBUTES) return false;
+    return SetFileAttributesW(path.c_str(), now | FILE_ATTRIBUTE_SYSTEM) != 0;
+#else
+    (void)path;
+    return true;
 #endif
 }
 
