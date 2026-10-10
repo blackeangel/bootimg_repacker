@@ -42,8 +42,8 @@ of a bare "unknown format".
 
 ```sh
 abr info   <image>
-abr unpack <image> [-o <outdir>]
-abr repack <dir> -o <image> [--avb-key <private_key.pem>] [--avb1-key <key> [--avb1-cert <cert>]]
+abr unpack <image> [-o <outdir>] [--no-tree | --tree-only]
+abr repack <dir> -o <image> [--ramdisk-from tree|cpio] [--avb-key <private_key.pem>] [--avb1-key <key> [--avb1-cert <cert>]]
 abr identify [-b] <file>...   # what is it? worded like Android Image Kitchen's `file -m androidbootimg.magic`
 # with any of them: -j N (or -jN, --threads N) = the most threads to use, 0 = automatic, 1 = none
 ```
@@ -64,6 +64,64 @@ compressed bytes are kept on the side and replayed verbatim if the
 extracted file comes back unchanged -- only an actual edit triggers
 recompression. See `tests/run_tests.sh` for this being checked against
 real images built with AOSP's own `mkbootimg.py`, `dtc`, and `mkimage`.
+
+### The ramdisk as a directory
+
+Like Android Image Kitchen's `ramdisk/`, `unpack` also lays the ramdisk out as
+files you can edit: `ramdisk/` next to `ramdisk.cpio` (a vendor_boot has
+`ramdisk0/`, `ramdisk1/`, ... one per fragment). Add, change or delete files,
+then `repack`: the archive is built again from the directory. Nothing is run
+(no `cpio`, no `find`, no shell), so it works the same on Android, Linux and
+Windows. An untouched directory is not rebuilt at all -- the image's own
+compressed bytes are replayed, which keeps the round trip exact. If both
+`ramdisk.cpio` and the directory were edited, `abr` stops and asks which one
+counts (`--ramdisk-from tree` or `--ramdisk-from cpio`); `--no-tree` writes
+only `ramdisk.cpio`, `--tree-only` only the directory.
+
+What a directory cannot hold -- owners, modes, device nodes, the order of the
+records, inode numbers, link counts -- is written beside it to `ramdisk.meta`,
+one readable line per entry, and **that file, not the file system, is the
+authority**. That is what makes the tree cross-platform: Windows has no owners
+or modes, so a tree unpacked there (or zipped, or carried through git) would
+lose them if they were read from the files.
+
+- A file that is in the metadata keeps the mode and owner the metadata gives it,
+  whatever the file system says; to change one, edit its line. A file deleted
+  from the directory is deleted from the ramdisk.
+- A file that is **new** gets the owner and time of the metadata's `default`
+  line and the permissions of its `newmode` line: root, `0644` for a file,
+  `0755` for a directory, `0777` for a link, and `0755` for an executable
+  file -- one that starts with `#!`, an ELF program (not a `.so` or `.ko`), or,
+  where the system has such a bit, one with the owner's executable bit. A line
+  of its own in `ramdisk.meta` gives a path any mode and owner. `repack` lists
+  the new and the deleted entries, so a mode that is not what you meant shows.
+- **Symbolic links** are real links on Linux and Android. Windows cannot make
+  them without administrator rights, so there a link is the small file that
+  Cygwin and MSYS2 use (`!<symlink>`, the byte-order mark FF FE, the target in
+  UTF-16LE, two zero bytes) carrying the System attribute -- no rights needed.
+  Every form is read back as a link wherever the directory was carried: a real
+  link, such a file, or -- where the metadata says the entry is a link -- a text
+  file holding the target.
+- A ramdisk that is **several cpio archives one after the other** (what
+  Magisk's own `cpio` makes: the ramdisk, then an archive with `.backup/` and
+  `overlay.d/`) gets a directory and a metadata file for each: `ramdisk/`,
+  `ramdisk.vol2/`, `ramdisk.vol3/`, ..., with `ramdisk.meta`,
+  `ramdisk.vol2.meta`, ... Every archive keeps its own magic, digit case and
+  padding, and an edit rebuilds only the archive it is in. A directory that is
+  deleted leaves its archive out of the image (`repack` says so); a directory
+  the unpack did not make is ignored with a warning.
+- The digits of a cpio header are upper case in GNU cpio and `gen_init_cpio`
+  and lower case in Android's `mkbootfs`, Magisk and libarchive; the metadata
+  records which (`hex upper|lower`), so a rebuilt archive is what the tool that
+  made the original would write.
+
+Only `newc` and `crc` archives become directories. One that cannot (the old
+`odc` and binary kinds, hard links, a name twice, a `..` or an absolute name,
+junk between archives, and on Windows a name Windows cannot hold) stays a
+`ramdisk.cpio` as before, and `unpack` says why. A directory that `unpack` did
+not make is never overwritten. The test suite builds ramdisks with GNU cpio 2.15
+itself and with a writer of its own, and compares GNU cpio's listing and
+extraction with what `abr` unpacked and rebuilt.
 
 ### `abr identify`
 
@@ -381,8 +439,8 @@ Two smaller gaps:
 
 ## Not implemented (yet)
 
-- **cpio ramdisk as a directory tree**: the ramdisk is extracted as one
-  decompressed `ramdisk.cpio`; unpacking/packing its files is planned.
+- Hard links in a ramdisk's cpio archive (the ramdisk then stays one
+  `ramdisk.cpio`); a directory tree is made for `newc`/`crc` archives only.
 - The rest of the Android Image Kitchen format list: OSIP and KRNL
   (RKCRC) images, blobpack, QCDT tooling, ChromeOS `futility` signing,
   LOKI/AMONET, Sony SIN. `abr identify` already names all of them; what

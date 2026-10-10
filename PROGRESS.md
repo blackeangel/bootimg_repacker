@@ -709,7 +709,7 @@ compiled from source and used only as oracles, never as a dependency.
 | NOOK (1 MiB) / NOOKTAB (256 KiB) header (`master_boot.key`) | done, as a constant prefix; synthetic fixtures only |
 | tail footers AVBv1 / AVBv2 / Bump / SEAndroid | AVBv1 and AVBv2 verified and re-created after an edit (`boot_signer` / `avbtool` oracles); Bump and SEAndroid kept verbatim and inert |
 | ramdisk codecs gzip / lzop / xz / lzma / bzip2 / lz4 / lz4-legacy | done, all judged by the real tools; plus zstd |
-| **ramdisk as a directory tree** (`cpio -i` / `find . | cpio -H newc`) | **not yet; the next big item** (design below) |
+| **ramdisk as a directory tree** (`cpio -i` / `find . | cpio -H newc`) | **done** for newc/crc, including several archives one after the other; owners/modes live in `ramdisk.meta`, links work on Windows; odc/binary/hard links stay a `ramdisk.cpio` (see "The ramdisk as a directory" below) |
 | AIK's compression defaults (`xz -1 -Ccrc32`, `lz4 -9`) and `--level` | abr uses each codec's usual setting; `<component>_level=N` overrides |
 | `--original` (repack with the stored ramdisk, skip `ramdisk/`), `--origsize` (pad back to the original size), `--forceelf` (repack an ELF as ELF), `--avbkey` | not needed as options: an untouched `ramdisk.cpio` is replayed as it was (compressed bytes included), the recorded partition-size fill (`pad_to`) is always written back, an ELF is always rebuilt as an ELF (AIK's default converts it to an AOSP image instead; abr cannot do that conversion), and `--avb-key` / `--avb1-key` are the signing keys |
 | BLOB (`blobunpack`, AndroidRoot/BlobTools) | recognised by `abr identify`, not unpacked |
@@ -728,26 +728,111 @@ shelling out to, the actual `elftool`/`mkmtkhdr`/`loki_tool`/etc. binaries --
 the point is one self-contained static binary. Their source is a reference
 for the format, not something to link against or invoke.
 
+## The ramdisk as a directory (done)
+
+`unpack` writes `ramdisk.cpio` (decompressed, byte for byte what the image held)
+and, when the archive can be one, the directory `ramdisk/` (vendor_boot:
+`ramdisk0/`, `ramdisk1/`, ...) with `ramdisk.meta`. Code: `include/abr/cpio.hpp`
++ `src/cpio.cpp` (reader and writer of newc `070701` and crc `070702`),
+`include/abr/ramdisk_tree.hpp` + `src/ramdisk_tree.cpp` (extract, rebuild, the
+metadata), the wiring in `src/main.cpp` (`save_ramdisk_trees`,
+`load_component`). Tests: `tests/unit/cpio_test.cpp` (`abr_unit_tests cpio`:
+1686 checks, 150 random ramdisks with random edits among them), the "ramdisk as
+a directory" section of `tests/run_tests.sh` (about 85 checks) with
+`tests/tools/cpio_gen.py` (a writer and reader of its own) and
+`tests/tools/ramdisk_oracle.py` (GNU cpio 2.15 as the judge: its listing and its
+extraction against the directory and the metadata). `ABR_REAL_IMAGES=<dir>
+tests/run_tests.sh <abr>` runs the same checks on the user's own images.
+
+**Which file counts.** Neither `ramdisk.cpio` nor the directory changed: the
+image's own compressed bytes are replayed (that is the exact round trip). Only
+the file changed: the file. Only the directory: the archive rebuilt from it.
+Both: an error, unless `--ramdisk-from tree|cpio`. "Changed" is a hash:
+`ramdisk_orig_hash` for the file, `ramdisk_tree_hash` (SHA-256 of the archive
+rebuilt from the untouched directory) for the tree -- never file times.
+`--no-tree` writes only the file, `--tree-only` only the directory.
+
+**The directives of 7 Oct, one by one.**
+
+1. *Several cpio archives one after the other (what Magisk's cpio unpacks).*
+   Supported: the archives of the stream are split (the zero fill after one
+   belongs to it; the next starts at a multiple of 4; at most 64; junk or an
+   odc archive between or after them keeps the whole ramdisk a file) and each
+   gets `ramdisk/`, `ramdisk.vol2/`, ... with `ramdisk.meta`,
+   `ramdisk.vol2.meta`, ...; the manifest says `ramdisk_tree_volumes=N` (only
+   when N > 1). Each archive keeps its own magic, digit case, name style and
+   fill. A volume whose directory was deleted is left out of the image (a note
+   says so); if all are gone `ramdisk.cpio` is used; a directory beyond the
+   last one is ignored with a warning (a new archive comes from `ramdisk.cpio`,
+   not from a new directory); a foreign non-empty `ramdisk.volN/` refuses the
+   whole tree ("is not an empty directory") rather than leave an archive half
+   in a directory; a later unpack removes the volumes of an earlier one that
+   the new image does not have.
+2. *Permissions of files put into the ramdisk, which Windows loses.* They live
+   in `ramdisk.meta` and are never read from the file system for an entry the
+   metadata knows. A new path gets `default uid= gid= mtime= dev=` and
+   `newmode file=0644 exec=0755 dir=0755 link=0777` from the header of the
+   metadata (editable), where "exec" means a `#!` script, an ELF program (not
+   `.so`, `.ko`, `.so.N`) or the owner-execute bit (not compiled on Windows,
+   where it does not exist). A path changing its kind is new. A line of its
+   own in the metadata gives any path any mode and owner. `repack` names what
+   it found new (12 at most, then "and N more") and what was deleted. The
+   leftovers of file managers (`.DS_Store`, `Thumbs.db`, `desktop.ini`) are
+   left out, with a note.
+3. *Symbolic links without administrator rights.* POSIX: a real link.
+   Windows: always the Cygwin/MSYS2 file -- `!<symlink>`, the mark FF FE, the
+   target in UTF-16LE (surrogate pairs beyond the first plane), `00 00` -- plus
+   the System attribute (`SetFileAttributesW`, `mark_system_file()` in
+   `byte_io.cpp`); that is the scheme of the user's ext4 unpacker (`attrib +s`)
+   and `tar_repacker`. Read back from a real link, a Cygwin file, the older
+   UTF-8 form of it, or -- when the metadata says `l` -- a text file with the
+   target (CR/LF stripped). A file whose metadata line says `f` stays a file
+   even if it looks like a link file (a note says how to change that). A tree
+   unpacked on Linux, carried to Windows (or through git without symlinks) and
+   repacked there gives the same ramdisk: the tests turn every link into a
+   Cygwin file and into a text file and demand the identical image.
+
+**What GNU cpio taught.** Its header digits are upper case (`gen_init_cpio`
+too); Android's `mkbootfs`, Magisk and libarchive write lower case. The first
+rebuilt archive differed from GNU's at byte 9 until `hex upper|lower` was
+recorded per archive (a mix inside one archive is refused). The GNU cpio 2.15
+of the test machine writes the root as `.` and every other name plain, the
+archives AIK makes have `./x`: `names plain|dotslash`, the root being an entry
+of its own. The fill after the trailer is a multiple of 512 (its I/O block)
+counted from the start of the whole stream, which is why `tail align N` is
+relative to the ramdisk and not to the archive; the heuristic tries 512 or 256
+(the likelier first), 1024, 4096, no fill, else `tail size N`. GNU cpio reads
+only the first archive of a stream, so the oracle cuts the stream itself.
+
+**Refused, kept as `ramdisk.cpio` with the reason in the log:** odc and binary
+archives, hard links (two names with one device and inode and a link count
+above 1), a name twice, `..` or an
+absolute name, a file before its directory, a link target with a line break,
+mixed magics or digit cases, an archive off its boundary, junk, a cut-short
+archive; on Windows also names it cannot hold (`"`, `\`, a control character, a
+trailing dot or space, `CON`, `NUL` ...), and on any system a file system that
+tells two names of the archive apart less well than the archive does.
+
+**Not done / later:** odc and binary archives (rare), hard links, a helper that
+makes Cygwin link files on Windows for a person who adds a link by hand (a text
+file with the target works when the metadata says `l`, but a brand-new link
+needs the Cygwin file or a line of its own).
+
+**Lessons from the test suite** (they cost time): `diff -r` follows links and
+exits 2 on a dangling one -- use `--no-dereference`; `producer | grep -q` or
+`| head` can SIGPIPE the producer under `pipefail` -- capture first; a Windows
+build printed `\` in paths, so the CLI prints `/` everywhere in these messages.
+
 ## Next steps (in order)
 
-1. **cpio ramdisk as a directory tree** (task 11). Design settled, nothing
-   written yet: newc (`070701`), crc (`070702`), odc (`070707`) and binary
-   archives; Android ramdisks are AOSP-`mkbootfs`-style newc (inodes from
-   300000, nlink 1, mtime 0, uid/gid 0, depth-first alphabetical order, a
-   trailer padded to 256/512). `ramdisk.cpio` stays the byte-exact source of
-   truth; the tree is written next to it with `ramdisk.meta` (type, mode,
-   uid, gid, mtime, device numbers, link target per path), and which of the
-   two was edited is decided by a hash of the cpio rebuilt from the tree
-   (`ramdisk_tree_hash`). Safety: no `..`, no absolute paths, no names
-   Windows cannot hold, case collisions reported. GNU cpio 2.15 is the oracle.
-2. Remaining AIK parity, easiest first: KRNL (+ `rkcrc`), AMONET, BLOB,
+1. Remaining AIK parity, easiest first: KRNL (+ `rkcrc`), AMONET, BLOB,
    OSIP, LOKI, QCDT creation, ChromeOS signing. The stages 2 and 3 of the
    user's own spec need a scope decision before anything is built.
-3. Housekeeping: AIK-like default levels as an opt-in, gzip OS-byte
+2. Housekeeping: AIK-like default levels as an opt-in, gzip OS-byte
    determinism, UTF-8 `wmain` on Windows, a fit-aware retry when an edited
    image overflows its partition, `zlib-ng` for faster gzip, splitting
    `main.cpp`.
-4. Run the CI matrix on every push (the workflow only runs on `main`, pull
+3. Run the CI matrix on every push (the workflow only runs on `main`, pull
    requests and manual dispatch: dispatch it with
    `gh api -X POST repos/<repo>/actions/workflows/build.yml/dispatches -f ref=<branch>`).
 
@@ -987,8 +1072,9 @@ Useful as a checklist; wrong in places, and much wider than `abr`:
   contradictory header / out-of-range offsets"*, *"mark a signature invalid
   after a payload change"* -- right, and now actually enforced (see above).
 - Stage 1 also lists **CPIO** (newc/crc/odc/binary), **MBN**, **FIT/ITB**
-  and Qualcomm **ELF** loaders -- not in abr yet (abr's ELF is the Sony
-  boot-image ELF). Stage 2/3 (Rockchip, Amlogic upgrade packages, MediaTek
+  and Qualcomm **ELF** loaders -- CPIO is done for newc/crc (odc and binary
+  are kept as files, see below); the others are not in abr yet (abr's ELF is
+  the Sony boot-image ELF). Stage 2/3 (Rockchip, Amlogic upgrade packages, MediaTek
   logo/md1img, Tegra BLOB/BCT, Samsung tar.md5, sparse) is a different and
   much larger scope than "the boot-image family"; some of it already has a
   sibling tool in the suite (`tar_repacker`, `md1img_repacker`). Needs the
@@ -998,9 +1084,8 @@ Useful as a checklist; wrong in places, and much wider than `abr`:
 
 1. ~~**AVBv1 BootSignature**~~ -- **done** (detect, verify, re-sign with the
    AOSP test key or `--avb1-key/--avb1-cert`; self-contained RSA).
-2. **CPIO ramdisk as a directory tree** (newc, crc, odc, binary): AIK
-   parity and spec stage 1. Keep an index of the original member order and
-   header fields so an unedited ramdisk still round-trips byte-for-byte.
+2. ~~**CPIO ramdisk as a directory tree**~~ -- **done** for newc and crc
+   (see "The ramdisk as a directory"); odc and binary archives stay files.
 3. Remaining AIK parity: PXA, OSIP/KRNL, RKCRC, blobpack, QCDT, ChromeOS
    futility signing, LOKI/AMONET, BLOB/NOOK/SIN.
 4. Spec stage 1 leftovers: MBN, FIT/ITB. Spec stages 2/3: scope decision.
