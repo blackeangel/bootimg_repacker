@@ -9,6 +9,7 @@
 //
 // Format is auto-detected from magic bytes; see detect_format() below.
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -158,6 +159,9 @@ struct RepackOptions {
     std::string avb_key_pem;               // --avb-key: AVB 2.0 signing key (file contents)
     std::optional<Signer> avb1_signer;     // --avb1-key/--avb1-cert: AVBv1 boot signature
     std::string ramdisk_from;              // --ramdisk-from: "tree" or "cpio" when both could be meant
+    // The second try of build_image(): what had to be compressed again is compressed as densely as the
+    // decoders allow (dense_level()), because the first try made an image too big for its partition.
+    bool dense = false;
 };
 
 struct UnpackOptions {
@@ -166,15 +170,57 @@ struct UnpackOptions {
 };
 
 // Messages for the user. Components are loaded on several threads, so these are serialised.
+// While a build may still be tried again (see build_image) they are held back, so that what the
+// first try said is not said twice: Deferral::flush() says them, ~Deferral() drops what is left.
 std::mutex g_message_mutex;
-void warn(const std::string& msg) {
+struct HeldMessage {
+    bool is_warning;
+    std::string text;
+};
+bool g_holding_messages = false;
+std::vector<HeldMessage> g_held_messages;
+// Set while an image is built when something was compressed at the usual setting that a denser one
+// would have made smaller: only then is a second try worth it (see build_image).
+std::atomic<bool> g_denser_would_help{false};
+void say(bool is_warning, const std::string& msg) {
     std::lock_guard<std::mutex> lock(g_message_mutex);
-    std::cerr << "warning: " << msg << "\n";
+    if (g_holding_messages) {
+        g_held_messages.push_back({is_warning, msg});
+    } else if (is_warning) {
+        std::cerr << "warning: " << msg << "\n";
+    } else {
+        std::cout << "note: " << msg << "\n";
+    }
 }
-void note(const std::string& msg) {
-    std::lock_guard<std::mutex> lock(g_message_mutex);
-    std::cout << "note: " << msg << "\n";
-}
+void warn(const std::string& msg) { say(true, msg); }
+void note(const std::string& msg) { say(false, msg); }
+
+class Deferral {
+public:
+    Deferral() {
+        std::lock_guard<std::mutex> lock(g_message_mutex);
+        g_holding_messages = true;
+    }
+    Deferral(const Deferral&) = delete;
+    Deferral& operator=(const Deferral&) = delete;
+    // Say what was held back, in order, and stop holding.
+    void flush() {
+        std::lock_guard<std::mutex> lock(g_message_mutex);
+        g_holding_messages = false;
+        for (const HeldMessage& h : g_held_messages) {
+            if (h.is_warning) std::cerr << "warning: " << h.text << "\n";
+            else std::cout << "note: " << h.text << "\n";
+        }
+        g_held_messages.clear();
+    }
+    // Forget what was held back, and stop holding.
+    void discard() {
+        std::lock_guard<std::mutex> lock(g_message_mutex);
+        g_holding_messages = false;
+        g_held_messages.clear();
+    }
+    ~Deferral() { discard(); }
+};
 
 // ------------------------------------------------------- component I/O --
 
@@ -432,11 +478,14 @@ Bytes load_component(const Manifest& m, const fs::path& dir, const std::string& 
                  (report.built.size() > 1 ? std::to_string(report.built.size()) + " cpio archives one after the other, " : std::string()) +
                  size + ")");
         }
-        auto c = codec_from_name(m.get(prefix + "_compression", "none"));
+        const Codec codec = codec_from_name(m.get(prefix + "_compression", "none")).value_or(Codec::NONE);
         // Optional `<prefix>_level=N` in the manifest picks the compression level
-        // (codec-specific; absent or -1: the codec's default).
-        const int level = static_cast<int>(std::strtol(m.get(prefix + "_level", "-1").c_str(), nullptr, 10));
-        result = compress(c.value_or(Codec::NONE), plain, level);
+        // (codec-specific; absent or -1: the codec's default -- or, on the second try of a build
+        // that did not fit its partition, the densest the decoders allow).
+        int level = static_cast<int>(std::strtol(m.get(prefix + "_level", "-1").c_str(), nullptr, 10));
+        if (level < 0 && opt.dense) level = dense_level(codec);
+        else if (level < 0 && dense_level(codec) >= 0) g_denser_would_help = true;
+        result = compress(codec, plain, level);
     }
     if (m.has(prefix + "_mtk_name")) result = add_mtk_header(result, m.get(prefix + "_mtk_name"));
     return result;
@@ -560,7 +609,7 @@ bool core_changed(const Manifest& m, const Bytes& core) {
 // `regenerated`: leading bytes of e.tail that were just rebuilt for `core` (an
 // AVBv1 signature) and are therefore not stale.
 Bytes assemble_envelope(const Manifest& m, const Envelope& e, const Bytes& core, bool changed,
-                        size_t regenerated = 0) {
+                        size_t regenerated, const RepackOptions& opt) {
     if (changed && !envelope_is_inert(m, e, regenerated)) {
         warn("the image was changed, but the " + std::to_string(e.prefix.size()) +
              " bytes before it and the " + std::to_string(e.tail.size() - regenerated) +
@@ -568,14 +617,19 @@ Bytes assemble_envelope(const Manifest& m, const Envelope& e, const Bytes& core,
              "signature, size or checksum stored there still describes the ORIGINAL image, so a "
              "bootloader that verifies it may reject the result");
     }
-    std::string note;
-    Bytes out = e.assemble(core, &note);
-    if (!note.empty()) warn(note);
+    std::string outgrown;
+    Bytes out = e.assemble(core, &outgrown);
+    // Bigger than the partition it was padded to: build_image() tries again with a denser compression
+    // (which may cure it). On that second try, and where nothing was compressed, it is only said.
+    if (!outgrown.empty()) {
+        if (!opt.dense) throw DoesNotFit(outgrown);
+        warn(outgrown);
+    }
     return out;
 }
 
-Bytes assemble_envelope(const Manifest& m, const fs::path& dir, const Bytes& core) {
-    return assemble_envelope(m, load_envelope(m, dir), core, core_changed(m, core));
+Bytes assemble_envelope(const Manifest& m, const fs::path& dir, const Bytes& core, const RepackOptions& opt) {
+    return assemble_envelope(m, load_envelope(m, dir), core, core_changed(m, core), 0, opt);
 }
 
 // ------------------------------------------------- trailing AVB footer --
@@ -926,7 +980,7 @@ Bytes repack_boot(const Manifest& m, const fs::path& dir, const RepackOptions& o
     const bool changed = core_changed(m, core);
     const size_t regenerated = refresh_avb1_signature(
         m, env, core, img.header_version <= 2 ? img.page_size : 4096, changed, opt);
-    Bytes host = assemble_envelope(m, env, core, changed, regenerated);
+    Bytes host = assemble_envelope(m, env, core, changed, regenerated, opt);
     return reattach_avb_footer(m, dir, std::move(host), opt.avb_key_pem);
 }
 
@@ -1029,7 +1083,7 @@ Bytes repack_vendor_boot(const Manifest& m, const fs::path& dir, const RepackOpt
         e.data = std::move(fragment_data[i]);
         img.ramdisk_fragments.push_back(std::move(e));
     }
-    Bytes host = assemble_envelope(m, dir, img.build());
+    Bytes host = assemble_envelope(m, dir, img.build(), opt);
     return reattach_avb_footer(m, dir, std::move(host), opt.avb_key_pem);
 }
 
@@ -1084,7 +1138,7 @@ Bytes repack_dtbo(const Manifest& m, const fs::path& dir, const RepackOptions& o
         e.data = load_raw(m, dir, p);
         img.entries.push_back(std::move(e));
     }
-    Bytes host = assemble_envelope(m, dir, img.build());
+    Bytes host = assemble_envelope(m, dir, img.build(), opt);
     return reattach_avb_footer(m, dir, std::move(host), opt.avb_key_pem);
 }
 
@@ -1462,9 +1516,8 @@ void print_info(const fs::path& path) {
 
 // ------------------------------------------------------------- dispatch --
 
-// Rebuilds the file described by an unpacked directory (everything `repack`
-// does except writing the result).
-Bytes build_image(const fs::path& dir, const RepackOptions& opt) {
+// Rebuilds the file described by an unpacked directory, once (see build_image).
+Bytes build_image_once(const fs::path& dir, const RepackOptions& opt) {
     Manifest m = Manifest::load(dir / "manifest.txt");
     Fmt f = fmt_from_name(m.get("type"));
     Bytes result;
@@ -1491,6 +1544,39 @@ Bytes build_image(const fs::path& dir, const RepackOptions& opt) {
         result = wrap_dhtb(result, dhtb);
     }
     return result;
+}
+
+// Rebuilds the file described by an unpacked directory (everything `repack` does except writing the
+// result). An edit can make an image too big for the partition it came out of when what was edited
+// has to be compressed again and the usual setting is less dense than the one the image was made with
+// (an OrangeFox vendor_boot: `zstd -19`, which abr's default level 3 does not match). Then the build is
+// tried once more with everything that is compressed again as dense as the codecs allow; what the first
+// try said is dropped, so it is not said twice.
+Bytes build_image(const fs::path& dir, const RepackOptions& opt) {
+    if (opt.dense) return build_image_once(dir, opt);
+    Deferral held;
+    g_denser_would_help = false;
+    try {
+        Bytes image = build_image_once(dir, opt);
+        held.flush();
+        return image;
+    } catch (const DoesNotFit& first) {
+        const bool denser = g_denser_would_help.load();
+        held.discard();
+        if (denser)
+            note(std::string(first.what()) + "; compressing what was edited again, as densely as the codecs allow");
+        RepackOptions again = opt;
+        again.dense = true;
+        try {
+            return build_image_once(dir, again);
+        } catch (const DoesNotFit& second) {
+            if (!denser) throw;
+            throw DoesNotFit(std::string(second.what()) + " -- not even with what was edited compressed as densely as the codecs allow");
+        }
+    } catch (...) {
+        held.flush();  // what led up to the error is worth reading
+        throw;
+    }
 }
 
 // Offset of the first byte where a and b differ (or the shorter length).

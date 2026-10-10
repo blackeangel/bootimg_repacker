@@ -1017,8 +1017,9 @@ if [ -x "$UNIT" ]; then
     openssl req -x509 -new -key rk2048.pem -subj "/CN=abr-test" -days 3650 -out rk2048_cert.pem >/dev/null 2>&1
     openssl x509 -in rk2048_cert.pem -outform DER -out rk2048_cert.der
     openssl dgst -sha256 -sign rk2048.pem -out rsa_ref.sig rsa_data.bin
-    cp rsa_ref.sig rsa_bad.sig
-    printf '\x55' | dd of=rsa_bad.sig bs=1 seek=100 conv=notrunc 2>/dev/null
+    # Flip bits of byte 100 (an XOR, so it always changes: writing a fixed value would leave the
+    # signature as it was once in 256 runs, when that byte happens to hold it already).
+    python3 -c "import sys; b = bytearray(open(sys.argv[1], 'rb').read()); b[100] ^= 0x55; open(sys.argv[2], 'wb').write(b)" rsa_ref.sig rsa_bad.sig
     if "$UNIT" rsa-verify rk2048_pub.pem sha256 rsa_data.bin rsa_ref.sig >/dev/null &&
         "$UNIT" rsa-verify rk2048_cert.pem sha256 rsa_data.bin rsa_ref.sig >/dev/null &&
         "$UNIT" rsa-verify rk2048_cert.der sha256 rsa_data.bin rsa_ref.sig >/dev/null &&

@@ -567,4 +567,14 @@ Bytes compress(Codec codec, const Bytes& data, int level) {
     fail("unknown codec");
 }
 
+int dense_level(Codec codec) {
+    switch (codec) {
+        case Codec::GZIP: return 9;
+        case Codec::LZ4: return 12;   // LZ4HC_CLEVEL_MAX; the usual 0 is the fast mode
+        case Codec::ZSTD: return 19;  // windowLog 23 (8 MiB): anything that reads zstd reads it
+        case Codec::XZ: return 9;
+        default: return -1;           // lz4_legacy (HC 12) and bzip2 (9) are dense already; the others have no setting
+    }
+}
+
 }  // namespace abr

@@ -478,9 +478,9 @@ Bytes VbmetaImage::build(const std::string& private_key_file,
         source_total_size >= kAvbFooterSize ? source_total_size - kAvbFooterSize : out.size();
     if (footer_pos < out.size()) {
         if (source_total_size)
-            throw FormatError("image plus AVB metadata (" + std::to_string(out.size() + kAvbFooterSize) +
-                              " bytes) no longer fits the original partition size (" +
-                              std::to_string(source_total_size) + " bytes)");
+            throw DoesNotFit("image plus AVB metadata (" + std::to_string(out.size() + kAvbFooterSize) +
+                             " bytes) no longer fits the original partition size (" +
+                             std::to_string(source_total_size) + " bytes)");
         footer_pos = out.size();
     }
     out.resize(static_cast<size_t>(footer_pos), 0);

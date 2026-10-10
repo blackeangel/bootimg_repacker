@@ -42,6 +42,13 @@ public:
     explicit FormatError(const std::string& what) : std::runtime_error(what) {}
 };
 
+// The rebuilt image is bigger than the partition it came out of. Its own kind of error because a
+// denser compression of what was edited can cure it: `repack` tries that before it gives up.
+class DoesNotFit : public FormatError {
+public:
+    using FormatError::FormatError;
+};
+
 // ---------------------------------------------------------------------
 // File helpers
 // ---------------------------------------------------------------------

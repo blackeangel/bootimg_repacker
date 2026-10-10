@@ -52,4 +52,10 @@ Bytes decompress(Codec codec, const Bytes& data);
 // any number of threads.
 Bytes compress(Codec codec, const Bytes& data, int level = -1);
 
+// The densest setting of a codec that the decoders in the wild still take (gzip 9, zstd 19 -- an 8 MiB
+// window, what `zstd -19` writes --, xz 9, lz4 frame 12); -1 where the usual setting (-1 above) already
+// is the densest, or the codec has no setting. For when the usual one makes an edited image too big for
+// its partition: the images of builds that care about size were compressed this way in the first place.
+int dense_level(Codec codec);
+
 }  // namespace abr
