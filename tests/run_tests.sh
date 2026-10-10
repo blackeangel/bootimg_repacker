@@ -1372,6 +1372,979 @@ else
 fi
 
 # =========================================================================
+# The ramdisk as a directory. `unpack` writes ramdisk.cpio (what the image held, byte for
+# byte) and, when the archive can be one, the directory ramdisk/ with ramdisk.meta (owners,
+# modes, order ...); a ramdisk that is several cpio archives one after the other (what Magisk
+# makes) gets a directory and a metadata file for each (ramdisk.vol2/, ramdisk.vol2.meta ...).
+# Archives come from tests/tools/cpio_gen.py (a writer of its own) and, when GNU cpio is
+# installed, from `find . | cpio -H newc -o` as Android Image Kitchen makes them; GNU cpio and
+# cpio_gen.py's reader also judge what abr built. Checked: an untouched image repacks to the
+# same bytes; the directory is the archive's contents; every kind of edit (a file, a deletion,
+# a new file/directory/link, a mode in the metadata, the archive file itself, both at once, one
+# archive of several) lands in the image as asked and nowhere else; what a new file gets as its
+# owner and mode, and what a symbolic link is on every system; archives that cannot be a
+# directory are kept as files with the reason; nothing of somebody else's is overwritten.
+# =========================================================================
+RDG="$TOOLS/cpio_gen.py"
+RDO="$TOOLS/ramdisk_oracle.py"
+HAVE_GNU_CPIO=0
+command -v cpio >/dev/null 2>&1 && HAVE_GNU_CPIO=1
+RD_GNU=""
+[ "$HAVE_GNU_CPIO" = 1 ] && RD_GNU=", GNU cpio agrees"
+RD_WINE=0
+case "$ABR" in */winebin/*) RD_WINE=1 ;; esac
+head -c 100000 /dev/urandom | gzip -9n >rd_kernel.gz
+
+rd_image() {  # <style> [<archive file>]: rdimg_<style>.img around a ramdisk of that style (boot v0, gzip)
+    local style="$1" cpio="${2:-rdimg_$1.cpio}"
+    [ -n "${2:-}" ] || python3 "$RDG" "$style" "$cpio" || return 1
+    gzip -9n -c "$cpio" >"rdimg_$style.gz"
+    python3 "$MKBOOTIMG" >/dev/null --header_version 0 --kernel rd_kernel.gz --ramdisk "rdimg_$style.gz" \
+        --pagesize 2048 --base 0x10000000 --cmdline "rd=$style" --output "rdimg_$style.img"
+}
+# The records of an archive (of every archive of a stream of several), read by cpio_gen.py's own parser:
+# "type mode uid gid size ino nlink name". Nothing here is piped into `grep -q` or `head`: under
+# pipefail the writer may be killed by SIGPIPE and the pipeline then fails though grep was satisfied.
+rd_list() { python3 "$RDG" list "$1"; }
+rd_has() {  # <archive> <regex>: a record of the archive matches
+    local out
+    out="$(python3 "$RDG" list "$1")" || return 1
+    grep -q -- "$2" <<<"$out"
+}
+rd_names() { rd_list "$1" | awk '{print $8}'; }
+rd_count() { local out; out="$(python3 "$RDG" list "$1")" || return 1; wc -l <<<"$out" | tr -d ' '; }
+rd_oracle() {  # <unpack dir> [<prefix>]: GNU cpio agrees with every volume's directory (true without GNU cpio)
+    [ "$HAVE_GNU_CPIO" = 1 ] || return 0
+    local p="${2:-ramdisk}"
+    python3 -I "$RDO" --prefix "$1/$p.cpio" "$1" "$p" >"$1.oracle" 2>&1 || { cat "$1.oracle" >&2; return 1; }
+}
+rd_oracle_frags() {  # <unpack dir> <prefix>...: GNU cpio agrees with the directories of every prefix
+    local d="$1" p
+    shift
+    for p in "$@"; do rd_oracle "$d" "$p" || return 1; done
+}
+rd_link() { python3 -I "$RDO" --link "$1"; }  # what a link in a tree points at: a real link, a Cygwin file or a text file
+rd_cyg() {  # <path> <target>: a link in the Cygwin/MSYS2 format ("!<symlink>", FF FE, UTF-16LE, 00 00)
+    python3 -c 'import sys; open(sys.argv[1], "wb").write(b"!<symlink>\xff\xfe" + sys.argv[2].encode("utf-16-le", "surrogatepass") + b"\0\0")' "$1" "$2"
+}
+rd_is_cyg() { [ "$(head -c 12 "$1" | od -An -tx1 | tr -d ' \n')" = "213c73796d6c696e6b3efffe" ]; }  # starts like a Cygwin link file
+
+# Checks are collected and reported together: rd_ck <what> <command...> notes what failed.
+rd_fails=""
+rd_ck() { local what="$1"; shift; "$@" >/dev/null || rd_fails="$rd_fails [$what]"; }
+rd_done() {  # <what the checks show>: one PASS or FAIL for the checks since the last call
+    if [ -z "$rd_fails" ]; then pass "$1"; else fail "$1 --$rd_fails"; fi
+    rd_fails=""
+}
+rd_unpack() {  # <image> <dir>: a fresh unpack
+    rm -rf "$2"
+    "$ABR" unpack "$1" -o "$2" >"$2.log" 2>&1
+}
+rd_repack_unpack() {  # <dir> <name>: repack <dir> to <name>.img (log: <name>.rlog), unpack that to <name>_re
+    "$ABR" repack "$1" -o "$2.img" >"$2.rlog" 2>&1 || return 1
+    rm -rf "${2}_re"
+    "$ABR" unpack "$2.img" -o "${2}_re" >/dev/null 2>&1
+}
+changed_lines() {  # <archive a> <archive b>: how many lines differ between two listings
+    diff <(rd_list "$1") <(rd_list "$2") | grep -c '^[<>]'
+}
+rd_idx() {  # <names, one per line> <name>: the position of a name (1 = first), nothing if it is not there
+    grep -n -x -F -- "$2" <<<"$1" | cut -d: -f1
+}
+rd_vols() { case "$1" in volumes2 | volumes_tail) echo 2 ;; volumes3) echo 3 ;; *) echo 1 ;; esac; }
+rd_has_text() { grep -q -F -- "$2" "$1"; }  # <file> <text>
+# `diff -r` follows links: a dangling one is an error (status 2) and a link to a directory is compared as
+# the directory. Compared as what they are, a link is the same when its target is.
+rd_same_tree() { diff -r --no-dereference "$1" "$2" >/dev/null; }  # <dir> <dir>
+rd_same_tree_x() { diff -r --no-dereference -x "$3" "$1" "$2" >/dev/null; }  # <dir> <dir> <a name to leave out>
+rd_differ() { ! cmp -s "$1" "$2"; }                                  # <file> <file>: not the same bytes
+rd_meta_add() {  # <meta file> <line>: a line of its own for a path (in front of the end record)
+    python3 -I - "$1" "$2" <<'PYEOF'
+import sys
+path, line = sys.argv[1], sys.argv[2]
+lines = open(path, "rb").read().decode("utf-8").split("\n")
+at = next(i for i, l in enumerate(lines) if l.startswith("T "))
+lines.insert(at, line)
+open(path, "wb").write("\n".join(lines).encode("utf-8"))
+PYEOF
+}
+rd_meta_sub() {  # <meta file> <old line> <new line>: one line of the metadata replaced (it must be there)
+    python3 -I - "$1" "$2" "$3" <<'PYEOF'
+import sys
+path, old, new = sys.argv[1], sys.argv[2], sys.argv[3]
+lines = open(path, "rb").read().decode("utf-8").split("\n")
+if old not in lines:
+    sys.exit("no line '%s' in %s" % (old, path))
+lines[lines.index(old)] = new
+open(path, "wb").write("\n".join(lines).encode("utf-8"))
+PYEOF
+}
+
+if [ -x "$UNIT" ]; then
+    if out=$("$UNIT" cpio 2>&1); then
+        pass "cpio and ramdisk-directory unit tests ($(tail -n 1 <<<"$out"))"
+    else
+        fail "cpio and ramdisk-directory unit tests: $(tail -n 4 <<<"$out" | tr '\n' ' ')"
+    fi
+fi
+
+# ---- archives that become directories: untouched round trip, the directory, GNU cpio's verdict
+for style in mkbootfs crc upper uppercrc owners aik dotroot explicit tail weird big volumes2 volumes3 volumes_tail; do
+    if ! rd_image "$style"; then fail "ramdisk directory: could not make the $style fixture"; continue; fi
+    n="$(rd_vols "$style")"
+    rd_unpack "rdimg_$style.img" "rd_$style"
+    "$ABR" repack "rd_$style" -o "rd_$style.out" >/dev/null 2>&1
+    if [ "$RD_WINE" = 1 ] && [ "$style" = weird ]; then
+        # A quote, a backslash or a tab cannot be in a name on Windows: the ramdisk stays a file, with the reason.
+        rd_ck "stays a file" grep -q "ramdisk.cpio stays a file only" "rd_$style.log"
+        rd_ck "the reason" grep -q "Windows does not allow" "rd_$style.log"
+        rd_ck "no directory" test ! -e "rd_$style/ramdisk"
+        rd_ck "no metadata" test ! -e "rd_$style/ramdisk.meta"
+        rd_ck "nothing about a tree in the manifest" test -z "$(grep _tree "rd_$style/manifest.txt")"
+        rd_ck "ramdisk.cpio is the original" cmp -s "rdimg_$style.cpio" "rd_$style/ramdisk.cpio"
+        rd_ck "untouched repack is identical" cmp -s "rdimg_$style.img" "rd_$style.out"
+        rd_done "ramdisk directory (weird, on Windows): names that Windows cannot hold keep the ramdisk a file, with the reason, and it repacks identically"
+        continue
+    fi
+    rd_ck "manifest" grep -qx "ramdisk_tree=ramdisk" "rd_$style/manifest.txt"
+    rd_ck "ramdisk/" test -d "rd_$style/ramdisk"
+    rd_ck "ramdisk.meta" test -f "rd_$style/ramdisk.meta"
+    rd_ck "ramdisk.cpio is the original" cmp -s "rdimg_$style.cpio" "rd_$style/ramdisk.cpio"
+    rd_ck "untouched repack is identical" cmp -s "rdimg_$style.img" "rd_$style.out"
+    rd_ck "no warning" test -z "$(grep '^warning' "rd_$style.log")"
+    if [ "$n" -gt 1 ]; then
+        rd_ck "volumes in the manifest" grep -qx "ramdisk_tree_volumes=$n" "rd_$style/manifest.txt"
+        for k in $(seq 2 "$n"); do
+            rd_ck "ramdisk.vol$k/" test -d "rd_$style/ramdisk.vol$k"
+            rd_ck "ramdisk.vol$k.meta" test -f "rd_$style/ramdisk.vol$k.meta"
+        done
+        rd_ck "no volume too many" test ! -e "rd_$style/ramdisk.vol$((n + 1))"
+        rd_ck "the log counts the archives" grep -q "$n cpio archives one after the other" "rd_$style.log"
+    else
+        rd_ck "no volumes in the manifest" test -z "$(grep _tree_volumes "rd_$style/manifest.txt")"
+        rd_ck "no vol2" test ! -e "rd_$style/ramdisk.vol2"
+    fi
+    rd_ck "GNU cpio" rd_oracle "rd_$style"
+    rd_done "ramdisk directory ($style, $n archive$([ "$n" = 1 ] || echo s)): ramdisk.cpio is the original, the directories come with their metadata, an untouched repack is byte-identical$RD_GNU"
+done
+# What the metadata says about the layout of each kind of archive.
+rd_ck "names ./x" grep -qx "names dotslash" rd_aik/ramdisk.meta
+rd_ck "its own order" grep -qx "order archive" rd_aik/ramdisk.meta
+rd_ck "inodes" grep -qx "inode explicit" rd_aik/ramdisk.meta
+rd_ck "link counts" grep -qx "nlink posix" rd_aik/ramdisk.meta
+rd_ck "GNU cpio's upper case digits" grep -qx "hex upper" rd_aik/ramdisk.meta
+rd_ck "512-byte fill" grep -qx "tail align 512" rd_aik/ramdisk.meta
+rd_ck "root" grep -q " ino=131073 \.$" rd_aik/ramdisk.meta
+rd_done "ramdisk directory: the layout of a 'find . | cpio' archive (names ./x, its own order, inodes, link counts, upper case digits, 512-byte fill) is recorded as such"
+rd_ck "plain names" grep -qx "names plain" rd_dotroot/ramdisk.meta
+rd_ck "root is an entry" grep -q "^d 0755 0 0 1760000000 ino=131073 \.$" rd_dotroot/ramdisk.meta
+rd_ck "upper case" grep -qx "hex upper" rd_dotroot/ramdisk.meta
+rd_ck "plain names in the tree" test -f rd_dotroot/ramdisk/init.rc
+rd_done "ramdisk directory: GNU cpio 2.15's layout (the root '.', every other name plain) is recorded as such"
+rd_ck "format crc" grep -qx "format crc" rd_crc/ramdisk.meta
+rd_ck "lower case" grep -qx "hex lower" rd_crc/ramdisk.meta
+rd_ck "upper crc" grep -qx "format crc" rd_uppercrc/ramdisk.meta
+rd_ck "upper crc digits" grep -qx "hex upper" rd_uppercrc/ramdisk.meta
+rd_ck "upper" grep -qx "hex upper" rd_upper/ramdisk.meta
+rd_ck "mkbootfs: lower case" grep -qx "hex lower" rd_mkbootfs/ramdisk.meta
+rd_ck "mkbootfs: sequential inodes" grep -qx "inode sequential 300000" rd_mkbootfs/ramdisk.meta
+rd_ck "mkbootfs: link count 1" grep -qx "nlink 1" rd_mkbootfs/ramdisk.meta
+rd_ck "mkbootfs: sorted" grep -qx "order sorted" rd_mkbootfs/ramdisk.meta
+rd_ck "mkbootfs: 256-byte fill" grep -qx "tail align 256" rd_mkbootfs/ramdisk.meta
+rd_ck "mkbootfs: device node" grep -q "^c 0600 0 0 0 rdev=5:1 dev/console$" rd_mkbootfs/ramdisk.meta
+rd_ck "mkbootfs: fifo" grep -q "^p 0600 0 0 0 - dev/pipe$" rd_mkbootfs/ramdisk.meta
+rd_ck "mkbootfs: link" grep -q "^l 0777 0 0 0 - etc$" rd_mkbootfs/ramdisk.meta
+rd_ck "mkbootfs: the link's target" test "$(rd_link rd_mkbootfs/ramdisk/etc)" = "/system/etc"
+rd_ck "mkbootfs: defaults for what is new" grep -qx "newmode file=0644 exec=0755 dir=0755 link=0777" rd_mkbootfs/ramdisk.meta
+rd_done "ramdisk directory: the metadata says what the directory cannot (magic, digit case, inodes, order, fill, device numbers, the owner defaults of what is new)"
+if [ "$RD_WINE" = 0 ]; then
+    rd_ck "quoted backslash" grep -q '^f 0644 0 0 0 - "res/back\\\\slash"$' rd_weird/ramdisk.meta
+    rd_ck "quoted tab" grep -q '^f 0644 0 0 0 - "res/tab\\there"$' rd_weird/ramdisk.meta
+    rd_ck "a quote inside a name needs no quoting" grep -qx 'f 0644 0 0 0 - res/"quoted".txt' rd_weird/ramdisk.meta
+    rd_ck "a leading space needs none either" grep -qx 'f 0644 0 0 0 - res/ leading' rd_weird/ramdisk.meta
+    rd_ck "space" test "$(cat "rd_weird/ramdisk/res/with space.txt")" = "1"
+    rd_ck "UTF-8" test "$(cat "rd_weird/ramdisk/res/ünï cödé.txt")" = "5ü"
+    rd_done "ramdisk directory: names with spaces, quotes, backslashes, tabs and UTF-8 are quoted in the metadata and read back"
+fi
+
+# A real `find . | cpio -R 0:0 -H newc -o`, which is how Android Image Kitchen packs a ramdisk. GNU cpio
+# writes the digits of its headers in upper case and numbers inodes as the file system does.
+rd_size_multiple() { [ $(($(wc -c <"$1") % $2)) = 0 ]; }  # <file> <n>: the size is a multiple of n
+if [ "$HAVE_GNU_CPIO" = 1 ]; then
+    rm -rf gnu_src gnu_src2 && mkdir -p gnu_src/sbin gnu_src/dev gnu_src/lib/modules gnu_src/proc gnu_src2/overlay.d/sbin gnu_src2/.backup
+    printf 'on init\n' >gnu_src/init.rc
+    printf '#!/bin/sh\n' >gnu_src/sbin/adbd && chmod 755 gnu_src/sbin/adbd
+    head -c 70000 /dev/urandom >gnu_src/lib/modules/big.ko
+    : >gnu_src/empty
+    ln -s ../init.rc gnu_src/sbin/rc
+    printf 'KEEPVERITY=true\n' >gnu_src2/.backup/.magisk
+    printf '#!/system/bin/sh\n' >gnu_src2/overlay.d/sbin/magisk && chmod 755 gnu_src2/overlay.d/sbin/magisk
+    for fmt in newc crc; do
+        (cd gnu_src && find . | cpio --quiet -R 0:0 -H "$fmt" -o) >"gnu_$fmt.cpio" 2>/dev/null
+        rd_image "gnu_$fmt" "gnu_$fmt.cpio"
+        rd_unpack "rdimg_gnu_$fmt.img" "rd_gnu_$fmt"
+        "$ABR" repack "rd_gnu_$fmt" -o "rd_gnu_$fmt.out" >/dev/null 2>&1
+        rd_ck "directory" grep -qx "ramdisk_tree=ramdisk" "rd_gnu_$fmt/manifest.txt"
+        rd_ck "exact" cmp -s "rdimg_gnu_$fmt.img" "rd_gnu_$fmt.out"
+        rd_ck "no warning" test -z "$(grep '^warning' "rd_gnu_$fmt.log")"
+        rd_ck "upper case digits" grep -qx "hex upper" "rd_gnu_$fmt/ramdisk.meta"
+        rd_ck "512-byte blocks" grep -qx "tail align 512" "rd_gnu_$fmt/ramdisk.meta"
+        rd_ck "the link" test "$(rd_link "rd_gnu_$fmt/ramdisk/sbin/rc")" = "../init.rc"
+        rd_ck "GNU cpio" rd_oracle "rd_gnu_$fmt"
+        rd_done "ramdisk directory: an archive written by GNU cpio itself (find . | cpio -H $fmt) becomes a directory, round-trips exactly, and cpio agrees"
+    done
+    # Two of them one after the other.
+    (cd gnu_src2 && find . | cpio --quiet -R 0:0 -H newc -o) >gnu_second.cpio 2>/dev/null
+    cat gnu_newc.cpio gnu_second.cpio >gnu_vol.cpio
+    rd_image gnu_vol gnu_vol.cpio
+    rd_unpack rdimg_gnu_vol.img rd_gnu_vol
+    "$ABR" repack rd_gnu_vol -o rd_gnu_vol.out >/dev/null 2>&1
+    rd_ck "two archives" grep -qx "ramdisk_tree_volumes=2" rd_gnu_vol/manifest.txt
+    rd_ck "exact" cmp -s rdimg_gnu_vol.img rd_gnu_vol.out
+    rd_ck "second directory" test -f rd_gnu_vol/ramdisk.vol2/.backup/.magisk
+    rd_ck "GNU cpio, both archives" rd_oracle rd_gnu_vol
+    rd_done "ramdisk directory: two archives written by GNU cpio one after the other are two directories, round-trip exactly, and cpio agrees with each"
+
+    # ... and what abr builds is something GNU cpio extracts as the directory says.
+    rm -rf gnu_edit && cp -a rd_gnu_newc gnu_edit
+    printf 'on init\n    start x\n' >gnu_edit/ramdisk/init.rc
+    rm gnu_edit/ramdisk/empty
+    printf 'new\n' >gnu_edit/ramdisk/sbin/newtool
+    "$ABR" repack gnu_edit -o gnu_edit.img >/dev/null 2>&1
+    "$ABR" unpack gnu_edit.img -o gnu_edit_re >/dev/null 2>&1
+    rm -rf gnu_x && mkdir -p gnu_x && (cd gnu_x && cpio --quiet -idm <../gnu_edit_re/ramdisk.cpio) 2>/dev/null
+    rd_ck "GNU cpio agrees" rd_oracle gnu_edit_re
+    rd_ck "changed file" test "$(cat gnu_x/init.rc)" = "$(printf 'on init\n    start x')"
+    rd_ck "deleted file" test ! -e gnu_x/empty
+    rd_ck "new file" test "$(cat gnu_x/sbin/newtool)" = "new"
+    rd_ck "link untouched" test "$(readlink gnu_x/sbin/rc)" = "../init.rc"
+    rd_ck "new file's mode" rd_has gnu_edit_re/ramdisk.cpio "^f 0644 0 0 4 .* 1 sbin/newtool$"
+    rd_ck "still upper case" grep -qx "hex upper" gnu_edit_re/ramdisk.meta
+    rd_ck "still in 512-byte blocks" rd_size_multiple gnu_edit_re/ramdisk.cpio 512
+    rd_done "ramdisk directory: an edited AIK-style ramdisk extracts with GNU cpio as the edit says (changed, deleted and new file, the link untouched), in upper case digits and 512-byte blocks as before"
+else
+    echo "note: GNU cpio not installed; its cross-checks are skipped"
+fi
+
+# ---- archives that cannot be a directory stay files, with the reason
+rd_bad_ok=1
+rd_bad_names=""
+while IFS='|' read -r style why; do
+    [ -n "$style" ] || continue
+    if ! rd_image "$style"; then rd_bad_ok=0; rd_bad_names="$rd_bad_names $style(fixture)"; continue; fi
+    rd_unpack "rdimg_$style.img" "rd_$style"
+    "$ABR" repack "rd_$style" -o "rd_$style.out" >/dev/null 2>&1
+    if grep -q "ramdisk.cpio stays a file only" "rd_$style.log" && grep -q -F -- "$why" "rd_$style.log" &&
+        ! grep -q "_tree" "rd_$style/manifest.txt" && [ ! -e "rd_$style/ramdisk" ] && [ ! -e "rd_$style/ramdisk.meta" ] &&
+        [ ! -e "rd_$style/ramdisk.vol2" ] && cmp -s "rdimg_$style.cpio" "rd_$style/ramdisk.cpio" &&
+        cmp -s "rdimg_$style.img" "rd_$style.out"; then
+        :
+    else
+        rd_bad_ok=0
+        rd_bad_names="$rd_bad_names $style"
+    fi
+done <<'EOF'
+hardlink|hard links
+dup|occurs twice
+dotdot|goes through
+absolute|absolute path
+nodir|without (or before) its directory
+junk|neither zero fill nor another cpio archive
+junk2|neither zero fill nor another cpio archive
+offbound|not at a multiple of 4
+odc|old kind
+trunc|runs past the end
+linkbreak|line break
+mixed|are mixed
+mixcase|upper case in some records
+EOF
+[ "$rd_bad_ok" = 1 ] &&
+    pass "ramdisk directory: hard links, a name twice, '..', an absolute name, a missing parent, junk after the end or between two archives, an archive off its boundary, odc, a cut-short archive, a link target with a line break and mixed magics or digit cases stay files, with the reason, and round-trip exactly" ||
+    fail "ramdisk directory: archives that cannot be a directory are not handled:$rd_bad_names"
+# An image whose ramdisk is no archive at all is not worth a word.
+rm -rf rd_nocpio && "$ABR" unpack fx/boot_v0_rawid.img -o rd_nocpio >rd_nocpio.log 2>&1
+if ! grep -q "stays a file only" rd_nocpio.log && ! grep -q "_tree" rd_nocpio/manifest.txt; then
+    pass "ramdisk directory: a ramdisk that is no cpio archive is left alone without a message"
+else
+    fail "ramdisk directory: a ramdisk that is no cpio archive got a message or a directory ($(cat rd_nocpio.log))"
+fi
+
+# ---- editing the directory
+rd_unpack rdimg_mkbootfs.img rd_base
+
+rm -rf rd_e1 && cp -a rd_base rd_e1 && printf '# added\n' >>rd_e1/ramdisk/init.rc
+rd_ck "repack" rd_repack_unpack rd_e1 rd_e1o
+rd_ck "two lines differ" test "$(changed_lines rd_base/ramdisk.cpio rd_e1o_re/ramdisk.cpio)" = 2
+d="$(diff <(rd_list rd_base/ramdisk.cpio) <(rd_list rd_e1o_re/ramdisk.cpio) || true)"
+rd_ck "it is init.rc" grep -q "init.rc" <<<"$d"
+rd_ck "the directory comes back as it was" rd_same_tree rd_e1/ramdisk rd_e1o_re/ramdisk
+rd_ck "the metadata is the same" cmp -s rd_base/ramdisk.meta rd_e1o_re/ramdisk.meta
+rd_ck "the message" grep -q "built from the directory ramdisk/" rd_e1o.rlog
+rd_done "ramdisk directory: an edited file lands in the image (only its size changes), nothing else moves, the metadata is the same"
+
+rm -rf rd_e2 && cp -a rd_base rd_e2 && rm -r rd_e2/ramdisk/lib/modules rd_e2/ramdisk/sepolicy
+rd_ck "repack" rd_repack_unpack rd_e2 rd_e2o
+names="$(rd_names rd_e2o_re/ramdisk.cpio)"
+rd_ck "gone" test -z "$(grep -E 'lib/modules|sepolicy' <<<"$names")"
+rd_ck "the directory they were in stays" grep -qx "lib" <<<"$names"
+rd_ck "17 records" test "$(wc -l <<<"$names" | tr -d ' ')" = 17
+rd_ck "inodes are counted again" test "$(rd_list rd_e2o_re/ramdisk.cpio | awk '{print $6}' | tr '\n' ' ')" = "$(seq 300000 300016 | tr '\n' ' ')"
+rd_ck "GNU cpio" rd_oracle rd_e2o_re
+rd_done "ramdisk directory: a deleted directory and a deleted file are gone from the image, the inodes are counted again$RD_GNU"
+
+rm -rf rd_e3 && cp -a rd_base rd_e3
+printf 'hi\n' >rd_e3/ramdisk/new_file
+mkdir rd_e3/ramdisk/newdir && printf '#!/bin/sh\n' >rd_e3/ramdisk/newdir/tool
+printf '/system/bin/sh' >rd_e3/ramdisk/sbin/sh   # a text file where there is no metadata line: a plain file
+rd_ck "repack" rd_repack_unpack rd_e3 rd_e3o
+rd_ck "new file" rd_has rd_e3o_re/ramdisk.cpio "^f 0644 0 0 3 .* 1 new_file$"
+rd_ck "new directory" rd_has rd_e3o_re/ramdisk.cpio "^d 0755 0 0 0 .* 1 newdir$"
+rd_ck "text file that looks like a link target" rd_has rd_e3o_re/ramdisk.cpio "^f 0644 0 0 14 .* 1 sbin/sh$"
+rd_ck "script in the new directory" rd_has rd_e3o_re/ramdisk.cpio "^f 0755 0 0 10 .* 1 newdir/tool$"
+rd_ck "sorted as mkbootfs sorts" test "$(rd_names rd_e3o_re/ramdisk.cpio | tr '\n' ' ')" = "$(rd_names rd_e3o_re/ramdisk.cpio | LC_ALL=C sort -t/ -k1,1 | tr '\n' ' ')"
+rd_ck "GNU cpio" rd_oracle rd_e3o_re
+rd_done "ramdisk directory: a new file, directory and file inside it join the archive in their place with the defaults (root, 0755 directory, 0644 file, 0755 for a #! script)$RD_GNU"
+
+rm -rf rd_e4 && cp -a rd_base rd_e4
+sed -i 's/^f 0750 0 0 0 - init.rc$/f 6755 1000 2000 1700000000 - init.rc/; s/^d 0500 0 0 0 - config$/d 1777 0 0 0 - config/' rd_e4/ramdisk.meta
+rd_ck "repack" rd_repack_unpack rd_e4 rd_e4o
+rd_ck "setuid file with owners" rd_has rd_e4o_re/ramdisk.cpio "^f 6755 1000 2000 .* init.rc$"
+rd_ck "sticky directory" rd_has rd_e4o_re/ramdisk.cpio "^d 1777 0 0 0 .* config$"
+rd_ck "nothing else moved" test "$(changed_lines rd_base/ramdisk.cpio rd_e4o_re/ramdisk.cpio)" = 4
+rd_ck "the time" grep -qx "f 6755 1000 2000 1700000000 - init.rc" rd_e4o_re/ramdisk.meta
+rd_done "ramdisk directory: a mode, owner and time edited in ramdisk.meta (setuid, sticky ...) reach the image"
+
+# The metadata gone: warned about, everything made up like mkbootfs does.
+rm -rf rd_e5 && cp -a rd_base rd_e5 && rm rd_e5/ramdisk.meta
+rd_ck "repack" rd_repack_unpack rd_e5 rd_e5o
+rd_ck "warned" grep -q "no ramdisk.meta" rd_e5o.rlog
+rd_ck "a device node is a plain file then" rd_has rd_e5o_re/ramdisk.cpio "^f 0644 0 0 0 .* dev/console$"
+rd_ck "22 records" test "$(rd_count rd_e5o_re/ramdisk.cpio)" = 22
+rd_done "ramdisk directory: without ramdisk.meta repack warns and makes owners, modes and order up (a device node is a plain file then)"
+
+# ---- editing ramdisk.cpio instead, or both
+rm -rf rd_e6 && cp -a rd_base rd_e6 && python3 "$RDG" owners rd_e6/ramdisk.cpio
+rd_ck "repack" rd_repack_unpack rd_e6 rd_e6o
+rd_ck "the archive file is what the image got" cmp -s rd_e6o_re/ramdisk.cpio rd_e6/ramdisk.cpio
+rd_ck "the directory was not used" test -z "$(grep 'built from the director' rd_e6o.rlog)"
+rd_done "ramdisk directory: when only ramdisk.cpio was replaced, the image gets that archive, not the (untouched) directory"
+rm -rf rd_e7 && cp -a rd_base rd_e7 && python3 "$RDG" owners rd_e7/ramdisk.cpio && printf 'more\n' >>rd_e7/ramdisk/init.rc
+if ! "$ABR" repack rd_e7 -o rd_e7.img >rd_e7.log 2>&1 && grep -q "ramdisk-from" rd_e7.log && [ ! -s rd_e7.img ]; then
+    pass "ramdisk directory: when both ramdisk.cpio and the directory were changed, repack stops and says how to choose"
+else
+    fail "ramdisk directory: both changed was not refused ($(cat rd_e7.log))"
+fi
+"$ABR" repack rd_e7 -o rd_e7t.img --ramdisk-from tree >/dev/null 2>&1 && "$ABR" unpack rd_e7t.img -o rd_e7t_re >/dev/null 2>&1
+"$ABR" repack rd_e7 -o rd_e7c.img --ramdisk-from cpio >/dev/null 2>&1 && "$ABR" unpack rd_e7c.img -o rd_e7c_re >/dev/null 2>&1
+if rd_same_tree rd_e7/ramdisk rd_e7t_re/ramdisk && cmp -s rd_e7c_re/ramdisk.cpio rd_e7/ramdisk.cpio && rd_differ rd_e7t.img rd_e7c.img; then
+    pass "ramdisk directory: --ramdisk-from tree builds from the directory, --ramdisk-from cpio takes ramdisk.cpio"
+else
+    fail "ramdisk directory: --ramdisk-from"
+fi
+if ! "$ABR" repack rd_e7 -o rd_e7x.img --ramdisk-from both >/dev/null 2>rd_e7x.err && grep -q "'tree' or 'cpio'" rd_e7x.err; then
+    pass "ramdisk directory: --ramdisk-from with anything but tree or cpio is refused"
+else
+    fail "ramdisk directory: --ramdisk-from with a wrong value"
+fi
+# The directory is deleted by hand: the archive file is what is left.
+rm -rf rd_e7d && cp -a rd_base rd_e7d && rm -rf rd_e7d/ramdisk && "$ABR" repack rd_e7d -o rd_e7d.img >/dev/null 2>&1
+if cmp -s rd_e7d.img rdimg_mkbootfs.img; then
+    pass "ramdisk directory: a directory that was removed is not missed (ramdisk.cpio is used)"
+else
+    fail "ramdisk directory: a removed directory"
+fi
+
+# ---- --tree-only and --no-tree
+rm -rf rd_to && "$ABR" unpack rdimg_mkbootfs.img -o rd_to --tree-only >rd_to.log 2>&1
+"$ABR" repack rd_to -o rd_to.img >/dev/null 2>&1
+if [ ! -e rd_to/ramdisk.cpio ] && [ -d rd_to/ramdisk ] && cmp -s rd_to.img rdimg_mkbootfs.img; then
+    pass "unpack --tree-only: no ramdisk.cpio, and the untouched directory still repacks to the identical image"
+else
+    fail "unpack --tree-only"
+fi
+printf 'x\n' >>rd_to/ramdisk/init.rc
+if rd_repack_unpack rd_to rd_to2 && [ "$(changed_lines rd_base/ramdisk.cpio rd_to2_re/ramdisk.cpio)" = 2 ]; then
+    pass "unpack --tree-only: an edit of the directory works without the archive file"
+else
+    fail "unpack --tree-only: editing"
+fi
+rm -rf rd_to3 && "$ABR" unpack rdimg_hardlink.img -o rd_to3 --tree-only >rd_to3.log 2>&1
+if [ -f rd_to3/ramdisk.cpio ] && cmp -s rd_to3/ramdisk.cpio rdimg_hardlink.cpio; then
+    pass "unpack --tree-only: an archive that cannot be a directory keeps its ramdisk.cpio"
+else
+    fail "unpack --tree-only: a refused archive lost its file"
+fi
+rm -rf rd_nt && "$ABR" unpack rdimg_mkbootfs.img -o rd_nt --no-tree >rd_nt.log 2>&1
+"$ABR" repack rd_nt -o rd_nt.img >/dev/null 2>&1
+if [ ! -e rd_nt/ramdisk ] && [ ! -e rd_nt/ramdisk.meta ] && ! grep -q _tree rd_nt/manifest.txt && cmp -s rd_nt.img rdimg_mkbootfs.img; then
+    pass "unpack --no-tree: only ramdisk.cpio, as before"
+else
+    fail "unpack --no-tree"
+fi
+if ! "$ABR" unpack rdimg_mkbootfs.img -o rd_bad --no-tree --tree-only >/dev/null 2>&1 && ! "$ABR" unpack rdimg_mkbootfs.img -o rd_bad2 --tre >/dev/null 2>&1; then
+    pass "unpack: contradicting or unknown options are refused"
+else
+    fail "unpack: options"
+fi
+
+# ---- somebody else's ramdisk/ is not touched; an earlier unpack's is replaced
+rm -rf rd_alien && mkdir -p rd_alien/ramdisk && printf 'precious\n' >rd_alien/ramdisk/mine.txt
+"$ABR" unpack rdimg_mkbootfs.img -o rd_alien >rd_alien.log 2>&1
+"$ABR" repack rd_alien -o rd_alien.img >/dev/null 2>&1
+if [ "$(cat rd_alien/ramdisk/mine.txt)" = "precious" ] && ! grep -q _tree rd_alien/manifest.txt && grep -q "is not an empty directory" rd_alien.log &&
+    cmp -s rd_alien.img rdimg_mkbootfs.img; then
+    pass "unpack: a ramdisk/ that is not from an earlier unpack is left alone (the ramdisk stays a file, with a message)"
+else
+    fail "unpack: a foreign ramdisk/ was touched or ignored silently ($(cat rd_alien.log))"
+fi
+rm -rf rd_empty && mkdir -p rd_empty/ramdisk && "$ABR" unpack rdimg_mkbootfs.img -o rd_empty >/dev/null 2>&1
+grep -q _tree rd_empty/manifest.txt && pass "unpack: an empty ramdisk/ is no obstacle" || fail "unpack: an empty ramdisk/ was treated as foreign"
+rm -rf rd_again && cp -a rd_base rd_again && printf 'junk\n' >rd_again/ramdisk/leftover && printf 'junk\n' >>rd_again/ramdisk/init.rc
+"$ABR" unpack rdimg_mkbootfs.img -o rd_again >/dev/null 2>&1
+if [ ! -e rd_again/ramdisk/leftover ] && rd_same_tree rd_base/ramdisk rd_again/ramdisk && cmp -s rd_base/ramdisk.meta rd_again/ramdisk.meta; then
+    pass "unpack: unpacking again over an earlier unpack replaces the directory (no leftovers, no old edits)"
+else
+    fail "unpack: unpacking over an earlier unpack"
+fi
+rm -rf rd_gone && cp -a rd_base rd_gone && "$ABR" unpack rdimg_mkbootfs.img -o rd_gone --no-tree >/dev/null 2>&1
+if [ ! -e rd_gone/ramdisk ] && [ ! -e rd_gone/ramdisk.meta ]; then
+    pass "unpack --no-tree over an earlier unpack removes its directory (it would be a trap, the repack would ignore it)"
+else
+    fail "unpack --no-tree left the old directory behind"
+fi
+rm -rf rd_refused && cp -a rd_base rd_refused && "$ABR" unpack rdimg_hardlink.img -o rd_refused >/dev/null 2>&1
+if [ ! -e rd_refused/ramdisk ] && [ ! -e rd_refused/ramdisk.meta ] && ! grep -q _tree rd_refused/manifest.txt; then
+    pass "unpack: an archive that cannot be a directory does not leave the directory of an earlier unpack behind"
+else
+    fail "unpack: a stale directory survived a refused archive"
+fi
+
+# ---- AIK-style: new entries go where the archive's own order puts them
+rm -rf rd_e17 && cp -a rd_aik rd_e17
+printf 'hi\n' >rd_e17/ramdisk/newfile && printf 'more\n' >>rd_e17/ramdisk/init.rc
+mkdir rd_e17/ramdisk/lib/newdir && printf 'z\n' >rd_e17/ramdisk/lib/newdir/z
+rd_ck "repack" rd_repack_unpack rd_e17 rd_e17o
+names="$(rd_names rd_e17o_re/ramdisk.cpio)"
+last_module="$(grep -n '^\./lib/modules/' <<<"$names" | tail -n 1 | cut -d: -f1)"
+rd_ck "the new directory follows its sibling's last record" test "$(rd_idx "$names" ./lib/newdir)" = "$((last_module + 1))"
+rd_ck "its file follows it" test "$(rd_idx "$names" ./lib/newdir/z)" = "$((last_module + 2))"
+rd_ck "the new file of the root goes last" test "$(tail -n 1 <<<"$names")" = "./newfile"
+rd_ck "lib's link count follows the new subdirectory" rd_has rd_e17o_re/ramdisk.cpio "^d 0755 0 0 0 [0-9]* 4 ./lib$"
+rd_ck "the root is where it was, with its link count" test "$(rd_list rd_e17o_re/ramdisk.cpio | head -n 1 | awk '{print $8, $7}')" = ". 11"
+rd_ck "upper case digits kept" grep -qx "hex upper" rd_e17o_re/ramdisk.meta
+rd_ck "GNU cpio" rd_oracle rd_e17o_re
+rd_done "ramdisk directory: new entries of an AIK-style archive go behind their directory's last record, link counts follow the new subdirectories$RD_GNU"
+
+# ---- permissions: what a file that is put into the unpacked ramdisk gets. The metadata is the only
+# authority for what was unpacked (Windows has no owners or modes, so nothing is read from the file system
+# about those); what is new gets the defaults of the metadata's header; an executable one is told by a
+# #! line or an ELF header (everywhere) or by the executable bit (where the system has one).
+rm -rf rd_p1 && cp -a rd_base rd_p1
+printf 'data\n' >rd_p1/ramdisk/plain.txt
+printf '#!/system/bin/sh\necho hi\n' >rd_p1/ramdisk/script
+printf '\177ELF\002\001\001\000 program' >rd_p1/ramdisk/prog
+printf '\177ELF\002\001\001\000 library' >rd_p1/ramdisk/libx.so
+printf '\177ELF\002\001\001\000 module' >rd_p1/ramdisk/mod.ko
+printf 'executable by its bit\n' >rd_p1/ramdisk/chmodx.txt && chmod 755 rd_p1/ramdisk/chmodx.txt
+printf 'private by its bits\n' >rd_p1/ramdisk/chmod600.txt && chmod 600 rd_p1/ramdisk/chmod600.txt
+mkdir rd_p1/ramdisk/newdir && printf 'x' >rd_p1/ramdisk/newdir/inner.cfg
+printf 'junk' >rd_p1/ramdisk/.DS_Store && printf 'junk' >rd_p1/ramdisk/newdir/Thumbs.db
+chmod 777 rd_p1/ramdisk/init.rc  # a file of the unpack: the metadata decides, not this
+rd_ck "repack" rd_repack_unpack rd_p1 rd_p1o
+L=rd_p1o_re/ramdisk.cpio
+rd_ck "plain data: 0644, root" rd_has $L "^f 0644 0 0 5 .* 1 plain.txt$"
+rd_ck "#! script: 0755" rd_has $L "^f 0755 0 0 25 .* 1 script$"
+rd_ck "ELF program: 0755" rd_has $L "^f 0755 0 0 .* 1 prog$"
+rd_ck "ELF library: 0644" rd_has $L "^f 0644 0 0 .* 1 libx.so$"
+rd_ck "kernel module: 0644" rd_has $L "^f 0644 0 0 .* 1 mod.ko$"
+rd_ck "new directory: 0755" rd_has $L "^d 0755 0 0 0 .* 1 newdir$"
+rd_ck "file in it: 0644" rd_has $L "^f 0644 0 0 1 .* 1 newdir/inner.cfg$"
+if [ "$RD_WINE" = 0 ]; then
+    rd_ck "executable bit: 0755" rd_has $L "^f 0755 0 0 22 .* 1 chmodx.txt$"
+else
+    rd_ck "no executable bit on Windows: 0644" rd_has $L "^f 0644 0 0 22 .* 1 chmodx.txt$"
+fi
+rd_ck "only the executable bit counts: 0644" rd_has $L "^f 0644 0 0 20 .* 1 chmod600.txt$"
+rd_ck "an entry of the unpack keeps its mode from the metadata" rd_has $L "^f 0750 0 0 .* 1 init.rc$"
+rd_ck "file manager leftovers stay out" test -z "$(rd_names $L | grep -E 'DS_Store|Thumbs')"
+rd_ck "the note names the new entries and their modes" grep -q "9 new entries not in ramdisk.meta, with its default owner 0:0 and these modes: " rd_p1o.rlog
+rd_ck "the note: a script" grep -q "script f 0755" rd_p1o.rlog
+rd_ck "the note: a library" grep -q "libx.so f 0644" rd_p1o.rlog
+rd_ck "the note: the leftovers" grep -q "'.DS_Store' is a leftover of a file manager" rd_p1o.rlog
+rd_ck "GNU cpio" rd_oracle rd_p1o_re
+rd_done "ramdisk permissions: files put into the directory get root, 0644 or 0755 (a #! script, an ELF program, the executable bit where there is one), a directory 0755; an entry of the unpack keeps its mode from ramdisk.meta whatever the file system says; the repack lists the new ones$RD_GNU"
+
+# What a new entry gets is what the header of the metadata says, and a line of its own beats that.
+rm -rf rd_p2 && cp -a rd_base rd_p2
+printf 'data\n' >rd_p2/ramdisk/plain.txt
+printf '#!/bin/sh\n' >rd_p2/ramdisk/script
+mkdir rd_p2/ramdisk/newdir
+printf 'own line\n' >rd_p2/ramdisk/own.txt
+rd_meta_sub rd_p2/ramdisk.meta "default uid=0 gid=0 mtime=0 dev=0:0" "default uid=1000 gid=2000 mtime=1234 dev=0:0"
+rd_meta_sub rd_p2/ramdisk.meta "newmode file=0644 exec=0755 dir=0755 link=0777" "newmode file=0640 exec=0700 dir=0750 link=0755"
+rd_meta_add rd_p2/ramdisk.meta "f 0600 5 6 7 - own.txt"
+rd_ck "the header was edited" grep -qx "newmode file=0640 exec=0700 dir=0750 link=0755" rd_p2/ramdisk.meta
+rd_ck "repack" rd_repack_unpack rd_p2 rd_p2o
+L=rd_p2o_re/ramdisk.cpio
+rd_ck "new file: the default owner and mode" rd_has $L "^f 0640 1000 2000 5 .* 1 plain.txt$"
+rd_ck "new script: the default for an executable" rd_has $L "^f 0700 1000 2000 10 .* 1 script$"
+rd_ck "new directory: the default" rd_has $L "^d 0750 1000 2000 0 .* 1 newdir$"
+rd_ck "the time" grep -q "^f 0640 1000 2000 1234 - plain.txt$" rd_p2o_re/ramdisk.meta
+rd_ck "a line of its own wins" rd_has $L "^f 0600 5 6 9 .* 1 own.txt$"
+rd_ck "and is not called new" test -z "$(grep 'own.txt f' rd_p2o.rlog)"
+rd_ck "an entry of the unpack is unaffected" rd_has $L "^f 0750 0 0 .* 1 init.rc$"
+rd_done "ramdisk permissions: what is new gets the owner, time and modes that the header of ramdisk.meta says (edit them there), and a line of its own in ramdisk.meta gives a path whatever it should have"
+
+# An entry that changed its kind is new: the old line (a mode of a directory) does not carry over to a file.
+rm -rf rd_p3 && cp -a rd_base rd_p3
+rm -r rd_p3/ramdisk/config && printf 'x' >rd_p3/ramdisk/config   # a 0500 directory becomes a file
+rd_ck "repack" rd_repack_unpack rd_p3 rd_p3o
+rd_ck "a file with the default mode, not the directory's" rd_has rd_p3o_re/ramdisk.cpio "^f 0644 0 0 1 .* 1 config$"
+rd_ck "and the repack says it is new" grep -q "config f 0644" rd_p3o.rlog
+rd_done "ramdisk permissions: a directory replaced by a file is a new file (default mode), not a file with the directory's mode"
+
+# A file that is gone is gone, and the repack says so.
+rm -rf rd_p4 && cp -a rd_base rd_p4 && rm rd_p4/ramdisk/init.rc rd_p4/ramdisk/sepolicy
+rd_ck "repack" rd_repack_unpack rd_p4 rd_p4o
+rd_ck "the note names them" grep -q "2 entries of ramdisk.meta are not in the directory and left out of the ramdisk: init.rc, sepolicy" rd_p4o.rlog
+rd_done "ramdisk permissions: the repack names the entries of the metadata that were deleted from the directory"
+
+# ---- symbolic links: a link where the system has them, the file Cygwin and MSYS2 use ("!<symlink>",
+# FF FE, the target in UTF-16LE, 00 00; on Windows with the System attribute) where it has not -- no
+# administrator rights needed -- and every form is read back as a link, wherever the tree was carried.
+if [ "$RD_WINE" = 0 ]; then
+    rd_ck "etc is a link" test -L rd_base/ramdisk/etc
+    rd_ck "sbin/ueventd is a link" test -L rd_base/ramdisk/sbin/ueventd
+    rd_ck "its target" test "$(readlink rd_base/ramdisk/sbin/ueventd)" = "../init"
+else
+    rd_ck "etc is a Cygwin link file" rd_is_cyg rd_base/ramdisk/etc
+    rd_ck "sbin/ueventd is a Cygwin link file" rd_is_cyg rd_base/ramdisk/sbin/ueventd
+    rd_ck "etc: not a real link" test ! -L rd_base/ramdisk/etc
+    rd_ck "etc: UTF-16LE target, two zero bytes" test "$(od -An -tx1 -j12 rd_base/ramdisk/etc | tr -d ' \n')" = "$(python3 -c 'print("/system/etc".encode("utf-16-le").hex() + "0000")')"
+    rd_ck "etc: it starts with !<symlink> and the FF FE mark" test "$(head -c 12 rd_base/ramdisk/etc | od -An -tx1 | tr -d ' \n')" = "213c73796d6c696e6b3efffe"
+fi
+rd_ck "what a link points at, whichever form" test "$(rd_link rd_base/ramdisk/sbin/ueventd)" = "../init"
+rd_done "ramdisk symlinks: a link in the directory is a real link where the system has them and a Cygwin link file ('!<symlink>', UTF-16LE) on Windows"
+
+rm -rf rd_l1 && cp -a rd_base rd_l1
+rd_cyg rd_l1/ramdisk/cyg_ascii "/system/bin/sh"
+rd_cyg rd_l1/ramdisk/cyg_utf8 "$(printf 'caf\303\251/\360\237\230\200')"
+printf '!<symlink>legacy/utf8\0' >rd_l1/ramdisk/cyg_legacy                  # the older, UTF-8 form
+printf '../textual\r\n' >rd_l1/ramdisk/text_link                              # a text file: a link when its line says l
+rd_meta_add rd_l1/ramdisk.meta "l 0755 7 8 9 - text_link"
+rd_cyg rd_l1/ramdisk/init.rc "/not/a/link"                                    # a file as far as the metadata says: stays one
+if [ "$RD_WINE" = 0 ]; then
+    ln -s lib rd_l1/ramdisk/dir_link                                          # a link to a directory is a link, not the directory
+    ln -s /does/not/exist rd_l1/ramdisk/dangling
+    ln -s "target with spaces" rd_l1/ramdisk/spaced
+fi
+rd_ck "repack" rd_repack_unpack rd_l1 rd_l1o
+L=rd_l1o_re/ramdisk.cpio
+rd_ck "Cygwin link file" rd_has $L "^l 0777 0 0 14 .* 1 cyg_ascii$"
+rd_ck "its target" test "$(rd_link rd_l1o_re/ramdisk/cyg_ascii)" = "/system/bin/sh"
+rd_ck "Cygwin link file with UTF-16 surrogates" rd_has $L "^l 0777 0 0 10 .* 1 cyg_utf8$"
+rd_ck "its UTF-8 target" test "$(rd_link rd_l1o_re/ramdisk/cyg_utf8)" = "$(printf 'caf\303\251/\360\237\230\200')"
+rd_ck "the older UTF-8 form" rd_has $L "^l 0777 0 0 11 .* 1 cyg_legacy$"
+rd_ck "text file where the metadata says l" rd_has $L "^l 0755 7 8 10 .* 1 text_link$"
+rd_ck "its target without the line break" test "$(rd_link rd_l1o_re/ramdisk/text_link)" = "../textual"
+rd_ck "a file whose line says f stays a file, link-like or not" rd_has $L "^f 0750 0 0 36 .* 1 init.rc$"
+rd_ck "and the repack says why" grep -q "'init.rc' looks like a symbolic link file" rd_l1o.rlog
+if [ "$RD_WINE" = 0 ]; then
+    rd_ck "link to a directory" rd_has $L "^l 0777 0 0 3 .* 1 dir_link$"
+    rd_ck "not followed" test -z "$(rd_names $L | grep '^dir_link/')"
+    rd_ck "dangling link" rd_has $L "^l 0777 0 0 15 .* 1 dangling$"
+    rd_ck "target with spaces" rd_has $L "^l 0777 0 0 18 .* 1 spaced$"
+fi
+rd_ck "GNU cpio agrees with every link" rd_oracle rd_l1o_re
+rd_done "ramdisk symlinks: real links, Cygwin link files (ASCII, UTF-8 beyond the first plane, the older UTF-8 form) and text files are all links in the archive; a file the metadata calls a file stays one$RD_GNU"
+
+# A link file that cannot be read stops the repack, with the file's name and the reason.
+rm -rf rd_l2 && cp -a rd_base rd_l2 && printf '!<symlink>\377\376\000\334\0\0' >rd_l2/ramdisk/badlink
+rm -f rd_l2.img
+if ! "$ABR" repack rd_l2 -o rd_l2.img >rd_l2.log 2>&1 && grep -q "the link file 'badlink' cannot be read" rd_l2.log && [ ! -s rd_l2.img ]; then
+    pass "ramdisk symlinks: a link file with broken UTF-16 stops the repack and names the file (nothing is written)"
+else
+    fail "ramdisk symlinks: a broken link file ($(cat rd_l2.log))"
+fi
+rm -rf rd_l3 && cp -a rd_base rd_l3 && printf '!<symlink>\377\376\0\0' >rd_l3/ramdisk/emptylink
+rm -f rd_l3.img
+if ! "$ABR" repack rd_l3 -o rd_l3.img >rd_l3.log 2>&1 && grep -q "the link file 'emptylink' cannot be read: it has no target" rd_l3.log && [ ! -s rd_l3.img ]; then
+    pass "ramdisk symlinks: a link file without a target stops the repack"
+else
+    fail "ramdisk symlinks: an empty link file ($(cat rd_l3.log))"
+fi
+
+# The tree travels: made by `unpack` here (links), repacked from a copy where every link is a Cygwin file
+# (as on Windows) or a text file -- the same ramdisk comes out of any of them.
+rm -rf rd_l4 && cp -a rd_base rd_l4
+for l in etc sbin/ueventd; do
+    t="$(rd_link "rd_l4/ramdisk/$l")"
+    rm "rd_l4/ramdisk/$l"
+    rd_cyg "rd_l4/ramdisk/$l" "$t"
+done
+"$ABR" repack rd_l4 -o rd_l4.img >/dev/null 2>&1
+rm -rf rd_l5 && cp -a rd_base rd_l5
+for l in etc sbin/ueventd; do
+    t="$(rd_link "rd_l5/ramdisk/$l")"
+    rm "rd_l5/ramdisk/$l"
+    printf '%s\n' "$t" >"rd_l5/ramdisk/$l"
+done
+"$ABR" repack rd_l5 -o rd_l5.img >/dev/null 2>&1
+if cmp -s rd_l4.img rdimg_mkbootfs.img && cmp -s rd_l5.img rdimg_mkbootfs.img; then
+    pass "ramdisk symlinks: a tree whose links became Cygwin link files (Windows) or text files (git without symlinks) repacks to the identical image"
+else
+    fail "ramdisk symlinks: a tree carried to another system does not repack to the same image"
+fi
+
+# ---- several archives one after the other (what Magisk's cpio makes: the ramdisk, then an archive of its
+# own with the backup and overlay.d): a directory and a metadata file for each, ramdisk/ and ramdisk.vol2/ ...
+# rd_volumes2 is the unpack of an image whose ramdisk is an mkbootfs archive (22 records) followed by a small
+# one (6 records); rd_volumes3 has three archives of three kinds (crc, `find . | cpio` style, mkbootfs).
+python3 "$RDG" split rd_volumes2/ramdisk.cpio rd_vsplit
+python3 "$RDG" split rd_volumes3/ramdisk.cpio rd_v3split
+rd_ck "the second archive's records are in the second directory" test -f rd_volumes2/ramdisk.vol2/.backup/.magisk
+rd_ck "...and are the only ones" test "$(rd_count rd_vsplit.1.cpio)" = 6
+rd_ck "the first has its own 22" test "$(rd_count rd_vsplit.0.cpio)" = 22
+rd_ck "three archives, three directories" test -f rd_volumes3/ramdisk.vol3/overlay.d/sbin/magisk
+rd_ck "three kinds of archive, three metadata files" test "$(grep -h '^format\|^hex\|^names' rd_volumes3/ramdisk.meta rd_volumes3/ramdisk.vol2.meta rd_volumes3/ramdisk.vol3.meta | tr '\n' ' ')" = "format crc hex lower names plain format newc hex upper names dotslash format newc hex lower names plain "
+rd_ck "each has the position of its own zero fill" grep -q "^tail " rd_volumes3/ramdisk.vol3.meta
+rd_done "ramdisk volumes: every archive of a stream of several has its own directory and metadata (magic, digit case, names and fill are those of that archive)"
+
+# An edit in the second one changes the second archive and nothing else.
+rm -rf rd_m1 && cp -a rd_volumes2 rd_m1
+printf 'KEEPVERITY=false\n' >rd_m1/ramdisk.vol2/.backup/.magisk
+printf 'new\n' >rd_m1/ramdisk.vol2/overlay.d/new.rc
+rd_ck "repack" rd_repack_unpack rd_m1 rd_m1o
+python3 "$RDG" split rd_m1o_re/ramdisk.cpio rd_m1s
+rd_ck "still two archives" test "$(ls rd_m1s.*.cpio | wc -l | tr -d ' ')" = 2
+rd_ck "the first archive: the same bytes" cmp -s rd_vsplit.0.cpio rd_m1s.0.cpio
+rd_ck "the second archive: not" rd_differ rd_vsplit.1.cpio rd_m1s.1.cpio
+rd_ck "the second has the new file (the defaults of its metadata)" rd_has rd_m1s.1.cpio "^f 0644 0 0 4 .* 1 overlay.d/new.rc$"
+rd_ck "the second has 7 records, the first 22" test "$(rd_count rd_m1s.1.cpio) $(rd_count rd_m1s.0.cpio)" = "7 22"
+rd_ck "the edited file" test "$(cat rd_m1o_re/ramdisk.vol2/.backup/.magisk)" = "KEEPVERITY=false"
+rd_ck "the first directory comes back as it was" rd_same_tree rd_volumes2/ramdisk rd_m1o_re/ramdisk
+rd_ck "the second as it was edited" rd_same_tree rd_m1/ramdisk.vol2 rd_m1o_re/ramdisk.vol2
+rd_ck "the first metadata is the same" cmp -s rd_volumes2/ramdisk.meta rd_m1o_re/ramdisk.meta
+rd_ck "the manifest still says two" grep -qx "ramdisk_tree_volumes=2" rd_m1o_re/manifest.txt
+rd_ck "the note names the volume of the new file" grep -q "ramdisk.vol2/: 1 new entry not in ramdisk.vol2.meta" rd_m1o.rlog
+rd_ck "...and says where the ramdisk comes from" grep -q "built from the directories ramdisk/ and ramdisk.vol2/ (2 cpio archives one after the other, " rd_m1o.rlog
+rd_ck "GNU cpio agrees with both" rd_oracle rd_m1o_re
+rd_done "ramdisk volumes: an edit in ramdisk.vol2/ rebuilds the second archive only (the first keeps its exact bytes), the new file is listed with its volume$RD_GNU"
+
+# ... in the first one, and the second archive keeps its bytes.
+rm -rf rd_m2 && cp -a rd_volumes2 rd_m2 && printf '# added\n' >>rd_m2/ramdisk/init.rc
+rd_ck "repack" rd_repack_unpack rd_m2 rd_m2o
+python3 "$RDG" split rd_m2o_re/ramdisk.cpio rd_m2s
+rd_ck "the second archive: the same bytes" cmp -s rd_vsplit.1.cpio rd_m2s.1.cpio
+rd_ck "the first archive: not" rd_differ rd_vsplit.0.cpio rd_m2s.0.cpio
+rd_ck "the second directory comes back as it was" rd_same_tree rd_volumes2/ramdisk.vol2 rd_m2o_re/ramdisk.vol2
+rd_ck "the second metadata is the same" cmp -s rd_volumes2/ramdisk.vol2.meta rd_m2o_re/ramdisk.vol2.meta
+rd_ck "GNU cpio agrees with both" rd_oracle rd_m2o_re
+rd_done "ramdisk volumes: an edit in ramdisk/ rebuilds the first archive only$RD_GNU"
+
+# A deletion in one, a new file in the other, a mode in the metadata of the second.
+rm -rf rd_m3 && cp -a rd_volumes2 rd_m3
+rm rd_m3/ramdisk.vol2/overlay.d/sbin/magisk.xz
+printf 'x\n' >rd_m3/ramdisk/newfile
+rd_meta_sub rd_m3/ramdisk.vol2.meta "f 0755 0 0 0 - overlay.d/sbin/magisk" "f 4755 1000 1000 1700000000 - overlay.d/sbin/magisk"
+rd_ck "repack" rd_repack_unpack rd_m3 rd_m3o
+L=rd_m3o_re/ramdisk.cpio
+rd_ck "the deleted file is gone" test -z "$(rd_names $L | grep 'magisk.xz')"
+rd_ck "its neighbour is not" rd_has $L "^f 4755 1000 1000 .* 1 overlay.d/sbin/magisk$"
+rd_ck "the new file is in the first" rd_has $L "^f 0644 0 0 2 .* 1 newfile$"
+rd_ck "the note names the deleted file and its metadata" grep -q "ramdisk.vol2/: 1 entry of ramdisk.vol2.meta is not in the directory and left out of the ramdisk: overlay.d/sbin/magisk.xz" rd_m3o.rlog
+rd_ck "the note names the new file and its metadata" grep -q "ramdisk/: 1 new entry not in ramdisk.meta" rd_m3o.rlog
+rd_ck "28 records in all (one gone, one new)" test "$(rd_count $L)" = 28
+rd_ck "GNU cpio agrees with both" rd_oracle rd_m3o_re
+rd_done "ramdisk volumes: a file deleted from one directory, a file added to another and a mode edited in the second metadata each land in their archive$RD_GNU"
+
+# Each archive has the defaults of its own metadata for what is new.
+rm -rf rd_m4 && cp -a rd_volumes2 rd_m4
+rd_meta_sub rd_m4/ramdisk.vol2.meta "default uid=0 gid=0 mtime=0 dev=0:0" "default uid=7 gid=8 mtime=9 dev=0:0"
+rd_meta_sub rd_m4/ramdisk.vol2.meta "newmode file=0644 exec=0755 dir=0755 link=0777" "newmode file=0600 exec=0700 dir=0700 link=0700"
+printf 'a\n' >rd_m4/ramdisk.vol2/overlay.d/a.txt
+printf 'b\n' >rd_m4/ramdisk/b.txt
+rd_ck "repack" rd_repack_unpack rd_m4 rd_m4o
+rd_ck "the second: its defaults" rd_has rd_m4o_re/ramdisk.cpio "^f 0600 7 8 2 .* 1 overlay.d/a.txt$"
+rd_ck "the first: its own" rd_has rd_m4o_re/ramdisk.cpio "^f 0644 0 0 2 .* 1 b.txt$"
+rd_ck "GNU cpio agrees with both" rd_oracle rd_m4o_re
+rd_done "ramdisk volumes: what is new gets the owner and modes of the metadata of its own archive$RD_GNU"
+
+# A metadata file that is gone: warned about, for that archive only.
+rm -rf rd_m5 && cp -a rd_volumes2 rd_m5 && rm rd_m5/ramdisk.vol2.meta
+printf 'n\n' >rd_m5/ramdisk.vol2/overlay.d/n.txt
+rd_ck "repack" rd_repack_unpack rd_m5 rd_m5o
+rd_ck "warned, naming the file" grep -q "no ramdisk.vol2.meta" rd_m5o.rlog
+rd_ck "not about the other" test -z "$(grep 'no ramdisk.meta' rd_m5o.rlog)"
+python3 "$RDG" split rd_m5o_re/ramdisk.cpio rd_m5s
+rd_ck "the first archive is untouched" cmp -s rd_vsplit.0.cpio rd_m5s.0.cpio
+rd_done "ramdisk volumes: a missing ramdisk.vol2.meta is warned about by its name and concerns that archive only"
+
+# A directory that is gone leaves its archive out of the ramdisk.
+rm -rf rd_m6 && cp -a rd_volumes2 rd_m6 && rm -rf rd_m6/ramdisk.vol2
+rd_ck "repack" rd_repack_unpack rd_m6 rd_m6o
+rd_ck "the image has the first archive only" test "$(rd_count rd_m6o_re/ramdisk.cpio)" = 22
+rd_ck "the second archive is gone: no volume any more" test -z "$(grep _tree_volumes rd_m6o_re/manifest.txt)"
+rd_ck "the first directory is the first directory" rd_same_tree rd_volumes2/ramdisk rd_m6o_re/ramdisk
+rd_ck "and it was said" grep -q "ramdisk.vol2/: the directory is not there, so that archive is left out of the ramdisk" rd_m6o.rlog
+rd_ck "built from the directory ramdisk/ alone" grep -q "built from the directory ramdisk/ (" rd_m6o.rlog
+rd_ck "the first archive: the same bytes" cmp -s rd_vsplit.0.cpio rd_m6o_re/ramdisk.cpio
+rd_done "ramdisk volumes: deleting ramdisk.vol2/ leaves the second archive out of the image (and says so)"
+rm -rf rd_m7 && cp -a rd_volumes2 rd_m7 && rm -rf rd_m7/ramdisk
+rd_ck "repack" rd_repack_unpack rd_m7 rd_m7o
+rd_ck "the image has the second archive only" test "$(rd_count rd_m7o_re/ramdisk.cpio)" = 6
+rd_ck "it is the first directory now" rd_same_tree rd_volumes2/ramdisk.vol2 rd_m7o_re/ramdisk
+rd_ck "and it was said" grep -q "ramdisk/: the directory is not there, so that archive is left out of the ramdisk" rd_m7o.rlog
+rd_done "ramdisk volumes: deleting ramdisk/ (the first) leaves the first archive out; what is left is the second archive"
+rm -rf rd_m8 && cp -a rd_volumes2 rd_m8 && rm -rf rd_m8/ramdisk rd_m8/ramdisk.vol2
+"$ABR" repack rd_m8 -o rd_m8.img >rd_m8.log 2>&1
+rd_ck "every directory gone: ramdisk.cpio is used, the image is the original" cmp -s rd_m8.img rdimg_volumes2.img
+rd_done "ramdisk volumes: with every directory deleted the repack takes ramdisk.cpio, as with one directory"
+
+# A directory beyond the last one is not part of the ramdisk: a warning, and it is left alone.
+rm -rf rd_m9 && cp -a rd_volumes2 rd_m9 && mkdir rd_m9/ramdisk.vol3 && printf 'x\n' >rd_m9/ramdisk.vol3/x
+"$ABR" repack rd_m9 -o rd_m9.img >rd_m9.log 2>&1
+rd_ck "warned" grep -q "ramdisk.vol3/ is not part of this ramdisk (the unpack had 2 archives) and is ignored" rd_m9.log
+rd_ck "the image is the original" cmp -s rd_m9.img rdimg_volumes2.img
+rd_ck "the directory is left in place" test -f rd_m9/ramdisk.vol3/x
+rd_done "ramdisk volumes: a ramdisk.vol3/ that the unpack did not make is warned about and ignored (a new archive is made by ramdisk.cpio, not by a directory)"
+
+# Both the archive file and a directory changed: say which, as with one.
+rm -rf rd_m10 && cp -a rd_volumes2 rd_m10 && python3 "$RDG" owners rd_m10/ramdisk.cpio && printf 'k\n' >>rd_m10/ramdisk.vol2/.backup/.magisk
+if ! "$ABR" repack rd_m10 -o rd_m10.img >rd_m10.log 2>&1 && grep -q "ramdisk-from" rd_m10.log; then
+    pass "ramdisk volumes: ramdisk.cpio and a volume's directory both changed: repack stops and says how to choose"
+else
+    fail "ramdisk volumes: both changed was not refused ($(cat rd_m10.log))"
+fi
+"$ABR" repack rd_m10 -o rd_m10t.img --ramdisk-from tree >/dev/null 2>&1 && "$ABR" unpack rd_m10t.img -o rd_m10t_re >/dev/null 2>&1
+"$ABR" repack rd_m10 -o rd_m10c.img --ramdisk-from cpio >/dev/null 2>&1 && "$ABR" unpack rd_m10c.img -o rd_m10c_re >/dev/null 2>&1
+if rd_same_tree rd_m10/ramdisk.vol2 rd_m10t_re/ramdisk.vol2 && cmp -s rd_m10c_re/ramdisk.cpio rd_m10/ramdisk.cpio; then
+    pass "ramdisk volumes: --ramdisk-from tree builds all the archives from their directories, --ramdisk-from cpio takes ramdisk.cpio"
+else
+    fail "ramdisk volumes: --ramdisk-from"
+fi
+
+# Three archives of three kinds: the middle one, written like GNU cpio does, is edited.
+rm -rf rd_m11 && cp -a rd_volumes3 rd_m11
+printf 'more\n' >>rd_m11/ramdisk.vol2/init.rc
+printf 'hi\n' >rd_m11/ramdisk.vol2/newfile
+rd_ck "repack" rd_repack_unpack rd_m11 rd_m11o
+python3 "$RDG" split rd_m11o_re/ramdisk.cpio rd_m11s
+rd_ck "the first archive (crc): the same bytes" cmp -s rd_v3split.0.cpio rd_m11s.0.cpio
+rd_ck "the third archive: the same bytes" cmp -s rd_v3split.2.cpio rd_m11s.2.cpio
+rd_ck "the second archive: not" rd_differ rd_v3split.1.cpio rd_m11s.1.cpio
+rd_ck "its new file is named as its archive names them" rd_has rd_m11s.1.cpio "^f 0644 0 0 3 .* 1 ./newfile$"
+rd_ck "the first is still crc" grep -qx "format crc" rd_m11o_re/ramdisk.meta
+rd_ck "the second is still upper case with ./ names" grep -qx "hex upper" rd_m11o_re/ramdisk.vol2.meta
+rd_ck "the third is lower case" grep -qx "hex lower" rd_m11o_re/ramdisk.vol3.meta
+rd_ck "GNU cpio agrees with all three" rd_oracle rd_m11o_re
+rd_done "ramdisk volumes: in three archives of three kinds the edited one keeps its own magic, digit case, names and fill, and the other two their exact bytes$RD_GNU"
+
+# No fill between the archives, the whole padded to a block at the end: edited in the first.
+rm -rf rd_m12 && cp -a rd_volumes_tail rd_m12 && printf 'q\n' >>rd_m12/ramdisk/init.rc && printf 'z\n' >rd_m12/ramdisk/zzz
+rd_ck "repack" rd_repack_unpack rd_m12 rd_m12o
+rd_ck "512-byte blocks at the end, as before" rd_size_multiple rd_m12o_re/ramdisk.cpio 512
+rd_ck "two archives" grep -qx "ramdisk_tree_volumes=2" rd_m12o_re/manifest.txt
+rd_ck "the second directory is the same" rd_same_tree rd_volumes_tail/ramdisk.vol2 rd_m12o_re/ramdisk.vol2
+rd_ck "GNU cpio agrees with both" rd_oracle rd_m12o_re
+rd_done "ramdisk volumes: archives with no fill between them (padded together at the end) are rebuilt the same way when the first one grows$RD_GNU"
+
+# ---- unpacking again, or differently, over a directory of an earlier unpack
+rm -rf rd_u1 && cp -a rd_volumes3 rd_u1 && "$ABR" unpack rdimg_volumes2.img -o rd_u1 >/dev/null 2>&1
+rd_ck "the third archive's directory is gone" test ! -e rd_u1/ramdisk.vol3
+rd_ck "... and its metadata" test ! -e rd_u1/ramdisk.vol3.meta
+rd_ck "the second is the one of this image" rd_same_tree rd_volumes2/ramdisk.vol2 rd_u1/ramdisk.vol2
+rd_ck "the first is too" rd_same_tree rd_volumes2/ramdisk rd_u1/ramdisk
+rd_ck "the manifest says two" grep -qx "ramdisk_tree_volumes=2" rd_u1/manifest.txt
+"$ABR" repack rd_u1 -o rd_u1.img >/dev/null 2>&1
+rd_ck "and it repacks to the image" cmp -s rd_u1.img rdimg_volumes2.img
+rd_done "unpack: over an earlier unpack with three archives, an image with two replaces two directories and removes the third (and its metadata)"
+rm -rf rd_u2 && cp -a rd_volumes3 rd_u2 && "$ABR" unpack rdimg_mkbootfs.img -o rd_u2 >/dev/null 2>&1
+rd_ck "no volume directories" test ! -e rd_u2/ramdisk.vol2 -a ! -e rd_u2/ramdisk.vol3
+rd_ck "no volume metadata" test ! -e rd_u2/ramdisk.vol2.meta -a ! -e rd_u2/ramdisk.vol3.meta
+rd_ck "no volumes in the manifest" test -z "$(grep _tree_volumes rd_u2/manifest.txt)"
+rd_ck "the one directory is the new one" rd_same_tree rd_mkbootfs/ramdisk rd_u2/ramdisk
+rd_done "unpack: over an earlier unpack with three archives, an image with one leaves one directory"
+rm -rf rd_u3 && cp -a rd_volumes3 rd_u3 && "$ABR" unpack rdimg_volumes3.img -o rd_u3 --no-tree >/dev/null 2>&1
+rd_ck "no directory" test ! -e rd_u3/ramdisk -a ! -e rd_u3/ramdisk.vol2 -a ! -e rd_u3/ramdisk.vol3
+rd_ck "no metadata" test ! -e rd_u3/ramdisk.meta -a ! -e rd_u3/ramdisk.vol2.meta -a ! -e rd_u3/ramdisk.vol3.meta
+rd_ck "no tree in the manifest" test -z "$(grep _tree rd_u3/manifest.txt)"
+"$ABR" repack rd_u3 -o rd_u3.img >/dev/null 2>&1
+rd_ck "the image is the original" cmp -s rd_u3.img rdimg_volumes3.img
+rd_done "unpack --no-tree: removes the directories and metadata of every archive of an earlier unpack"
+rm -rf rd_u4 && cp -a rd_volumes3 rd_u4 && "$ABR" unpack rdimg_hardlink.img -o rd_u4 >/dev/null 2>&1
+rd_ck "no directory" test ! -e rd_u4/ramdisk -a ! -e rd_u4/ramdisk.vol2 -a ! -e rd_u4/ramdisk.vol3
+rd_ck "no metadata" test ! -e rd_u4/ramdisk.meta -a ! -e rd_u4/ramdisk.vol2.meta -a ! -e rd_u4/ramdisk.vol3.meta
+rd_ck "no tree in the manifest" test -z "$(grep _tree rd_u4/manifest.txt)"
+rd_done "unpack: an archive that cannot be a directory removes the directories of every archive of an earlier unpack"
+
+# Somebody else's ramdisk.vol2/ stops the whole directory (an archive half in a directory would be a trap).
+rm -rf rd_u5 && mkdir -p rd_u5/ramdisk.vol2 && printf 'precious\n' >rd_u5/ramdisk.vol2/mine.txt
+"$ABR" unpack rdimg_volumes2.img -o rd_u5 >rd_u5.log 2>&1
+"$ABR" repack rd_u5 -o rd_u5.img >/dev/null 2>&1
+rd_ck "mine.txt is untouched" test "$(cat rd_u5/ramdisk.vol2/mine.txt)" = "precious"
+rd_ck "the first archive got no directory either" test ! -e rd_u5/ramdisk -a ! -e rd_u5/ramdisk.meta
+rd_ck "no tree in the manifest" test -z "$(grep _tree rd_u5/manifest.txt)"
+rd_ck "said why, naming the directory" grep -q "ramdisk.vol2 exists and is not an empty directory" rd_u5.log
+rd_ck "ramdisk.cpio is there" cmp -s rd_u5/ramdisk.cpio rdimg_volumes2.cpio
+rd_ck "the image is the original" cmp -s rd_u5.img rdimg_volumes2.img
+rd_done "unpack: a ramdisk.vol2/ that is not from an earlier unpack is left alone, and then no archive of the ramdisk becomes a directory (the ramdisk stays a file, with a message)"
+rm -rf rd_u6 && mkdir -p rd_u6/ramdisk.vol3 && "$ABR" unpack rdimg_volumes2.img -o rd_u6 >/dev/null 2>&1
+rd_ck "an empty directory is no obstacle" grep -qx "ramdisk_tree_volumes=2" rd_u6/manifest.txt
+rd_done "unpack: an empty ramdisk.vol3/ beyond the archives is nothing to be afraid of"
+
+# --tree-only with volumes: no archive file, and the directories are enough.
+rm -rf rd_to2 && "$ABR" unpack rdimg_volumes2.img -o rd_to2 --tree-only >rd_to2.log 2>&1
+"$ABR" repack rd_to2 -o rd_to2.img >/dev/null 2>&1
+rd_ck "no ramdisk.cpio" test ! -e rd_to2/ramdisk.cpio
+rd_ck "both directories and metadata" test -d rd_to2/ramdisk -a -d rd_to2/ramdisk.vol2 -a -f rd_to2/ramdisk.meta -a -f rd_to2/ramdisk.vol2.meta
+rd_ck "the untouched directories repack to the identical image" cmp -s rd_to2.img rdimg_volumes2.img
+printf 'x\n' >rd_to2/ramdisk.vol2/overlay.d/x
+rd_ck "an edit works without the archive file" rd_repack_unpack rd_to2 rd_to2e
+rd_ck "and is in the second archive" test -f rd_to2e_re/ramdisk.vol2/overlay.d/x
+rd_done "unpack --tree-only: an image with two archives needs only the directories and the metadata"
+
+# ---- vendor_boot: every ramdisk fragment is a ramdisk of its own, with its directory (ramdisk0/, ramdisk1/ ...)
+# and, when a fragment is several archives one after the other, ramdisk0.vol2/ ... as well.
+dtc -I dts -O dtb -o rd_v.dtb v2.dts 2>/dev/null
+python3 "$RDG" crc rd_frag0.cpio && python3 "$RDG" aik rd_frag1.cpio && gzip -9n -c rd_frag0.cpio >rd_frag0.gz
+zstd -q -19 -f rd_frag1.cpio -o rd_frag1.zst 2>/dev/null || gzip -9n -c rd_frag1.cpio >rd_frag1.zst
+python3 "$MKBOOTIMG" >/dev/null --header_version 4 --dtb rd_v.dtb --vendor_cmdline "x=y" \
+    --ramdisk_type platform --ramdisk_name "" --vendor_ramdisk_fragment rd_frag0.gz \
+    --ramdisk_type dlkm --ramdisk_name dlkm_frag --board_id0 7 --vendor_ramdisk_fragment rd_frag1.zst \
+    --vendor_boot rd_vb.img
+rd_unpack rd_vb.img rd_vbu
+"$ABR" repack rd_vbu -o rd_vb.out >/dev/null 2>&1
+rd_ck "a directory for each fragment" test -d rd_vbu/ramdisk0 -a -d rd_vbu/ramdisk1
+rd_ck "...and its metadata" test -f rd_vbu/ramdisk0.meta -a -f rd_vbu/ramdisk1.meta
+rd_ck "the manifest" grep -qx "ramdisk1_tree=ramdisk1" rd_vbu/manifest.txt
+rd_ck "one archive each: no volumes" test -z "$(grep _tree_volumes rd_vbu/manifest.txt)"
+rd_ck "the first fragment's archive" cmp -s rd_frag0.cpio rd_vbu/ramdisk0.cpio
+rd_ck "the second fragment's archive" cmp -s rd_frag1.cpio rd_vbu/ramdisk1.cpio
+rd_ck "an untouched repack is byte-identical" cmp -s rd_vb.img rd_vb.out
+rd_ck "GNU cpio, first fragment" rd_oracle rd_vbu ramdisk0
+rd_ck "GNU cpio, second fragment" rd_oracle rd_vbu ramdisk1
+rd_done "ramdisk directory: a vendor_boot with two ramdisk fragments gets a directory for each (ramdisk0/, ramdisk1/), untouched repack is byte-identical$RD_GNU"
+rm -rf rd_vbe && cp -a rd_vbu rd_vbe && printf 'edited\n' >rd_vbe/ramdisk1/init.rc
+rd_ck "repack" rd_repack_unpack rd_vbe rd_vbeo
+rd_ck "the other fragment keeps its exact compressed bytes" cmp -s rd_vbu/.abr_raw/ramdisk0.cpio.raw rd_vbeo_re/.abr_raw/ramdisk0.cpio.raw
+rd_ck "the edited one does not" rd_differ rd_vbu/.abr_raw/ramdisk1.cpio.raw rd_vbeo_re/.abr_raw/ramdisk1.cpio.raw
+rd_ck "the other fragment's directory is the same" rd_same_tree rd_vbu/ramdisk0 rd_vbeo_re/ramdisk0
+rd_ck "the edit" test "$(cat rd_vbeo_re/ramdisk1/init.rc)" = "edited"
+rd_ck "name survives" grep -qx "ramdisk1_name=dlkm_frag" rd_vbeo_re/manifest.txt
+rd_ck "type survives" grep -qx "ramdisk1_type=dlkm" rd_vbeo_re/manifest.txt
+rd_ck "GNU cpio, second fragment" rd_oracle rd_vbeo_re ramdisk1
+rd_ck "GNU cpio, first fragment" rd_oracle rd_vbeo_re ramdisk0
+rd_done "ramdisk directory: editing one vendor_boot fragment's directory rebuilds that fragment only (the other keeps its exact compressed bytes, names and types survive)$RD_GNU"
+for j in 1 2 4 8; do "$ABR" -j$j repack rd_vbe -o rd_vbe.j$j.img >/dev/null 2>&1; done
+if cmp -s rd_vbe.j1.img rd_vbe.j2.img && cmp -s rd_vbe.j1.img rd_vbe.j4.img && cmp -s rd_vbe.j1.img rd_vbe.j8.img && cmp -s rd_vbe.j1.img rd_vbeo.img; then
+    pass "ramdisk directory: repacking from edited directories gives the same bytes with 1, 2, 4 and 8 threads"
+else
+    fail "ramdisk directory: the result depends on the number of threads"
+fi
+rm -rf rd_tj1 rd_tj4 && "$ABR" -j1 unpack rd_vb.img -o rd_tj1 >/dev/null 2>&1 && "$ABR" -j4 unpack rd_vb.img -o rd_tj4 >/dev/null 2>&1
+if diff -r --no-dereference -x manifest.txt rd_tj1 rd_tj4 >/dev/null && diff <(tail -n +2 rd_tj1/manifest.txt) <(tail -n +2 rd_tj4/manifest.txt) >/dev/null; then
+    pass "ramdisk directory: unpacking gives the same directories and manifest with 1 and 4 threads"
+else
+    fail "ramdisk directory: unpack depends on the number of threads"
+fi
+
+# A fragment that is several archives (a Magisk-patched vendor ramdisk, say) and another that is three.
+python3 "$RDG" volumes2 rd_fragv0.cpio && python3 "$RDG" volumes3 rd_fragv1.cpio
+gzip -9n -c rd_fragv0.cpio >rd_fragv0.gz
+zstd -q -19 -f rd_fragv1.cpio -o rd_fragv1.zst 2>/dev/null || gzip -9n -c rd_fragv1.cpio >rd_fragv1.zst
+python3 "$MKBOOTIMG" >/dev/null --header_version 4 --dtb rd_v.dtb --vendor_cmdline "x=y" \
+    --ramdisk_type platform --ramdisk_name "" --vendor_ramdisk_fragment rd_fragv0.gz \
+    --ramdisk_type dlkm --ramdisk_name dlkm_frag --board_id0 7 --vendor_ramdisk_fragment rd_fragv1.zst \
+    --vendor_boot rd_vv.img
+rd_unpack rd_vv.img rd_vvu
+"$ABR" repack rd_vvu -o rd_vv.out >/dev/null 2>&1
+rd_ck "volumes of the first fragment" grep -qx "ramdisk0_tree_volumes=2" rd_vvu/manifest.txt
+rd_ck "volumes of the second" grep -qx "ramdisk1_tree_volumes=3" rd_vvu/manifest.txt
+rd_ck "directories" test -d rd_vvu/ramdisk0 -a -d rd_vvu/ramdisk0.vol2 -a -d rd_vvu/ramdisk1 -a -d rd_vvu/ramdisk1.vol2 -a -d rd_vvu/ramdisk1.vol3
+rd_ck "metadata" test -f rd_vvu/ramdisk0.vol2.meta -a -f rd_vvu/ramdisk1.vol2.meta -a -f rd_vvu/ramdisk1.vol3.meta
+rd_ck "no volume too many" test ! -e rd_vvu/ramdisk0.vol3 -a ! -e rd_vvu/ramdisk1.vol4
+rd_ck "the log counts them" grep -q "in 2 cpio archives one after the other -> rd_vvu/ramdisk0/, rd_vvu/ramdisk0.vol2/" rd_vvu.log
+rd_ck "an untouched repack is byte-identical" cmp -s rd_vv.img rd_vv.out
+rd_ck "GNU cpio, every archive of both fragments" rd_oracle_frags rd_vvu ramdisk0 ramdisk1
+rd_done "ramdisk directory: a vendor_boot fragment that is several cpio archives one after the other gets a directory for each (ramdisk0.vol2/ ...), and an untouched repack is byte-identical$RD_GNU"
+python3 "$RDG" split rd_vvu/ramdisk0.cpio rd_vv0s
+python3 "$RDG" split rd_vvu/ramdisk1.cpio rd_vv1s
+rm -rf rd_vve && cp -a rd_vvu rd_vve
+printf 'KEEPVERITY=false\n' >rd_vve/ramdisk0.vol2/.backup/.magisk     # fragment 0, its second archive
+printf 'more\n' >>rd_vve/ramdisk1.vol3/overlay.d/sbin/magisk.xz       # fragment 1, its third
+rd_ck "repack" rd_repack_unpack rd_vve rd_vveo
+python3 "$RDG" split rd_vveo_re/ramdisk0.cpio rd_vve0s
+python3 "$RDG" split rd_vveo_re/ramdisk1.cpio rd_vve1s
+rd_ck "fragment 0: the first archive keeps its bytes" cmp -s rd_vv0s.0.cpio rd_vve0s.0.cpio
+rd_ck "fragment 0: the second does not" rd_differ rd_vv0s.1.cpio rd_vve0s.1.cpio
+rd_ck "fragment 1: the first archive keeps its bytes" cmp -s rd_vv1s.0.cpio rd_vve1s.0.cpio
+rd_ck "fragment 1: the second archive keeps its bytes" cmp -s rd_vv1s.1.cpio rd_vve1s.1.cpio
+rd_ck "fragment 1: the third does not" rd_differ rd_vv1s.2.cpio rd_vve1s.2.cpio
+rd_ck "the volumes are still there" grep -qx "ramdisk1_tree_volumes=3" rd_vveo_re/manifest.txt
+rd_ck "the edits" test "$(cat rd_vveo_re/ramdisk0.vol2/.backup/.magisk)" = "KEEPVERITY=false"
+rd_ck "GNU cpio, both fragments" rd_oracle_frags rd_vveo_re ramdisk0 ramdisk1
+rd_done "ramdisk directory: edits in the second archive of one fragment and the third of another rebuild those archives only$RD_GNU"
+for j in 1 2 4 8; do "$ABR" -j$j repack rd_vve -o rd_vve.j$j.img >/dev/null 2>&1; done
+if cmp -s rd_vve.j1.img rd_vve.j2.img && cmp -s rd_vve.j1.img rd_vve.j4.img && cmp -s rd_vve.j1.img rd_vve.j8.img && cmp -s rd_vve.j1.img rd_vveo.img; then
+    pass "ramdisk directory: fragments of several archives repack to the same bytes with 1, 2, 4 and 8 threads"
+else
+    fail "ramdisk directory: the result depends on the number of threads (fragments of several archives)"
+fi
+# One archive of a fragment taken out, in one fragment only.
+rm -rf rd_vvl && cp -a rd_vvu rd_vvl && rm -rf rd_vvl/ramdisk1.vol3
+rd_ck "repack" rd_repack_unpack rd_vvl rd_vvlo
+rd_ck "fragment 1 has two archives now" grep -qx "ramdisk1_tree_volumes=2" rd_vvlo_re/manifest.txt
+rd_ck "fragment 0 has the exact bytes it had" cmp -s rd_vvu/.abr_raw/ramdisk0.cpio.raw rd_vvlo_re/.abr_raw/ramdisk0.cpio.raw
+python3 "$RDG" split rd_vvlo_re/ramdisk1.cpio rd_vvl1s
+rd_ck "fragment 1's first archive is the same" cmp -s rd_vv1s.0.cpio rd_vvl1s.0.cpio
+rd_ck "fragment 1's second archive is the same" cmp -s rd_vv1s.1.cpio rd_vvl1s.1.cpio
+rd_ck "and it has no third" test ! -e rd_vvl1s.2.cpio
+rd_ck "it was said, with the name of the directory" grep -q "ramdisk1.vol3/: the directory is not there, so that archive is left out of the ramdisk" rd_vvlo.rlog
+rd_done "ramdisk directory: deleting ramdisk1.vol3/ of a vendor_boot leaves that archive out of fragment 1 and touches nothing else"
+rm -rf rd_vvj1 rd_vvj4 && "$ABR" -j1 unpack rd_vv.img -o rd_vvj1 >/dev/null 2>&1 && "$ABR" -j4 unpack rd_vv.img -o rd_vvj4 >/dev/null 2>&1
+if diff -r --no-dereference -x manifest.txt rd_vvj1 rd_vvj4 >/dev/null && diff <(tail -n +2 rd_vvj1/manifest.txt) <(tail -n +2 rd_vvj4/manifest.txt) >/dev/null; then
+    pass "ramdisk directory: unpacking fragments of several archives gives the same directories with 1 and 4 threads"
+else
+    fail "ramdisk directory: unpack of fragments of several archives depends on the number of threads"
+fi
+
+# ---- images of your own: ABR_REAL_IMAGES=<directory> tests/run_tests.sh <abr> checks every file of it the way
+# the fixtures above are checked -- an untouched repack is identical, every ramdisk archive is a directory that
+# GNU cpio agrees with, and a file put into a directory lands in the image. (Files abr does not take, an ext4
+# image say, are listed; nothing is asserted about them.)
+if [ -n "${ABR_REAL_IMAGES:-}" ] && [ -d "$ABR_REAL_IMAGES" ]; then
+    echo "note: checking the images of $ABR_REAL_IMAGES"
+    for img in "$ABR_REAL_IMAGES"/*; do
+        [ -f "$img" ] || continue
+        rb="$(basename "$img")"
+        rw="real_$(printf '%s' "$rb" | tr -c 'A-Za-z0-9_.-' '_')"
+        rm -rf "$rw" "$rw.out" "$rw.edit" "$rw.edit.img" "$rw.edit_re"
+        if ! "$ABR" unpack "$img" -o "$rw" >"$rw.log" 2>&1; then
+            echo "note: $rb is not an image abr unpacks ($(tail -n 1 "$rw.log"))"
+            continue
+        fi
+        "$ABR" repack "$rw" -o "$rw.out" >/dev/null 2>&1
+        rd_ck "untouched repack is identical" cmp -s "$img" "$rw.out"
+        prefixes="$(sed -n 's/^\(ramdisk[0-9]*\)_tree=.*/\1/p;s/^ramdisk_tree=.*/ramdisk/p' "$rw/manifest.txt")"
+        for p in $prefixes; do
+            rd_ck "$p: GNU cpio" rd_oracle "$rw" "$p"
+            vols="$(sed -n "s/^${p}_tree_volumes=//p" "$rw/manifest.txt")"
+            rd_ck "$p: the volumes the manifest counts are there" test "$(ls -d "$rw/$p" "$rw/$p".vol* 2>/dev/null | grep -c -v '\.meta$')" = "${vols:-1}"
+        done
+        if [ -n "$prefixes" ]; then
+            first="$(sed -n '1p' <<<"$prefixes")"
+            cp -a "$rw" "$rw.edit" && printf 'abr test\n' >"$rw.edit/$first/abr_test_file"
+            "$ABR" repack "$rw.edit" -o "$rw.edit.img" >/dev/null 2>&1 && "$ABR" unpack "$rw.edit.img" -o "$rw.edit_re" >/dev/null 2>&1
+            rd_ck "$first: a file put into the directory is in the image" test "$(cat "$rw.edit_re/$first/abr_test_file" 2>/dev/null)" = "abr test"
+            rd_ck "$first: nothing else changed" rd_same_tree_x "$rw/$first" "$rw.edit_re/$first" abr_test_file
+            rd_ck "the image is the same size or larger by a little" test "$(wc -c <"$rw.edit.img")" -ge "$(wc -c <"$img")"
+        fi
+        rd_done "real image $rb: ${prefixes:+ramdisk directories (${prefixes//$'\n'/, }), }untouched repack identical$RD_GNU"
+    done
+fi
+
+# =========================================================================
 # Identification: the signatures of Android Image Kitchen's androidbootimg.magic,
 # written down as code. tests/tools/magic_samples.py makes one sample per rule
 # (and the awkward combinations) and knows what each must be called. When
