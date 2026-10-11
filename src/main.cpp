@@ -35,6 +35,7 @@
 #include "abr/legacy/avb1.hpp"
 #include "abr/legacy/dhtb.hpp"
 #include "abr/legacy/elf_boot.hpp"
+#include "abr/legacy/krnl.hpp"
 #include "abr/legacy/mtk.hpp"
 #include "abr/manifest.hpp"
 #include "abr/parallel.hpp"
@@ -52,7 +53,7 @@ namespace {
 
 // ------------------------------------------------------------ detection --
 
-enum class Fmt { BOOT, VENDOR_BOOT, DTBO, DTB, VBMETA, UIMAGE, ELF_BOOT, UNKNOWN };
+enum class Fmt { BOOT, VENDOR_BOOT, DTBO, DTB, VBMETA, UIMAGE, ELF_BOOT, KRNL, UNKNOWN };
 
 // Where the "ANDROID!" container starts: within the first kMagicSearchLimit bytes (a vendor
 // wrapper in front of it), or -- Barnes & Noble Nook images -- right behind the fixed-size
@@ -80,6 +81,7 @@ Fmt detect_format(const Bytes& d) {
     }
     if (d.size() >= 64 && std::memcmp(d.data() + d.size() - 64, "AVBf", 4) == 0) return Fmt::VBMETA;
     if (ElfBootImage::looks_like(d)) return Fmt::ELF_BOOT;
+    if (KrnlImage::looks_like(d)) return Fmt::KRNL;
     // A vendor wrapper in front of an ordinary image (Spreadtrum BFBF/SSSS,
     // for one): the container's magic is not at offset 0 but close to it.
     // This is only consulted once nothing else matched, so a stray
@@ -137,6 +139,7 @@ const char* fmt_name(Fmt f) {
         case Fmt::VBMETA: return "vbmeta";
         case Fmt::UIMAGE: return "uimage";
         case Fmt::ELF_BOOT: return "elf_boot";
+        case Fmt::KRNL: return "krnl";
         case Fmt::UNKNOWN: return "unknown";
     }
     return "unknown";
@@ -150,6 +153,7 @@ Fmt fmt_from_name(const std::string& s) {
     if (s == "vbmeta") return Fmt::VBMETA;
     if (s == "uimage") return Fmt::UIMAGE;
     if (s == "elf_boot") return Fmt::ELF_BOOT;
+    if (s == "krnl") return Fmt::KRNL;
     return Fmt::UNKNOWN;
 }
 
@@ -1327,6 +1331,51 @@ Bytes repack_elf_boot(const Manifest& m, const fs::path& dir, const RepackOption
     return img.build();
 }
 
+// ---------------------------------------------------------------- krnl --
+//
+// Rockchip "KRNL" (abr/legacy/krnl.hpp): 8 bytes, the payload, a CRC. What Android Image Kitchen calls a
+// ramdisk: a cpio archive -- compressed, as Rockchip's boot.img has it -- becomes `ramdisk.cpio` and the
+// directory `ramdisk/`; a payload that is anything else (kernel.img holds a kernel) stays `kernel`.
+
+void unpack_krnl(const Bytes& host, const fs::path& dir, const UnpackOptions& uo) {
+    legacy::KrnlImage img = legacy::KrnlImage::parse(host);
+    Manifest m;
+    m.set("type", "krnl");
+    DecodedComponent part = decode_component(img.payload);
+    const bool ramdisk = part.plain.size() < 5 || std::memcmp(part.plain.data(), "07070", 5) == 0;  // (an empty one is a ramdisk)
+    const std::string prefix = ramdisk ? "ramdisk" : "kernel";
+    const std::string filename = ramdisk ? "ramdisk.cpio" : "kernel";
+    if (part.present) {
+        fs::create_directories(dir / ".abr_raw");
+        write_file(dir / filename, part.plain);
+        write_file(dir / ".abr_raw" / (filename + ".raw"), part.stored(img.payload));
+        record_component(m, prefix, filename, part);
+        if (ramdisk) save_ramdisk_trees(m, dir, {{"ramdisk", "ramdisk.cpio", &part}}, uo);
+    }
+    if (!img.crc_ok) {
+        // Put back as it was while the payload is untouched, so that the round trip stays exact.
+        m.set_addr("krnl_crc", img.crc);
+        m.set_hex("krnl_payload_sha256", hash::sha256(img.payload));
+        char found[16], should[16];
+        std::snprintf(found, sizeof found, "0x%08x", img.crc);
+        std::snprintf(should, sizeof should, "0x%08x", legacy::rkcrc32(img.payload));
+        warn(std::string("the CRC stored in this KRNL image (") + found + ") is not the CRC of its payload (" + should +
+             "); it is kept as long as the payload is not changed, and computed afresh after an edit");
+    }
+    const Envelope env = Envelope::capture(host, 0, img.file_size());
+    save_envelope(m, dir, env, host, 0, img.file_size());
+    m.save(dir / "manifest.txt", "abr krnl manifest -- edit then `abr repack " + dir.string() + " -o out.img`");
+}
+
+Bytes repack_krnl(const Manifest& m, const fs::path& dir, const RepackOptions& opt) {
+    legacy::KrnlImage img;
+    img.payload = load_component(m, dir, m.has("kernel_file") ? "kernel" : "ramdisk", opt);
+    std::optional<uint32_t> crc;
+    if (m.has("krnl_crc") && hash::sha256(img.payload) == m.get_hex("krnl_payload_sha256"))
+        crc = static_cast<uint32_t>(m.get_addr("krnl_crc", 0));
+    return assemble_envelope(m, dir, img.build(crc), opt);
+}
+
 // ------------------------------------------------------------ info cmd --
 
 void print_envelope_info(const Envelope& e) {
@@ -1493,6 +1542,15 @@ void print_info(const fs::path& path) {
             std::cout << "data:        " << img.data.size() << " bytes\n";
             break;
         }
+        case Fmt::KRNL: {
+            legacy::KrnlImage img = legacy::KrnlImage::parse(data);
+            std::cout << "payload:        " << img.payload.size() << " bytes (" << codec_name(detect_codec(img.payload)) << ")\n";
+            char word[16];
+            std::snprintf(word, sizeof word, "0x%08x", img.crc);
+            std::cout << "crc:            " << word << (img.crc_ok ? " (matches the payload)" : " (does NOT match the payload)") << "\n";
+            print_envelope_info(Envelope::capture(data, 0, img.file_size()));
+            break;
+        }
         case Fmt::ELF_BOOT: {
             legacy::ElfBootImage img = legacy::ElfBootImage::parse(data);
             std::cout << "class:    " << (img.is_64bit ? "ELF64" : "ELF32") << "\n";
@@ -1530,6 +1588,7 @@ Bytes build_image_once(const fs::path& dir, const RepackOptions& opt) {
         case Fmt::VBMETA: result = repack_vbmeta(m, dir, opt); break;
         case Fmt::UIMAGE: result = repack_uimage(m, dir); break;
         case Fmt::ELF_BOOT: result = repack_elf_boot(m, dir, opt); break;
+        case Fmt::KRNL: result = repack_krnl(m, dir, opt); break;
         case Fmt::UNKNOWN:
             throw FormatError("manifest.txt has no (or an unrecognized) 'type=' field");
     }
@@ -1622,28 +1681,40 @@ void do_unpack(const fs::path& in, const fs::path& outdir, const UnpackOptions& 
 
     Fmt f = detect_format(payload);
     if (f == Fmt::UNKNOWN) throw FormatError(in.string() + ": " + describe_unknown(payload));
+    // A directory this unpack made is not left behind, empty or half written, when it fails (a cut-short
+    // image, say); one that was there before is not touched.
+    const bool made_outdir = !fs::exists(outdir);
     fs::create_directories(outdir);
-    switch (f) {
-        case Fmt::BOOT: unpack_boot(payload, outdir, uo); break;
-        case Fmt::VENDOR_BOOT: unpack_vendor_boot(payload, outdir, uo); break;
-        case Fmt::DTBO: unpack_dtbo(payload, outdir); break;
-        case Fmt::DTB: unpack_dtb(payload, outdir); break;
-        case Fmt::VBMETA: unpack_vbmeta(payload, outdir); break;
-        case Fmt::UIMAGE: unpack_uimage(payload, outdir); break;
-        case Fmt::ELF_BOOT: unpack_elf_boot(payload, outdir); break;
-        case Fmt::UNKNOWN:
-            throw FormatError(in.string() + ": " + describe_unknown(payload));
-    }
+    try {
+        switch (f) {
+            case Fmt::BOOT: unpack_boot(payload, outdir, uo); break;
+            case Fmt::VENDOR_BOOT: unpack_vendor_boot(payload, outdir, uo); break;
+            case Fmt::DTBO: unpack_dtbo(payload, outdir); break;
+            case Fmt::DTB: unpack_dtb(payload, outdir); break;
+            case Fmt::VBMETA: unpack_vbmeta(payload, outdir); break;
+            case Fmt::UIMAGE: unpack_uimage(payload, outdir); break;
+            case Fmt::ELF_BOOT: unpack_elf_boot(payload, outdir); break;
+            case Fmt::KRNL: unpack_krnl(payload, outdir, uo); break;
+            case Fmt::UNKNOWN:
+                throw FormatError(in.string() + ": " + describe_unknown(payload));
+        }
 
-    if (dhtb) {
-        Manifest m = Manifest::load(outdir / "manifest.txt");
-        m.set_bool("has_dhtb", true);
-        m.set_bool("dhtb_seandroid_footer", dhtb->has_seandroid_footer);
-        m.set_bool("dhtb_padding", dhtb->has_padding);
-        save_raw(m, outdir, "dhtb_trailing_extra", dhtb->trailing_extra, "dhtb_trailing_extra.bin");
-        m.save(outdir / "manifest.txt",
-               "abr manifest (DHTB-wrapped) -- edit then `abr repack " + outdir.string() +
-                   " -o out.img`");
+        if (dhtb) {
+            Manifest m = Manifest::load(outdir / "manifest.txt");
+            m.set_bool("has_dhtb", true);
+            m.set_bool("dhtb_seandroid_footer", dhtb->has_seandroid_footer);
+            m.set_bool("dhtb_padding", dhtb->has_padding);
+            save_raw(m, outdir, "dhtb_trailing_extra", dhtb->trailing_extra, "dhtb_trailing_extra.bin");
+            m.save(outdir / "manifest.txt",
+                   "abr manifest (DHTB-wrapped) -- edit then `abr repack " + outdir.string() +
+                       " -o out.img`");
+        }
+    } catch (...) {
+        if (made_outdir) {
+            std::error_code ec;
+            fs::remove_all(outdir, ec);
+        }
+        throw;
     }
 
     std::cout << "unpacked " << (dhtb ? std::string("dhtb-wrapped ") : std::string()) << fmt_name(f)
@@ -1709,7 +1780,8 @@ void usage() {
         "Supported: boot.img/init_boot.img/boot-debug.img/boot-test-harness.img,\n"
         "recovery.img/recovery-two-step.img (header v0-v4), vendor_boot.img/\n"
         "vendor_boot-debug.img/vendor_kernel_boot.img (header v3-v4), dtbo.img,\n"
-        "raw dtb, vbmeta.img/vbmeta_system.img (AVB), U-Boot legacy uImage.\n"
+        "raw dtb, vbmeta.img/vbmeta_system.img (AVB), U-Boot legacy uImage, Sony ELF\n"
+        "boot images, Rockchip KRNL (kernel.img / boot.img).\n"
         "Also transparently handled: a trailing AVB hash footer on boot/\n"
         "vendor_boot/dtbo; a DHTB wrapper (with SEAndroid footer/padding) around\n"
         "any of them; a MediaTek (MTK) sub-header on the kernel and/or ramdisk.\n";

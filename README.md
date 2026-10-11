@@ -18,6 +18,7 @@ build-time contents:
 | vbmeta (AVB) | `vbmeta.img`, `vbmeta_system.img`, and AVB footers appended to other partitions |
 | uboot | U-Boot's legacy `mkimage`/uImage container |
 | ELF boot image | Sony/Xperia-style boot images that are an ELF file with the kernel/ramdisk as segments |
+| Rockchip KRNL | Rockchip's `kernel.img` and `boot.img` (`"KRNL"`, the size, a kernel or a gzip cpio ramdisk, Rockchip's own CRC) |
 
 Also handled transparently, wherever it appears around those: a
 MediaTek (MTK) sub-header on the kernel and/or ramdisk, a DHTB wrapper
@@ -132,7 +133,7 @@ question needs no other program: `abr identify boot.img` prints the label
 (`AOSP bootimg`, `AOSP-PXA bootimg`, `NOOK signing (green loader)`,
 `MTK bootimg, KERNEL, ...`, `AVBv2 signing footer`, ...), `-b` leaves the
 file name off. Formats that `abr` recognises but cannot unpack yet (a
-signing blob, a ChromeOS kernel, Sony SIN, Intel OSIP, Rockchip KRNL) are
+signing blob, a ChromeOS kernel, Sony SIN, Intel OSIP) are
 named in the refusal, together with the AIK tool that opens them, instead
 of "unrecognized format"; a refused `unpack` leaves no empty directory
 behind. The test suite compares 98 synthetic samples with the built-in
@@ -140,6 +141,26 @@ expectation table and, when `ABR_AIK_MAGIC` points at AIK's magic file and
 `file` is installed, with `file(1)` itself (the magic file is not shipped
 here). It deliberately differs from `file(1)` in four documented ways; see
 the header of `include/abr/identify.hpp`.
+
+### Rockchip KRNL images
+
+The `kernel.img` and `boot.img` of Rockchip devices are `"KRNL"`, the size
+of the payload (u32 le), the payload and a CRC (u32 le). The payload is a
+kernel or -- in the `boot.img` of the Rockchip Android SDK, and what Android
+Image Kitchen takes it for -- a compressed cpio ramdisk. `abr` looks at the
+payload once it is decompressed: a cpio archive becomes `ramdisk.cpio` and
+the `ramdisk/` directory like any other ramdisk, anything else is `kernel`.
+The CRC is Rockchip's own: most significant bit first, start value 0, no
+reflection, no final inversion, over the payload only, and with the
+polynomial 0x04C10DB7 -- the usual CRC-32 polynomial 0x04C11DB7 with one
+digit changed (a slip in the table of Rockchip's tools), so no library CRC-32
+gives it. It is made afresh after an edit; a CRC that was not the payload's
+in the original (a damaged dump) is said at `unpack`, kept as it was while
+the payload is untouched, and made right once the payload is edited. A dump
+of a whole partition (zeros after the CRC) is kept at its size. The test
+suite makes images with a Python tool of its own and, where `ABR_RKCRC`
+names a compiled `rkcrc` (from rkflashtool, BSD; the CI compiles it), checks
+that `rkcrc -k` writes the same bytes.
 
 ### Threads and compression levels
 
@@ -413,6 +434,12 @@ The Marvell PXA header is judged by osm0sis's `pxa-mkbootimg` and
 unpack and repack byte-for-byte, and 34 edited ones come out equal to what the
 tool builds from the same pieces.
 
+The Rockchip KRNL images are judged by `rkcrc` of rkflashtool (compiled from
+its sources, not vendored, used when `ABR_RKCRC` is set): the CRCs it wrote for
+four payloads are what a Python tool of the suite and `abr` compute, and every
+image `abr` writes -- untouched, with an edited ramdisk, with an edited kernel,
+with a ramdisk file added -- is what `rkcrc -k` writes from the same payload.
+
 Compression is judged by the real tools. For every codec the suite builds a
 boot image with `abr`, slices the ramdisk out of it with a separate script
 (`tests/tools/verify.py`, not `abr`) and has the real `gzip`, `lz4`, `zstd`,
@@ -466,11 +493,10 @@ Two smaller gaps:
 
 - Hard links in a ramdisk's cpio archive (the ramdisk then stays one
   `ramdisk.cpio`); a directory tree is made for `newc`/`crc` archives only.
-- The rest of the Android Image Kitchen format list: OSIP and KRNL
-  (RKCRC) images, blobpack, QCDT tooling, ChromeOS `futility` signing,
-  LOKI/AMONET, Sony SIN. `abr identify` already names all of them; what
-  is missing is unpacking and packing them. See `PROGRESS.md` for the
-  plan.
+- The rest of the Android Image Kitchen format list: OSIP images,
+  blobpack, QCDT tooling, ChromeOS `futility` signing, LOKI/AMONET, Sony
+  SIN. `abr identify` already names all of them; what is missing is
+  unpacking and packing them. See `PROGRESS.md` for the plan.
 - U-Boot's newer FIT (Flattened Image Tree) format -- only the older
   legacy `mkimage` container is supported.
 - Filesystems (ext4, F2FS, EROFS, SquashFS) and sparse images: out of

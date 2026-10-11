@@ -311,9 +311,6 @@ std::string Identity::unsupported_note() const {
         case Kind::OSIP_HEADERLESS:
             return "this is an Intel OSIP image (Android Image Kitchen opens it with mboot); abr "
                    "cannot unpack it yet";
-        case Kind::KRNL:
-            return "this is a Rockchip KRNL image (kernel/ramdisk with a CRC trailer; Android Image "
-                   "Kitchen unpacks it with dd and packs it with rkcrc); abr cannot unpack it yet";
         case Kind::QCDT:
             return "this is a Qualcomm device-tree table (QCDT), a part of boot images rather than a "
                    "container of its own";

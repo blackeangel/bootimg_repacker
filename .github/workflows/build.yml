@@ -32,6 +32,16 @@ jobs:
             libbcprov-java g++-14 clang-20 cpio
           pip3 install --break-system-packages python-lzo
 
+      # rkcrc of rkflashtool (BSD licence; compiled here, not part of this repository) writes the
+      # Rockchip KRNL images: the suite compares abr's with its output. Without it that one comparison
+      # is skipped (the independent Python tool still judges the CRC).
+      - name: Compile rkcrc, a judge of the Rockchip KRNL images
+        continue-on-error: true
+        run: |
+          git clone --depth 1 https://github.com/linux-rockchip/rkflashtool.git "$RUNNER_TEMP/rkflashtool"
+          gcc -O2 -o "$RUNNER_TEMP/rkcrc" "$RUNNER_TEMP/rkflashtool/rkcrc.c"
+          echo "ABR_RKCRC=$RUNNER_TEMP/rkcrc" >> "$GITHUB_ENV"
+
       - name: Configure
         run: >
           cmake -S . -B build -G Ninja

@@ -124,6 +124,7 @@ add_library(abr_core STATIC
   src/legacy/mtk.cpp
   src/legacy/dhtb.cpp
   src/legacy/elf_boot.cpp
+  src/legacy/krnl.cpp
   src/legacy/avb1.cpp
   src/legacy/avb1_aosp_key.cpp
 )

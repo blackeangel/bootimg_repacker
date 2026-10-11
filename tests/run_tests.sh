@@ -2515,6 +2515,141 @@ if python3 "$AVBTOOL" version >/dev/null 2>&1; then
     rd_done "dense vendor_boot v4 with a tight AVB hash footer: an edit to fragment 0 is compressed again and fits"
 fi
 
+# =========================================================================
+# Rockchip KRNL: "KRNL", the size of the payload, the payload, a CRC of Rockchip's own
+# (abr/legacy/krnl.hpp). The images are made -- and what abr makes is read -- by
+# tests/tools/krnl_tool.py, whose CRC is written from rkcrc's source, not from abr's; where
+# ABR_RKCRC names a compiled rkcrc (rkflashtool, BSD; not part of this repository) the real
+# `rkcrc -k` is a judge as well.
+# =========================================================================
+KT="$TOOLS/krnl_tool.py"
+
+# The CRC: the polynomial is 0x04C10DB7, not the usual CRC-32 one (0x04C11DB7). Four payloads
+# whose CRC the real rkcrc wrote (the last four bytes of `rkcrc -k`): the Python tool agrees with
+# them, and abr agrees with the Python tool (info says whether the stored CRC is the payload's).
+python3 - <<'PYEOF'
+open("krnl_v_empty.bin", "wb").write(b"")
+open("krnl_v_digits.bin", "wb").write(b"123456789")
+open("krnl_v_ff.bin", "wb").write(b"\xff" * 1000)
+open("krnl_v_ramp.bin", "wb").write(bytes(range(256)) * 4)
+PYEOF
+for vec in empty:00000000 digits:889a9615 ff:f45d7ebb ramp:be63b112; do
+    krnl_name="${vec%%:*}"
+    krnl_want="${vec##*:}"
+    python3 "$KT" make "krnl_v_$krnl_name.bin" "krnl_v_$krnl_name.img"
+    rd_ck "the CRC of the $krnl_name payload, as rkcrc wrote it" test "$(python3 "$KT" crc "krnl_v_$krnl_name.bin")" = "$krnl_want"
+    rd_ck "abr reads the image of the $krnl_name payload, its CRC is the payload's" said "crc: .*0x$krnl_want (matches the payload)" "$ABR" info "krnl_v_$krnl_name.img"
+done
+rd_done "KRNL: the CRC is Rockchip's (polynomial 0x04C10DB7): the values rkcrc wrote are what the independent tool and abr compute"
+
+# A ramdisk image (what the Rockchip Android SDK's boot.img is: the gzip-compressed cpio) and a
+# kernel image (kernel.img: a kernel, not a cpio).
+python3 "$RDG" mkbootfs krnl_rd.cpio
+gzip -9n -c krnl_rd.cpio >krnl_rd.gz
+python3 "$KT" make krnl_rd.gz krnl_rd.img
+python3 -c "import random; open('krnl_kernel.bin', 'wb').write(random.Random(5).randbytes(120000))"
+python3 "$KT" make krnl_kernel.bin krnl_kernel.img
+krnl_ref() {  # <payload> <image>: the real rkcrc -k writes the same image (true where it is not at hand)
+    [ -n "${ABR_RKCRC:-}" ] && [ -x "${ABR_RKCRC:-}" ] || return 0
+    "$ABR_RKCRC" -k "$1" "$2.ref" 2>/dev/null && cmp -s "$2" "$2.ref"
+}
+
+rd_unpack krnl_rd.img krnl_u
+rd_ck "identify" said "KRNL bootimg" "$ABR" identify krnl_rd.img
+rd_ck "unpacked as krnl" grep -q '^type=krnl$' krnl_u/manifest.txt
+rd_ck "ramdisk.cpio is the archive" cmp -s krnl_u/ramdisk.cpio krnl_rd.cpio
+rd_ck "and there is a directory" test -d krnl_u/ramdisk
+rd_ck "GNU cpio agrees with it" rd_oracle krnl_u
+rd_ck "the CRC is the payload's" said "(matches the payload)" "$ABR" info krnl_rd.img
+"$ABR" repack krnl_u -o krnl_back.img >krnl_back.log 2>&1
+rd_ck "an untouched repack is identical" cmp -s krnl_rd.img krnl_back.img
+rd_ck "and the real rkcrc writes the same image" krnl_ref krnl_rd.gz krnl_back.img
+rd_done "KRNL image with a gzip cpio ramdisk: unpack gives ramdisk.cpio and ramdisk/ (GNU cpio agrees), an untouched repack is identical"
+
+# Edit the directory: the CRC is made afresh, the payload is what the real tools read.
+printf 'abr test\n' >krnl_u/ramdisk/abr_test_file
+"$ABR" -j1 repack krnl_u -o krnl_e1.img >krnl_e1.log 2>&1
+"$ABR" -j4 repack krnl_u -o krnl_e4.img >krnl_e4.log 2>&1
+rd_ck "-j1 and -j4 give the same bytes" cmp -s krnl_e1.img krnl_e4.img
+rd_ck "the size field and the CRC are right (read by krnl_tool.py)" python3 "$KT" payload krnl_e4.img krnl_e4.gz
+gzip -dc <krnl_e4.gz >krnl_e4.cpio 2>/dev/null
+rd_ck "the payload is gzip, and it holds the new file" rd_has krnl_e4.cpio ' abr_test_file$'
+rd_ck "the real rkcrc writes the same image from that payload" krnl_ref krnl_e4.gz krnl_e4.img
+rd_unpack krnl_e4.img krnl_e4_re
+rd_ck "unpacking it again: the file is there" test "$(cat krnl_e4_re/ramdisk/abr_test_file 2>/dev/null)" = "abr test"
+rd_ck "and nothing else changed" rd_same_tree_x krnl_u/ramdisk krnl_e4_re/ramdisk abr_test_file
+rd_ck "the note about the new file was said" grep -q 'abr_test_file' krnl_e4.log
+rd_done "KRNL: a file put into ramdisk/ is in the repacked image, the CRC is right, -j1 = -j4"
+
+# Edit ramdisk.cpio instead.
+rd_unpack krnl_rd.img krnl_u2
+printf 'abr-edit' >>krnl_u2/ramdisk.cpio
+"$ABR" repack krnl_u2 -o krnl_e2.img >/dev/null 2>&1
+rd_ck "the size field and the CRC are right" python3 "$KT" payload krnl_e2.img krnl_e2.gz
+gzip -dc <krnl_e2.gz >krnl_e2.cpio 2>/dev/null
+rd_ck "the archive is the edited one" cmp -s krnl_e2.cpio krnl_u2/ramdisk.cpio
+rd_ck "the real rkcrc writes the same image from that payload" krnl_ref krnl_e2.gz krnl_e2.img
+rd_done "KRNL: an edited ramdisk.cpio is compressed again, the CRC is right"
+
+# A kernel image: the payload is no cpio, so it is `kernel`. Compressed or not, an untouched repack is identical.
+rd_unpack krnl_kernel.img krnl_k
+rd_ck "the payload is kernel" cmp -s krnl_k/kernel krnl_kernel.bin
+rd_ck "there is no ramdisk" test ! -e krnl_k/ramdisk.cpio -a ! -e krnl_k/ramdisk
+"$ABR" repack krnl_k -o krnl_k_back.img >/dev/null 2>&1
+rd_ck "an untouched repack is identical" cmp -s krnl_kernel.img krnl_k_back.img
+printf 'x' >>krnl_k/kernel
+"$ABR" repack krnl_k -o krnl_k_edit.img >/dev/null 2>&1
+rd_ck "an edit: the payload is the edited kernel, the CRC is right" python3 "$KT" payload krnl_k_edit.img krnl_k_edit.bin
+rd_ck "(the same bytes)" cmp -s krnl_k_edit.bin krnl_k/kernel
+rd_ck "and the real rkcrc writes the same image" krnl_ref krnl_k_edit.bin krnl_k_edit.img
+gzip -9n -c krnl_kernel.bin >krnl_kernel.gz
+python3 "$KT" make krnl_kernel.gz krnl_kernelgz.img
+rd_unpack krnl_kernelgz.img krnl_kg
+rd_ck "a gzip-compressed kernel is unpacked" cmp -s krnl_kg/kernel krnl_kernel.bin
+rd_ck "and said to be gzip" grep -q '^kernel_compression=gzip$' krnl_kg/manifest.txt
+"$ABR" repack krnl_kg -o krnl_kg_back.img >/dev/null 2>&1
+rd_ck "an untouched repack is identical" cmp -s krnl_kernelgz.img krnl_kg_back.img
+rd_done "KRNL image with a kernel (plain and gzip): kernel is the payload, an untouched repack is identical, an edit gets a right CRC"
+
+# A CRC that is not the payload's (a corrupt dump, or an image made by a careless tool): said, kept while the
+# payload is untouched (the round trip stays exact), made right when the payload is edited.
+python3 "$KT" make krnl_rd.gz krnl_badcrc.img --crc 0x12345678
+rd_unpack krnl_badcrc.img krnl_bad
+rd_ck "said at unpack" grep -q 'is not the CRC of its payload' krnl_bad.log
+rd_ck "and by info" said "does NOT match the payload" "$ABR" info krnl_badcrc.img
+"$ABR" repack krnl_bad -o krnl_bad_back.img >/dev/null 2>&1
+rd_ck "an untouched repack is identical (the CRC it had)" cmp -s krnl_badcrc.img krnl_bad_back.img
+printf 'abr test\n' >krnl_bad/ramdisk/abr_test_file
+"$ABR" repack krnl_bad -o krnl_bad_edit.img >/dev/null 2>&1
+rd_ck "an edit: the CRC is right now" python3 "$KT" payload krnl_bad_edit.img krnl_bad_edit.gz
+rd_done "KRNL image with a wrong CRC: reported, kept while the payload is untouched, right after an edit"
+
+# A dump of a whole partition: fill after the image, kept and kept at its size.
+python3 "$KT" make krnl_rd.gz krnl_part.img --size 262144
+rd_unpack krnl_part.img krnl_p
+rd_ck "the fill is in the manifest" grep -q '^pad_to=262144$' krnl_p/manifest.txt
+"$ABR" repack krnl_p -o krnl_p_back.img >/dev/null 2>&1
+rd_ck "an untouched repack is identical" cmp -s krnl_part.img krnl_p_back.img
+printf 'abr test\n' >krnl_p/ramdisk/abr_test_file
+"$ABR" repack krnl_p -o krnl_p_edit.img >/dev/null 2>&1
+rd_ck "an edit keeps the size of the partition" test "$(wc -c <krnl_p_edit.img | tr -d ' ')" = 262144
+rd_ck "and the CRC is right" python3 "$KT" payload krnl_p_edit.img krnl_p_edit.gz
+rd_done "KRNL image padded to its partition size: the fill is kept, also after an edit"
+
+# Not an image: a cut-short file is refused, and no directory is left behind.
+head -c 5000 krnl_rd.img >krnl_cut.img
+rm -rf krnl_cut
+"$ABR" unpack krnl_cut.img -o krnl_cut >krnl_cut.out 2>&1
+krnl_rc=$?
+rd_ck "refused" test "$krnl_rc" -ne 0
+rd_ck "with the reason" grep -q 'cut short' krnl_cut.out
+rd_ck "no directory is left behind" test ! -e krnl_cut
+mkdir -p krnl_cut2
+printf 'mine' >krnl_cut2/keep.txt
+"$ABR" unpack krnl_cut.img -o krnl_cut2 >/dev/null 2>&1
+rd_ck "a directory that was there is not removed" test "$(cat krnl_cut2/keep.txt)" = "mine"
+rd_done "KRNL image cut short: refused with a reason, a directory the failed unpack made is removed, one that was there stays"
+
 # ---- images of your own: ABR_REAL_IMAGES=<directory> tests/run_tests.sh <abr> checks every file of it the way
 # the fixtures above are checked -- an untouched repack is identical, every ramdisk archive is a directory that
 # GNU cpio agrees with, and a file put into a directory lands in the image. (Files abr does not take, an ext4
@@ -2572,7 +2707,7 @@ if [ "$("$ABR" identify idsamples/loki_rec)" = "idsamples/loki_rec: AOSP bootimg
 else
     fail "identify: output format"
 fi
-for kind in blob:SIGNBLOB chromeos:ChromeOS sin2:Sony osip:OSIP krnl:Rockchip; do
+for kind in blob:SIGNBLOB chromeos:ChromeOS sin2:Sony osip:OSIP; do
     sample="${kind%%:*}"
     word="${kind##*:}"
     rm -rf id_out

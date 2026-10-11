@@ -23,6 +23,7 @@ tools" below.
 | vbmeta (AVB): vbmeta.img, vbmeta_system.img, footer-on-other-partitions | **done + verified**, incl. RSA signing (images made by the real `avbtool` round-trip exactly; images `abr` re-signed pass `avbtool verify_image`) |
 | uboot: U-Boot legacy uImage | **done + verified** |
 | ELF boot images (Sony/Xperia) | **done + verified** against real elftool (commit `67157cf`) |
+| Rockchip KRNL images (`kernel.img`, SDK `boot.img`) | **done + verified** against the real `rkcrc -k` (compiled, not vendored) and an independent Python tool: the payload (kernel, or a compressed cpio ramdisk -> `ramdisk.cpio` + `ramdisk/`), Rockchip's own CRC (polynomial 0x04C10DB7), partition fill, wrong stored CRC kept |
 | Marvell PXA boot header (Samsung Galaxy J1 / Core Prime / Tab 4) | **done + verified** against the real `pxa-mkbootimg` / `pxa-unpackbootimg` (compiled, not vendored): 240 images byte-identical, 34 edits equal to the tool's output (commit `0652429`) |
 | `abr identify`: AIK's `androidbootimg.magic` as code | **done + verified**: 98 samples, agree with `file(1)` + AIK's magic file on all (when both are at hand) and with the built-in table; unsupported-but-known formats are named in the refusal (commit `803b820`) |
 | Nook / Nook-tablet signing header in front, LG Bump footer behind | **done** (synthetic fixtures; no real device dump of either yet): header kept as a constant prefix (`prefix_kind=`), footer kept as tail, neither triggers the stale-signature warning (commit `2a76f87`) |
@@ -36,7 +37,7 @@ tools" below.
 | self-contained RSA: BigInt (Knuth D, Montgomery), DER/PEM/X.509, PKCS#1 v1.5 sign/verify, PKCS#8/PKCS#1 key parsing, AVB public-key blob -- **no OpenSSL anywhere in the build** | **done + verified** (Python integers, `openssl dgst -sign`, `avbtool extract_public_key`; see "Self-contained crypto" below) |
 | manifest + CLI (`abr info/unpack/repack`) | **done** |
 | CMake: FetchContent-vendored static zlib/lz4/zstd/xz/bzip2 | **done + build-verified natively on Linux**, both the dynamic and the `-DABR_STATIC_BINARY=ON` fully-static configurations |
-| Test suite (`tests/run_tests.sh`) | **done, 246/246 passing** locally on g++-14 (with the optional `pxa-*` oracle and AIK's magic file); CI runs the matrix (g++-14, clang-20, Windows under wine, arm64 under qemu-user) -- see Verification |
+| Test suite (`tests/run_tests.sh`) | **done, 253/253 passing** locally on g++-14 (with the optional `pxa-*` / `rkcrc` oracles and AIK's magic file); CI runs the matrix (g++-14, clang-20, Windows under wine, arm64 under qemu-user) -- see Verification |
 | CMake cross toolchains (mingw-w64, Android NDK) | **done + verified** (mingw reproduced locally; NDK only provable via CI, see below) |
 | GitHub Actions static build matrix (linux-x86_64, windows-x86_64, android-arm64) | **done + verified**: run 35313499827, all 3 jobs green, all 3 static binaries produced as artifacts (abr-linux-x86_64, abr-windows-x86_64, abr-android-arm64) |
 
@@ -716,7 +717,7 @@ compiled from source and used only as oracles, never as a dependency.
 | ChromeOS kernel blob (`futility vbutil_kernel`) | recognised, not unpacked; signing is its own project |
 | Sony SIN (`sony_dump`) | recognised, not unpacked |
 | Intel OSIP (`mboot`) | recognised, not unpacked (needs osm0sis/mboot as the reference) |
-| Rockchip KRNL (`dd skip=8`, `rkcrc -k`) | recognised, not unpacked (8-byte skip + CRC trailer; simple once a real sample exists) |
+| Rockchip KRNL (`dd skip=8`, `rkcrc -k`) | **done**, oracle-verified (`rkcrc`): unpack / repack / info; a payload that is a cpio gets the ramdisk directory (AIK treats it as a ramdisk the same way); see "Rockchip KRNL" below |
 | LOKI (`loki_tool unlok`) / AMONET (microloader in the first 1024 bytes) | recognised, not unpacked; re-patching LOKI needs the device's `aboot.img` |
 | QCDT device-tree table tooling (`dtbTool`) | the blob is carried as `dt_file`; creating one from several dtbs is not done |
 
@@ -882,11 +883,60 @@ value (0x55), which left the signature unchanged one run in 256 -- an XOR now;
 and the GNU `cpio` oracle needs the package installed in the CI jobs (added to
 the `apt-get` lists of the linux, windows/wine and arm64/qemu jobs).
 
+## Rockchip KRNL (done, 11 Oct 2026)
+
+AIK's `unpackimg.sh` takes a `KRNL` file for a ramdisk image (`dd skip=8`, the
+payload being what it hands to the ramdisk codecs) and `repackimg.sh` writes it
+back with `rkcrc -k`. abr does the same without either tool.
+
+The format: `"KRNL"`, u32 le size of the payload, the payload, u32 le CRC. Code:
+`include/abr/legacy/krnl.hpp` + `src/legacy/krnl.cpp` (`KrnlImage::parse/build`,
+`rkcrc32`), the wiring in `src/main.cpp` (`Fmt::KRNL`, `unpack_krnl`,
+`repack_krnl`, the `info` case), `tests/tools/krnl_tool.py` (an independent
+writer/reader), the "Rockchip KRNL" part of `tests/run_tests.sh` (8 checks).
+
+**The CRC is not CRC-32.** It is MSB-first, start value 0, no reflection, no final
+XOR, over the payload only -- and the polynomial in rkflashtool's `rkcrc.h` is
+**0x04C10DB7**, the usual 0x04C11DB7 with one digit wrong (a slip every Rockchip
+tool inherited). No library CRC-32 variant gives it; the first attempt with the
+usual polynomial disagreed with the real `rkcrc -k`, which is how it was found.
+Values the real `rkcrc` wrote, now pinned in the suite: empty -> `00000000`,
+`123456789` -> `889a9615`, 1000 x 0xFF -> `f45d7ebb`, `bytes(range(256)) * 4` ->
+`be63b112`.
+
+Behaviour: the payload goes through the same codec detection as any ramdisk; if
+what comes out is a cpio archive (`07070...`, or empty) it is `ramdisk_*` +
+`ramdisk.cpio` + the `ramdisk/` tree (several volumes, `.meta`, all of that), else
+it is `kernel_*` + `kernel`. Repack goes through `load_component`, so the tree
+rules, the raw replay of an untouched file, `<prefix>_level` and the fit-aware
+retry all apply. A stored CRC that is not the payload's (a damaged dump) is said
+at unpack, kept in the manifest (`krnl_crc`, with `krnl_payload_sha256` of the
+payload it belonged to) and written back as long as the payload is the same
+bytes, so the round trip stays exact; after an edit the CRC is made right. A dump
+of a whole partition keeps its fill (`pad_to`, through the usual envelope). A file
+whose header declares more than it holds is refused ("cut short").
+
+Also changed for every format: `do_unpack` removes the output directory when
+*this run* made it and the unpack then failed (a refused image no longer leaves an
+empty directory behind); a directory that was already there is never removed.
+
+Judged by: the real `rkcrc -k` (compiled from rkflashtool, BSD, not vendored;
+`ABR_RKCRC=<path>`; the linux CI jobs compile it with `continue-on-error`, so a
+failed clone only skips the comparison) -- every image abr writes (untouched,
+edited tree, edited `ramdisk.cpio`, edited kernel) equals `rkcrc -k` of the same
+payload -- and by the Python tool, which writes its CRC from the C source's table
+construction, not from abr's. No real Rockchip dump has been tried (none supplied);
+the format is simple and the CRC verified against the real tool, but a real
+`boot.img` from a Rockchip SDK build would be the best next test.
+
+Not done for Rockchip: `rkcrc -p` ("PARM" parameter files), RKFW/RKAF update
+images, `rkunpack` of the loader -- stage 2/3 of the user's own spec.
+
 ## Next steps (in order)
 
-1. Remaining AIK parity, easiest first: KRNL (+ `rkcrc`), AMONET, BLOB,
-   OSIP, LOKI, QCDT creation, ChromeOS signing. The stages 2 and 3 of the
-   user's own spec need a scope decision before anything is built.
+1. Remaining AIK parity, easiest first: AMONET, BLOB, OSIP, LOKI, QCDT
+   creation, ChromeOS signing. The stages 2 and 3 of the user's own spec need a
+   scope decision before anything is built.
 2. Housekeeping: AIK-like default levels as an opt-in, gzip OS-byte
    determinism, UTF-8 `wmain` on Windows, `zlib-ng` for faster gzip, splitting
    `main.cpp`.
