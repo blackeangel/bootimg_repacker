@@ -24,6 +24,7 @@ tools" below.
 | uboot: U-Boot legacy uImage | **done + verified** |
 | ELF boot images (Sony/Xperia) | **done + verified** against real elftool (commit `67157cf`) |
 | Rockchip KRNL images (`kernel.img`, SDK `boot.img`) | **done + verified** against the real `rkcrc -k` (compiled, not vendored) and an independent Python tool: the payload (kernel, or a compressed cpio ramdisk -> `ramdisk.cpio` + `ramdisk/`), Rockchip's own CRC (polynomial 0x04C10DB7), partition fill, wrong stored CRC kept |
+| AMONET patch (Amazon Fire, MediaTek): microloader + boot header moved to 1024 | **done + verified** against AIK's own `dd`/`truncate`/`cat` commands (copied into the suite): `microloader.bin`, `has_amonet=true`, refuses what the patch would overwrite; layered under DHTB |
 | Marvell PXA boot header (Samsung Galaxy J1 / Core Prime / Tab 4) | **done + verified** against the real `pxa-mkbootimg` / `pxa-unpackbootimg` (compiled, not vendored): 240 images byte-identical, 34 edits equal to the tool's output (commit `0652429`) |
 | `abr identify`: AIK's `androidbootimg.magic` as code | **done + verified**: 98 samples, agree with `file(1)` + AIK's magic file on all (when both are at hand) and with the built-in table; unsupported-but-known formats are named in the refusal (commit `803b820`) |
 | Nook / Nook-tablet signing header in front, LG Bump footer behind | **done** (synthetic fixtures; no real device dump of either yet): header kept as a constant prefix (`prefix_kind=`), footer kept as tail, neither triggers the stale-signature warning (commit `2a76f87`) |
@@ -37,7 +38,7 @@ tools" below.
 | self-contained RSA: BigInt (Knuth D, Montgomery), DER/PEM/X.509, PKCS#1 v1.5 sign/verify, PKCS#8/PKCS#1 key parsing, AVB public-key blob -- **no OpenSSL anywhere in the build** | **done + verified** (Python integers, `openssl dgst -sign`, `avbtool extract_public_key`; see "Self-contained crypto" below) |
 | manifest + CLI (`abr info/unpack/repack`) | **done** |
 | CMake: FetchContent-vendored static zlib/lz4/zstd/xz/bzip2 | **done + build-verified natively on Linux**, both the dynamic and the `-DABR_STATIC_BINARY=ON` fully-static configurations |
-| Test suite (`tests/run_tests.sh`) | **done, 253/253 passing** locally on g++-14 (with the optional `pxa-*` / `rkcrc` oracles and AIK's magic file); CI runs the matrix (g++-14, clang-20, Windows under wine, arm64 under qemu-user) -- see Verification |
+| Test suite (`tests/run_tests.sh`) | **done, 260/260 passing** locally on g++-14 (with the optional `pxa-*` / `rkcrc` oracles and AIK's magic file); CI runs the matrix (g++-14, clang-20, Windows under wine, arm64 under qemu-user) -- see Verification |
 | CMake cross toolchains (mingw-w64, Android NDK) | **done + verified** (mingw reproduced locally; NDK only provable via CI, see below) |
 | GitHub Actions static build matrix (linux-x86_64, windows-x86_64, android-arm64) | **done + verified**: run 35313499827, all 3 jobs green, all 3 static binaries produced as artifacts (abr-linux-x86_64, abr-windows-x86_64, abr-android-arm64) |
 
@@ -718,7 +719,8 @@ compiled from source and used only as oracles, never as a dependency.
 | Sony SIN (`sony_dump`) | recognised, not unpacked |
 | Intel OSIP (`mboot`) | recognised, not unpacked (needs osm0sis/mboot as the reference) |
 | Rockchip KRNL (`dd skip=8`, `rkcrc -k`) | **done**, oracle-verified (`rkcrc`): unpack / repack / info; a payload that is a cpio gets the ramdisk directory (AIK treats it as a ramdisk the same way); see "Rockchip KRNL" below |
-| LOKI (`loki_tool unlok`) / AMONET (microloader in the first 1024 bytes) | recognised, not unpacked; re-patching LOKI needs the device's `aboot.img` |
+| AMONET (microloader in the first 1024 bytes, `dd`/`truncate`/`cat`) | **done**, judged by AIK's own commands: unpack / repack / info, wrapper layer under DHTB; see "AMONET" below |
+| LOKI (`loki_tool unlok`) | recognised, not unpacked; re-patching LOKI needs the device's `aboot.img` |
 | QCDT device-tree table tooling (`dtbTool`) | the blob is carried as `dt_file`; creating one from several dtbs is not done |
 
 `abr identify` names every row above, so none of them is reported as
@@ -932,11 +934,44 @@ the format is simple and the CRC verified against the real tool, but a real
 Not done for Rockchip: `rkcrc -p` ("PARM" parameter files), RKFW/RKAF update
 images, `rkunpack` of the loader -- stage 2/3 of the user's own spec.
 
+## AMONET (done, 11 Oct 2026)
+
+The patch of Amazon's MediaTek Fire tablets: a 1024-byte microloader at offset 0,
+the boot image's first 1024 bytes at offset 1024 (so "ANDROID!" is at 1024), the
+rest from 2048 on as it was. What the patch loses is the original [1024, 2048):
+the zero padding of the first 2048-byte page behind a v0 header (608 bytes). AIK
+takes it off with `dd`/`truncate`/`cat` (zeros back in the lost 1024 bytes) and
+puts it on with three `dd`s; abr does the same. Before this, an AMONET image was
+read as a boot image behind a 1024-byte "vendor wrapper", with every offset 1024
+too far -- it never worked.
+
+Code: `include/abr/legacy/amonet.hpp` + `src/legacy/amonet.cpp` (`has_amonet_patch`,
+`strip_amonet`, `apply_amonet`; the detection is `identify`'s rule: "ANDROID!" at
+1024 and the word "microloader" behind offset 96), and in `src/main.cpp` a
+`Wrappers` layer (`peel_wrappers`) shared by `unpack`, `info` and `repack`: DHTB
+comes off first, the patch under it; repack puts the patch on first, DHTB over it.
+The manifest has `has_amonet=true` and `amonet_microloader_file=microloader.bin`
+(1024 bytes); the same two lines on the unpack of an ordinary v0 image make an
+AMONET image. `apply_amonet` refuses what the patch would destroy: anything but
+zeros in [1024, 2048) of the repacked image (a v1/v2 header is longer than 1024
+bytes; a first page that is not 2048) -- AIK silently corrupts there -- with the
+way out in the message (`has_amonet=false`), and a microloader that is not 1024
+bytes. A patched file shorter than 2048 bytes is refused ("cut short").
+
+Judged by AIK's literal commands, copied from `unpackimg.sh`/`repackimg.sh` into the
+suite (`amo_aik_patch`, `amo_aik_unpatch`): they make the patched fixtures, and the
+image abr repacks after an edit equals AIK's patching of the same edit repacked
+without the patch (7 checks: sanity of the fixtures + identify/info; unpack and
+untouched repack, GNU cpio agreeing with the tree, the same manifest and files as the
+unpatched image; edit, -j1 = -j4; the patch put on an ordinary image; refusals; a
+partition dump with zero fill; under a DHTB wrapper). The negative control (a binary
+without the code) fails all 7. No real Amazon image was tried -- none was supplied.
+
 ## Next steps (in order)
 
-1. Remaining AIK parity, easiest first: AMONET, BLOB, OSIP, LOKI, QCDT
-   creation, ChromeOS signing. The stages 2 and 3 of the user's own spec need a
-   scope decision before anything is built.
+1. Remaining AIK parity, easiest first: BLOB, OSIP, LOKI, QCDT creation,
+   ChromeOS signing. The stages 2 and 3 of the user's own spec need a scope
+   decision before anything is built.
 2. Housekeeping: AIK-like default levels as an opt-in, gzip OS-byte
    determinism, UTF-8 `wmain` on Windows, `zlib-ng` for faster gzip, splitting
    `main.cpp`.

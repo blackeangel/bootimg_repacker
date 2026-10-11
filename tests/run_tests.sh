@@ -2650,6 +2650,156 @@ printf 'mine' >krnl_cut2/keep.txt
 rd_ck "a directory that was there is not removed" test "$(cat krnl_cut2/keep.txt)" = "mine"
 rd_done "KRNL image cut short: refused with a reason, a directory the failed unpack made is removed, one that was there stays"
 
+# =========================================================================
+# AMONET: the patch of Amazon's MediaTek Fire tablets (abr/legacy/amonet.hpp): a 1024-byte microloader at the
+# start of the image, the first 1024 bytes of the boot image behind it. Android Image Kitchen puts it on and
+# takes it off with dd, truncate and cat; those commands, copied from its repackimg.sh and unpackimg.sh, make
+# the images here and judge what abr writes.
+# =========================================================================
+amo_aik_patch() {  # <plain image> <microloader> <out>: repackimg.sh, "Amonet patching new image"
+    cp -f "$1" "$3"
+    cp -f "$2" amo_ml.tmp
+    dd bs=1024 count=1 conv=notrunc if="$1" of=amo_head.tmp 2>/dev/null
+    dd bs=1024 seek=1 conv=notrunc if=amo_head.tmp of="$3" 2>/dev/null
+    dd conv=notrunc if=amo_ml.tmp of="$3" 2>/dev/null
+    rm -f amo_head.tmp amo_ml.tmp
+}
+amo_aik_unpatch() {  # <patched image> <out image> <out microloader>: unpackimg.sh, "Amonet patch detected, reverting"
+    dd bs=2048 count=1 conv=notrunc if="$1" of="$3" 2>/dev/null
+    dd bs=1024 skip=1 conv=notrunc if="$3" of=amo_head 2>/dev/null
+    truncate -s 1024 "$3"
+    truncate -s 2048 amo_head
+    dd bs=2048 skip=1 conv=notrunc if="$1" of=amo_tail 2>/dev/null
+    cat amo_head amo_tail >"$2"
+    rm -f amo_head amo_tail
+}
+python3 - <<'PYEOF'
+import random
+b = bytearray(random.Random(11).randbytes(1024))
+b[0:4] = b"\xea\x00\x00\x0e"  # code, not "ANDROID!"
+b[100:111] = b"microloader"   # the word the signature file looks for
+open("amo_ml.bin", "wb").write(bytes(b))
+PYEOF
+gzip -dc <rd_kernel.gz >amo_kernel.bin
+python3 "$MKBOOTIMG" >/dev/null --header_version 0 --kernel rd_kernel.gz --ramdisk krnl_rd.gz \
+    --pagesize 2048 --base 0x10000000 --cmdline "amonet test" --output amo_plain.img
+amo_aik_patch amo_plain.img amo_ml.bin amo.img
+
+rd_ck "AIK's unpatching commands run" amo_aik_unpatch amo.img amo_unpatched.img amo_ml_back.bin
+rd_ck "they give the boot image the patch was put on" cmp -s amo_unpatched.img amo_plain.img
+rd_ck "and the microloader" cmp -s amo_ml_back.bin amo_ml.bin
+rd_ck "identify names the patch" said "AMONET header" "$ABR" identify amo.img
+rd_ck "info says what it is and still reads the header at 1024" said "header_version: 0" "$ABR" info amo.img
+rd_ck "info names the wrapper" said "wrapper: AMONET patch" "$ABR" info amo.img
+rd_done "AMONET: the images of the tests are made and unmade by AIK's own dd/truncate/cat commands; identify and info see the patch"
+
+rd_unpack amo.img amo_u
+rd_ck "unpacked as a boot image" grep -q '^type=boot$' amo_u/manifest.txt
+rd_ck "the patch is in the manifest" grep -q '^has_amonet=true$' amo_u/manifest.txt
+rd_ck "microloader.bin is the microloader" cmp -s amo_u/microloader.bin amo_ml.bin
+rd_ck "the kernel is the kernel" cmp -s amo_u/kernel amo_kernel.bin
+rd_ck "ramdisk.cpio is the archive" cmp -s amo_u/ramdisk.cpio krnl_rd.cpio
+rd_ck "GNU cpio agrees with the tree" rd_oracle amo_u
+rd_ck "unpack says what it unpacked" grep -q 'unpacked amonet-patched boot' amo_u.log
+rd_ck "and that the round trip is exact" grep -q 'reproduces this image byte-for-byte' amo_u.log
+rd_unpack amo_unpatched.img amo_u0
+rd_ck "the same image without the patch has the same manifest, but for the patch" \
+    test "$(grep -v '^#\|^has_amonet\|^amonet_' amo_u/manifest.txt)" = "$(grep -v '^#' amo_u0/manifest.txt)"
+rd_ck "and the same files" diff -r --no-dereference -x manifest.txt -x microloader.bin amo_u amo_u0
+"$ABR" repack amo_u -o amo_back.img >amo_back.log 2>&1
+rd_ck "an untouched repack is identical" cmp -s amo.img amo_back.img
+rd_done "AMONET image: unpacked under the patch (microloader.bin; the boot image as AIK's unpatching leaves it), an untouched repack is identical"
+
+# An edit: the image is what AIK's patching makes of the plain repack.
+printf 'abr test\n' >amo_u/ramdisk/abr_test_file
+"$ABR" -j1 repack amo_u -o amo_e1.img >amo_e1.log 2>&1
+"$ABR" -j4 repack amo_u -o amo_e4.img >amo_e4.log 2>&1
+rd_ck "-j1 and -j4 give the same bytes" cmp -s amo_e1.img amo_e4.img
+rm -rf amo_up
+cp -r amo_u amo_up
+sed 's/^has_amonet=true$/has_amonet=false/' amo_u/manifest.txt >amo_up/manifest.txt
+"$ABR" repack amo_up -o amo_e_plain.img >/dev/null 2>&1
+rd_ck "the plain repack (patch left out) starts with ANDROID!" test "$(head -c 8 amo_e_plain.img)" = "ANDROID!"
+amo_aik_patch amo_e_plain.img amo_ml.bin amo_e_expect.img
+rd_ck "the edited image is what AIK's patching makes of it" cmp -s amo_e4.img amo_e_expect.img
+rd_unpack amo_e4.img amo_e4_re
+rd_ck "unpacking it again: the file is there" test "$(cat amo_e4_re/ramdisk/abr_test_file 2>/dev/null)" = "abr test"
+rd_ck "the patch is still on" grep -q '^has_amonet=true$' amo_e4_re/manifest.txt
+rd_ck "with the same microloader" cmp -s amo_e4_re/microloader.bin amo_ml.bin
+rd_done "AMONET: a file put into ramdisk/ is in the repacked image, which is AIK's patching of the plain repack; -j1 = -j4"
+
+# The patch can be put on an ordinary image: two lines of the manifest and the microloader.
+rd_unpack amo_plain.img amo_p
+rd_ck "an ordinary image has no patch" test "$(grep -c '^has_amonet' amo_p/manifest.txt)" = 0
+cp amo_ml.bin amo_p/microloader.bin
+printf 'has_amonet=true\namonet_microloader_file=microloader.bin\n' >>amo_p/manifest.txt
+"$ABR" repack amo_p -o amo_p.img >/dev/null 2>&1
+rd_ck "the image the manifest makes is the patched one AIK makes" cmp -s amo_p.img amo.img
+rd_done "AMONET: has_amonet=true and a microloader.bin turn the unpack of an ordinary image into the patched image AIK makes"
+
+# What cannot carry the patch is refused, and so is what is not there.
+rm -rf amo_v2
+cp -r amo_u amo_v2
+sed 's/^header_version=0$/header_version=2/' amo_u/manifest.txt >amo_v2/manifest.txt
+"$ABR" repack amo_v2 -o amo_v2.img >amo_v2.log 2>&1
+amo_rc=$?
+rd_ck "a header longer than 1024 bytes is refused" test "$amo_rc" -ne 0
+rd_ck "with the reason" grep -q 'would overwrite' amo_v2.log
+rd_ck "and the way out" grep -q 'has_amonet=false' amo_v2.log
+rd_ck "no image is written" test ! -e amo_v2.img
+sed 's/^has_amonet=true$/has_amonet=false/' amo_v2/manifest.txt >amo_v2/manifest.new
+mv -f amo_v2/manifest.new amo_v2/manifest.txt
+"$ABR" repack amo_v2 -o amo_v2.img >/dev/null 2>&1
+rd_ck "the way out works: an image that starts with ANDROID!" test "$(head -c 8 amo_v2.img 2>/dev/null)" = "ANDROID!"
+rm -rf amo_nm
+cp -r amo_u amo_nm
+rm -f amo_nm/microloader.bin
+"$ABR" repack amo_nm -o amo_nm.img >amo_nm.log 2>&1
+amo_rc=$?
+rd_ck "a microloader that is not there is refused" test "$amo_rc" -ne 0
+head -c 1000 amo_ml.bin >amo_nm/microloader.bin
+"$ABR" repack amo_nm -o amo_nm.img >amo_nm.log 2>&1
+amo_rc=$?
+rd_ck "a microloader of 1000 bytes is refused" test "$amo_rc" -ne 0
+rd_ck "with the reason" grep -q 'exactly 1024 bytes' amo_nm.log
+head -c 1500 amo.img >amo_cut.img
+rm -rf amo_cut
+"$ABR" unpack amo_cut.img -o amo_cut >amo_cut.out 2>&1
+amo_rc=$?
+rd_ck "a patched image cut short is refused" test "$amo_rc" -ne 0
+rd_ck "with the reason" grep -q 'cut short' amo_cut.out
+rd_ck "and no directory is left behind" test ! -e amo_cut
+rd_done "AMONET: a header that would be overwritten, a missing or a wrong microloader and a cut-short image are refused with a reason (has_amonet=false is the way out)"
+
+# A dump of a whole partition (zeros after the image).
+cp amo.img amo_part.img
+truncate -s 1048576 amo_part.img
+rd_unpack amo_part.img amo_pp
+rd_ck "the fill is in the manifest" grep -q '^pad_to=1048576$' amo_pp/manifest.txt
+"$ABR" repack amo_pp -o amo_pp_back.img >/dev/null 2>&1
+rd_ck "an untouched repack is identical" cmp -s amo_part.img amo_pp_back.img
+printf 'abr test\n' >amo_pp/ramdisk/abr_test_file
+"$ABR" repack amo_pp -o amo_pp_edit.img >/dev/null 2>&1
+rd_ck "an edit keeps the size of the partition" test "$(wc -c <amo_pp_edit.img | tr -d ' ')" = 1048576
+head -c 1024 amo_pp_edit.img >amo_pp_edit.ml
+rd_ck "and the microloader" cmp -s amo_pp_edit.ml amo_ml.bin
+rd_done "AMONET image padded to its partition size: the fill is kept, also after an edit"
+
+# Under a DHTB wrapper (the two come off in that order and go on in the opposite one).
+python3 - <<'PYEOF'
+import hashlib, struct
+payload = open("amo.img", "rb").read()
+header = b"DHTB\x01\x00\x00\x00" + hashlib.sha256(payload).digest() + b"\x00" * 8 + struct.pack("<I", len(payload))
+open("amo_dhtb.img", "wb").write(header + b"\x00" * (512 - len(header)) + payload)
+PYEOF
+rd_unpack amo_dhtb.img amo_d
+rd_ck "both wrappers are in the manifest" grep -q '^has_dhtb=true$' amo_d/manifest.txt
+rd_ck "(the patch)" grep -q '^has_amonet=true$' amo_d/manifest.txt
+rd_ck "and are named" grep -q 'unpacked dhtb-wrapped amonet-patched boot' amo_d.log
+"$ABR" repack amo_d -o amo_d_back.img >/dev/null 2>&1
+rd_ck "an untouched repack is identical" cmp -s amo_dhtb.img amo_d_back.img
+rd_done "AMONET under a DHTB wrapper: both are taken off and put back, the round trip is exact"
+
 # ---- images of your own: ABR_REAL_IMAGES=<directory> tests/run_tests.sh <abr> checks every file of it the way
 # the fixtures above are checked -- an untouched repack is identical, every ramdisk archive is a directory that
 # GNU cpio agrees with, and a file put into a directory lands in the image. (Files abr does not take, an ext4

@@ -32,6 +32,7 @@
 #include "abr/dtbo.hpp"
 #include "abr/envelope.hpp"
 #include "abr/identify.hpp"
+#include "abr/legacy/amonet.hpp"
 #include "abr/legacy/avb1.hpp"
 #include "abr/legacy/dhtb.hpp"
 #include "abr/legacy/elf_boot.hpp"
@@ -155,6 +156,31 @@ Fmt fmt_from_name(const std::string& s) {
     if (s == "elf_boot") return Fmt::ELF_BOOT;
     if (s == "krnl") return Fmt::KRNL;
     return Fmt::UNKNOWN;
+}
+
+// What is put around a plain image and has to come off before anything can be read: a DHTB header
+// (abr/legacy/dhtb.hpp), and under it the amonet patch (abr/legacy/amonet.hpp). Repack puts them back in
+// the opposite order.
+struct Wrappers {
+    std::optional<legacy::DhtbInfo> dhtb;
+    std::optional<legacy::AmonetInfo> amonet;
+    Bytes dhtb_inner;  // what the wrappers' removal leaves is kept here, if it is not `data` itself
+    Bytes unpatched;
+
+    bool any() const { return dhtb || amonet; }
+    // "dhtb-wrapped ", "amonet-patched ", both, or nothing: for the line that says what was unpacked.
+    std::string adjectives() const {
+        return std::string(dhtb ? "dhtb-wrapped " : "") + (amonet ? "amonet-patched " : "");
+    }
+};
+
+// Takes the wrappers off `data`. The plain image is `data` itself or lives in `w`: the reference is good
+// as long as both are.
+const Bytes& peel_wrappers(const Bytes& data, Wrappers& w) {
+    w.dhtb = strip_dhtb(data, w.dhtb_inner);
+    const Bytes& inner = w.dhtb ? w.dhtb_inner : data;
+    w.amonet = strip_amonet(inner, w.unpatched);
+    return w.amonet ? w.unpatched : inner;
 }
 
 // What the command line can add to a repack: keys for the signatures abr
@@ -1430,16 +1456,20 @@ void print_avb_footer_info(const AvbFooter& f, const Bytes& host) {
 
 void print_info(const fs::path& path) {
     Bytes raw = read_file(path);
-    Bytes inner;
-    auto dhtb = strip_dhtb(raw, inner);
-    const Bytes& data = dhtb ? inner : raw;
+    Wrappers wrap;
+    const Bytes& data = peel_wrappers(raw, wrap);
 
     Fmt f = detect_format(data);
     std::cout << "file:   " << path.string() << " (" << raw.size() << " bytes)\n";
-    if (dhtb) {
-        std::cout << "wrapper: DHTB (" << (dhtb->has_seandroid_footer ? "+SEAndroid footer " : "")
-                   << (dhtb->has_padding ? "+padding " : "") << ", inner " << data.size()
+    if (wrap.dhtb) {
+        std::cout << "wrapper: DHTB (" << (wrap.dhtb->has_seandroid_footer ? "+SEAndroid footer " : "")
+                   << (wrap.dhtb->has_padding ? "+padding " : "") << ", inner " << wrap.dhtb_inner.size()
                    << " bytes)\n";
+    }
+    if (wrap.amonet) {
+        std::cout << "wrapper: AMONET patch (a " << wrap.amonet->microloader.size()
+                   << "-byte microloader at the start; the boot image's first " << legacy::kAmonetHeadSize
+                   << " bytes are at offset " << legacy::kAmonetMicroloaderSize << ")\n";
     }
     std::cout << "format: " << fmt_name(f) << "\n";
     switch (f) {
@@ -1596,6 +1626,16 @@ Bytes build_image_once(const fs::path& dir, const RepackOptions& opt) {
     if (opt.avb1_signer && f != Fmt::BOOT)
         warn("--avb1-key/--avb1-cert only apply to boot and recovery images; ignored here");
 
+    // The wrappers go on in the opposite order to the one they came off in: the amonet patch, then DHTB.
+    if (m.get_bool("has_amonet", false)) {
+        legacy::AmonetInfo amonet;
+        amonet.microloader = load_raw(m, dir, "amonet_microloader");
+        try {
+            result = legacy::apply_amonet(result, amonet);
+        } catch (const FormatError& e) {
+            throw FormatError(std::string(e.what()) + " (has_amonet=false in manifest.txt leaves the AMONET patch out)");
+        }
+    }
     if (m.get_bool("has_dhtb", false)) {
         legacy::DhtbInfo dhtb;
         dhtb.has_seandroid_footer = m.get_bool("dhtb_seandroid_footer", false);
@@ -1675,9 +1715,8 @@ void self_check(const fs::path& outdir, const Bytes& original) {
 void do_unpack(const fs::path& in, const fs::path& outdir, const UnpackOptions& uo) {
     Bytes data = read_file(in);
 
-    Bytes inner;
-    auto dhtb = strip_dhtb(data, inner);
-    const Bytes& payload = dhtb ? inner : data;
+    Wrappers wrap;
+    const Bytes& payload = peel_wrappers(data, wrap);
 
     Fmt f = detect_format(payload);
     if (f == Fmt::UNKNOWN) throw FormatError(in.string() + ": " + describe_unknown(payload));
@@ -1699,15 +1738,23 @@ void do_unpack(const fs::path& in, const fs::path& outdir, const UnpackOptions& 
                 throw FormatError(in.string() + ": " + describe_unknown(payload));
         }
 
-        if (dhtb) {
+        if (wrap.any()) {
             Manifest m = Manifest::load(outdir / "manifest.txt");
-            m.set_bool("has_dhtb", true);
-            m.set_bool("dhtb_seandroid_footer", dhtb->has_seandroid_footer);
-            m.set_bool("dhtb_padding", dhtb->has_padding);
-            save_raw(m, outdir, "dhtb_trailing_extra", dhtb->trailing_extra, "dhtb_trailing_extra.bin");
+            std::string what;
+            if (wrap.dhtb) {
+                m.set_bool("has_dhtb", true);
+                m.set_bool("dhtb_seandroid_footer", wrap.dhtb->has_seandroid_footer);
+                m.set_bool("dhtb_padding", wrap.dhtb->has_padding);
+                save_raw(m, outdir, "dhtb_trailing_extra", wrap.dhtb->trailing_extra, "dhtb_trailing_extra.bin");
+                what = "DHTB-wrapped";
+            }
+            if (wrap.amonet) {
+                m.set_bool("has_amonet", true);
+                save_raw(m, outdir, "amonet_microloader", wrap.amonet->microloader, "microloader.bin");
+                what += std::string(what.empty() ? "" : ", ") + "AMONET-patched";
+            }
             m.save(outdir / "manifest.txt",
-                   "abr manifest (DHTB-wrapped) -- edit then `abr repack " + outdir.string() +
-                       " -o out.img`");
+                   "abr manifest (" + what + ") -- edit then `abr repack " + outdir.string() + " -o out.img`");
         }
     } catch (...) {
         if (made_outdir) {
@@ -1717,7 +1764,7 @@ void do_unpack(const fs::path& in, const fs::path& outdir, const UnpackOptions& 
         throw;
     }
 
-    std::cout << "unpacked " << (dhtb ? std::string("dhtb-wrapped ") : std::string()) << fmt_name(f)
+    std::cout << "unpacked " << wrap.adjectives() << fmt_name(f)
               << " -> " << outdir.string() << "/\n";
     self_check(outdir, data);
 }

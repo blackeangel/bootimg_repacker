@@ -22,10 +22,14 @@ build-time contents:
 
 Also handled transparently, wherever it appears around those: a
 MediaTek (MTK) sub-header on the kernel and/or ramdisk, a DHTB wrapper
-(with its SEAndroid footer/padding), the Barnes & Noble Nook signing header
-in front of an image (1 MiB, 256 KiB on the tablets), LG's Bump and
-Samsung's SEAndroid footers behind it, an AVB hash footer on boot /
-vendor_boot / dtbo, and the vendor data described below.
+(with its SEAndroid footer/padding), the *amonet* patch of Amazon's
+MediaTek Fire tablets (a 1024-byte microloader in front, the boot header
+moved behind it: `unpack` keeps it as `microloader.bin` and `has_amonet=true`
+in the manifest, reads the boot image under it, and `repack` puts it back;
+the same two manifest lines put it on an ordinary v0 image), the Barnes &
+Noble Nook signing header in front of an image (1 MiB, 256 KiB on the
+tablets), LG's Bump and Samsung's SEAndroid footers behind it, an AVB hash
+footer on boot / vendor_boot / dtbo, and the vendor data described below.
 
 Compression: gzip, lz4 (frame and the Android/GKI "legacy" block
 format), zstd, xz, LZMA (headerless "alone" stream), bzip2, and LZO
@@ -440,6 +444,12 @@ four payloads are what a Python tool of the suite and `abr` compute, and every
 image `abr` writes -- untouched, with an edited ramdisk, with an edited kernel,
 with a ramdisk file added -- is what `rkcrc -k` writes from the same payload.
 
+The amonet patch is judged by the commands Android Image Kitchen itself runs
+for it (`dd`, `truncate` and `cat`, copied from its `unpackimg.sh` and
+`repackimg.sh`): they make the patched images the tests start from and take
+the patch off again, and what `abr` repacks after an edit is what they make of
+the plain repack. (No real Amazon image has been tried: none was at hand.)
+
 Compression is judged by the real tools. For every codec the suite builds a
 boot image with `abr`, slices the ramdisk out of it with a separate script
 (`tests/tools/verify.py`, not `abr`) and has the real `gzip`, `lz4`, `zstd`,
@@ -494,9 +504,9 @@ Two smaller gaps:
 - Hard links in a ramdisk's cpio archive (the ramdisk then stays one
   `ramdisk.cpio`); a directory tree is made for `newc`/`crc` archives only.
 - The rest of the Android Image Kitchen format list: OSIP images,
-  blobpack, QCDT tooling, ChromeOS `futility` signing, LOKI/AMONET, Sony
-  SIN. `abr identify` already names all of them; what is missing is
-  unpacking and packing them. See `PROGRESS.md` for the plan.
+  blobpack, QCDT tooling, ChromeOS `futility` signing, LOKI, Sony SIN.
+  `abr identify` already names all of them; what is missing is unpacking
+  and packing them. See `PROGRESS.md` for the plan.
 - U-Boot's newer FIT (Flattened Image Tree) format -- only the older
   legacy `mkimage` container is supported.
 - Filesystems (ext4, F2FS, EROFS, SquashFS) and sparse images: out of
