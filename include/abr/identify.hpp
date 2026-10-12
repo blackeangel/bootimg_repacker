@@ -25,6 +25,9 @@
 //   * a prefix signature always wins over an "ANDROID!" found later, and a
 //     vendor_boot image that starts with "VNDRBOOT" is a vendor_boot image
 //     (file(1) ranks the two by a strength rule that can call it a boot image).
+//
+// Formats abr handles that AIK's signature file does not name (vbmeta, dtbo, dtb,
+// an ASUS blob without the signing header) get a label of their own.
 #pragma once
 
 #include <cstddef>

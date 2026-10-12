@@ -25,6 +25,7 @@ tools" below.
 | ELF boot images (Sony/Xperia) | **done + verified** against real elftool (commit `67157cf`) |
 | Rockchip KRNL images (`kernel.img`, SDK `boot.img`) | **done + verified** against the real `rkcrc -k` (compiled, not vendored) and an independent Python tool: the payload (kernel, or a compressed cpio ramdisk -> `ramdisk.cpio` + `ramdisk/`), Rockchip's own CRC (polynomial 0x04C10DB7), partition fill, wrong stored CRC kept |
 | AMONET patch (Amazon Fire, MediaTek): microloader + boot header moved to 1024 | **done + verified** against AIK's own `dd`/`truncate`/`cat` commands (copied into the suite): `microloader.bin`, `has_amonet=true`, refuses what the patch would overwrite; layered under DHTB |
+| ASUS blob (`"MSM-RADIO-UPDATE"`, with or without the `-SIGNED-BY-SIGNBLOB-` header): AIK's `blobunpack`/`blobpack` | **done + verified** against the real BlobTools `blobpack`/`blobunpack` (compiled, not vendored) and an independent Python tool: a blob that holds one image is a wrapper layer (`has_blob=true`; AIK's case), any other is `type=blob` with a file per partition; the signature is kept, `datalen` follows an edit; only blobpack's layout is read |
 | Marvell PXA boot header (Samsung Galaxy J1 / Core Prime / Tab 4) | **done + verified** against the real `pxa-mkbootimg` / `pxa-unpackbootimg` (compiled, not vendored): 240 images byte-identical, 34 edits equal to the tool's output (commit `0652429`) |
 | `abr identify`: AIK's `androidbootimg.magic` as code | **done + verified**: 98 samples, agree with `file(1)` + AIK's magic file on all (when both are at hand) and with the built-in table; unsupported-but-known formats are named in the refusal (commit `803b820`) |
 | Nook / Nook-tablet signing header in front, LG Bump footer behind | **done** (synthetic fixtures; no real device dump of either yet): header kept as a constant prefix (`prefix_kind=`), footer kept as tail, neither triggers the stale-signature warning (commit `2a76f87`) |
@@ -38,7 +39,7 @@ tools" below.
 | self-contained RSA: BigInt (Knuth D, Montgomery), DER/PEM/X.509, PKCS#1 v1.5 sign/verify, PKCS#8/PKCS#1 key parsing, AVB public-key blob -- **no OpenSSL anywhere in the build** | **done + verified** (Python integers, `openssl dgst -sign`, `avbtool extract_public_key`; see "Self-contained crypto" below) |
 | manifest + CLI (`abr info/unpack/repack`) | **done** |
 | CMake: FetchContent-vendored static zlib/lz4/zstd/xz/bzip2 | **done + build-verified natively on Linux**, both the dynamic and the `-DABR_STATIC_BINARY=ON` fully-static configurations |
-| Test suite (`tests/run_tests.sh`) | **done, 260/260 passing** locally on g++-14 (with the optional `pxa-*` / `rkcrc` oracles and AIK's magic file); CI runs the matrix (g++-14, clang-20, Windows under wine, arm64 under qemu-user) -- see Verification |
+| Test suite (`tests/run_tests.sh`) | **done, 268/268 passing** locally on g++-14 (with the optional `pxa-*` / `rkcrc` / `blobpack`+`blobunpack` oracles and AIK's magic file); CI runs the matrix (g++-14, clang-20, Windows under wine, arm64 under qemu-user) -- see Verification |
 | CMake cross toolchains (mingw-w64, Android NDK) | **done + verified** (mingw reproduced locally; NDK only provable via CI, see below) |
 | GitHub Actions static build matrix (linux-x86_64, windows-x86_64, android-arm64) | **done + verified**: run 35313499827, all 3 jobs green, all 3 static binaries produced as artifacts (abr-linux-x86_64, abr-windows-x86_64, abr-android-arm64) |
 
@@ -714,7 +715,7 @@ compiled from source and used only as oracles, never as a dependency.
 | **ramdisk as a directory tree** (`cpio -i` / `find . | cpio -H newc`) | **done** for newc/crc, including several archives one after the other; owners/modes live in `ramdisk.meta`, links work on Windows; odc/binary/hard links stay a `ramdisk.cpio` (see "The ramdisk as a directory" below) |
 | AIK's compression defaults (`xz -1 -Ccrc32`, `lz4 -9`) and `--level` | abr uses each codec's usual setting; `<component>_level=N` overrides |
 | `--original` (repack with the stored ramdisk, skip `ramdisk/`), `--origsize` (pad back to the original size), `--forceelf` (repack an ELF as ELF), `--avbkey` | not needed as options: an untouched `ramdisk.cpio` is replayed as it was (compressed bytes included), the recorded partition-size fill (`pad_to`) is always written back, an ELF is always rebuilt as an ELF (AIK's default converts it to an AOSP image instead; abr cannot do that conversion), and `--avb-key` / `--avb1-key` are the signing keys |
-| BLOB (`blobunpack`, AndroidRoot/BlobTools) | recognised by `abr identify`, not unpacked |
+| BLOB (`blobunpack` / `blobpack`, AndroidRoot/BlobTools) | **done**, judged by the real tools: unpack / repack / info; wrapper layer between DHTB and AMONET, or a directory of its own for several partitions; see "BLOB" below |
 | ChromeOS kernel blob (`futility vbutil_kernel`) | recognised, not unpacked; signing is its own project |
 | Sony SIN (`sony_dump`) | recognised, not unpacked |
 | Intel OSIP (`mboot`) | recognised, not unpacked (needs osm0sis/mboot as the reference) |
@@ -967,9 +968,68 @@ unpatched image; edit, -j1 = -j4; the patch put on an ordinary image; refusals; 
 partition dump with zero fill; under a DHTB wrapper). The negative control (a binary
 without the code) fails all 7. No real Amazon image was tried -- none was supplied.
 
+## BLOB (done, 12 Oct 2026)
+
+ASUS's Tegra blobs (AIK: "ASUS Blob Signature", `blobunpack` / `blobpack` of
+AndroidRoot/BlobTools). The layout, from BlobTools' sources (`shared/blob.h`,
+`blobpack.cpp`, `blobunpack.cpp`): an optional 28-byte secure header
+(`"-SIGNED-BY-SIGNBLOB-"`, `datalen`, `siglen`; all u32 le), then the blob proper:
+a 60-byte header (`"MSM-RADIO-UPDATE"`, version 0x00010000, header size 60, table
+offset 60, the number of partitions, seven zero words), a 16-byte entry per
+partition (name[4], offset counted from the start of the blob proper, size,
+version 1), the partitions' data one after the other, and -- in a signed blob --
+the signature behind. AIK's way: `blobunpack` for a file that has a single
+partition (`mv "$file."* "$file"`; the partition name, its first three characters,
+is kept as `blobtype`), and on repack `-SIGNED-BY-SIGNBLOB-` + 8 NULs (`datalen`
+and `siglen` 0) in front of `blobpack`'s output.
+
+Code: `include/abr/legacy/blob.hpp` + `src/legacy/blob.cpp` (`BlobImage::looks_like`,
+`parse`, `blob_size`, `build`), in `src/main.cpp` `Fmt::BLOB` (`unpack_blob`,
+`repack_blob`, `pack_blob`, `save_blob_fields`/`load_blob_fields`, the `info` case)
+and a third layer in `Wrappers`: DHTB comes off first, then the blob (when it has
+exactly one partition and what is in it is an image `detect_format` knows), then
+the amonet patch; repack puts them on in the opposite order. Any other blob --
+several partitions, or one partition that is no image -- is a directory of its
+own, `type=blob`, `part<i>[_NAME].bin` per partition. `src/identify.cpp` names a
+blob without the signing header (`MSM-RADIO-UPDATE blob`; AIK's magic file knows
+only the signed one: "BLOB signing"). `tests/tools/blob_tool.py` writes and reads
+blobs independently (written from BlobTools' layout, shares nothing with abr).
+
+Manifest: `has_blob=true` (wrapper) or `type=blob`; `blob_secure`,
+`blob_secure_datalen`, `blob_secure_siglen`, `blob_version`, `blob_unknown` (only if
+one of the seven words is not zero), `blob_parts`, `blob_part<i>_name` (a word of
+[0-9A-Za-z_.-]) or `blob_part<i>_name_hex` (four raw bytes), `blob_part<i>_version`,
+`blob_size`, `blob_data_sha256`, and `blob_tail_file=blob_tail.bin` (the signature).
+Decisions worth knowing:
+- Only the layout blobpack writes is read: header size 60, table at 60, the
+  partitions contiguous right behind the table. Anything else (including a gap) is
+  refused with the reason, because rebuilding it in blobpack's layout would lose
+  the difference silently. A blob cut short, a count over 4096 and a SIGNBLOB
+  header with no blob behind it are refused too; a failed unpack leaves no directory.
+- The signature cannot be made again (ASUS's key). It is kept behind the data.
+  `datalen` follows the blob when it equalled the original blob's length (AIK's
+  blobs have 0 and keep it); when the contents changed and a signature (siglen
+  or a non-zero tail) is kept, `repack` warns that it describes the original.
+- Names are kept to four bytes (AIK keeps three); `0x`-style hex names make the
+  odd ones round-trip.
+
+Judged by the real BlobTools (compiled in the CI, `ABR_BLOBPACK`/`ABR_BLOBUNPACK`;
+the tests skip those checks where they are not set) and by the Python tool: the
+signed blob AIK makes (28 bytes + blobpack's output) is what the tool writes and
+what abr repacks; an edit equals the tool's and blobpack's output for the plain
+repack; blobunpack finds the partitions of what abr wrote; signed (siglen 256,
+signature kept, datalen follows, the warning); bare; three partitions with a new
+size of the first (offsets move); one non-image partition; odd names/versions;
+under amonet and DHTB; refusals. 8 test groups; the suites: g++-14 268/268, clang-20
+268/268, Windows under wine 267/267. Negative controls: with fake
+oracles (`/bin/false`) the four groups that use them fail, a binary without the
+code fails all. mawk (Debian/Ubuntu `awk`) drops `\00` in printf: AIK's own
+header line is written with it, abr and the tests do not depend on that. No real
+ASUS blob was tried -- none was supplied.
+
 ## Next steps (in order)
 
-1. Remaining AIK parity, easiest first: BLOB, OSIP, LOKI, QCDT creation,
+1. Remaining AIK parity, easiest first: OSIP, LOKI, QCDT creation,
    ChromeOS signing. The stages 2 and 3 of the user's own spec need a scope
    decision before anything is built.
 2. Housekeeping: AIK-like default levels as an opt-in, gzip OS-byte
@@ -1229,8 +1289,8 @@ Useful as a checklist; wrong in places, and much wider than `abr`:
    AOSP test key or `--avb1-key/--avb1-cert`; self-contained RSA).
 2. ~~**CPIO ramdisk as a directory tree**~~ -- **done** for newc and crc
    (see "The ramdisk as a directory"); odc and binary archives stay files.
-3. Remaining AIK parity: PXA, OSIP/KRNL, RKCRC, blobpack, QCDT, ChromeOS
-   futility signing, LOKI/AMONET, BLOB/NOOK/SIN.
+3. Remaining AIK parity: OSIP, QCDT creation, ChromeOS futility signing,
+   LOKI, SIN (PXA, KRNL/RKCRC, AMONET, BLOB, NOOK are done).
 4. Spec stage 1 leftovers: MBN, FIT/ITB. Spec stages 2/3: scope decision.
 5. Housekeeping: CI should run the quirk suite; `main.cpp` is ~1200 lines
    and should be split per format.

@@ -2800,6 +2800,202 @@ rd_ck "and are named" grep -q 'unpacked dhtb-wrapped amonet-patched boot' amo_d.
 rd_ck "an untouched repack is identical" cmp -s amo_dhtb.img amo_d_back.img
 rd_done "AMONET under a DHTB wrapper: both are taken off and put back, the round trip is exact"
 
+# =========================================================================
+# BLOB: ASUS (Tegra) "MSM-RADIO-UPDATE" blobs and the "-SIGNED-BY-SIGNBLOB-" header (abr/legacy/blob.hpp). The
+# blobs of these tests are made by tests/tools/blob_tool.py, which is written from the layout of AndroidRoot's
+# BlobTools (shared/blob.h, blobpack.cpp, blobunpack.cpp) and shares no code with abr. ABR_BLOBPACK and
+# ABR_BLOBUNPACK name the compiled blobpack and blobunpack of BlobTools (Apache-2.0; not part of this repository;
+# the linux CI jobs compile them): where they are at hand they are judges too, and what Android Image Kitchen
+# does with a signed blob (its 28 bytes, then blobpack's blob; blobunpack for the way back) is done by them here.
+# =========================================================================
+BTL="$TOOLS/blob_tool.py"
+blob_real() { [ -n "${ABR_BLOBPACK:-}" ] && [ -x "${ABR_BLOBPACK:-}" ] && [ -n "${ABR_BLOBUNPACK:-}" ] && [ -x "${ABR_BLOBUNPACK:-}" ]; }
+blob_ref_make() {  # <plain image> <partition> <blob>: AIK's repackimg.sh ("BLOB)") on the plain image gives that blob (true without the tools)
+    blob_real || return 0
+    # (printf writes the NULs: the awk AIK uses for this, in Debian's and Ubuntu's mawk, drops them)
+    printf -- '-SIGNED-BY-SIGNBLOB-\0\0\0\0\0\0\0\0' >"$3.ref" || return 1
+    "$ABR_BLOBPACK" blob_tmp.bin "$2" "$1" >/dev/null || return 1
+    cat blob_tmp.bin >>"$3.ref"
+    rm -f blob_tmp.bin
+    cmp -s "$3" "$3.ref"
+}
+blob_ref_extract() {  # <blob> <partition> <expected data>: the real blobunpack writes that partition (true without the tools)
+    blob_real || return 0
+    rm -f blob_ref blob_ref.*
+    cp "$1" blob_ref || return 1
+    "$ABR_BLOBUNPACK" blob_ref >/dev/null 2>&1 || return 1
+    cmp -s "blob_ref.$2" "$3"
+}
+blob_datalen_is_blob_length() {  # <blob>: the secure header's datalen is the length of the blob proper
+    local out dl bl
+    out="$(python3 -I "$BTL" list "$1")" || return 1
+    dl="$(sed -n 's/^secure datalen=\([0-9]*\) .*/\1/p' <<<"$out")"
+    bl="$(sed -n 's/^blob \([0-9]*\)$/\1/p' <<<"$out")"
+    [ -n "$dl" ] && [ "$dl" = "$bl" ]
+}
+blob_tail_is() {  # <blob> <file>: the blob ends with that file
+    tail -c "$(wc -c <"$2" | tr -d ' ')" "$1" >blob_tail_chk.bin && cmp -s blob_tail_chk.bin "$2"
+}
+blob_size() { wc -c <"$1" | tr -d ' '; }
+head -c 5000 /dev/urandom >blob_ebt.bin
+head -c 777 /dev/urandom >blob_app.bin
+head -c 256 /dev/urandom >blob_sig.bin
+
+python3 -I "$BTL" make blob_aik.img --secure 0:0 LNX=amo_plain.img
+rd_ck "the blob the independent tool writes is what blobpack and AIK's 28 bytes make" blob_ref_make amo_plain.img LNX blob_aik.img
+rd_ck "blobunpack finds the boot image in its partition" blob_ref_extract blob_aik.img LNX amo_plain.img
+rd_ck "identify: BLOB signing" said "BLOB signing" "$ABR" identify blob_aik.img
+rd_ck "info names the wrapper and the partition" said "wrapper: ASUS blob (signed header, partition LNX" "$ABR" info blob_aik.img
+rd_ck "and still reads the boot image inside" said "header_version: 0" "$ABR" info blob_aik.img
+rd_done "BLOB: the signed blob Android Image Kitchen makes (28 bytes + blobpack's blob) is what the independent tool writes; identify and info see the wrapper"
+
+# A blob with a boot image in its only partition (AIK's case): the blob is a wrapper, the directory is the image's.
+rd_unpack blob_aik.img blob_u
+rd_ck "unpacked as the boot image inside" grep -q '^type=boot$' blob_u/manifest.txt
+rd_ck "the blob is in the manifest" grep -q '^has_blob=true$' blob_u/manifest.txt
+rd_ck "its partition is LNX" grep -q '^blob_part0_name=LNX$' blob_u/manifest.txt
+rd_ck "unpack says what it unpacked" grep -q 'unpacked blob-wrapped boot' blob_u.log
+rd_unpack amo_plain.img blob_u0
+rd_ck "the boot image alone unpacks to the same files" rd_same_tree_x blob_u blob_u0 manifest.txt
+rd_ck "and the same manifest, but for the blob" \
+    test "$(grep -v '^#\|^has_blob\|^blob_' blob_u/manifest.txt)" = "$(grep -v '^#' blob_u0/manifest.txt)"
+"$ABR" repack blob_u -o blob_back.img >blob_back.log 2>&1
+rd_ck "an untouched repack is identical" cmp -s blob_aik.img blob_back.img
+rd_done "BLOB around a boot image (AIK's case): unpacked as that image with has_blob=true, an untouched repack is identical"
+
+# An edit: the blob is what the independent tool (and blobpack) make of the plain repack.
+printf 'abr test\n' >blob_u/ramdisk/abr_test_file
+head -c 9000 /dev/urandom >blob_u/ramdisk/blob_big_file  # more than a page, so the blob grows
+"$ABR" repack blob_u -o blob_e.img >blob_e.log 2>&1
+rm -rf blob_up
+cp -r blob_u blob_up
+sed 's/^has_blob=true$/has_blob=false/' blob_u/manifest.txt >blob_up/manifest.txt
+"$ABR" repack blob_up -o blob_e_plain.img >/dev/null 2>&1
+rd_ck "the plain repack (blob left out) is a boot image" test "$(head -c 8 blob_e_plain.img)" = "ANDROID!"
+rd_ck "and the blob is bigger than the one before" test "$(blob_size blob_e.img)" -gt "$(blob_size blob_aik.img)"
+python3 -I "$BTL" make blob_e_expect.img --secure 0:0 LNX=blob_e_plain.img
+rd_ck "the edited blob is what the independent tool makes of it" cmp -s blob_e.img blob_e_expect.img
+rd_ck "and what blobpack makes (AIK's way)" blob_ref_make blob_e_plain.img LNX blob_e.img
+rd_ck "blobunpack finds the plain repack in the partition" blob_ref_extract blob_e.img LNX blob_e_plain.img
+rd_ck "datalen was 0 (AIK's unsigned blob) and stays 0" said "secure datalen=0 siglen=0" python3 -I "$BTL" list blob_e.img
+rd_ck "there is no signature to warn about" test "$(grep -c 'signature' blob_e.log)" = 0
+rd_unpack blob_e.img blob_e_re
+rd_ck "unpacking it again: the files are there" test -f blob_e_re/ramdisk/abr_test_file -a -f blob_e_re/ramdisk/blob_big_file
+rd_done "BLOB: a ramdisk edit lands in the partition; the blob is what the independent tool and blobpack make of the plain repack"
+
+# A signed blob: datalen and siglen, the signature behind the data. The signature is kept, datalen follows the blob.
+python3 -I "$BTL" make blob_sig.img --secure auto:256 --tail blob_sig.bin LNX=amo_plain.img
+rd_unpack blob_sig.img blob_s
+rd_ck "unpacked as the boot image inside" grep -q '^type=boot$' blob_s/manifest.txt
+rd_ck "siglen is in the manifest" grep -q '^blob_secure_siglen=0x100$' blob_s/manifest.txt
+rd_ck "the signature is a file" cmp -s blob_s/blob_tail.bin blob_sig.bin
+"$ABR" repack blob_s -o blob_s_back.img >blob_s_back.log 2>&1
+rd_ck "an untouched repack says nothing about the signature" test "$(grep -c 'signature' blob_s_back.log)" = 0
+rd_ck "and is identical, signature included" cmp -s blob_sig.img blob_s_back.img
+head -c 9000 /dev/urandom >blob_s/ramdisk/blob_big_file
+"$ABR" repack blob_s -o blob_s_edit.img >blob_s_edit.log 2>&1
+rd_ck "an edit: the blob is one the independent reader takes" python3 -I "$BTL" list blob_s_edit.img
+rd_ck "datalen follows the length of the blob" blob_datalen_is_blob_length blob_s_edit.img
+rd_ck "siglen is as it was" said "siglen=256" python3 -I "$BTL" list blob_s_edit.img
+rd_ck "the signature is as it was" blob_tail_is blob_s_edit.img blob_sig.bin
+rd_ck "and it is said not to fit any more" grep -q 'kept as they were' blob_s_edit.log
+rd_done "BLOB with a signature: kept as it was, datalen follows the edited blob, the stale signature is said at repack"
+
+# Without the signing header.
+python3 -I "$BTL" make blob_bare.img LNX=amo_plain.img
+rd_ck "identify names it" said "MSM-RADIO-UPDATE blob" "$ABR" identify blob_bare.img
+rd_unpack blob_bare.img blob_b
+rd_ck "unpacked as the boot image inside, with no signed header" grep -q '^blob_secure=false$' blob_b/manifest.txt
+"$ABR" repack blob_b -o blob_b_back.img >/dev/null 2>&1
+rd_ck "an untouched repack is identical" cmp -s blob_bare.img blob_b_back.img
+rd_ck "blobunpack reads it too" blob_ref_extract blob_bare.img LNX amo_plain.img
+rd_done "BLOB without the signing header: recognised, unpacked, an untouched repack is identical"
+
+# The blob is a directory of its own when it has several partitions, or one that is no image.
+python3 -I "$BTL" make blob_multi.img --secure 0:0 EBT=blob_ebt.bin LNX=amo_plain.img APP=blob_app.bin
+rd_unpack blob_multi.img blob_m
+rd_ck "a blob of three partitions is a directory of its own" grep -q '^type=blob$' blob_m/manifest.txt
+rd_ck "a file for each partition" test -f blob_m/part0_EBT.bin -a -f blob_m/part1_LNX.bin -a -f blob_m/part2_APP.bin
+rd_ck "(EBT)" cmp -s blob_m/part0_EBT.bin blob_ebt.bin
+rd_ck "(LNX)" cmp -s blob_m/part1_LNX.bin amo_plain.img
+rd_ck "(APP)" cmp -s blob_m/part2_APP.bin blob_app.bin
+rd_ck "info lists them, and says which one is an image" said "\[1\] LNX: $(blob_size amo_plain.img) bytes, version 1, boot" "$ABR" info blob_multi.img
+"$ABR" repack blob_m -o blob_m_back.img >/dev/null 2>&1
+rd_ck "an untouched repack is identical" cmp -s blob_multi.img blob_m_back.img
+head -c 3000 /dev/urandom >blob_m/part0_EBT.bin  # another size: the offsets after it move
+"$ABR" repack blob_m -o blob_m_e.img >/dev/null 2>&1
+rd_ck "an edit: the layout is the one blobpack writes (the independent reader)" python3 -I "$BTL" list blob_m_e.img
+python3 -I "$BTL" make blob_m_expect.img --secure 0:0 EBT=blob_m/part0_EBT.bin LNX=amo_plain.img APP=blob_app.bin
+rd_ck "and the independent tool makes the same file" cmp -s blob_m_e.img blob_m_expect.img
+rd_ck "blobunpack reads the new first partition" blob_ref_extract blob_m_e.img EBT blob_m/part0_EBT.bin
+rd_ck "and the last" blob_ref_extract blob_m_e.img APP blob_app.bin
+python3 -I "$BTL" make blob_sos.img SOS=blob_app.bin
+rd_unpack blob_sos.img blob_sos
+rd_ck "one partition that is no image: a directory of its own" grep -q '^type=blob$' blob_sos/manifest.txt
+"$ABR" repack blob_sos -o blob_sos_back.img >/dev/null 2>&1
+rd_ck "an untouched repack is identical" cmp -s blob_sos.img blob_sos_back.img
+python3 -I "$BTL" make blob_odd.img 0x61006200=blob_app.bin 0x01020304@7=blob_ebt.bin
+rd_unpack blob_odd.img blob_o
+rd_ck "names that are no words are kept as hex" grep -q '^blob_part0_name_hex=61006200$' blob_o/manifest.txt
+rd_ck "(and the version of a partition)" grep -q '^blob_part1_version=7$' blob_o/manifest.txt
+"$ABR" repack blob_o -o blob_o_back.img >/dev/null 2>&1
+rd_ck "an untouched repack is identical" cmp -s blob_odd.img blob_o_back.img
+rd_done "BLOB with several partitions (or one that is no image): type=blob, a file per partition, an edit moves the offsets the way blobpack lays them out"
+
+# The wrappers stack: an AMONET-patched image in a blob, and that in a DHTB wrapper.
+python3 -I "$BTL" make blob_amo.img --secure 0:0 LNX=amo.img
+rd_unpack blob_amo.img blob_a
+rd_ck "both wrappers are in the manifest" grep -q '^has_blob=true$' blob_a/manifest.txt
+rd_ck "(the patch)" grep -q '^has_amonet=true$' blob_a/manifest.txt
+rd_ck "and are named" grep -q 'unpacked blob-wrapped amonet-patched boot' blob_a.log
+"$ABR" repack blob_a -o blob_a_back.img >/dev/null 2>&1
+rd_ck "an untouched repack is identical" cmp -s blob_amo.img blob_a_back.img
+python3 -I - <<'PYEOF'
+import hashlib, struct
+payload = open("blob_amo.img", "rb").read()
+header = b"DHTB\x01\x00\x00\x00" + hashlib.sha256(payload).digest() + b"\x00" * 8 + struct.pack("<I", len(payload))
+open("blob_dhtb.img", "wb").write(header + b"\x00" * (512 - len(header)) + payload)
+PYEOF
+rd_unpack blob_dhtb.img blob_d
+rd_ck "three wrappers, named in the order they come off" grep -q 'unpacked dhtb-wrapped blob-wrapped amonet-patched boot' blob_d.log
+"$ABR" repack blob_d -o blob_d_back.img >/dev/null 2>&1
+rd_ck "an untouched repack is identical" cmp -s blob_dhtb.img blob_d_back.img
+rd_done "BLOB around an AMONET-patched image (and under DHTB): the wrappers are taken off and put back in order, the round trip is exact"
+
+# What is not read is refused with a reason, and leaves nothing behind.
+head -c "$(($(blob_size blob_aik.img) / 2))" blob_aik.img >blob_cut.img
+rm -rf blob_cut
+"$ABR" unpack blob_cut.img -o blob_cut >blob_cut.out 2>&1
+blob_rc=$?
+rd_ck "a blob cut short is refused" test "$blob_rc" -ne 0
+rd_ck "with the reason" grep -q 'cut short' blob_cut.out
+rd_ck "and no directory is left behind" test ! -e blob_cut
+python3 -I - <<'PYEOF'
+import struct
+d = bytearray(open("blob_aik.img", "rb").read())
+at = 28 + 60 + 4  # the offset of the first partition in its table entry (28: the signed header, 60: the blob header)
+offset = struct.unpack("<I", d[at:at + 4])[0]
+d[at:at + 4] = struct.pack("<I", offset + 4)
+d[28 + offset:28 + offset] = b"\xde\xad\xbe\xef"  # four bytes between the table and the data
+open("blob_gap.img", "wb").write(bytes(d))
+PYEOF
+rm -rf blob_gap
+"$ABR" unpack blob_gap.img -o blob_gap >blob_gap.out 2>&1
+blob_rc=$?
+rd_ck "a blob with a gap before its data is refused" test "$blob_rc" -ne 0
+rd_ck "with the reason" grep -q 'where blobpack puts it' blob_gap.out
+rd_ck "(the independent reader refuses it too)" test "$(python3 -I "$BTL" list blob_gap.img >/dev/null 2>&1; echo $?)" = 1
+rd_ck "and no directory is left behind" test ! -e blob_gap
+printf -- '-SIGNED-BY-SIGNBLOB-\0\0\0\0\0\0\0\0' >blob_nothing.img
+head -c 4000 /dev/zero >>blob_nothing.img
+rm -rf blob_nothing
+"$ABR" unpack blob_nothing.img -o blob_nothing >blob_nothing.out 2>&1
+blob_rc=$?
+rd_ck "the signing header with no blob behind it is refused" test "$blob_rc" -ne 0
+rd_ck "with the reason" grep -q 'no "MSM-RADIO-UPDATE" blob behind it' blob_nothing.out
+rd_ck "and no directory is left behind" test ! -e blob_nothing
+rd_done "BLOB: a cut-short blob, a gap in the layout and a signing header without a blob are refused with a reason, leaving no directory"
+
 # ---- images of your own: ABR_REAL_IMAGES=<directory> tests/run_tests.sh <abr> checks every file of it the way
 # the fixtures above are checked -- an untouched repack is identical, every ramdisk archive is a directory that
 # GNU cpio agrees with, and a file put into a directory lands in the image. (Files abr does not take, an ext4

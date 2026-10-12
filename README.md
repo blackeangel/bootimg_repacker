@@ -19,10 +19,12 @@ build-time contents:
 | uboot | U-Boot's legacy `mkimage`/uImage container |
 | ELF boot image | Sony/Xperia-style boot images that are an ELF file with the kernel/ramdisk as segments |
 | Rockchip KRNL | Rockchip's `kernel.img` and `boot.img` (`"KRNL"`, the size, a kernel or a gzip cpio ramdisk, Rockchip's own CRC) |
+| ASUS blob | the `"MSM-RADIO-UPDATE"` blobs of ASUS Tegra tablets (what `blobpack` writes), with or without the `-SIGNED-BY-SIGNBLOB-` signing header |
 
 Also handled transparently, wherever it appears around those: a
 MediaTek (MTK) sub-header on the kernel and/or ramdisk, a DHTB wrapper
-(with its SEAndroid footer/padding), the *amonet* patch of Amazon's
+(with its SEAndroid footer/padding), an ASUS blob that holds one image
+(`has_blob=true` in the manifest; see below), the *amonet* patch of Amazon's
 MediaTek Fire tablets (a 1024-byte microloader in front, the boot header
 moved behind it: `unpack` keeps it as `microloader.bin` and `has_amonet=true`
 in the manifest, reads the boot image under it, and `repack` puts it back;
@@ -137,7 +139,7 @@ question needs no other program: `abr identify boot.img` prints the label
 (`AOSP bootimg`, `AOSP-PXA bootimg`, `NOOK signing (green loader)`,
 `MTK bootimg, KERNEL, ...`, `AVBv2 signing footer`, ...), `-b` leaves the
 file name off. Formats that `abr` recognises but cannot unpack yet (a
-signing blob, a ChromeOS kernel, Sony SIN, Intel OSIP) are
+ChromeOS kernel, Sony SIN, Intel OSIP) are
 named in the refusal, together with the AIK tool that opens them, instead
 of "unrecognized format"; a refused `unpack` leaves no empty directory
 behind. The test suite compares 98 synthetic samples with the built-in
@@ -165,6 +167,47 @@ of a whole partition (zeros after the CRC) is kept at its size. The test
 suite makes images with a Python tool of its own and, where `ABR_RKCRC`
 names a compiled `rkcrc` (from rkflashtool, BSD; the CI compiles it), checks
 that `rkcrc -k` writes the same bytes.
+
+### ASUS blobs
+
+ASUS packs images into blobs (the "ASUS Blob Signature" of Android Image
+Kitchen; the format `blobpack` of BlobTools writes): a 60-byte header
+(`"MSM-RADIO-UPDATE"`, the version 0x00010000, its own size, the offset of the
+table, the number of partitions), a 16-byte entry per partition (a name of four
+characters at most, such as `LNX` or `SOS`, the offset counted from the start of
+the blob, the size, the version), and the data of the partitions one after the
+other. A *signed* blob has 28 bytes in
+front of all that -- `"-SIGNED-BY-SIGNBLOB-"`, the length of the blob
+(`datalen`) and the length of the signature (`siglen`) -- and the signature
+behind the data. Android Image Kitchen unpacks a blob that holds one image
+with `blobunpack`, and packs it again as `-SIGNED-BY-SIGNBLOB-` and eight zero
+bytes in front of `blobpack`'s output (`datalen` and `siglen` 0).
+
+`abr` does the same without either program. A blob of one partition that holds
+an image `abr` reads (a boot image in the partition `LNX`, say) is a wrapper,
+like DHTB: `unpack` writes the directory of that image and
+`has_blob=true`, `blob_part0_name=LNX` and the other fields of the blob into the
+manifest, and `repack` puts the blob back around the repacked image (under the
+blob there may be the amonet patch; the three wrappers come off and go on in
+order). Any other blob -- several partitions, or one that holds no image -- is
+a directory of its own: `type=blob`, a file `part<i>_<NAME>.bin` for every
+partition, which can be replaced by a file of another size (the offsets after
+it move the way `blobpack` lays them out). `info` lists the partitions and says
+which are images.
+
+What the signature is worth after an edit is not something `abr` can know. It
+is kept where it was, behind the data (`blob_tail.bin`); `datalen` follows the
+blob when it was the length of the blob in the original (a blob made by AIK has
+`datalen` 0, and keeps it); and when the blob has changed and a signature is
+kept, `repack` says that the signature no longer fits. Only the layout
+`blobpack` writes is read (a header of 60 bytes, the table right behind it, the
+partitions one after the other with no gap): a blob laid out differently, a cut
+one, and a SIGNBLOB header with no blob behind it are refused with the reason,
+so that nothing is lost silently. The test suite makes its blobs with a Python
+tool of its own, written from the layout of BlobTools, and, where `ABR_BLOBPACK`
+and `ABR_BLOBUNPACK` name a compiled `blobpack` and `blobunpack` (AndroidRoot's
+BlobTools, Apache-2.0; the CI compiles them), has the real tools make and read
+the same blobs.
 
 ### Threads and compression levels
 
@@ -450,6 +493,14 @@ for it (`dd`, `truncate` and `cat`, copied from its `unpackimg.sh` and
 the patch off again, and what `abr` repacks after an edit is what they make of
 the plain repack. (No real Amazon image has been tried: none was at hand.)
 
+The ASUS blobs are judged by the real `blobpack` and `blobunpack` of BlobTools
+(compiled from its sources, not vendored, used when `ABR_BLOBPACK` and
+`ABR_BLOBUNPACK` are set) and by a Python tool of the suite: the signed blob
+AIK makes (its 28 bytes, then `blobpack`'s output) is what `abr` writes, a blob
+with an edited ramdisk, a new partition size or a signature behind it is read by
+both, and `blobunpack` finds in it the partition that was put there. (No real
+ASUS blob has been tried: none was at hand.)
+
 Compression is judged by the real tools. For every codec the suite builds a
 boot image with `abr`, slices the ramdisk out of it with a separate script
 (`tests/tools/verify.py`, not `abr`) and has the real `gzip`, `lz4`, `zstd`,
@@ -504,7 +555,7 @@ Two smaller gaps:
 - Hard links in a ramdisk's cpio archive (the ramdisk then stays one
   `ramdisk.cpio`); a directory tree is made for `newc`/`crc` archives only.
 - The rest of the Android Image Kitchen format list: OSIP images,
-  blobpack, QCDT tooling, ChromeOS `futility` signing, LOKI, Sony SIN.
+  QCDT tooling, ChromeOS `futility` signing, LOKI, Sony SIN.
   `abr identify` already names all of them; what is missing is unpacking
   and packing them. See `PROGRESS.md` for the plan.
 - U-Boot's newer FIT (Flattened Image Tree) format -- only the older

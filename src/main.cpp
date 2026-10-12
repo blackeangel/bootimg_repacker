@@ -34,6 +34,7 @@
 #include "abr/identify.hpp"
 #include "abr/legacy/amonet.hpp"
 #include "abr/legacy/avb1.hpp"
+#include "abr/legacy/blob.hpp"
 #include "abr/legacy/dhtb.hpp"
 #include "abr/legacy/elf_boot.hpp"
 #include "abr/legacy/krnl.hpp"
@@ -54,7 +55,7 @@ namespace {
 
 // ------------------------------------------------------------ detection --
 
-enum class Fmt { BOOT, VENDOR_BOOT, DTBO, DTB, VBMETA, UIMAGE, ELF_BOOT, KRNL, UNKNOWN };
+enum class Fmt { BOOT, VENDOR_BOOT, DTBO, DTB, VBMETA, UIMAGE, ELF_BOOT, KRNL, BLOB, UNKNOWN };
 
 // Where the "ANDROID!" container starts: within the first kMagicSearchLimit bytes (a vendor
 // wrapper in front of it), or -- Barnes & Noble Nook images -- right behind the fixed-size
@@ -80,6 +81,7 @@ Fmt detect_format(const Bytes& d) {
         if (be == kFdtMagic) return Fmt::DTB;
         if (be == kUimageMagic) return Fmt::UIMAGE;
     }
+    if (BlobImage::looks_like(d)) return Fmt::BLOB;
     if (d.size() >= 64 && std::memcmp(d.data() + d.size() - 64, "AVBf", 4) == 0) return Fmt::VBMETA;
     if (ElfBootImage::looks_like(d)) return Fmt::ELF_BOOT;
     if (KrnlImage::looks_like(d)) return Fmt::KRNL;
@@ -141,6 +143,7 @@ const char* fmt_name(Fmt f) {
         case Fmt::UIMAGE: return "uimage";
         case Fmt::ELF_BOOT: return "elf_boot";
         case Fmt::KRNL: return "krnl";
+        case Fmt::BLOB: return "blob";
         case Fmt::UNKNOWN: return "unknown";
     }
     return "unknown";
@@ -155,32 +158,49 @@ Fmt fmt_from_name(const std::string& s) {
     if (s == "uimage") return Fmt::UIMAGE;
     if (s == "elf_boot") return Fmt::ELF_BOOT;
     if (s == "krnl") return Fmt::KRNL;
+    if (s == "blob") return Fmt::BLOB;
     return Fmt::UNKNOWN;
 }
 
 // What is put around a plain image and has to come off before anything can be read: a DHTB header
-// (abr/legacy/dhtb.hpp), and under it the amonet patch (abr/legacy/amonet.hpp). Repack puts them back in
-// the opposite order.
+// (abr/legacy/dhtb.hpp), an ASUS blob whose only partition holds the image (abr/legacy/blob.hpp), and under
+// them the amonet patch (abr/legacy/amonet.hpp). Repack puts them back in the opposite order.
 struct Wrappers {
     std::optional<legacy::DhtbInfo> dhtb;
+    std::optional<legacy::BlobImage> blob;  // its one partition's data is `blob_inner`, not in here
     std::optional<legacy::AmonetInfo> amonet;
     Bytes dhtb_inner;  // what the wrappers' removal leaves is kept here, if it is not `data` itself
+    Bytes blob_inner;
     Bytes unpatched;
 
-    bool any() const { return dhtb || amonet; }
-    // "dhtb-wrapped ", "amonet-patched ", both, or nothing: for the line that says what was unpacked.
+    bool any() const { return dhtb || blob || amonet; }
+    // "dhtb-wrapped ", "blob-wrapped ", "amonet-patched ", or several, or nothing: for the line that
+    // says what was unpacked.
     std::string adjectives() const {
-        return std::string(dhtb ? "dhtb-wrapped " : "") + (amonet ? "amonet-patched " : "");
+        return std::string(dhtb ? "dhtb-wrapped " : "") + (blob ? "blob-wrapped " : "") + (amonet ? "amonet-patched " : "");
     }
 };
 
 // Takes the wrappers off `data`. The plain image is `data` itself or lives in `w`: the reference is good
-// as long as both are.
+// as long as both are. A blob is a wrapper only if its single partition holds something abr unpacks
+// (what Android Image Kitchen does with it); any other blob is a container of its own (Fmt::BLOB).
 const Bytes& peel_wrappers(const Bytes& data, Wrappers& w) {
     w.dhtb = strip_dhtb(data, w.dhtb_inner);
-    const Bytes& inner = w.dhtb ? w.dhtb_inner : data;
-    w.amonet = strip_amonet(inner, w.unpatched);
-    return w.amonet ? w.unpatched : inner;
+    const Bytes* inner = w.dhtb ? &w.dhtb_inner : &data;
+    if (legacy::BlobImage::looks_like(*inner)) {
+        legacy::BlobImage blob = legacy::BlobImage::parse(*inner);
+        if (blob.parts.size() == 1) {
+            const Fmt held = detect_format(blob.parts[0].data);
+            if (held != Fmt::UNKNOWN && held != Fmt::BLOB) {
+                w.blob_inner = std::move(blob.parts[0].data);
+                blob.parts[0].data.clear();
+                w.blob = std::move(blob);
+                inner = &w.blob_inner;
+            }
+        }
+    }
+    w.amonet = strip_amonet(*inner, w.unpatched);
+    return w.amonet ? w.unpatched : *inner;
 }
 
 // What the command line can add to a repack: keys for the signatures abr
@@ -1402,6 +1422,156 @@ Bytes repack_krnl(const Manifest& m, const fs::path& dir, const RepackOptions& o
     return assemble_envelope(m, dir, img.build(crc), opt);
 }
 
+// ---------------------------------------------------------------- blob --
+//
+// ASUS "MSM-RADIO-UPDATE" blob, signed ("-SIGNED-BY-SIGNBLOB-") or not (abr/legacy/blob.hpp). Android Image
+// Kitchen opens a blob whose only partition holds a boot image and works on that image; abr does the same: the
+// blob is a wrapper then (`has_blob=true`, as with DHTB and amonet) and the directory is the image's. Any other
+// blob is a directory of its own: `type=blob`, one file per partition.
+
+// A partition name that is a plain word ("LNX") is written as text, anything else as hex.
+bool blob_name_is_word(const std::array<uint8_t, 4>& n) {
+    size_t len = 0;
+    while (len < n.size() && n[len] != 0) ++len;
+    if (len == 0) return false;
+    for (size_t i = 0; i < len; ++i) {
+        const uint8_t c = n[i];
+        const bool plain = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_' || c == '-' || c == '.';
+        if (!plain) return false;
+    }
+    for (size_t i = len; i < n.size(); ++i)
+        if (n[i] != 0) return false;
+    return true;
+}
+std::string blob_name_word(const std::array<uint8_t, 4>& n) {
+    size_t len = 0;
+    while (len < n.size() && n[len] != 0) ++len;
+    return std::string(reinterpret_cast<const char*>(n.data()), len);
+}
+
+// The fields of the blob except what the partitions hold. `data_bytes` and `data_sha256` describe that
+// (all partitions, one after the other): kept to see, at repack, whether the contents changed (the
+// signature then no longer fits) and what the secure header's datalen was a length of.
+void save_blob_fields(Manifest& m, const fs::path& dir, const legacy::BlobImage& b, size_t data_bytes,
+                      const Bytes& data_sha256) {
+    m.set_bool("blob_secure", b.secure);
+    if (b.secure) {
+        m.set_addr("blob_secure_datalen", b.secure_datalen);
+        m.set_addr("blob_secure_siglen", b.secure_siglen);
+    }
+    m.set_addr("blob_version", b.version);
+    Bytes unknown;
+    bool any_unknown = false;
+    for (uint32_t u : b.unknown) {
+        any_unknown = any_unknown || u != 0;
+        for (int i = 0; i < 4; ++i) unknown.push_back(static_cast<uint8_t>(u >> (8 * i)));
+    }
+    if (any_unknown) m.set_hex("blob_unknown", unknown);
+    m.set_u32("blob_parts", static_cast<uint32_t>(b.parts.size()));
+    for (size_t i = 0; i < b.parts.size(); ++i) {
+        const std::string key = "blob_part" + std::to_string(i);
+        const auto& name = b.parts[i].name;
+        if (blob_name_is_word(name)) m.set(key + "_name", blob_name_word(name));
+        else m.set_hex(key + "_name_hex", Bytes(name.begin(), name.end()));
+        m.set_u32(key + "_version", b.parts[i].version);
+    }
+    m.set_u64("blob_size", legacy::kBlobHeaderSize + b.parts.size() * legacy::kBlobPartEntrySize + data_bytes);
+    m.set_hex("blob_data_sha256", data_sha256);
+    if (!b.tail.empty()) save_raw(m, dir, "blob_tail", b.tail, "blob_tail.bin");
+}
+
+// The blob without its partitions' data. A wrapper's has one partition; the data is the caller's to put in.
+legacy::BlobImage load_blob_fields(const Manifest& m, const fs::path& dir) {
+    legacy::BlobImage b;
+    b.secure = m.get_bool("blob_secure", false);
+    b.secure_datalen = static_cast<uint32_t>(m.get_addr("blob_secure_datalen", 0));
+    b.secure_siglen = static_cast<uint32_t>(m.get_addr("blob_secure_siglen", 0));
+    b.version = static_cast<uint32_t>(m.get_addr("blob_version", legacy::kBlobVersion));
+    const Bytes unknown = m.get_hex("blob_unknown");
+    if (!unknown.empty()) {
+        if (unknown.size() != 4 * b.unknown.size())
+            throw FormatError("blob_unknown in manifest.txt must be " + std::to_string(4 * b.unknown.size()) + " bytes");
+        for (size_t i = 0; i < b.unknown.size(); ++i)
+            b.unknown[i] = uint32_t(unknown[4 * i]) | (uint32_t(unknown[4 * i + 1]) << 8) |
+                           (uint32_t(unknown[4 * i + 2]) << 16) | (uint32_t(unknown[4 * i + 3]) << 24);
+    }
+    const uint32_t count = m.get_u32("blob_parts", 1);
+    for (uint32_t i = 0; i < count; ++i) {
+        const std::string key = "blob_part" + std::to_string(i);
+        legacy::BlobPart part;
+        if (m.has(key + "_name_hex")) {
+            const Bytes raw = m.get_hex(key + "_name_hex");
+            if (raw.size() != part.name.size()) throw FormatError(key + "_name_hex in manifest.txt must be 4 bytes");
+            std::copy(raw.begin(), raw.end(), part.name.begin());
+        } else {
+            const std::string word = m.get(key + "_name");
+            if (word.empty() || word.size() > part.name.size())
+                throw FormatError(key + "_name in manifest.txt must be 1 to 4 characters");
+            std::copy(word.begin(), word.end(), part.name.begin());
+        }
+        part.version = m.get_u32(key + "_version", 1);
+        b.parts.push_back(std::move(part));
+    }
+    b.tail = load_raw(m, dir, "blob_tail");
+    return b;
+}
+
+Bytes blob_data_sha256(const legacy::BlobImage& b) {
+    hash::Sha256 h;
+    for (const legacy::BlobPart& p : b.parts)
+        if (!p.data.empty()) h.update(p.data.data(), p.data.size());
+    return h.finish();
+}
+
+// The blob as it goes into the file. The secure header's datalen is a length of the blob: when it was the
+// length of the blob at unpack it follows an edit (zero, which Android Image Kitchen writes, stays zero). The
+// signature cannot be made again: if the contents changed it is kept as it was and said not to fit.
+Bytes pack_blob(const Manifest& m, legacy::BlobImage b) {
+    const uint64_t was = m.get_u64("blob_size", 0);
+    if (b.secure && was != 0 && b.secure_datalen == was) b.secure_datalen = static_cast<uint32_t>(b.blob_size());
+    const Bytes original = m.get_hex("blob_data_sha256");
+    const bool changed = !original.empty() && blob_data_sha256(b) != original;
+    if (changed && b.secure && (b.secure_siglen != 0 || !tail_is_inert(b.tail)))
+        warn("the blob was changed, but the " + std::to_string(b.tail.size()) +
+             " bytes after it (its signature, siglen " + std::to_string(b.secure_siglen) +
+             ") are kept as they were; they still describe the ORIGINAL contents, so a bootloader that verifies "
+             "them may reject the result");
+    Bytes out = b.build();
+    out.insert(out.end(), b.tail.begin(), b.tail.end());
+    return out;
+}
+
+std::string blob_part_file(size_t index, const std::array<uint8_t, 4>& name) {
+    std::string file = "part" + std::to_string(index);
+    if (blob_name_is_word(name)) file += "_" + blob_name_word(name);
+    return file + ".bin";
+}
+
+void unpack_blob(const Bytes& host, const fs::path& dir) {
+    legacy::BlobImage b = legacy::BlobImage::parse(host);
+    Manifest m;
+    m.set("type", "blob");
+    size_t bytes = 0;
+    for (const legacy::BlobPart& p : b.parts) bytes += p.data.size();
+    save_blob_fields(m, dir, b, bytes, blob_data_sha256(b));
+    for (size_t i = 0; i < b.parts.size(); ++i) {
+        const std::string file = blob_part_file(i, b.parts[i].name);
+        write_file(dir / file, b.parts[i].data);
+        m.set("blob_part" + std::to_string(i) + "_file", file);
+    }
+    m.save(dir / "manifest.txt", "abr blob manifest -- edit then `abr repack " + dir.string() + " -o out.img`");
+}
+
+Bytes repack_blob(const Manifest& m, const fs::path& dir) {
+    legacy::BlobImage b = load_blob_fields(m, dir);
+    for (size_t i = 0; i < b.parts.size(); ++i) {
+        const std::string key = "blob_part" + std::to_string(i) + "_file";
+        if (!m.has(key)) throw FormatError("manifest.txt has no " + key);
+        b.parts[i].data = read_file(dir / m.get(key));
+    }
+    return pack_blob(m, std::move(b));
+}
+
 // ------------------------------------------------------------ info cmd --
 
 void print_envelope_info(const Envelope& e) {
@@ -1465,6 +1635,12 @@ void print_info(const fs::path& path) {
         std::cout << "wrapper: DHTB (" << (wrap.dhtb->has_seandroid_footer ? "+SEAndroid footer " : "")
                    << (wrap.dhtb->has_padding ? "+padding " : "") << ", inner " << wrap.dhtb_inner.size()
                    << " bytes)\n";
+    }
+    if (wrap.blob) {
+        const legacy::BlobPart& part = wrap.blob->parts[0];
+        std::cout << "wrapper: ASUS blob (" << (wrap.blob->secure ? "signed header, " : "") << "partition "
+                  << (blob_name_is_word(part.name) ? blob_name_word(part.name) : std::string("?")) << ", inner "
+                  << wrap.blob_inner.size() << " bytes)\n";
     }
     if (wrap.amonet) {
         std::cout << "wrapper: AMONET patch (a " << wrap.amonet->microloader.size()
@@ -1572,6 +1748,25 @@ void print_info(const fs::path& path) {
             std::cout << "data:        " << img.data.size() << " bytes\n";
             break;
         }
+        case Fmt::BLOB: {
+            legacy::BlobImage b = legacy::BlobImage::parse(data);
+            if (b.secure) {
+                std::cout << "secure header:  datalen " << b.secure_datalen << ", siglen " << b.secure_siglen << "\n";
+            } else {
+                std::cout << "secure header:  none\n";
+            }
+            std::cout << "partitions:     " << b.parts.size() << "\n";
+            for (size_t i = 0; i < b.parts.size(); ++i) {
+                const legacy::BlobPart& p = b.parts[i];
+                std::cout << "  [" << i << "] " << (blob_name_is_word(p.name) ? blob_name_word(p.name) : std::string("?"))
+                          << ": " << p.data.size() << " bytes, version " << p.version;
+                const Fmt held = detect_format(p.data);
+                if (held != Fmt::UNKNOWN && held != Fmt::BLOB) std::cout << ", " << fmt_name(held);
+                std::cout << "\n";
+            }
+            if (!b.tail.empty()) std::cout << "tail:           " << b.tail.size() << " bytes (a signature?)\n";
+            break;
+        }
         case Fmt::KRNL: {
             legacy::KrnlImage img = legacy::KrnlImage::parse(data);
             std::cout << "payload:        " << img.payload.size() << " bytes (" << codec_name(detect_codec(img.payload)) << ")\n";
@@ -1619,6 +1814,7 @@ Bytes build_image_once(const fs::path& dir, const RepackOptions& opt) {
         case Fmt::UIMAGE: result = repack_uimage(m, dir); break;
         case Fmt::ELF_BOOT: result = repack_elf_boot(m, dir, opt); break;
         case Fmt::KRNL: result = repack_krnl(m, dir, opt); break;
+        case Fmt::BLOB: result = repack_blob(m, dir); break;
         case Fmt::UNKNOWN:
             throw FormatError("manifest.txt has no (or an unrecognized) 'type=' field");
     }
@@ -1635,6 +1831,14 @@ Bytes build_image_once(const fs::path& dir, const RepackOptions& opt) {
         } catch (const FormatError& e) {
             throw FormatError(std::string(e.what()) + " (has_amonet=false in manifest.txt leaves the AMONET patch out)");
         }
+    }
+    if (m.get_bool("has_blob", false)) {
+        legacy::BlobImage blob = load_blob_fields(m, dir);
+        if (blob.parts.size() != 1)
+            throw FormatError("has_blob=true wraps one image, so blob_parts must be 1 (a blob of several partitions is a "
+                              "directory of its own, type=blob)");
+        blob.parts[0].data = std::move(result);
+        result = pack_blob(m, std::move(blob));
     }
     if (m.get_bool("has_dhtb", false)) {
         legacy::DhtbInfo dhtb;
@@ -1734,6 +1938,7 @@ void do_unpack(const fs::path& in, const fs::path& outdir, const UnpackOptions& 
             case Fmt::UIMAGE: unpack_uimage(payload, outdir); break;
             case Fmt::ELF_BOOT: unpack_elf_boot(payload, outdir); break;
             case Fmt::KRNL: unpack_krnl(payload, outdir, uo); break;
+            case Fmt::BLOB: unpack_blob(payload, outdir); break;
             case Fmt::UNKNOWN:
                 throw FormatError(in.string() + ": " + describe_unknown(payload));
         }
@@ -1747,6 +1952,11 @@ void do_unpack(const fs::path& in, const fs::path& outdir, const UnpackOptions& 
                 m.set_bool("dhtb_padding", wrap.dhtb->has_padding);
                 save_raw(m, outdir, "dhtb_trailing_extra", wrap.dhtb->trailing_extra, "dhtb_trailing_extra.bin");
                 what = "DHTB-wrapped";
+            }
+            if (wrap.blob) {
+                m.set_bool("has_blob", true);
+                save_blob_fields(m, outdir, *wrap.blob, wrap.blob_inner.size(), hash::sha256(wrap.blob_inner));
+                what += std::string(what.empty() ? "" : ", ") + "blob-wrapped";
             }
             if (wrap.amonet) {
                 m.set_bool("has_amonet", true);
@@ -1828,10 +2038,12 @@ void usage() {
         "recovery.img/recovery-two-step.img (header v0-v4), vendor_boot.img/\n"
         "vendor_boot-debug.img/vendor_kernel_boot.img (header v3-v4), dtbo.img,\n"
         "raw dtb, vbmeta.img/vbmeta_system.img (AVB), U-Boot legacy uImage, Sony ELF\n"
-        "boot images, Rockchip KRNL (kernel.img / boot.img).\n"
+        "boot images, Rockchip KRNL (kernel.img / boot.img), ASUS blobs (\"MSM-RADIO-UPDATE\",\n"
+        "signed with the SIGNBLOB header or not).\n"
         "Also transparently handled: a trailing AVB hash footer on boot/\n"
         "vendor_boot/dtbo; a DHTB wrapper (with SEAndroid footer/padding) around\n"
-        "any of them; a MediaTek (MTK) sub-header on the kernel and/or ramdisk.\n";
+        "any of them; an ASUS blob around one image; the AMONET patch of Amazon's\n"
+        "Fire tablets; a MediaTek (MTK) sub-header on the kernel and/or ramdisk.\n";
 }
 
 // -j N, -jN, --threads N and --threads=N, wherever they stand on the command

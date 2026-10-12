@@ -167,6 +167,11 @@ Identity identify(const Bytes& d) {
         id.label = osip_label(d);
         return id;
     }
+    if (at(d, 0, "MSM-RADIO-UPDATE"sv)) {  // an ASUS blob without the signing header in front: AIK's file does not name it
+        id.kind = Kind::BLOB;
+        id.label = "MSM-RADIO-UPDATE blob";
+        return id;
+    }
     if (at(d, 0, "KRNL"sv)) {
         id.kind = Kind::KRNL;
         id.label = "KRNL bootimg";
@@ -296,9 +301,6 @@ std::string Identity::aik_type() const {
 
 std::string Identity::unsupported_note() const {
     switch (kind) {
-        case Kind::BLOB:
-            return "this is an ASUS/Qualcomm SIGNBLOB container (Android Image Kitchen opens it with "
-                   "blobunpack); abr cannot unpack it yet";
         case Kind::CHROMEOS:
             return "this is a ChromeOS kernel blob (Android Image Kitchen opens it with futility "
                    "vbutil_kernel); abr cannot unpack it yet";
