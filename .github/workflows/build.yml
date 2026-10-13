@@ -55,6 +55,17 @@ jobs:
           echo "ABR_BLOBPACK=$RUNNER_TEMP/blobpack" >> "$GITHUB_ENV"
           echo "ABR_BLOBUNPACK=$RUNNER_TEMP/blobunpack" >> "$GITHUB_ENV"
 
+      # mboot of osm0sis (GPL-2.0; compiled here, not part of this repository) is what Android Image Kitchen
+      # runs for an Intel OSIP boot image: the suite has it pack the same pieces as the independent Python
+      # tool, read what abr unpacked, and take an image abr wrote apart and pack it again. Without it those
+      # comparisons are skipped (the independent Python tool still judges the layout).
+      - name: Compile mboot, a judge of the Intel OSIP boot images
+        continue-on-error: true
+        run: |
+          git clone --depth 1 https://github.com/osm0sis/mboot.git "$RUNNER_TEMP/mboot-src"
+          gcc -O2 -w -o "$RUNNER_TEMP/mboot-bin" "$RUNNER_TEMP/mboot-src/mboot.c"
+          echo "ABR_MBOOT=$RUNNER_TEMP/mboot-bin" >> "$GITHUB_ENV"
+
       - name: Configure
         run: >
           cmake -S . -B build -G Ninja

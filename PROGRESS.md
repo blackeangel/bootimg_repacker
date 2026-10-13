@@ -26,6 +26,7 @@ tools" below.
 | Rockchip KRNL images (`kernel.img`, SDK `boot.img`) | **done + verified** against the real `rkcrc -k` (compiled, not vendored) and an independent Python tool: the payload (kernel, or a compressed cpio ramdisk -> `ramdisk.cpio` + `ramdisk/`), Rockchip's own CRC (polynomial 0x04C10DB7), partition fill, wrong stored CRC kept |
 | AMONET patch (Amazon Fire, MediaTek): microloader + boot header moved to 1024 | **done + verified** against AIK's own `dd`/`truncate`/`cat` commands (copied into the suite): `microloader.bin`, `has_amonet=true`, refuses what the patch would overwrite; layered under DHTB |
 | ASUS blob (`"MSM-RADIO-UPDATE"`, with or without the `-SIGNED-BY-SIGNBLOB-` header): AIK's `blobunpack`/`blobpack` | **done + verified** against the real BlobTools `blobpack`/`blobunpack` (compiled, not vendored) and an independent Python tool: a blob that holds one image is a wrapper layer (`has_blob=true`; AIK's case), any other is `type=blob` with a file per partition; the signature is kept, `datalen` follows an edit; only blobpack's layout is read |
+| Intel OSIP boot images (AIK's `mboot`): OSIP header (or none), signature of 0/480/728/1024 bytes, cmdline, image info, bootstub of 4096/8192 bytes, kernel, gzip ramdisk | **done + verified** against the real `mboot` (compiled, not vendored) and an independent Python tool: images with and without a header, unsigned and signed, are packed to the same bytes, `abr` unpacks them into the pieces `mboot -u` writes, an untouched repack is identical, and an edited image (ramdisk, signature taken away or put in) is a fixed point of `mboot`; the header's sector count, "unsigned" bit and checksum follow mboot's rules, but only when the size or the signature changed; the ramdisk is `ramdisk.cpio` + `ramdisk/` |
 | Marvell PXA boot header (Samsung Galaxy J1 / Core Prime / Tab 4) | **done + verified** against the real `pxa-mkbootimg` / `pxa-unpackbootimg` (compiled, not vendored): 240 images byte-identical, 34 edits equal to the tool's output (commit `0652429`) |
 | `abr identify`: AIK's `androidbootimg.magic` as code | **done + verified**: 98 samples, agree with `file(1)` + AIK's magic file on all (when both are at hand) and with the built-in table; unsupported-but-known formats are named in the refusal (commit `803b820`) |
 | Nook / Nook-tablet signing header in front, LG Bump footer behind | **done** (synthetic fixtures; no real device dump of either yet): header kept as a constant prefix (`prefix_kind=`), footer kept as tail, neither triggers the stale-signature warning (commit `2a76f87`) |
@@ -718,7 +719,7 @@ compiled from source and used only as oracles, never as a dependency.
 | BLOB (`blobunpack` / `blobpack`, AndroidRoot/BlobTools) | **done**, judged by the real tools: unpack / repack / info; wrapper layer between DHTB and AMONET, or a directory of its own for several partitions; see "BLOB" below |
 | ChromeOS kernel blob (`futility vbutil_kernel`) | recognised, not unpacked; signing is its own project |
 | Sony SIN (`sony_dump`) | recognised, not unpacked |
-| Intel OSIP (`mboot`) | recognised, not unpacked (needs osm0sis/mboot as the reference) |
+| Intel OSIP (`mboot`) | **done**, judged by the real `mboot`: unpack / repack / info, header rules as mboot's, the ramdisk as a directory; see "OSIP" below |
 | Rockchip KRNL (`dd skip=8`, `rkcrc -k`) | **done**, oracle-verified (`rkcrc`): unpack / repack / info; a payload that is a cpio gets the ramdisk directory (AIK treats it as a ramdisk the same way); see "Rockchip KRNL" below |
 | AMONET (microloader in the first 1024 bytes, `dd`/`truncate`/`cat`) | **done**, judged by AIK's own commands: unpack / repack / info, wrapper layer under DHTB; see "AMONET" below |
 | LOKI (`loki_tool unlok`) | recognised, not unpacked; re-patching LOKI needs the device's `aboot.img` |
@@ -1027,9 +1028,108 @@ code fails all. mawk (Debian/Ubuntu `awk`) drops `\00` in printf: AIK's own
 header line is written with it, abr and the tests do not depend on that. No real
 ASUS blob was tried -- none was supplied.
 
+## OSIP (done, 13 Oct 2026)
+
+Intel's boot image for Android devices (AIK: "OSIP", opened with osm0sis' `mboot`,
+after Jocelyn Falempe's `mboot.py`; the file header of `mboot.c` is GPL-2.0). The
+layout, read from `mboot.c`: an optional 512-byte OSIP header (`"$OS$" 00 00 01`,
+a 32-byte header proper and one 24-byte OSII entry), a signature of 0, 480, 728 or
+1024 bytes, a 1024-byte cmdline, 3072 bytes of image info (u32 kernel size, u32
+ramdisk size, 8 bytes "parameter", then padding: zeros, but `BD 02 BD 02 BD 12 BD 12`
+right behind the parameter in a signed image), a bootstub of 4096 (8192 on some
+devices) bytes, the kernel, the ramdisk (gzip cpio), and `0xFF` padding up to a
+multiple of 512. What mboot's pack keeps up to date in the header: the size in
+sectors (offset 48: padded size / 512 - 1), the "unsigned" bit (offset 52: 0 boot
+signed, 1 boot unsigned, 0x0C / 0x0D recovery; `|= 1` when there is no
+signature) and the XOR checksum (byte 7, over the first 56 bytes, itself counted as
+zero). What it guesses when it unpacks: the signature size (the first of the
+positions 0, 480, 728, 1024 with four letters/digits where the cmdline starts) and
+the bootstub size (8192 if one of the two bytes where a 4096 stub ends is a
+letter/digit), and it refuses a kernel under 500000 bytes and a ramdisk under 10000
+(the suite's fixtures are 600000 and about 80000).
+
+Code: `include/abr/legacy/osip.hpp` + `src/legacy/osip.cpp` (`OsipImage::looks_like`,
+`parse`, `build`, `body_size`; `osip_header_checksum`, `osip_header_checksum_ok`,
+`osip_header_sectors`, `osip_header_attribute`, `osip_refresh_header`,
+`osip_set_header_checksum`), the OSIP section of `src/main.cpp` (`Fmt::OSIP`,
+`unpack_osip`, `repack_osip`, `osip_padding`, `osip_cmdline_block`,
+`osip_cmdline_shown`, `osip_payload_sha256`, the `info` case; `detect_format` asks
+`OsipImage::looks_like` after KRNL and before the vendor-wrapper search) and
+`src/identify.cpp` (only a bootstub found where the layout does not put it is still
+refused, `Kind::OSIP_HEADERLESS`). `tests/tools/osip_tool.py` is the independent
+tool, written from `mboot.c` (`make` = its pack, `list` / `extract` = its unpack,
+`check` = its header rules).
+
+Manifest: `type=osip`; `osip_header_file` + `osip_header_checksum_ok`;
+`osip_signature_file` + `osip_signature_size`; `cmdline`; `osip_cmdline_file` (only
+when the block is more than the text and NULs, or the text has white space at its
+ends or a line break, which `manifest.txt` cannot hold); `osip_parameter` (16 hex
+digits); `osip_info_file` (the 3056 bytes behind the parameter, trailing zeros
+trimmed, absent when all zero); `bootstub_file`; `kernel_file`; the ramdisk as in a
+boot image (`ramdisk_file=ramdisk.cpio`, `ramdisk_compression`, `ramdisk_tree`,
+`.abr_raw/ramdisk.cpio.raw`); `osip_body_size`; `osip_payload_sha256`;
+`osip_sector_pad` (`0xNN` or `none`); and the envelope keys (partition fill).
+Decisions worth knowing:
+- mboot's header rules are applied only when the size of the image changed or the
+  signature was put in or taken away (the checksum is also redone whenever the
+  original's was valid). An image that was not touched comes back as it was, with a
+  header whose checksum or sector count was wrong too (`info` says
+  `checksum WRONG` / `N sectors (the image has M)`, `unpack` notes it).
+- The mark of a signed image behind the parameter goes in with a signature and out
+  with it, as mboot's pack does; the rest of the image info is carried as it is
+  (mboot's pack would zero it).
+- A signature cannot be made again (Intel's key). A kept one after an edit is
+  said at `repack` ("describes the ORIGINAL contents": the SHA-256 over cmdline,
+  parameter, info, bootstub, kernel and ramdisk is what is compared); a signature that
+  was not there before is not called stale, but a note says when the header still
+  reads "unsigned" (mboot keeps it as it is: the type comes with the `hdr` file, here
+  `osip_header.bin`). To take a signature off: delete `osip_signature_file=` from the
+  manifest.
+- The layout: mboot's guess first; another layout replaces it only if it fits the
+  file, has a non-zero kernel and a ramdisk that starts like one (a codec is
+  detected, or `07070`). An earlier version took any layout that fitted: a
+  truncated image was then "read" as another layout with kernel 0 and ramdisk 0 and
+  unpacked without a word. Found with a cut image by hand, now refused ("cut short
+  ...", with the sizes the image info declares) and a test. The cases where mboot's
+  guess is wrong (a cmdline that starts with a space makes mboot take a signature of
+  1024 bytes; a signature that starts with four letters makes it take none) are read
+  right and tested.
+- A cmdline with a leading/trailing space or a line break is kept exactly:
+  `manifest.txt` trims values, so the 1024-byte block becomes `osip_cmdline.bin` and
+  is used as long as the text in the manifest is what it was. (Found with the
+  leading-space image above; the self-check at the end of `unpack` had said so.)
+- Headerless signed images: mboot cannot take them apart (a first byte that is not a
+  letter is "an OSIP header" to it), so only the independent tool judges them; abr
+  finds the layout from the bootstub magic and the sizes.
+- The sector padding (one byte, `0xFF` where mboot wrote it) belongs to the image;
+  what is behind it is the partition's fill (the common envelope). An edit that
+  outgrows the partition is built and warned about, as for every format.
+- An uncompressed ramdisk, one that is no cpio, and an empty one round-trip (checked
+  by hand; mboot itself refuses a ramdisk under 10000 bytes).
+
+Judged by the real `mboot` (`ABR_MBOOT`; the CI compiles it from
+https://github.com/osm0sis/mboot; the checks that need it are skipped where it is
+not set) and by the Python tool. 9 test groups: seven kinds of image (unsigned,
+signed 480 / 728 / 1024, bootstub 4096 and 8192, headerless) - the tool packs what
+mboot packs, the header is what mboot makes it, identify and info, the pieces are
+those `mboot -u` writes, an untouched repack is identical; the same seven edited
+(files in `ramdisk/`): sectors, unsigned bit, checksum, a fixed point of mboot,
+the stale signature; headerless signed images; the signature taken away / put in
+(equal to what mboot packs of the same pieces); a partition with a `0xFF` / `0x00`
+fill, and an edit that outgrows it; the cmdline (leading space, line break, edit,
+1025 bytes refused); headers with a wrong checksum / sector count; mboot's wrong
+guesses; refusals (cut short, a bare header, bootstub / signature / parameter /
+info / header that do not fit). The suites: g++-14 277/277, clang-20 277/277,
+Windows under wine 276/276 (268 / 268 / 267 before). Negative controls: with an
+oracle that always fails (`/bin/false`) or that packs one byte wrong, the four
+groups that use mboot fail (and only those); six mutations of the code (sector
+count off by one, no unsigned bit, a checksum that counts its own byte, no mark of
+a signed image, only mboot's guess, zero padding) each fail the groups they should.
+No real Intel image was tried -- none was supplied.
+
 ## Next steps (in order)
 
-1. Remaining AIK parity, easiest first: OSIP, LOKI, QCDT creation,
+1. Remaining AIK parity, easiest first: LOKI, QCDT creation,
    ChromeOS signing. The stages 2 and 3 of the user's own spec need a scope
    decision before anything is built.
 2. Housekeeping: AIK-like default levels as an opt-in, gzip OS-byte
@@ -1289,8 +1389,8 @@ Useful as a checklist; wrong in places, and much wider than `abr`:
    AOSP test key or `--avb1-key/--avb1-cert`; self-contained RSA).
 2. ~~**CPIO ramdisk as a directory tree**~~ -- **done** for newc and crc
    (see "The ramdisk as a directory"); odc and binary archives stay files.
-3. Remaining AIK parity: OSIP, QCDT creation, ChromeOS futility signing,
-   LOKI, SIN (PXA, KRNL/RKCRC, AMONET, BLOB, NOOK are done).
+3. Remaining AIK parity: QCDT creation, ChromeOS futility signing,
+   LOKI, SIN (PXA, KRNL/RKCRC, AMONET, BLOB, OSIP, NOOK are done).
 4. Spec stage 1 leftovers: MBN, FIT/ITB. Spec stages 2/3: scope decision.
 5. Housekeeping: CI should run the quirk suite; `main.cpp` is ~1200 lines
    and should be split per format.

@@ -125,6 +125,7 @@ add_library(abr_core STATIC
   src/legacy/dhtb.cpp
   src/legacy/amonet.cpp
   src/legacy/blob.cpp
+  src/legacy/osip.cpp
   src/legacy/elf_boot.cpp
   src/legacy/krnl.cpp
   src/legacy/avb1.cpp

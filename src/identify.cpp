@@ -309,10 +309,10 @@ std::string Identity::unsupported_note() const {
         case Kind::SIN3:
             return "this looks like a Sony SIN container (" + aik_type() +
                    "; Android Image Kitchen opens it with sony_dump); abr cannot unpack it yet";
-        case Kind::OSIP:
         case Kind::OSIP_HEADERLESS:
-            return "this is an Intel OSIP image (Android Image Kitchen opens it with mboot); abr "
-                   "cannot unpack it yet";
+            return "this has the bootstub of an Intel OSIP image without its header (Android Image Kitchen opens "
+                   "such an image with mboot), but not where the layout puts it (4096 bytes behind the cmdline, which "
+                   "starts the file or follows a signature of 480, 728 or 1024 bytes); abr cannot unpack it";
         case Kind::QCDT:
             return "this is a Qualcomm device-tree table (QCDT), a part of boot images rather than a "
                    "container of its own";

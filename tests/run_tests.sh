@@ -2996,6 +2996,366 @@ rd_ck "with the reason" grep -q 'no "MSM-RADIO-UPDATE" blob behind it' blob_noth
 rd_ck "and no directory is left behind" test ! -e blob_nothing
 rd_done "BLOB: a cut-short blob, a gap in the layout and a signing header without a blob are refused with a reason, leaving no directory"
 
+# =========================================================================
+# OSIP: the boot image of Intel's Atom-based Android devices, the one Android Image Kitchen opens with osm0sis'
+# mboot (abr/legacy/osip.hpp). The images of these tests are made by tests/tools/osip_tool.py, which is written from
+# mboot.c's layout and shares no code with abr. ABR_MBOOT names a compiled mboot (GPL-2.0, github.com/osm0sis/mboot;
+# not part of this repository, the linux CI jobs compile it): where it is at hand it is a judge too -- it packs the
+# same pieces (the independent tool must make the very same image), reads the pieces abr unpacked, and takes an
+# image abr wrote apart and packs it again (the same image: abr's header fields are what mboot makes them).
+# =========================================================================
+OTL="$TOOLS/osip_tool.py"
+osip_real() { [ -n "${ABR_MBOOT:-}" ] && [ -x "${ABR_MBOOT:-}" ]; }
+OSIP_CMD="init=/init pci=noearly console=ttyS0 androidboot.hardware=redhookbay"
+python3 "$RDG" mkbootfs osip_rd.cpio
+gzip -9n -c osip_rd.cpio >osip_rd.gz
+python3 -I - <<'PYEOF'
+import random
+r = random.Random(20261013)
+# mboot refuses a kernel of less than 500000 bytes and a ramdisk of less than 10000: these are 600000 and about 80000
+kernel = b"\xeb\x3c" + r.randbytes(600000 - 2)           # (not starting with a letter: it follows a 4096-byte bootstub)
+stub4 = b"\xfc\xfa\xbc\x00" + r.randbytes(4096 - 4)      # a bootstub starts like Intel's: FC FA BC 00
+stub8 = stub4 + b"ZZ" + r.randbytes(4096 - 2)            # 8192 bytes: letters where mboot looks for its second half
+open("osip_kernel.bin", "wb").write(kernel)
+open("osip_stub4.bin", "wb").write(stub4)
+open("osip_stub8.bin", "wb").write(stub8)
+for size in (480, 728, 1024):
+    s = bytearray(r.randbytes(size))
+    for at in (0, 480, 728):                             # where mboot looks for the cmdline: not four letters there
+        if at < size:
+            s[at:at + 4] = b"\x00\x01\x02\x03"
+    open("osip_sig%d.bin" % size, "wb").write(bytes(s))
+    s[0:4] = b"ABCD"                                     # ... and a signature mboot takes for a cmdline
+    open("osip_siga%d.bin" % size, "wb").write(bytes(s))
+PYEOF
+python3 -I "$OTL" header osip_hdr_u.bin --attribute 1  # a boot image without a signature
+python3 -I "$OTL" header osip_hdr_s.bin --attribute 0  # a signed one
+
+osip_size() { wc -c <"$1" | tr -d ' '; }
+osip_make() {  # <image> <header: none|u|s> <signature: none|480|728|1024|a480..> <bootstub: 4|8> [<cmdline>]: the independent tool packs the pieces
+    local out="$1" h="$2" s="$3" b="$4" cmd="${5-$OSIP_CMD}" args=()
+    [ "$h" = none ] || args+=(--hdr "osip_hdr_$h.bin")
+    [ "$s" = none ] || args+=(--sig "osip_sig$s.bin")
+    python3 -I "$OTL" make "$out" ${args[@]+"${args[@]}"} --cmdline "$cmd" --parameter 0102030405060708 \
+        --bootstub "osip_stub$b.bin" --kernel osip_kernel.bin --ramdisk osip_rd.gz
+}
+osip_mboot_make() {  # <image> <header> <signature> <bootstub>: mboot packs the same pieces, and that is this image (true without the tool)
+    osip_real || return 0
+    local out="$1" h="$2" s="$3" b="$4" d="$1.pieces"
+    rm -rf "$d" && mkdir "$d" || return 1
+    cp osip_kernel.bin "$d/kernel" && cp osip_rd.gz "$d/ramdisk.cpio.gz" && cp "osip_stub$b.bin" "$d/bootstub" || return 1
+    printf '%s' "$OSIP_CMD" >"$d/cmdline.txt"
+    printf '\001\002\003\004\005\006\007\010' >"$d/parameter"
+    [ "$h" = none ] || cp "osip_hdr_$h.bin" "$d/hdr"
+    [ "$s" = none ] || cp "osip_sig$s.bin" "$d/sig"
+    "$ABR_MBOOT" -d "$d" -f "$out.mboot" >/dev/null 2>&1 || return 1
+    cmp -s "$out" "$out.mboot"
+}
+osip_fixpoint() {  # <image>: mboot takes the image apart and packs the pieces again: the same image (true without the tool)
+    osip_real || return 0
+    rm -rf osip_fx && mkdir osip_fx || return 1
+    "$ABR_MBOOT" -u -f "$1" -d osip_fx >/dev/null 2>&1 || return 1
+    "$ABR_MBOOT" -d osip_fx -f osip_fx.img >/dev/null 2>&1 || return 1
+    cmp -s "$1" osip_fx.img
+}
+osip_pieces() {  # <the directory an image was taken apart into (mboot's names)> <abr's unpack dir>: the same pieces
+    local x="$1" d="$2"
+    cmp -s "$x/kernel" "$d/kernel" || return 1
+    cmp -s "$x/bootstub" "$d/bootstub.bin" || return 1
+    if [ -f "$x/hdr" ]; then cmp -s "$x/hdr" "$d/osip_header.bin" || return 1; else [ ! -e "$d/osip_header.bin" ] || return 1; fi
+    if [ -f "$x/sig" ]; then cmp -s "$x/sig" "$d/osip_sig.bin" || return 1; else [ ! -e "$d/osip_sig.bin" ] || return 1; fi
+    gzip -dc "$x/ramdisk.cpio.gz" >osip_pieces.cpio 2>/dev/null && cmp -s osip_pieces.cpio "$d/ramdisk.cpio"
+}
+osip_agree() {  # <image> <abr's unpack dir>: what abr unpacked is what the independent tool (and mboot) take the image apart into
+    rm -rf osip_ex_py osip_ex_mb
+    python3 -I "$OTL" extract "$1" osip_ex_py || return 1
+    osip_pieces osip_ex_py "$2" || return 1
+    osip_real || return 0
+    mkdir osip_ex_mb && "$ABR_MBOOT" -u -f "$1" -d osip_ex_mb >/dev/null 2>&1 || return 1
+    osip_pieces osip_ex_mb "$2"
+}
+osip_cmd_is() { [ "$(sed -n 's/^cmdline=//p' "$1/manifest.txt")" = "$2" ]; }  # <unpack dir> <text>
+osip_add_files() {  # <unpack dir>: two files in the ramdisk directory (one of them random, so that the image grows)
+    printf 'abr test\n' >"$1/ramdisk/abr_test_file"
+    head -c 9000 /dev/urandom >"$1/ramdisk/osip_big_file"
+}
+osip_same_but_added() { diff -r --no-dereference -x abr_test_file -x osip_big_file "$1" "$2" >/dev/null; }  # <dir> <dir>
+osip_sectors_ok() {  # <image without a fill>: the header's sector count is the size in sectors, less its own
+    [ "$(od -An -tu4 -j48 -N4 "$1" | tr -d ' ')" = "$(($(osip_size "$1") / 512 - 1))" ]
+}
+osip_refuse() {  # <name> <unpack dir> <pattern>: repack of that (damaged) directory is refused with that reason and writes no image
+    local out rc
+    rm -f "osip_rf_$1.img"
+    out="$("$ABR" repack "$2" -o "osip_rf_$1.img" 2>&1)"
+    rc=$?
+    [ "$rc" -ne 0 ] && [ ! -e "osip_rf_$1.img" ] && grep -q -- "$3" <<<"$out"
+}
+
+# Seven kinds of image: the pieces as mboot takes them apart, identify, an untouched repack.
+OSIP_VARIANTS="u4:u:none:4 s480:s:480:4 s728:s:728:4 s1024:s:1024:4 u8:u:none:8 s480_8:s:480:8 h4:none:none:4"
+for v in $OSIP_VARIANTS; do
+    IFS=: read -r n h s b <<<"$v"
+    case "$h" in
+        u) label="OSIP bootimg, boot (unsigned)" ;;
+        s) label="OSIP bootimg, boot (signed)" ;;
+        *) label="OSIP bootimg (headerless)" ;;
+    esac
+    osip_make "osip_$n.img" "$h" "$s" "$b"
+    rd_ck "$n: the independent tool packs what mboot packs" osip_mboot_make "osip_$n.img" "$h" "$s" "$b"
+    rd_ck "$n: its header is what mboot makes it" python3 -I "$OTL" check "osip_$n.img"
+    rd_ck "$n: identify" said "$label" "$ABR" identify "osip_$n.img"
+    rd_unpack "osip_$n.img" "osip_u_$n"
+    rd_ck "$n: type" grep -q '^type=osip$' "osip_u_$n/manifest.txt"
+    rd_ck "$n: the size of the signature" grep -q "^osip_signature_size=${s/none/0}\$" "osip_u_$n/manifest.txt"
+    rd_ck "$n: the cmdline" osip_cmd_is "osip_u_$n" "$OSIP_CMD"
+    rd_ck "$n: the parameter" grep -q '^osip_parameter=0102030405060708$' "osip_u_$n/manifest.txt"
+    rd_ck "$n: the ramdisk is gzip" grep -q '^ramdisk_compression=gzip$' "osip_u_$n/manifest.txt"
+    rd_ck "$n: and a directory" test -f "osip_u_$n/ramdisk/init.rc"
+    rd_ck "$n: header, signature, bootstub, kernel and ramdisk are what the image holds" osip_agree "osip_$n.img" "osip_u_$n"
+    rd_ck "$n: unpack says an untouched repack is exact" grep -q 'reproduces this image byte-for-byte' "osip_u_$n.log"
+    "$ABR" repack "osip_u_$n" -o "osip_r_$n.img" >"osip_r_$n.log" 2>&1
+    rd_ck "$n: an untouched repack is identical" cmp -s "osip_$n.img" "osip_r_$n.img"
+done
+rd_ck "info: the header and its checksum" said "header: *512 bytes, boot (unsigned), [0-9]* sectors, checksum OK" "$ABR" info osip_u4.img
+rd_ck "info: a signed image" said "header: *512 bytes, boot (signed), [0-9]* sectors, checksum OK" "$ABR" info osip_s480.img
+rd_ck "info: its signature" said "signature: *480 bytes" "$ABR" info osip_s480.img
+rd_ck "info: the bootstub" said "bootstub: *8192 bytes" "$ABR" info osip_u8.img
+rd_ck "info: the kernel" said "kernel: *600000 bytes" "$ABR" info osip_u4.img
+rd_ck "info: the ramdisk" said "ramdisk: *[0-9]* bytes (gzip)" "$ABR" info osip_u4.img
+rd_ck "info: the cmdline" said "cmdline: *$OSIP_CMD" "$ABR" info osip_u4.img
+rd_ck "info: no header" said "header: *none" "$ABR" info osip_h4.img
+rd_done "OSIP: images with a header (unsigned, a signature of 480, 728 or 1024 bytes, a bootstub of 4096 or 8192) and without one, as mboot packs them: the independent tool makes the same bytes, identify and info see them, the pieces are those mboot reads, an untouched repack is identical"
+
+# An edit: the ramdisk is built from the directory, the sizes in the header follow, and the result is what mboot
+# makes of its own pieces (it takes the image apart and packs it again: the same image).
+for v in $OSIP_VARIANTS; do
+    IFS=: read -r n h s b <<<"$v"
+    rm -rf "osip_e_$n"
+    cp -a "osip_u_$n" "osip_e_$n"
+    osip_add_files "osip_e_$n"
+    rd_ck "$n: repack" rd_repack_unpack "osip_e_$n" "osip_ed_$n"
+    rd_ck "$n: the file is in the image" test "$(cat "osip_ed_${n}_re/ramdisk/abr_test_file" 2>/dev/null)" = "abr test"
+    rd_ck "$n: nothing else changed" osip_same_but_added "osip_u_$n/ramdisk" "osip_ed_${n}_re/ramdisk"
+    rd_ck "$n: the image is a whole number of sectors" test "$(($(osip_size "osip_ed_$n.img") % 512))" = 0
+    rd_ck "$n: and it grew" test "$(osip_size "osip_ed_$n.img")" -gt "$(osip_size "osip_$n.img")"
+    rd_ck "$n: its header (sector count, unsigned bit, checksum) is what mboot makes it" python3 -I "$OTL" check "osip_ed_$n.img"
+    [ "$h" = none ] || rd_ck "$n: the header's sector count" osip_sectors_ok "osip_ed_$n.img"
+    rd_ck "$n: mboot takes it apart and packs the same image" osip_fixpoint "osip_ed_$n.img"
+    rd_ck "$n: the ramdisk, the kernel and the rest are what mboot reads" osip_agree "osip_ed_$n.img" "osip_ed_${n}_re"
+    if [ "$s" != none ]; then
+        rd_ck "$n: the signature is as it was" cmp -s "osip_u_$n/osip_sig.bin" "osip_ed_${n}_re/osip_sig.bin"
+        rd_ck "$n: and the repack says it no longer fits the image" grep -q 'describes the ORIGINAL contents' "osip_ed_$n.rlog"
+    else
+        rd_ck "$n: no signature, nothing to say about one" test -z "$(grep 'signature' "osip_ed_$n.rlog")"
+    fi
+done
+rd_done "OSIP: an edited ramdisk lands in the image, the header follows it, and the result is a fixed point of mboot (it takes the image apart and packs it again: the same bytes); a kept signature is called stale"
+
+# Signed images without a header: mboot cannot take these apart (it takes a first byte that is not a letter for
+# an OSIP header), the independent tool packs them; abr finds the layout from the bootstub and the sizes.
+osip_make osip_hs1024.img none 1024 4
+osip_make osip_hs728_8.img none 728 8
+for v in hs1024:1024 hs728_8:728; do
+    n="${v%%:*}"
+    size="${v##*:}"
+    rd_ck "$n: identify" said "OSIP bootimg (headerless)" "$ABR" identify "osip_$n.img"
+    rd_unpack "osip_$n.img" "osip_u_$n"
+    rd_ck "$n: the size of the signature" grep -q "^osip_signature_size=$size\$" "osip_u_$n/manifest.txt"
+    rd_ck "$n: the signature is the first bytes of the image" test "$(head -c "$size" "osip_$n.img" | cmp -s - "osip_u_$n/osip_sig.bin" && echo same)" = same
+    rd_ck "$n: no header" test ! -e "osip_u_$n/osip_header.bin"
+    "$ABR" repack "osip_u_$n" -o "osip_r_$n.img" >/dev/null 2>&1
+    rd_ck "$n: an untouched repack is identical" cmp -s "osip_$n.img" "osip_r_$n.img"
+    rm -rf "osip_e_$n"
+    cp -a "osip_u_$n" "osip_e_$n"
+    osip_add_files "osip_e_$n"
+    rd_ck "$n: repack" rd_repack_unpack "osip_e_$n" "osip_ed_$n"
+    rd_ck "$n: the file is in the image" test "$(cat "osip_ed_${n}_re/ramdisk/abr_test_file" 2>/dev/null)" = "abr test"
+    rd_ck "$n: nothing else changed" osip_same_but_added "osip_u_$n/ramdisk" "osip_ed_${n}_re/ramdisk"
+    rd_ck "$n: the signature is as it was" cmp -s "osip_u_$n/osip_sig.bin" "osip_ed_${n}_re/osip_sig.bin"
+    rd_ck "$n: a whole number of sectors" test "$(($(osip_size "osip_ed_$n.img") % 512))" = 0
+done
+rd_done "OSIP: a signed image without a header (the layout comes from the bootstub and the sizes in the image info): unpacked, an untouched repack is identical, an edit lands and keeps the signature"
+
+# The signature taken away, the signature put in: what mboot packs of the same pieces (the unsigned bit, the
+# sector count, the checksum, and the mark that a signed image has behind the parameter).
+rm -rf osip_nosig
+cp -a osip_u_s480 osip_nosig
+sed -i '/^osip_signature_file=/d' osip_nosig/manifest.txt
+"$ABR" repack osip_nosig -o osip_nosig.img >osip_nosig.log 2>&1
+osip_make osip_nosig_ref.img s none 4
+rd_ck "no signature: the image is the pieces without it, as the independent tool packs them" cmp -s osip_nosig.img osip_nosig_ref.img
+rd_ck "(and mboot)" osip_mboot_make osip_nosig.img s none 4
+rd_ck "its header says unsigned now" said "OSIP bootimg, boot (unsigned)" "$ABR" identify osip_nosig.img
+rd_ck "and is what mboot makes it" python3 -I "$OTL" check osip_nosig.img
+rd_ck "it is a fixed point of mboot" osip_fixpoint osip_nosig.img
+rd_ck "there is nothing to say about the signature that went" test -z "$(grep 'describes the ORIGINAL' osip_nosig.log)"
+rm -rf osip_addsig
+cp -a osip_u_u4 osip_addsig
+cp osip_sig480.bin osip_addsig/osip_sig.bin
+printf 'osip_signature_file=osip_sig.bin\n' >>osip_addsig/manifest.txt
+"$ABR" repack osip_addsig -o osip_addsig.img >osip_addsig.log 2>&1
+osip_make osip_addsig_ref.img u 480 4
+rd_ck "a signature put in: the image is the pieces with it, as the independent tool packs them" cmp -s osip_addsig.img osip_addsig_ref.img
+rd_ck "(and mboot)" osip_mboot_make osip_addsig.img u 480 4
+rd_ck "the mark of a signed image is behind the parameter" test "$(od -An -tx1 -j$((512 + 480 + 1024 + 16)) -N8 osip_addsig.img | tr -d ' \n')" = bd02bd02bd12bd12
+rd_ck "it is a fixed point of mboot" osip_fixpoint osip_addsig.img
+rd_ck "the header is kept as mboot keeps it, and the repack says so" grep -q 'still says "boot (unsigned)"' osip_addsig.log
+rd_ck "a signature that was not there is not a stale one" test -z "$(grep 'describes the ORIGINAL' osip_addsig.log)"
+rd_ck "the new signature is read back" said "signature: *480 bytes" "$ABR" info osip_addsig.img
+rd_done "OSIP: taking the signature away (unsigned bit, mark, sector count and checksum follow) and putting one in give what mboot packs of the same pieces"
+
+# An image inside a partition: the fill behind the image proper (and the padding up to a whole sector) is the
+# partition's; an edit leaves the partition its size.
+python3 -I - <<'PYEOF'
+d = open("osip_u4.img", "rb").read()
+open("osip_part_ff.img", "wb").write(d + b"\xff" * (2 * 1024 * 1024 - len(d)))
+open("osip_part_00.img", "wb").write(d + b"\x00" * (2 * 1024 * 1024 - len(d)))
+PYEOF
+for k in ff:'\377' 00:'\000'; do
+    f="${k%%:*}"
+    fillchar="${k#*:}"
+    rd_ck "$f: identify" said "OSIP bootimg, boot (unsigned)" "$ABR" identify "osip_part_$f.img"
+    rd_unpack "osip_part_$f.img" "osip_pu_$f"
+    rd_ck "$f: info says the fill" said "padding:" "$ABR" info "osip_part_$f.img"
+    "$ABR" repack "osip_pu_$f" -o "osip_pr_$f.img" >/dev/null 2>&1
+    rd_ck "$f: an untouched repack is identical" cmp -s "osip_part_$f.img" "osip_pr_$f.img"
+    rm -rf "osip_pe_$f"
+    cp -a "osip_pu_$f" "osip_pe_$f"
+    osip_add_files "osip_pe_$f"
+    rd_ck "$f: repack" rd_repack_unpack "osip_pe_$f" "osip_ped_$f"
+    rd_ck "$f: the partition keeps its size" test "$(osip_size "osip_ped_$f.img")" = 2097152
+    rd_ck "$f: the file is in the image" test "$(cat "osip_ped_${f}_re/ramdisk/abr_test_file" 2>/dev/null)" = "abr test"
+    rd_ck "$f: the header is what mboot makes it" python3 -I "$OTL" check "osip_ped_$f.img"
+    rd_ck "$f: the fill goes on behind the image" test "$(tail -c 1000000 "osip_ped_$f.img" | tr -d "$fillchar" | wc -c | tr -d ' ')" = 0
+done
+rm -rf osip_pe_big
+cp -a osip_pu_ff osip_pe_big
+head -c 3000000 /dev/urandom >osip_pe_big/ramdisk/osip_huge_file
+"$ABR" repack osip_pe_big -o osip_pe_big.img >osip_pe_big.rlog 2>&1
+rd_ck "an edit that outgrows the partition is built and the size is said" grep -q 'larger than the original' osip_pe_big.rlog
+rd_done "OSIP: an image in a partition (0xFF or 0x00 fill): an untouched repack is identical, an edit keeps the size of the partition and the fill, one that outgrows it is said"
+
+# The cmdline: the text of the manifest; white space at its ends or something behind it that is not NULs is kept
+# (a file of its own) as long as the text is the one that was there.
+osip_make osip_sp.img u none 4 " init=/init quiet"
+osip_make osip_nl.img u none 4 $'console=ttyS0\tquiet\n'
+for k in sp:"init=/init quiet" nl:$'console=ttyS0\tquiet'; do
+    f="${k%%:*}"
+    text="${k#*:}"
+    rd_unpack "osip_$f.img" "osip_cu_$f"
+    rd_ck "$f: the manifest has the text without the white space at its ends" osip_cmd_is "osip_cu_$f" "$text"
+    rd_ck "$f: the block is a file of its own" grep -q '^osip_cmdline_file=osip_cmdline.bin$' "osip_cu_$f/manifest.txt"
+    "$ABR" repack "osip_cu_$f" -o "osip_cr_$f.img" >/dev/null 2>&1
+    rd_ck "$f: an untouched repack is identical" cmp -s "osip_$f.img" "osip_cr_$f.img"
+done
+rd_ck "the plain cmdline has no file of its own" test ! -e osip_u_u4/osip_cmdline.bin
+rm -rf osip_ce
+cp -a osip_cu_sp osip_ce
+sed -i 's/^cmdline=.*/cmdline=init=\/init quiet debug/' osip_ce/manifest.txt
+"$ABR" repack osip_ce -o osip_ce.img >/dev/null 2>&1
+rd_ck "an edited cmdline is what the image has" test "$(python3 -I "$OTL" list osip_ce.img | sed -n 's/^cmdline //p')" = "init=/init quiet debug"
+rd_ck "(its size did not change: neither did the header)" test "$(head -c 512 osip_ce.img | cmp -s - osip_cu_sp/osip_header.bin && echo same)" = same
+rd_ck "mboot reads it" osip_fixpoint osip_ce.img
+rm -rf osip_cl
+cp -a osip_u_u4 osip_cl
+sed -i "s/^cmdline=.*/cmdline=$(head -c 1025 /dev/zero | tr '\0' a)/" osip_cl/manifest.txt
+rd_ck "a cmdline of 1025 bytes is refused" osip_refuse cmdline osip_cl "room for 1024"
+rd_done "OSIP: a cmdline with white space at its ends or a line break is kept exactly, an edited one is written in a block of 1024 bytes, a longer one is refused"
+
+# Headers that are not as mboot would make them stay as they are until the size of the image changes.
+python3 -I - <<'PYEOF'
+d = bytearray(open("osip_u4.img", "rb").read())
+d[7] ^= 0x55                    # a checksum that is not right
+open("osip_badck.img", "wb").write(bytes(d))
+e = bytearray(open("osip_u4.img", "rb").read())
+e[48] = 7                       # a sector count that is not right, with the checksum of that
+e[7] = 0
+x = 0
+for i, c in enumerate(e[:56]):
+    if i != 7:
+        x ^= c
+e[7] = x
+open("osip_badsec.img", "wb").write(bytes(e))
+PYEOF
+for k in badck badsec; do
+    rd_unpack "osip_$k.img" "osip_hu_$k"
+    "$ABR" repack "osip_hu_$k" -o "osip_hr_$k.img" >/dev/null 2>&1
+    rd_ck "$k: an untouched repack is identical" cmp -s "osip_$k.img" "osip_hr_$k.img"
+    rd_ck "$k: the independent tool finds it wrong" test "$(python3 -I "$OTL" check "osip_$k.img" >/dev/null 2>&1; echo $?)" = 1
+    rm -rf "osip_he_$k"
+    cp -a "osip_hu_$k" "osip_he_$k"
+    sed -i 's/^cmdline=.*/cmdline=init=\/init quiet debug and a longer one/' "osip_he_$k/manifest.txt"
+    "$ABR" repack "osip_he_$k" -o "osip_he_$k.img" >/dev/null 2>&1
+    rd_ck "$k: an edit that keeps the size leaves the header alone" test "$(head -c 512 "osip_he_$k.img" | cmp -s - <(head -c 512 "osip_$k.img") && echo same)" = same
+    rm -rf "osip_hs_$k"
+    cp -a "osip_hu_$k" "osip_hs_$k"
+    osip_add_files "osip_hs_$k"
+    "$ABR" repack "osip_hs_$k" -o "osip_hs_$k.img" >/dev/null 2>&1
+    rd_ck "$k: one that changes it gets a header mboot makes" python3 -I "$OTL" check "osip_hs_$k.img"
+done
+rd_ck "info says the checksum is wrong" said "checksum WRONG" "$ABR" info osip_badck.img
+rd_ck "info says what the header counts and what the image has" said "[0-9]* sectors (the image has [0-9]*)" "$ABR" info osip_badsec.img
+rd_ck "unpack notes a checksum that is wrong" said "checksum in the OSIP header" "$ABR" unpack osip_badck.img -o osip_hu_badck2
+rd_done "OSIP: a header with a wrong checksum or sector count is kept as it is by an untouched repack and by one that keeps the size; a changed size makes it right"
+
+# Where mboot's guess at the layout (four letters = the cmdline) is wrong: the layout that fits the image info is taken.
+for n in 480 728 1024; do
+    osip_make "osip_sa$n.img" s "a$n" 4
+    rd_ck "a$n: identify" said "OSIP bootimg, boot (signed)" "$ABR" identify "osip_sa$n.img"
+    rd_unpack "osip_sa$n.img" "osip_u_sa$n"
+    rd_ck "a$n: the signature is $n bytes, though it starts like a cmdline" grep -q "^osip_signature_size=$n\$" "osip_u_sa$n/manifest.txt"
+    rd_ck "a$n: the cmdline" osip_cmd_is "osip_u_sa$n" "$OSIP_CMD"
+    "$ABR" repack "osip_u_sa$n" -o "osip_r_sa$n.img" >/dev/null 2>&1
+    rd_ck "a$n: an untouched repack is identical" cmp -s "osip_sa$n.img" "osip_r_sa$n.img"
+    rm -rf "osip_e_sa$n"
+    cp -a "osip_u_sa$n" "osip_e_sa$n"
+    osip_add_files "osip_e_sa$n"
+    rd_ck "a$n: repack" rd_repack_unpack "osip_e_sa$n" "osip_ed_sa$n"
+    rd_ck "a$n: the file is in the image" test "$(cat "osip_ed_sa${n}_re/ramdisk/abr_test_file" 2>/dev/null)" = "abr test"
+    rd_ck "a$n: the header's sector count" osip_sectors_ok "osip_ed_sa$n.img"
+done
+rd_ck "a cmdline that starts with a space (mboot takes the image for one with a signature of 1024 bytes): identify" said "OSIP bootimg, boot (unsigned)" "$ABR" identify osip_sp.img
+rd_ck "and the image has no signature" grep -q '^osip_signature_size=0$' osip_cu_sp/manifest.txt
+rd_done "OSIP: a signature that starts with four letters, a cmdline that starts with a space (what mboot's guess at the layout takes for something else): the layout that fits the image info is taken"
+
+# What is not read is refused with a reason, and leaves nothing behind.
+head -c 300000 osip_u4.img >osip_cut.img      # the kernel is cut
+head -c 3000 osip_u4.img >osip_cut2.img       # inside the cmdline and image info
+head -c 200000 osip_h4.img >osip_cut3.img     # no header, cut
+python3 -I "$OTL" header osip_hdr_only.img    # a header and nothing else
+for k in cut cut2 cut3 hdr_only; do
+    rm -rf "osip_$k.dir"
+    "$ABR" unpack "osip_$k.img" -o "osip_$k.dir" >"osip_$k.out" 2>&1
+    rc=$?
+    rd_ck "$k: refused" test "$rc" -ne 0
+    rd_ck "$k: with the reason" grep -q 'cut short' "osip_$k.out"
+    rd_ck "$k: and no directory is left behind" test ! -e "osip_$k.dir"
+done
+rd_ck "the sizes the image info declares are said" grep -q 'declares a kernel of 600000 bytes' osip_cut.out
+rm -rf osip_bad
+cp -a osip_u_u4 osip_bad
+head -c 5000 /dev/zero >osip_bad/bootstub.bin
+rd_ck "a bootstub of 5000 bytes is refused on repack" osip_refuse stub osip_bad "4096 or 8192 bytes"
+rm -rf osip_bad
+cp -a osip_u_s480 osip_bad
+head -c 500 /dev/urandom >osip_bad/osip_sig.bin
+rd_ck "a signature of 500 bytes is refused on repack" osip_refuse sig osip_bad "480, 728 or 1024 bytes"
+rm -rf osip_bad
+cp -a osip_u_u4 osip_bad
+sed -i 's/^osip_parameter=.*/osip_parameter=01020304/' osip_bad/manifest.txt
+rd_ck "a parameter of 4 bytes is refused on repack" osip_refuse param osip_bad "must be 8 bytes"
+rm -rf osip_bad
+cp -a osip_u_u4 osip_bad
+head -c 4000 /dev/urandom >osip_bad/osip_info.bin
+printf 'osip_info_file=osip_info.bin\n' >>osip_bad/manifest.txt
+rd_ck "an image info that does not fit is refused on repack" osip_refuse info osip_bad "has room for"
+rm -rf osip_bad
+cp -a osip_u_h4 osip_bad
+printf 'osip_header_file=osip_header.bin\n' >>osip_bad/manifest.txt
+head -c 100 /dev/zero >osip_bad/osip_header.bin
+rd_ck "a header of 100 bytes is refused on repack" osip_refuse header osip_bad "512 bytes"
+rd_done "OSIP: an image that is cut short (or a header alone) is refused with the sizes it declares, and a bootstub, signature, parameter, image info or header that does not fit the layout is refused on repack, leaving no output"
+
 # ---- images of your own: ABR_REAL_IMAGES=<directory> tests/run_tests.sh <abr> checks every file of it the way
 # the fixtures above are checked -- an untouched repack is identical, every ramdisk archive is a directory that
 # GNU cpio agrees with, and a file put into a directory lands in the image. (Files abr does not take, an ext4

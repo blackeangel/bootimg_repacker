@@ -20,6 +20,7 @@ build-time contents:
 | ELF boot image | Sony/Xperia-style boot images that are an ELF file with the kernel/ramdisk as segments |
 | Rockchip KRNL | Rockchip's `kernel.img` and `boot.img` (`"KRNL"`, the size, a kernel or a gzip cpio ramdisk, Rockchip's own CRC) |
 | ASUS blob | the `"MSM-RADIO-UPDATE"` blobs of ASUS Tegra tablets (what `blobpack` writes), with or without the `-SIGNED-BY-SIGNBLOB-` signing header |
+| Intel OSIP | the boot images that Android Image Kitchen opens with `mboot`: an OSIP header (or none), a signature (or none), the cmdline, a bootstub, the kernel and a gzip ramdisk |
 
 Also handled transparently, wherever it appears around those: a
 MediaTek (MTK) sub-header on the kernel and/or ramdisk, a DHTB wrapper
@@ -139,7 +140,7 @@ question needs no other program: `abr identify boot.img` prints the label
 (`AOSP bootimg`, `AOSP-PXA bootimg`, `NOOK signing (green loader)`,
 `MTK bootimg, KERNEL, ...`, `AVBv2 signing footer`, ...), `-b` leaves the
 file name off. Formats that `abr` recognises but cannot unpack yet (a
-ChromeOS kernel, Sony SIN, Intel OSIP) are
+ChromeOS kernel, Sony SIN) are
 named in the refusal, together with the AIK tool that opens them, instead
 of "unrecognized format"; a refused `unpack` leaves no empty directory
 behind. The test suite compares 98 synthetic samples with the built-in
@@ -208,6 +209,54 @@ tool of its own, written from the layout of BlobTools, and, where `ABR_BLOBPACK`
 and `ABR_BLOBUNPACK` name a compiled `blobpack` and `blobunpack` (AndroidRoot's
 BlobTools, Apache-2.0; the CI compiles them), has the real tools make and read
 the same blobs.
+
+### Intel OSIP images
+
+Android Image Kitchen opens Intel's boot image for Android devices with
+`mboot` (osm0sis', after Jocelyn Falempe's `mboot.py`). The layout,
+as `mboot` reads and writes it: an optional 512-byte OSIP header (`"$OS$"`, 0, 0,
+1, ...), a signature of 0, 480, 728 or 1024 bytes, 1024 bytes of cmdline, 3072
+bytes of image info (the sizes of the kernel and the ramdisk, an 8-byte
+"parameter", padding), a bootstub of 4096 (or 8192) bytes, the kernel, the
+gzip-compressed ramdisk, and padding up to a whole 512-byte sector.
+
+`unpack` writes `kernel`, `bootstub.bin`, the ramdisk as `ramdisk.cpio` and as
+the directory `ramdisk/` (as for a boot image), `osip_header.bin` and
+`osip_sig.bin` where the image has them, and the cmdline and the parameter into
+`manifest.txt`. `repack` does what `mboot` does when it packs: the size of the
+image in sectors (offset 48 of the header), the "unsigned" bit of the image type
+(offset 52, set when there is no signature: 0 is a signed boot image, 1 an
+unsigned one, 0x0C and 0x0D the same for a recovery) and the checksum of the
+header (byte 7: the XOR of its first 56 bytes) are made afresh, and the mark a
+signed image has behind the parameter (`BD 02 BD 02 BD 12 BD 12`) goes in or out
+with the signature. That happens only when the size of the image changed or the
+signature was put in or taken away: an image that was not touched comes back as
+it was, whatever its header says (a checksum or a sector count that is not right
+is reported by `info` and `unpack`, and kept).
+
+To take the signature off an image, delete the line `osip_signature_file=` from
+`manifest.txt`; to put one in, name a file of 480, 728 or 1024 bytes there. The
+header is kept as `mboot` keeps it, so where the type should change (a signed
+image that was unsigned) put the header of a signed image in `osip_header.bin`;
+`repack` says so. A signature that is kept after the image changed describes the
+original contents, and `repack` says that too.
+
+`mboot` guesses the layout: four letters or digits where the cmdline starts mark
+the end of the signature (so it is 0, 480, 728 or 1024 bytes), and letters
+behind the bootstub make it 8192 bytes instead of 4096. `abr` makes the same
+guess and keeps it if the sizes in the image info fit the file and the ramdisk
+starts like one; where `mboot`'s guess is wrong (a cmdline that starts with a
+space, a signature that starts with four letters) it takes the layout that fits.
+A cmdline with white space at its ends or a line break is kept exactly
+(`osip_cmdline_file`), and an image that is a whole partition (a fill behind it)
+keeps its size. An image that is cut short, or whose bootstub, signature,
+parameter or image info is not what the layout allows, is refused with the
+reason and nothing is left behind.
+
+The test suite makes its images with a Python tool of its own, written from
+`mboot.c`'s layout, and, where `ABR_MBOOT` names a compiled `mboot` (osm0sis',
+GPL-2.0; the CI compiles it), has the real tool pack the same pieces, read what
+`abr` unpacked, and take every image `abr` wrote apart and pack it again.
 
 ### Threads and compression levels
 
@@ -501,6 +550,15 @@ with an edited ramdisk, a new partition size or a signature behind it is read by
 both, and `blobunpack` finds in it the partition that was put there. (No real
 ASUS blob has been tried: none was at hand.)
 
+The Intel OSIP images are judged by the real `mboot` of osm0sis (compiled from its
+sources, not vendored, used when `ABR_MBOOT` is set) and by a Python tool of the
+suite: images with a header or without one, unsigned or signed (signatures of 480,
+728 and 1024 bytes), with a bootstub of 4096 or 8192 bytes, are packed to the same
+bytes by both; `abr` unpacks them into the pieces `mboot -u` writes; an untouched
+repack is identical; and an image with an edited ramdisk, with the signature taken
+off or one put in, is a fixed point of `mboot` (`mboot -u`, then `mboot` on its
+pieces: the same bytes). (No real Intel image has been tried: none was at hand.)
+
 Compression is judged by the real tools. For every codec the suite builds a
 boot image with `abr`, slices the ramdisk out of it with a separate script
 (`tests/tools/verify.py`, not `abr`) and has the real `gzip`, `lz4`, `zstd`,
@@ -554,7 +612,7 @@ Two smaller gaps:
 
 - Hard links in a ramdisk's cpio archive (the ramdisk then stays one
   `ramdisk.cpio`); a directory tree is made for `newc`/`crc` archives only.
-- The rest of the Android Image Kitchen format list: OSIP images,
+- The rest of the Android Image Kitchen format list:
   QCDT tooling, ChromeOS `futility` signing, LOKI, Sony SIN.
   `abr identify` already names all of them; what is missing is unpacking
   and packing them. See `PROGRESS.md` for the plan.

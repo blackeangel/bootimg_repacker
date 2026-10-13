@@ -39,6 +39,7 @@
 #include "abr/legacy/elf_boot.hpp"
 #include "abr/legacy/krnl.hpp"
 #include "abr/legacy/mtk.hpp"
+#include "abr/legacy/osip.hpp"
 #include "abr/manifest.hpp"
 #include "abr/parallel.hpp"
 #include "abr/ramdisk_tree.hpp"
@@ -55,7 +56,7 @@ namespace {
 
 // ------------------------------------------------------------ detection --
 
-enum class Fmt { BOOT, VENDOR_BOOT, DTBO, DTB, VBMETA, UIMAGE, ELF_BOOT, KRNL, BLOB, UNKNOWN };
+enum class Fmt { BOOT, VENDOR_BOOT, DTBO, DTB, VBMETA, UIMAGE, ELF_BOOT, KRNL, BLOB, OSIP, UNKNOWN };
 
 // Where the "ANDROID!" container starts: within the first kMagicSearchLimit bytes (a vendor
 // wrapper in front of it), or -- Barnes & Noble Nook images -- right behind the fixed-size
@@ -85,6 +86,7 @@ Fmt detect_format(const Bytes& d) {
     if (d.size() >= 64 && std::memcmp(d.data() + d.size() - 64, "AVBf", 4) == 0) return Fmt::VBMETA;
     if (ElfBootImage::looks_like(d)) return Fmt::ELF_BOOT;
     if (KrnlImage::looks_like(d)) return Fmt::KRNL;
+    if (OsipImage::looks_like(d)) return Fmt::OSIP;
     // A vendor wrapper in front of an ordinary image (Spreadtrum BFBF/SSSS,
     // for one): the container's magic is not at offset 0 but close to it.
     // This is only consulted once nothing else matched, so a stray
@@ -144,6 +146,7 @@ const char* fmt_name(Fmt f) {
         case Fmt::ELF_BOOT: return "elf_boot";
         case Fmt::KRNL: return "krnl";
         case Fmt::BLOB: return "blob";
+        case Fmt::OSIP: return "osip";
         case Fmt::UNKNOWN: return "unknown";
     }
     return "unknown";
@@ -159,6 +162,7 @@ Fmt fmt_from_name(const std::string& s) {
     if (s == "elf_boot") return Fmt::ELF_BOOT;
     if (s == "krnl") return Fmt::KRNL;
     if (s == "blob") return Fmt::BLOB;
+    if (s == "osip") return Fmt::OSIP;
     return Fmt::UNKNOWN;
 }
 
@@ -1572,6 +1576,198 @@ Bytes repack_blob(const Manifest& m, const fs::path& dir) {
     return pack_blob(m, std::move(b));
 }
 
+// ---------------------------------------------------------------- osip --
+//
+// Intel OSIP boot image (abr/legacy/osip.hpp), which Android Image Kitchen opens with mboot: an OSIP header,
+// a signature, the cmdline and the image info, the bootstub, the kernel and a gzip-compressed ramdisk. The
+// kernel and the bootstub stay files as they are; the ramdisk is `ramdisk.cpio` and the directory `ramdisk/`,
+// as in a boot image. mboot's habits are kept up: when the size of the image (or the presence of the signature)
+// changes, the sector count, the "unsigned" bit and the checksum of the header are made afresh, and the image
+// is padded up to a whole sector; an image that is not touched comes back exactly as it was.
+
+// The padding behind the image proper that belongs to it: up to a whole sector, all of one byte (0xFF where
+// mboot wrote it). What is behind that is the envelope's (the rest of a partition).
+struct OsipPadding {
+    bool aligned = false;  // the file has that padding
+    uint8_t byte = 0xFF;
+    size_t core_size = 0;  // the image with its padding
+};
+
+OsipPadding osip_padding(const Bytes& host, size_t consumed) {
+    OsipPadding p;
+    p.core_size = consumed;
+    const size_t need = static_cast<size_t>(padding_for(consumed, kOsipSectorSize));
+    if (need == 0) {
+        p.aligned = true;
+        return p;
+    }
+    if (host.size() < consumed + need) return p;
+    const uint8_t first = host[consumed];
+    for (size_t i = 1; i < need; ++i)
+        if (host[consumed + i] != first) return p;
+    p.aligned = true;
+    p.byte = first;
+    p.core_size = consumed + need;
+    return p;
+}
+
+// What a signature would cover (and what an edit changes): all but the header and the signature.
+Bytes osip_payload_sha256(const OsipImage& img) {
+    hash::Sha256 h;
+    auto add = [&h](const Bytes& b) {
+        if (!b.empty()) h.update(b.data(), b.size());
+    };
+    add(img.cmdline);
+    h.update(img.parameter.data(), img.parameter.size());
+    add(img.info_rest);
+    add(img.bootstub);
+    add(img.kernel);
+    add(img.ramdisk);
+    return h.finish();
+}
+
+std::string osip_type_name(uint8_t attribute) {
+    switch (attribute) {
+        case 0x00: return "boot (signed)";
+        case 0x01: return "boot (unsigned)";
+        case 0x0C: return "recovery (signed)";
+        case 0x0D: return "recovery (unsigned)";
+    }
+    char word[24];
+    std::snprintf(word, sizeof word, "type 0x%02x", attribute);
+    return word;
+}
+
+// The text of a cmdline as manifest.txt can hold it: a line of its own, without white space at either end.
+std::string osip_cmdline_shown(std::string text) {
+    for (char& c : text)
+        if (c == '\n' || c == '\r') c = ' ';
+    const auto first = text.find_first_not_of(" \t");
+    if (first == std::string::npos) return {};
+    return text.substr(first, text.find_last_not_of(" \t") - first + 1);
+}
+
+// The cmdline block: the text of the manifest; where the block held more than that (white space at the ends,
+// something behind the text that is not NULs: a file of its own then), that block, as long as the text of the
+// manifest is the one that was in it.
+Bytes osip_cmdline_block(const Manifest& m, const fs::path& dir) {
+    const std::string text = m.get("cmdline");
+    const Bytes raw = load_raw(m, dir, "osip_cmdline");
+    if (raw.size() == kOsipCmdlineSize) {
+        size_t len = 0;
+        while (len < raw.size() && raw[len] != 0) ++len;
+        if (osip_cmdline_shown(std::string(raw.begin(), raw.begin() + static_cast<std::ptrdiff_t>(len))) == text) return raw;
+    }
+    if (text.size() > kOsipCmdlineSize)
+        throw FormatError("the cmdline in manifest.txt is " + std::to_string(text.size()) + " bytes; an OSIP image has room for " +
+                          std::to_string(kOsipCmdlineSize));
+    Bytes block(kOsipCmdlineSize, 0);
+    std::copy(text.begin(), text.end(), block.begin());
+    return block;
+}
+
+void unpack_osip(const Bytes& host, const fs::path& dir, const UnpackOptions& uo) {
+    OsipImage img = OsipImage::parse(host);
+    Manifest m;
+    m.set("type", "osip");
+    if (!img.header.empty()) {
+        save_raw(m, dir, "osip_header", img.header, "osip_header.bin");
+        const bool ok = osip_header_checksum_ok(img.header);
+        m.set_bool("osip_header_checksum_ok", ok);
+        if (!ok)
+            note("the checksum in the OSIP header (byte 7) is not the one mboot computes; it is kept as it is while the size of "
+                 "the image does not change");
+    }
+    save_raw(m, dir, "osip_signature", img.signature, "osip_sig.bin");
+    m.set_u32("osip_signature_size", static_cast<uint32_t>(img.signature.size()));
+    {
+        const std::string text = img.cmdline_text();
+        const std::string shown = osip_cmdline_shown(text);
+        m.set("cmdline", shown);
+        Bytes plain(kOsipCmdlineSize, 0);
+        std::copy(text.begin(), text.end(), plain.begin());
+        if (plain != img.cmdline || shown != text) save_raw(m, dir, "osip_cmdline", img.cmdline, "osip_cmdline.bin");  // more than text and NULs
+    }
+    m.set_hex("osip_parameter", Bytes(img.parameter.begin(), img.parameter.end()));
+    Bytes rest = img.info_rest;  // zeros behind it are not written down
+    while (!rest.empty() && rest.back() == 0) rest.pop_back();
+    save_raw(m, dir, "osip_info", rest, "osip_info.bin");
+    save_raw(m, dir, "bootstub", img.bootstub, "bootstub.bin");
+    save_raw(m, dir, "kernel", img.kernel, "kernel");
+
+    DecodedComponent ramdisk = decode_component(img.ramdisk);
+    if (ramdisk.present) {
+        fs::create_directories(dir / ".abr_raw");
+        write_file(dir / "ramdisk.cpio", ramdisk.plain);
+        write_file(dir / ".abr_raw" / "ramdisk.cpio.raw", ramdisk.stored(img.ramdisk));
+        record_component(m, "ramdisk", "ramdisk.cpio", ramdisk);
+        save_ramdisk_trees(m, dir, {{"ramdisk", "ramdisk.cpio", &ramdisk}}, uo);
+    }
+
+    m.set_u64("osip_body_size", img.body_size());
+    m.set_hex("osip_payload_sha256", osip_payload_sha256(img));
+    const OsipPadding pad = osip_padding(host, img.consumed);
+    if (pad.aligned) m.set_addr("osip_sector_pad", pad.byte);
+    else m.set("osip_sector_pad", "none");
+    const Envelope env = Envelope::capture(host, 0, pad.core_size);
+    save_envelope(m, dir, env, host, 0, pad.core_size);
+    m.save(dir / "manifest.txt", "abr osip manifest -- edit then `abr repack " + dir.string() + " -o out.img`");
+}
+
+Bytes repack_osip(const Manifest& m, const fs::path& dir, const RepackOptions& opt) {
+    OsipImage img;
+    img.header = load_raw(m, dir, "osip_header");
+    img.signature = load_raw(m, dir, "osip_signature");
+    img.cmdline = osip_cmdline_block(m, dir);
+    const Bytes parameter = m.get_hex("osip_parameter");
+    if (!parameter.empty()) {
+        if (parameter.size() != img.parameter.size())
+            throw FormatError("osip_parameter in manifest.txt must be 8 bytes (16 hex digits)");
+        std::copy(parameter.begin(), parameter.end(), img.parameter.begin());
+    }
+    img.info_rest = load_raw(m, dir, "osip_info");
+    if (img.info_rest.size() > kOsipInfoSize - kOsipInfoFixedSize)
+        throw FormatError("osip_info.bin is longer than the " + std::to_string(kOsipInfoSize - kOsipInfoFixedSize) +
+                          " bytes the image info has room for behind the parameter");
+    img.info_rest.resize(kOsipInfoSize - kOsipInfoFixedSize, 0);
+    img.bootstub = load_raw(m, dir, "bootstub");
+    img.kernel = load_raw(m, dir, "kernel");
+    img.ramdisk = load_component(m, dir, "ramdisk", opt);
+
+    // A signed image has a mark behind the parameter in the image info: put there when a signature is added,
+    // taken away with it (what mboot does when it packs the pieces).
+    const bool signed_now = !img.signature.empty();
+    const bool signed_was = m.get_u64("osip_signature_size", 0) != 0;
+    const std::array<uint8_t, 8> none{};
+    if (signed_now && !signed_was) {
+        if (std::equal(none.begin(), none.end(), img.info_rest.begin())) std::copy(kOsipSignedMagic, kOsipSignedMagic + 8, img.info_rest.begin());
+    } else if (!signed_now && signed_was) {
+        if (std::equal(kOsipSignedMagic, kOsipSignedMagic + 8, img.info_rest.begin())) std::fill_n(img.info_rest.begin(), 8, uint8_t(0));
+    }
+
+    const uint64_t body = img.body_size();
+    const std::string pad_word = m.get("osip_sector_pad", "0xFF");
+    const bool aligned = pad_word != "none";
+    const uint8_t pad_byte = aligned ? static_cast<uint8_t>(m.get_addr("osip_sector_pad", 0xFF)) : 0;
+    if (!img.header.empty()) {
+        const bool size_changed = !m.has("osip_body_size") || m.get_u64("osip_body_size", 0) != body;
+        if (size_changed || signed_now != signed_was) osip_refresh_header(img.header, align_up(body, kOsipSectorSize), signed_now);
+        else if (m.get_bool("osip_header_checksum_ok", false)) osip_set_header_checksum(img.header);
+    }
+
+    const Bytes was = m.get_hex("osip_payload_sha256");
+    if (signed_now && signed_was && !was.empty() && osip_payload_sha256(img) != was)
+        warn("the image was changed, but its signature (" + std::to_string(img.signature.size()) +
+             " bytes) is kept as it was; it describes the ORIGINAL contents, so a bootloader that verifies it may reject the result");
+    if (signed_now && !signed_was && !img.header.empty() && (osip_header_attribute(img.header) & 1) != 0)
+        note("the image has a signature now, but its header still says \"" + osip_type_name(osip_header_attribute(img.header)) +
+             "\"; the header is kept as mboot keeps it (put the header of a signed image in osip_header.bin to change that)");
+
+    Bytes core = img.build();
+    if (aligned) core.insert(core.end(), static_cast<size_t>(padding_for(core.size(), kOsipSectorSize)), pad_byte);
+    return assemble_envelope(m, dir, core, opt);
+}
+
 // ------------------------------------------------------------ info cmd --
 
 void print_envelope_info(const Envelope& e) {
@@ -1776,6 +1972,34 @@ void print_info(const fs::path& path) {
             print_envelope_info(Envelope::capture(data, 0, img.file_size()));
             break;
         }
+        case Fmt::OSIP: {
+            OsipImage img = OsipImage::parse(data);
+            if (img.header.empty()) {
+                std::cout << "header:         none\n";
+            } else {
+                const uint64_t expected = align_up(img.consumed, kOsipSectorSize) / kOsipSectorSize - 1;
+                const uint32_t sectors = osip_header_sectors(img.header);
+                std::cout << "header:         " << img.header.size() << " bytes, " << osip_type_name(osip_header_attribute(img.header))
+                          << ", " << sectors << " sectors"
+                          << (sectors == expected ? std::string() : " (the image has " + std::to_string(expected) + ")")
+                          << ", checksum " << (osip_header_checksum_ok(img.header) ? "OK" : "WRONG") << "\n";
+            }
+            std::cout << "signature:      "
+                      << (img.signature.empty() ? std::string("none") : std::to_string(img.signature.size()) + " bytes") << "\n";
+            std::cout << "cmdline:        " << img.cmdline_text() << "\n";
+            std::cout << "bootstub:       " << img.bootstub.size() << " bytes\n";
+            std::cout << "kernel:         " << img.kernel.size() << " bytes\n";
+            std::cout << "ramdisk:        " << img.ramdisk.size() << " bytes (" << codec_name(detect_codec(img.ramdisk)) << ")\n";
+            std::string parameter;
+            for (uint8_t b : img.parameter) {
+                char two[4];
+                std::snprintf(two, sizeof two, "%02x", b);
+                parameter += two;
+            }
+            std::cout << "parameter:      " << parameter << "\n";
+            print_envelope_info(Envelope::capture(data, 0, osip_padding(data, img.consumed).core_size));
+            break;
+        }
         case Fmt::ELF_BOOT: {
             legacy::ElfBootImage img = legacy::ElfBootImage::parse(data);
             std::cout << "class:    " << (img.is_64bit ? "ELF64" : "ELF32") << "\n";
@@ -1815,6 +2039,7 @@ Bytes build_image_once(const fs::path& dir, const RepackOptions& opt) {
         case Fmt::ELF_BOOT: result = repack_elf_boot(m, dir, opt); break;
         case Fmt::KRNL: result = repack_krnl(m, dir, opt); break;
         case Fmt::BLOB: result = repack_blob(m, dir); break;
+        case Fmt::OSIP: result = repack_osip(m, dir, opt); break;
         case Fmt::UNKNOWN:
             throw FormatError("manifest.txt has no (or an unrecognized) 'type=' field");
     }
@@ -1939,6 +2164,7 @@ void do_unpack(const fs::path& in, const fs::path& outdir, const UnpackOptions& 
             case Fmt::ELF_BOOT: unpack_elf_boot(payload, outdir); break;
             case Fmt::KRNL: unpack_krnl(payload, outdir, uo); break;
             case Fmt::BLOB: unpack_blob(payload, outdir); break;
+            case Fmt::OSIP: unpack_osip(payload, outdir, uo); break;
             case Fmt::UNKNOWN:
                 throw FormatError(in.string() + ": " + describe_unknown(payload));
         }
@@ -2039,7 +2265,7 @@ void usage() {
         "vendor_boot-debug.img/vendor_kernel_boot.img (header v3-v4), dtbo.img,\n"
         "raw dtb, vbmeta.img/vbmeta_system.img (AVB), U-Boot legacy uImage, Sony ELF\n"
         "boot images, Rockchip KRNL (kernel.img / boot.img), ASUS blobs (\"MSM-RADIO-UPDATE\",\n"
-        "signed with the SIGNBLOB header or not).\n"
+        "signed with the SIGNBLOB header or not), Intel OSIP boot images.\n"
         "Also transparently handled: a trailing AVB hash footer on boot/\n"
         "vendor_boot/dtbo; a DHTB wrapper (with SEAndroid footer/padding) around\n"
         "any of them; an ASUS blob around one image; the AMONET patch of Amazon's\n"
