@@ -38,6 +38,7 @@
 #include "abr/legacy/dhtb.hpp"
 #include "abr/legacy/elf_boot.hpp"
 #include "abr/legacy/krnl.hpp"
+#include "abr/legacy/loki.hpp"
 #include "abr/legacy/mtk.hpp"
 #include "abr/legacy/osip.hpp"
 #include "abr/manifest.hpp"
@@ -168,20 +169,24 @@ Fmt fmt_from_name(const std::string& s) {
 
 // What is put around a plain image and has to come off before anything can be read: a DHTB header
 // (abr/legacy/dhtb.hpp), an ASUS blob whose only partition holds the image (abr/legacy/blob.hpp), and under
-// them the amonet patch (abr/legacy/amonet.hpp). Repack puts them back in the opposite order.
+// them the loki patch (abr/legacy/loki.hpp) or the amonet patch (abr/legacy/amonet.hpp). Repack puts them back
+// in the opposite order.
 struct Wrappers {
     std::optional<legacy::DhtbInfo> dhtb;
     std::optional<legacy::BlobImage> blob;  // its one partition's data is `blob_inner`, not in here
+    std::optional<legacy::LokiInfo> loki;
     std::optional<legacy::AmonetInfo> amonet;
     Bytes dhtb_inner;  // what the wrappers' removal leaves is kept here, if it is not `data` itself
     Bytes blob_inner;
+    Bytes loki_plain;
     Bytes unpatched;
 
-    bool any() const { return dhtb || blob || amonet; }
-    // "dhtb-wrapped ", "blob-wrapped ", "amonet-patched ", or several, or nothing: for the line that
-    // says what was unpacked.
+    bool any() const { return dhtb || blob || loki || amonet; }
+    // "dhtb-wrapped ", "blob-wrapped ", "loki-patched ", "amonet-patched ", or several, or nothing: for the
+    // line that says what was unpacked.
     std::string adjectives() const {
-        return std::string(dhtb ? "dhtb-wrapped " : "") + (blob ? "blob-wrapped " : "") + (amonet ? "amonet-patched " : "");
+        return std::string(dhtb ? "dhtb-wrapped " : "") + (blob ? "blob-wrapped " : "") + (loki ? "loki-patched " : "") +
+               (amonet ? "amonet-patched " : "");
     }
 };
 
@@ -203,6 +208,8 @@ const Bytes& peel_wrappers(const Bytes& data, Wrappers& w) {
             }
         }
     }
+    w.loki = legacy::strip_loki(*inner, w.loki_plain);
+    if (w.loki) inner = &w.loki_plain;
     w.amonet = strip_amonet(*inner, w.unpatched);
     return w.amonet ? w.unpatched : *inner;
 }
@@ -1580,6 +1587,100 @@ Bytes repack_blob(const Manifest& m, const fs::path& dir) {
     return pack_blob(m, std::move(b));
 }
 
+// ---------------------------------------------------------------- loki --
+//
+// A boot or recovery image that went through loki_tool (abr/legacy/loki.hpp) is a wrapper around the plain boot
+// image, like a DHTB header: `has_loki=true`, and the directory is the plain image's. The manifest keeps what
+// the patch added -- the type, the build it was made for, the block behind the ramdisk with the patch code in it,
+// what follows the image -- and repack puts the patch on the image the directory builds. `has_loki=false` leaves
+// it out (a plain boot image comes out).
+
+// The build field as text if it is text: a word of printable characters (no space at either end, the manifest
+// does not keep it), then zeros up to the end of the 128 bytes, with at least one. Anything else goes as hex.
+std::optional<std::string> loki_build_text(const Bytes& b) {
+    size_t len = 0;
+    while (len < b.size() && b[len] != 0) ++len;
+    if (len == b.size()) return std::nullopt;  // no NUL at all
+    for (size_t i = len; i < b.size(); ++i)
+        if (b[i] != 0) return std::nullopt;
+    std::string text(b.begin(), b.begin() + static_cast<std::ptrdiff_t>(len));
+    for (char c : text)
+        if (c < 0x20 || c > 0x7e) return std::nullopt;
+    if (!text.empty() && (text.front() == ' ' || text.back() == ' ')) return std::nullopt;
+    return text;
+}
+
+// The build to show a person: its printable beginning.
+std::string loki_build_shown(const Bytes& b) {
+    std::string out;
+    for (uint8_t c : b) {
+        if (c == 0) break;
+        out.push_back(c >= 0x20 && c <= 0x7e ? static_cast<char>(c) : '?');
+    }
+    return out;
+}
+
+void save_loki_fields(Manifest& m, const fs::path& dir, const legacy::LokiInfo& l) {
+    m.set_u32("loki_recovery", l.recovery);
+    if (auto text = loki_build_text(l.build))
+        m.set("loki_build", *text);
+    else
+        m.set_hex("loki_build_hex", l.build);
+    m.set_addr("loki_patched_ramdisk_addr", l.patched_ramdisk_addr);
+    m.set_u32("loki_patched_ramdisk_size", l.patched_ramdisk_size);
+    if (l.hdr_ramdisk_addr) m.set_addr("loki_hdr_ramdisk_addr", *l.hdr_ramdisk_addr);
+    save_raw(m, dir, "loki_block", l.block, "loki_block.bin");
+    m.set_u32("loki_shellcode_offset", l.patch_offset);
+    // What follows the image: kept as it was, and the fill up to the size of the partition made again.
+    save_raw(m, dir, "loki_tail", l.tail.tail, "loki_tail.bin");
+    if (l.tail.pad_to) {
+        m.set_addr("loki_pad_byte", l.tail.pad_byte);
+        m.set_u64("loki_pad_to", l.tail.pad_to);
+    }
+}
+
+legacy::LokiInfo load_loki_fields(const Manifest& m, const fs::path& dir) {
+    for (const char* key : {"loki_recovery", "loki_patched_ramdisk_addr", "loki_patched_ramdisk_size",
+                            "loki_shellcode_offset", "loki_block_file"})
+        if (!m.has(key))
+            throw FormatError(std::string("manifest.txt says has_loki=true but has no ") + key +
+                              " (has_loki=false leaves the LOKI patch out)");
+    legacy::LokiInfo l;
+    l.recovery = m.get_u32("loki_recovery", 0);
+    if (m.has("loki_build_hex")) {
+        l.build = m.get_hex("loki_build_hex");
+    } else {
+        const std::string text = m.get("loki_build");
+        if (text.size() >= legacy::kLokiBuildSize)
+            throw FormatError("loki_build in manifest.txt is " + std::to_string(text.size()) + " characters long; the field of "
+                              "the LOKI header holds " + std::to_string(legacy::kLokiBuildSize - 1) + " and a zero");
+        l.build.assign(text.begin(), text.end());
+        l.build.resize(legacy::kLokiBuildSize, 0);
+    }
+    l.patched_ramdisk_addr = static_cast<uint32_t>(m.get_addr("loki_patched_ramdisk_addr", 0));
+    l.patched_ramdisk_size = m.get_u32("loki_patched_ramdisk_size", 0);
+    if (m.has("loki_hdr_ramdisk_addr")) l.hdr_ramdisk_addr = static_cast<uint32_t>(m.get_addr("loki_hdr_ramdisk_addr", 0));
+    l.block = load_raw(m, dir, "loki_block");
+    l.patch_offset = m.get_u32("loki_shellcode_offset", 0);
+    l.tail.tail = load_raw(m, dir, "loki_tail");
+    l.tail.pad_byte = static_cast<uint8_t>(m.get_u32("loki_pad_byte", 0));
+    l.tail.pad_to = m.get_u64("loki_pad_to", 0);
+    return l;
+}
+
+// The patch put on the image the directory builds; the tail behind it (other data, fill up to the partition's
+// size) as it was.
+Bytes apply_loki_wrapper(const Manifest& m, const fs::path& dir, const Bytes& plain, const RepackOptions& opt) {
+    const legacy::LokiInfo l = load_loki_fields(m, dir);
+    Bytes core;
+    try {
+        core = legacy::apply_loki(plain, l);
+    } catch (const FormatError& e) {
+        throw FormatError(std::string(e.what()) + " (has_loki=false in manifest.txt leaves the LOKI patch out)");
+    }
+    return assemble_envelope(m, l.tail, core, false, 0, opt);
+}
+
 // ---------------------------------------------------------------- osip --
 //
 // Intel OSIP boot image (abr/legacy/osip.hpp), which Android Image Kitchen opens with mboot: an OSIP header,
@@ -1847,6 +1948,16 @@ void print_info(const fs::path& path) {
                    << "-byte microloader at the start; the boot image's first " << legacy::kAmonetHeadSize
                    << " bytes are at offset " << legacy::kAmonetMicroloaderSize << ")\n";
     }
+    if (wrap.loki) {
+        const legacy::LokiInfo& l = *wrap.loki;
+        std::cout << "wrapper: LOKI patch (" << (l.recovery == 0 ? "boot" : l.recovery == 1 ? "recovery" : "type " + std::to_string(l.recovery))
+                  << ", build \"" << loki_build_shown(l.build) << "\"; " << l.block.size()
+                  << " bytes of the bootloader's code with the patch code behind the ramdisk"
+                  << (l.tail.empty() ? ""
+                                     : "; " + std::to_string(l.tail.pad_to ? l.tail.pad_to - l.core_size : l.tail.tail.size()) +
+                                           " bytes follow the image")
+                  << ")\n";
+    }
     std::cout << "format: " << fmt_name(f) << "\n";
     switch (f) {
         case Fmt::BOOT: {
@@ -2051,7 +2162,8 @@ Bytes build_image_once(const fs::path& dir, const RepackOptions& opt) {
     if (opt.avb1_signer && f != Fmt::BOOT)
         warn("--avb1-key/--avb1-cert only apply to boot and recovery images; ignored here");
 
-    // The wrappers go on in the opposite order to the one they came off in: the amonet patch, then DHTB.
+    // The wrappers go on in the opposite order to the one they came off in: the amonet patch, the loki patch, the
+    // blob, then DHTB.
     if (m.get_bool("has_amonet", false)) {
         legacy::AmonetInfo amonet;
         amonet.microloader = load_raw(m, dir, "amonet_microloader");
@@ -2061,6 +2173,7 @@ Bytes build_image_once(const fs::path& dir, const RepackOptions& opt) {
             throw FormatError(std::string(e.what()) + " (has_amonet=false in manifest.txt leaves the AMONET patch out)");
         }
     }
+    if (m.get_bool("has_loki", false)) result = apply_loki_wrapper(m, dir, result, opt);
     if (m.get_bool("has_blob", false)) {
         legacy::BlobImage blob = load_blob_fields(m, dir);
         if (blob.parts.size() != 1)
@@ -2193,6 +2306,11 @@ void do_unpack(const fs::path& in, const fs::path& outdir, const UnpackOptions& 
                 save_raw(m, outdir, "amonet_microloader", wrap.amonet->microloader, "microloader.bin");
                 what += std::string(what.empty() ? "" : ", ") + "AMONET-patched";
             }
+            if (wrap.loki) {
+                m.set_bool("has_loki", true);
+                save_loki_fields(m, outdir, *wrap.loki);
+                what += std::string(what.empty() ? "" : ", ") + "LOKI-patched";
+            }
             m.save(outdir / "manifest.txt",
                    "abr manifest (" + what + ") -- edit then `abr repack " + outdir.string() + " -o out.img`");
         }
@@ -2272,8 +2390,9 @@ void usage() {
         "signed with the SIGNBLOB header or not), Intel OSIP boot images.\n"
         "Also transparently handled: a trailing AVB hash footer on boot/\n"
         "vendor_boot/dtbo; a DHTB wrapper (with SEAndroid footer/padding) around\n"
-        "any of them; an ASUS blob around one image; the AMONET patch of Amazon's\n"
-        "Fire tablets; a MediaTek (MTK) sub-header on the kernel and/or ramdisk.\n";
+        "any of them; an ASUS blob around one image; the LOKI patch (loki_tool) of a\n"
+        "boot or recovery image; the AMONET patch of Amazon's Fire tablets; a MediaTek\n"
+        "(MTK) sub-header on the kernel and/or ramdisk.\n";
 }
 
 // -j N, -jN, --threads N and --threads=N, wherever they stand on the command

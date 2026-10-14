@@ -27,6 +27,7 @@ tools" below.
 | AMONET patch (Amazon Fire, MediaTek): microloader + boot header moved to 1024 | **done + verified** against AIK's own `dd`/`truncate`/`cat` commands (copied into the suite): `microloader.bin`, `has_amonet=true`, refuses what the patch would overwrite; layered under DHTB |
 | ASUS blob (`"MSM-RADIO-UPDATE"`, with or without the `-SIGNED-BY-SIGNBLOB-` header): AIK's `blobunpack`/`blobpack` | **done + verified** against the real BlobTools `blobpack`/`blobunpack` (compiled, not vendored) and an independent Python tool: a blob that holds one image is a wrapper layer (`has_blob=true`; AIK's case), any other is `type=blob` with a file per partition; the signature is kept, `datalen` follows an edit; only blobpack's layout is read |
 | Intel OSIP boot images (AIK's `mboot`): OSIP header (or none), signature of 0/480/728/1024 bytes, cmdline, image info, bootstub of 4096/8192 bytes, kernel, gzip ramdisk | **done + verified** against the real `mboot` (compiled, not vendored) and an independent Python tool: images with and without a header, unsigned and signed, are packed to the same bytes, `abr` unpacks them into the pieces `mboot -u` writes, an untouched repack is identical, and an edited image (ramdisk, signature taken away or put in) is a fixed point of `mboot`; the header's sector count, "unsigned" bit and checksum follow mboot's rules, but only when the size or the signature changed; the ramdisk is `ramdisk.cpio` + `ramdisk/` |
+| LOKI patch of `loki_tool` (AIK: `loki_tool unlok` / `patch`) on boot and recovery images | **done + verified** against the real `loki_tool` (compiled, not vendored) and an independent Python tool, on synthetic bootloader images: a wrapper layer (`has_loki=true`) that needs no `aboot.img` -- the block of the bootloader's code behind the ramdisk is carried, so an untouched image comes back as it was and an edited one is what `loki_tool patch` makes of the plain repack; the patch code at offsets 0/4/8/12, a block of 512 bytes or of a page, boot and recovery, with and without a device tree, tails and partition fill; `loki patch` itself (the search in an `aboot.img`, loki's table of targets) is not done |
 | Marvell PXA boot header (Samsung Galaxy J1 / Core Prime / Tab 4) | **done + verified** against the real `pxa-mkbootimg` / `pxa-unpackbootimg` (compiled, not vendored): 240 images byte-identical, 34 edits equal to the tool's output (commit `0652429`) |
 | `abr identify`: AIK's `androidbootimg.magic` as code | **done + verified**: 98 samples, agree with `file(1)` + AIK's magic file on all (when both are at hand) and with the built-in table; unsupported-but-known formats are named in the refusal (commit `803b820`) |
 | Nook / Nook-tablet signing header in front, LG Bump footer behind | **done** (synthetic fixtures; no real device dump of either yet): header kept as a constant prefix (`prefix_kind=`), footer kept as tail, neither triggers the stale-signature warning (commit `2a76f87`) |
@@ -40,7 +41,7 @@ tools" below.
 | self-contained RSA: BigInt (Knuth D, Montgomery), DER/PEM/X.509, PKCS#1 v1.5 sign/verify, PKCS#8/PKCS#1 key parsing, AVB public-key blob -- **no OpenSSL anywhere in the build** | **done + verified** (Python integers, `openssl dgst -sign`, `avbtool extract_public_key`; see "Self-contained crypto" below) |
 | manifest + CLI (`abr info/unpack/repack`) | **done** |
 | CMake: FetchContent-vendored static zlib/lz4/zstd/xz/bzip2 | **done + build-verified natively on Linux**, both the dynamic and the `-DABR_STATIC_BINARY=ON` fully-static configurations |
-| Test suite (`tests/run_tests.sh`) | **done, 268/268 passing** locally on g++-14 (with the optional `pxa-*` / `rkcrc` / `blobpack`+`blobunpack` oracles and AIK's magic file); CI runs the matrix (g++-14, clang-20, Windows under wine, arm64 under qemu-user) -- see Verification |
+| Test suite (`tests/run_tests.sh`) | **done, 295/295 passing** locally on g++-14 and on clang-20, 294/294 for `abr.exe` under wine (with the optional `pxa-*` / `rkcrc` / `blobpack`+`blobunpack` / `mboot` / `loki_tool` oracles and AIK's magic file); CI runs the matrix (g++-14, clang-20, Windows under wine, arm64 under qemu-user) -- see Verification |
 | CMake cross toolchains (mingw-w64, Android NDK) | **done + verified** (mingw reproduced locally; NDK only provable via CI, see below) |
 | GitHub Actions static build matrix (linux-x86_64, windows-x86_64, android-arm64) | **done + verified**: run 35313499827, all 3 jobs green, all 3 static binaries produced as artifacts (abr-linux-x86_64, abr-windows-x86_64, abr-android-arm64) |
 
@@ -722,7 +723,7 @@ compiled from source and used only as oracles, never as a dependency.
 | Intel OSIP (`mboot`) | **done**, judged by the real `mboot`: unpack / repack / info, header rules as mboot's, the ramdisk as a directory; see "OSIP" below |
 | Rockchip KRNL (`dd skip=8`, `rkcrc -k`) | **done**, oracle-verified (`rkcrc`): unpack / repack / info; a payload that is a cpio gets the ramdisk directory (AIK treats it as a ramdisk the same way); see "Rockchip KRNL" below |
 | AMONET (microloader in the first 1024 bytes, `dd`/`truncate`/`cat`) | **done**, judged by AIK's own commands: unpack / repack / info, wrapper layer under DHTB; see "AMONET" below |
-| LOKI (`loki_tool unlok`) | recognised, not unpacked; re-patching LOKI needs the device's `aboot.img` |
+| LOKI (`loki_tool unlok` / `patch`, needs the device's `aboot.img`) | **done**, judged by the real `loki_tool`: unpack / repack / info as a wrapper layer (DHTB -> blob -> LOKI -> AMONET); no `aboot.img` is needed to repack, the block that was in the image is put back; patching a plain image for a bootloader that has no LOKI image of its own (`loki patch`) is not done; see "LOKI" below |
 | QCDT device-tree table tooling (`dtbTool`) | the blob is carried as `dt_file`; creating one from several dtbs is not done |
 
 `abr identify` names every row above, so none of them is reported as
@@ -1151,10 +1152,97 @@ count off by one, no unsigned bit, a checksum that counts its own byte, no mark 
 a signed image, only mboot's guess, zero padding) each fail the groups they should.
 No real Intel image was tried -- none was supplied.
 
+## LOKI (done, 14 Oct 2026)
+
+Dan Rosenberg's `loki` (BSD-2-Clause, https://github.com/djrbliss/loki). `loki_tool patch` turns a plain boot or
+recovery image and the `aboot.img` of the phone into an image whose signature the bootloader's check does not
+reject; AIK takes the patch off with `loki_tool unlok` and asks for the `aboot.img` again when it repacks. The
+layout, read from `loki.h`, `loki_patch.c` and `loki_unlok.c`:
+
+- the header page of the plain image (version 0 header; `loki_tool patch` drops a second stage) with
+  `kernel_size` = padded kernel + ramdisk size, `ramdisk_size` = 0 (one page for the targets whose table entry says
+  `lg`) and `ramdisk_addr` = `check_sigs & ~0xf` (the bootloader's signature check, rounded down to 16 bytes);
+- the LOKI header at byte 0x400, inside the extra command line (148 bytes): `"LOKI"`, u32 type (0 boot, 1
+  recovery), `char build[128]` (the target's build), u32 original kernel size, u32 original ramdisk size, u32
+  ramdisk address (`kernel_addr` + padded kernel);
+- the padded kernel and ramdisk, as they were;
+- a block of 0x200 bytes (a page for `lg` targets) of the `aboot.img` from `check_sigs & ~0xf`, with 65 bytes
+  written over it at offset `check_sigs & 0xf` (0, 4, 8 or 12 in the table): 56 bytes of Thumb code, u32 an address
+  of the bootloader (the target's `hdr`), u32 the ORIGINAL `ramdisk_addr`, a NUL;
+- the device tree, `dt_size` bytes, not padded (word 10 of a version 0 header above 8 is the CAF device-tree size).
+
+What `loki_tool unlok` writes is [header page, padded kernel, padded ramdisk, device tree]; the size of the block it
+skips it guesses from the address (`ramdisk_addr > 0x88f00000 || < 0xfa00000` = a page, else 0x200), which is wrong
+for the table's `0x4010fe18` entry (a page-size block at an address the guess takes for 512 bytes).
+
+Code: `include/abr/legacy/loki.hpp` + `src/legacy/loki.cpp` (`has_loki_header`, `strip_loki`, `apply_loki`, `LokiInfo`),
+the LOKI part of `src/main.cpp` (`Wrappers::loki`, `loki_build_text`, `save_loki_fields`, `load_loki_fields`,
+`apply_loki_wrapper`, the `info` line, `has_loki` in `build_image_once` / `do_unpack`). The wrapper comes off after
+DHTB and the blob and before AMONET, and goes on in the opposite order. Its own tail (data, or fill up to the size
+of the partition) is an `Envelope` like the other wrappers'. `tests/tools/loki_tool.py` is the independent tool,
+written from the layout: `aboot` makes a synthetic bootloader image (random bytes, one of loki's patterns at the
+address of a table entry, the base address at byte 12 -- all that `loki_tool patch` reads), `patch` = its writer,
+`unlok` / `list` / `check` = its readers (six synthetic targets: the patch code 0, 4, 8 and 12 bytes into a block of
+512 bytes or of a page).
+
+Manifest: `has_loki=true`, `loki_recovery`, `loki_build` (text; `loki_build_hex` for a field that is no text, has a
+space at its end or no NUL), `loki_patched_ramdisk_addr`, `loki_patched_ramdisk_size`, `loki_hdr_ramdisk_addr` (only
+when it is not `kernel_addr` + padded kernel), `loki_block_file=loki_block.bin`, `loki_shellcode_offset`, the tail
+as `loki_tail_file` or `loki_pad_byte` + `loki_pad_to`; the rest of the directory is the plain image's.
+Decisions worth knowing:
+- **No `aboot.img` on repack.** The block is a copy of the bootloader's code taken from the image; carrying it makes
+  an untouched image byte-identical and an edited one what `loki_tool patch` makes of the same plain image with the
+  same `aboot.img` (only the original ramdisk address inside the patch code follows the plain header; kernel_size, the
+  padded header fields and the LOKI header follow it as well). Verified against the real tool.
+- **`loki patch` itself is not in abr** (the pattern search in an `aboot.img` and loki's table of about forty
+  targets). Only the 56 bytes of patch code are copied from loki (BSD-2-Clause, notice kept in `src/legacy/loki.cpp`
+  and named in the README). Patching an image for a bootloader that no LOKI image was unpacked from would take that
+  table; it can be added later as `--loki-aboot`, if wanted.
+- The size of the block is read from the header (`ramdisk_size` 0 = 0x200, = page size = a page), not guessed from
+  the address like `unlok` does. The suite compares abr with the real `unlok` for every target but the one where it
+  guesses wrong (the independent tool and abr agree there).
+- The patch code is searched in the first 16 bytes of the block, like `unlok`; any offset 0..15 is read (the tool
+  writes only 0, 4, 8, 12).
+- Refused, with the reason, leaving no directory: a second stage, a header of version 1+, an implausible page size,
+  a kernel size that is not padded kernel + original ramdisk of the LOKI header, a ramdisk size that is neither 0
+  nor a page, no patch code in the window, a cut-short image. On repack: a block that cannot hold the patch code
+  at `loki_shellcode_offset`, a build of 128 characters or more, a missing field, a command line of 929+ characters
+  (the LOKI header overwrites the end of the extra command line), data behind the device tree; each names
+  `has_loki=false` as the way out.
+- A plain image with non-zero page padding is flagged by the self-check as for every boot image (abr does not keep
+  such padding); LOKI does not change that.
+- Found while testing: the general builder lost data when the last component of a dump whose final page padding is
+  missing grew (what `unlok` writes is such a dump: the device tree is not padded) -- see "The last component of a
+  trimmed dump, edited".
+
+Judged by the real `loki_tool` (`ABR_LOKI_TOOL`; the CI compiles it from https://github.com/djrbliss/loki; the checks
+that need it are skipped where it is not set) and by the Python tool. 9 test groups: fourteen kinds of image (six
+targets, boot and recovery, with and without a device tree, pages of 2048 and 4096, whole-page sizes, a cmdline that
+reaches into the extra one) -- both tools make the same bytes, the independent reader finds the image is
+`loki_tool`'s patch of the plain one, identify and info, the directory is the plain image's plus the patch, without
+the patch it builds what `unlok` writes, an untouched repack is identical; the same fourteen edited (ramdisk files,
+or kernel bytes where the ramdisk is no archive): the result is the patch of what the directory builds without it,
+the real tool makes the same bytes, the block and the rest stay, a fixed point; header edits (load addresses,
+cmdline, name, a bigger kernel); a device tree that grows, shrinks or is whole pages long; tails (data, `0xFF` and
+`0x00` fill to 1 MiB, an edit that outgrows the partition); fields that are not loki's (another type, a build that is
+no text, another load address, data in the header page, the code at the ends of its window); manifest edits (type,
+build of 127 and 128 characters, offsets, a short block, a missing field, a command line that runs into the LOKI
+header or ends just before it); the patch under a blob and DHTB; refusals. The suites: g++-14 295/295, clang-20
+295/295, Windows under wine 294/294 (286 / 286 / 285 before). Negative controls: with an oracle that lies (copies the
+plain image for `patch` and the LOKI image for `unlok`) the five groups that use the real tool fail (and only those);
+eighteen mutations of the code (no original ramdisk address in the patch code, kernel_size without the ramdisk, the
+load address off by one, a page block read as 512 bytes, a window of 8 bytes, the LOKI header left in the plain
+image, a device tree that loses a byte, no check of the LOKI header area, a build with a space kept as text, an odd
+load address not kept, the tail dropped, a second stage accepted, the kernel size not checked, the patched ramdisk
+address, the type, the shellcode offset, a build without NUL as text, a page block of a fixed 2048) each fail the
+groups they should -- all but one: leaving the LOKI header in the plain image changes nothing anyone reads (the
+generic parser reads the command line only up to its NUL), so that mutant is equivalent. None of the 14 real images
+supplied has a LOKI header: no real LOKI image has been tried.
+
 ## Next steps (in order)
 
-1. Remaining AIK parity, easiest first: LOKI, QCDT creation,
-   ChromeOS signing. The stages 2 and 3 of the user's own spec need a scope
+1. Remaining AIK parity, easiest first: QCDT creation,
+   ChromeOS signing, Sony SIN. The stages 2 and 3 of the user's own spec need a scope
    decision before anything is built.
 2. Housekeeping: AIK-like default levels as an opt-in, gzip OS-byte
    determinism, UTF-8 `wmain` on Windows, `zlib-ng` for faster gzip, splitting
@@ -1414,7 +1502,7 @@ Useful as a checklist; wrong in places, and much wider than `abr`:
 2. ~~**CPIO ramdisk as a directory tree**~~ -- **done** for newc and crc
    (see "The ramdisk as a directory"); odc and binary archives stay files.
 3. Remaining AIK parity: QCDT creation, ChromeOS futility signing,
-   LOKI, SIN (PXA, KRNL/RKCRC, AMONET, BLOB, OSIP, NOOK are done).
+   SIN (PXA, KRNL/RKCRC, AMONET, BLOB, OSIP, LOKI, NOOK are done).
 4. Spec stage 1 leftovers: MBN, FIT/ITB. Spec stages 2/3: scope decision.
 5. Housekeeping: CI should run the quirk suite; `main.cpp` is ~1200 lines
    and should be split per format.

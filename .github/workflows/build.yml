@@ -66,6 +66,17 @@ jobs:
           gcc -O2 -w -o "$RUNNER_TEMP/mboot-bin" "$RUNNER_TEMP/mboot-src/mboot.c"
           echo "ABR_MBOOT=$RUNNER_TEMP/mboot-bin" >> "$GITHUB_ENV"
 
+      # loki_tool of Dan Rosenberg's loki (BSD-2-Clause; compiled here, not part of this repository) is what
+      # Android Image Kitchen runs for a LOKI-patched boot or recovery image: the suite has it patch the same plain
+      # images as the independent Python tool (against synthetic bootloader images), take the patch off, and patch
+      # what abr repacked. Without it those comparisons are skipped (the independent Python tool still judges).
+      - name: Compile loki_tool, a judge of the LOKI-patched images
+        continue-on-error: true
+        run: |
+          git clone --depth 1 https://github.com/djrbliss/loki.git "$RUNNER_TEMP/loki-src"
+          (cd "$RUNNER_TEMP/loki-src" && gcc -O2 -w -o "$RUNNER_TEMP/loki_tool" main.c loki_flash.c loki_find.c loki_patch.c loki_unlok.c)
+          echo "ABR_LOKI_TOOL=$RUNNER_TEMP/loki_tool" >> "$GITHUB_ENV"
+
       - name: Configure
         run: >
           cmake -S . -B build -G Ninja

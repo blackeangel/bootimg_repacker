@@ -29,7 +29,9 @@ MediaTek (MTK) sub-header on the kernel and/or ramdisk, a DHTB wrapper
 MediaTek Fire tablets (a 1024-byte microloader in front, the boot header
 moved behind it: `unpack` keeps it as `microloader.bin` and `has_amonet=true`
 in the manifest, reads the boot image under it, and `repack` puts it back;
-the same two manifest lines put it on an ordinary v0 image), the Barnes &
+the same two manifest lines put it on an ordinary v0 image), the *loki*
+patch of `loki_tool` on a boot or recovery image (a block of the bootloader's
+code behind the ramdisk: `has_loki=true`; see below), the Barnes &
 Noble Nook signing header in front of an image (1 MiB, 256 KiB on the
 tablets), LG's Bump and Samsung's SEAndroid footers behind it, an AVB hash
 footer on boot / vendor_boot / dtbo, and the vendor data described below.
@@ -257,6 +259,50 @@ The test suite makes its images with a Python tool of its own, written from
 `mboot.c`'s layout, and, where `ABR_MBOOT` names a compiled `mboot` (osm0sis',
 GPL-2.0; the CI compiles it), has the real tool pack the same pieces, read what
 `abr` unpacked, and take every image `abr` wrote apart and pack it again.
+
+### LOKI images
+
+Android Image Kitchen takes the patch of Dan Rosenberg's `loki_tool` off a boot
+or recovery image with `loki_tool unlok`, and puts it on again with
+`loki_tool patch`, which needs the `aboot.img` of the phone the image is for.
+What the patch makes of a boot image (version 0 header, no second stage): the
+header page with `kernel_size` made the padded kernel plus the ramdisk,
+`ramdisk_size` 0 (a page for the "LG-type" targets of its table) and
+`ramdisk_addr` an address inside the bootloader, and a 148-byte LOKI header at
+byte 1024 of it (`"LOKI"`, the type 0 for boot and 1 for recovery, the 128-byte
+build the patch was made for, the original kernel and ramdisk sizes, the load
+address of the ramdisk); then the padded kernel and ramdisk; a block of 512
+bytes (a page for the LG-type targets) of the bootloader's own code with the 64
+bytes of the patch laid over its start; and the device tree, not padded.
+
+`abr` reads that without the bootloader. `unpack` writes the directory of the
+plain boot image -- the same bytes `loki_tool unlok` writes, except where
+`unlok` guesses the size of the block from an address and is wrong (one family
+of its targets; `abr` reads the size from the header) -- and `has_loki=true`
+with `loki_recovery`, `loki_build`, `loki_patched_ramdisk_addr`,
+`loki_patched_ramdisk_size`, `loki_shellcode_offset` and the block as
+`loki_block.bin` in the manifest. What follows the image (other data, or a fill
+up to the size of the partition) is kept, as for the other wrappers; so are
+fields that are not what `loki_tool` writes (another type, a build that is no
+text, another load address in the LOKI header). `repack` builds the plain image
+and puts the patch back on it. The block is the one that was in the image, so
+an image that was not touched comes back as it was, and an edited one is what
+`loki_tool patch` makes of the repacked plain image with the `aboot.img` the
+image was patched with (the original ramdisk address inside the patch code
+follows the plain header). `has_loki=false` leaves the patch out.
+
+What `abr` does not do is patch an image for a bootloader it has no LOKI image
+of: finding the signature check in an `aboot.img` and the table of targets are
+`loki_tool patch`'s. An image that has the LOKI header but is not what
+`loki_tool` makes (a second stage, a header of another version, sizes that do
+not add up, no patch code in the first 16 bytes of the block, a cut-short
+image) is refused with the reason and nothing is left behind. A command line of
+more than 928 characters has no room beside the LOKI header: `repack` says so
+and names `has_loki=false`.
+
+The 56 bytes of the patch code are the one thing of loki that is in `abr`
+(Copyright (c) 2013 Dan Rosenberg, BSD-2-Clause; the notice is in
+`src/legacy/loki.cpp`); the layout was read from its sources.
 
 ### Threads and compression levels
 
@@ -559,6 +605,20 @@ repack is identical; and an image with an edited ramdisk, with the signature tak
 off or one put in, is a fixed point of `mboot` (`mboot -u`, then `mboot` on its
 pieces: the same bytes). (No real Intel image has been tried: none was at hand.)
 
+The LOKI images are judged by the real `loki_tool` (Dan Rosenberg's loki,
+BSD-2-Clause; compiled from its sources, not vendored, used when `ABR_LOKI_TOOL`
+is set) and by a Python tool of the suite (`tests/tools/loki_tool.py`, written
+from loki's layout), against synthetic bootloader images: random bytes with the
+bytes `loki_tool patch` looks for, at the addresses of six entries of its table
+(the patch code 0, 4, 8 and 12 bytes into a block of 512 bytes or of a page).
+Both patch the same plain images -- boot and recovery, with and without a device
+tree, pages of 2048 and 4096 bytes, sizes that are whole pages, a long cmdline --
+to the same bytes; `abr` unpacks them into the plain image's directory (what
+`loki_tool unlok` writes); an untouched repack is identical; and what `abr`
+repacks after an edit of the ramdisk, the kernel, the device tree or the header
+fields is what `loki_tool patch` makes of the plain image the same directory
+builds without the patch. (No real LOKI image has been tried: none was at hand.)
+
 Compression is judged by the real tools. For every codec the suite builds a
 boot image with `abr`, slices the ramdisk out of it with a separate script
 (`tests/tools/verify.py`, not `abr`) and has the real `gzip`, `lz4`, `zstd`,
@@ -613,7 +673,7 @@ Two smaller gaps:
 - Hard links in a ramdisk's cpio archive (the ramdisk then stays one
   `ramdisk.cpio`); a directory tree is made for `newc`/`crc` archives only.
 - The rest of the Android Image Kitchen format list:
-  QCDT tooling, ChromeOS `futility` signing, LOKI, Sony SIN.
+  QCDT tooling, ChromeOS `futility` signing, Sony SIN.
   `abr identify` already names all of them; what is missing is unpacking
   and packing them. See `PROGRESS.md` for the plan.
 - U-Boot's newer FIT (Flattened Image Tree) format -- only the older
@@ -632,6 +692,11 @@ README explaining exactly what and why -- see those for details:
 - `third_party/minilzo/`: LZO1X compress/decompress, GPL-2.0-or-later
   (compatible with, and combined here under, this project's own
   GPL-3.0-or-later).
+- `src/legacy/loki.cpp`: 56 bytes of machine code (the patch of `loki_tool`,
+  https://github.com/djrbliss/loki), Copyright (c) 2013 Dan Rosenberg,
+  BSD-2-Clause; the full notice is kept in that file, and has to go with a
+  binary distribution of `abr` (the notice of the licence, in the documentation
+  or other material).
 - `tests/reference/mkbootimg/`: AOSP's `mkbootimg.py` and friends,
   Apache-2.0, not linked into the `abr` binary at all.
 - `tests/reference/avb/`: AOSP's `avbtool.py`, MIT, used only as the

@@ -3393,6 +3393,405 @@ head -c 100 /dev/zero >osip_bad/osip_header.bin
 rd_ck "a header of 100 bytes is refused on repack" osip_refuse header osip_bad "512 bytes"
 rd_done "OSIP: an image that is cut short (or a header alone) is refused with the sizes it declares, and a bootstub, signature, parameter, image info or header that does not fit the layout is refused on repack, leaving no output"
 
+# =========================================================================
+# LOKI: the patch of loki_tool (Dan Rosenberg's "loki", 2013), which Android Image Kitchen takes off a boot or
+# recovery image with `loki_tool unlok` (abr/legacy/loki.hpp). abr takes it off without the aboot.img of the phone and
+# puts the block of the bootloader's code that was in the image back, so an image comes back byte for byte. The
+# bootloader images and the patched images of these tests are made by tests/tools/loki_tool.py, which is written from
+# loki's layout and shares no code with abr; an aboot made there is random bytes that hold what `loki_tool patch`
+# reads of one (one of its patterns at the address of an entry of its table, a base address), nothing that is a
+# bootloader. ABR_LOKI_TOOL names a compiled loki_tool (BSD-2-Clause, github.com/djrbliss/loki; not part of this
+# repository, the linux CI jobs compile it): where it is at hand it is a judge too -- it patches the same plain image
+# into the same bytes (the independent tool must make them as well), and takes the patch off the way abr does.
+# =========================================================================
+LKT="$TOOLS/loki_tool.py"
+LKB="$TOOLS/blob_tool.py"
+loki_real() { [ -n "${ABR_LOKI_TOOL:-}" ] && [ -x "${ABR_LOKI_TOOL:-}" ]; }
+for t in a b c d e f; do python3 -I "$LKT" aboot "$t" "loki_aboot_$t.img"; done
+python3 "$RDG" mkbootfs loki_rd.cpio
+gzip -9n -c loki_rd.cpio >loki_rd.gz
+python3 -I - "$TOOLS" <<'PYEOF'
+import random
+import sys
+sys.path.insert(0, sys.argv[1])
+import fixtures
+r = random.Random(20261014)
+rd = open("loki_rd.gz", "rb").read()
+kernel = r.randbytes(70001)                      # not a whole number of pages
+cmd = "console=ttyS0,115200 androidboot.hardware=lokitest"
+longcmd = " ".join("opt%03d=%d" % (i, i * 7) for i in range(200))[:900]   # runs into the extra command line
+def w(name, data):
+    open("loki_plain_%s.img" % name, "wb").write(data)
+w("nodt", fixtures.boot_v012(0, kernel, rd, page=2048, cmdline=cmd, name="lokitest"))
+w("dt", fixtures.boot_v012(0, kernel, rd, dt=r.randbytes(5000), page=2048, cmdline=cmd, name="lokitest"))
+w("p4k", fixtures.boot_v012(0, r.randbytes(100000), rd, dt=r.randbytes(8192), page=4096, cmdline=cmd))
+# sizes that are whole pages: the kernel, the ramdisk (no archive) and the device tree
+w("al", fixtures.boot_v012(0, r.randbytes(2048 * 30), r.randbytes(2048 * 8), dt=r.randbytes(2048), page=2048, cmdline=cmd))
+w("cl", fixtures.boot_v012(0, kernel, rd, page=2048, cmdline=longcmd))
+PYEOF
+
+loki_size() { wc -c <"$1" | tr -d ' '; }
+loki_real_patch_is() {  # <image> <target> <boot|recovery> <plain image>: loki_tool patch makes this very image of the plain one (true without the tool)
+    loki_real || return 0
+    rm -f "$1.real"
+    "$ABR_LOKI_TOOL" patch "$3" "loki_aboot_$2.img" "$4" "$1.real" >/dev/null 2>&1 && cmp -s "$1" "$1.real"
+}
+loki_real_unlok_is() {  # <LOKI image> <plain image>: loki_tool unlok takes the patch off to this very image (true without the tool)
+    loki_real || return 0
+    rm -f "$1.unlok"
+    "$ABR_LOKI_TOOL" unlok "$1" "$1.unlok" >/dev/null 2>&1 && cmp -s "$1.unlok" "$2"
+}
+loki_make() {  # <image> <target> <boot|recovery> <plain image>: the independent tool patches the plain image (and the real one makes the same bytes)
+    python3 -I "$LKT" patch "$2" "$3" "loki_aboot_$2.img" "$4" "$1" || return 1
+    loki_real_patch_is "$1" "$2" "$3" "$4"
+}
+loki_check() {  # <image> <plain image> <target>: the independent reader: the image is what loki_tool patch makes of the plain one with that bootloader
+    python3 -I "$LKT" check "$1" "$2" "loki_aboot_$3.img" >/dev/null
+}
+loki_plain_of() {  # <unpack dir> <out>: what the directory builds without the patch (has_loki=false in a copy)
+    rm -rf "$1.nolk" && cp -a "$1" "$1.nolk" || return 1
+    sed -i 's/^has_loki=true$/has_loki=false/' "$1.nolk/manifest.txt" || return 1
+    "$ABR" repack "$1.nolk" -o "$2" >"$2.log" 2>&1
+}
+loki_offset() { case "$1" in e) echo 0 ;; f) echo 4 ;; a | d) echo 8 ;; *) echo 12 ;; esac; }  # check_sigs & 15 of the synthetic targets
+loki_block() {  # <target> <plain image's name>: the size of the block (512 bytes, a page for the targets whose table says so)
+    case "$1" in
+        a | e) echo 512 ;;
+        *) case "$2" in p4k) echo 4096 ;; *) echo 2048 ;; esac ;;
+    esac
+}
+loki_rec() { if [ "$1" = recovery ]; then echo 1; else echo 0; fi; }
+loki_edit() {  # <unpack dir>: two files in the ramdisk's directory or, where the ramdisk is no archive, bytes at the end of the kernel
+    if [ -d "$1/ramdisk" ]; then
+        printf 'abr test\n' >"$1/ramdisk/abr_test_file"
+        head -c 9000 /dev/urandom >"$1/ramdisk/loki_big_file"
+    else
+        head -c 5000 /dev/urandom >>"$1/kernel"
+        printf 'abr test\n' >>"$1/kernel"
+    fi
+}
+loki_edit_is_in() {  # <the directory unpacked from the repacked image>
+    if [ -d "$1/ramdisk" ]; then
+        [ "$(cat "$1/ramdisk/abr_test_file" 2>/dev/null)" = "abr test" ]
+    else
+        [ "$(tail -c 9 "$1/kernel")" = "abr test" ]
+    fi
+}
+loki_same_but_edit() {  # <the directory before the edit> <the directory unpacked from the repacked image>
+    if [ -d "$1/ramdisk" ]; then
+        diff -r --no-dereference -x abr_test_file -x loki_big_file "$1/ramdisk" "$2/ramdisk" >/dev/null || return 1
+    else
+        cmp -s "$1/ramdisk.cpio" "$2/ramdisk.cpio" || return 1
+    fi
+    [ ! -e "$1/dt.img" ] || cmp -s "$1/dt.img" "$2/dt.img"
+}
+loki_same_patch() {  # <dir> <dir>: the patch is the same: the block, and what the manifest says of it
+    cmp -s "$1/loki_block.bin" "$2/loki_block.bin" || return 1
+    [ "$(grep '^loki_' "$1/manifest.txt")" = "$(grep '^loki_' "$2/manifest.txt")" ]
+}
+loki_refuse() {  # <name> <image> <pattern>: unpack of that image is refused with that reason and leaves no directory
+    local out rc
+    rm -rf "loki_rf_$1"
+    out="$("$ABR" unpack "$2" -o "loki_rf_$1" 2>&1)"
+    rc=$?
+    [ "$rc" -ne 0 ] && [ ! -e "loki_rf_$1" ] && grep -q -- "$3" <<<"$out"
+}
+loki_refuse_repack() {  # <name> <dir> <pattern>: repack of that directory is refused with that reason and writes no image
+    local out rc
+    rm -f "loki_rr_$1.img"
+    out="$("$ABR" repack "$2" -o "loki_rr_$1.img" 2>&1)"
+    rc=$?
+    [ "$rc" -ne 0 ] && [ ! -e "loki_rr_$1.img" ] && grep -q -- "$3" <<<"$out"
+}
+loki_copy() {  # <dir> <copy>: a fresh copy of an unpack directory
+    rm -rf "$2" && cp -a "$1" "$2"
+}
+
+# Fourteen kinds of image: every synthetic target (the patch code 0, 4, 8 or 12 bytes into the block; a block of
+# 512 bytes or of one page), boot and recovery, with a device tree (the CAF layout: its size in word 10 of the
+# header) and without, pages of 2048 and 4096, whole-page sizes, a command line that reaches into the extra one.
+for p in nodt dt p4k al cl; do rd_unpack "loki_plain_$p.img" "loki_pu_$p"; done
+LOKI_VARIANTS="a_nodt:a:boot:nodt a_dt_r:a:recovery:dt b_dt:b:boot:dt b_nodt_r:b:recovery:nodt c_dt:c:boot:dt d_dt:d:boot:dt d_nodt_r:d:recovery:nodt e_nodt:e:boot:nodt e_4k:e:boot:p4k f_dt:f:boot:dt f_4k_r:f:recovery:p4k a_al:a:boot:al b_al_r:b:recovery:al b_cl:b:boot:cl"
+for v in $LOKI_VARIANTS; do
+    IFS=: read -r n t k p <<<"$v"
+    rd_ck "$n: the image (the independent tool makes it, and the real one the same bytes)" loki_make "loki_$n.img" "$t" "$k" "loki_plain_$p.img"
+    rd_ck "$n: the independent reader finds it is loki_tool's patch of the plain image" loki_check "loki_$n.img" "loki_plain_$p.img" "$t"
+    rd_ck "$n: identify" said "LOKI header ($k)" "$ABR" identify "loki_$n.img"
+    rd_unpack "loki_$n.img" "loki_u_$n"
+    rd_ck "$n: unpack says what it took off" grep -q 'unpacked loki-patched boot' "loki_u_$n.log"
+    rd_ck "$n: and that an untouched repack is identical" grep -q 'reproduces this image byte-for-byte' "loki_u_$n.log"
+    rd_ck "$n: the manifest has the patch" grep -q '^has_loki=true$' "loki_u_$n/manifest.txt"
+    rd_ck "$n: and its type" grep -q "^loki_recovery=$(loki_rec "$k")\$" "loki_u_$n/manifest.txt"
+    rd_ck "$n: and where its code is" grep -q "^loki_shellcode_offset=$(loki_offset "$t")\$" "loki_u_$n/manifest.txt"
+    rd_ck "$n: the block is a file of the size the target has" test "$(loki_size "loki_u_$n/loki_block.bin")" = "$(loki_block "$t" "$p")"
+    rd_ck "$n: nothing follows the image" test ! -e "loki_u_$n/loki_tail.bin"
+    rd_ck "$n: the rest of the directory is what the plain image gives" diff -r --no-dereference -x manifest.txt -x 'loki_*' "loki_pu_$p" "loki_u_$n"
+    loki_plain_of "loki_u_$n" "loki_plainb_$n.img"
+    python3 -I "$LKT" unlok "loki_$n.img" "loki_un_$n.img"
+    rd_ck "$n: without the patch (has_loki=false) the directory builds what the independent tool takes the patch off to" cmp -s "loki_plainb_$n.img" "loki_un_$n.img"
+    # (loki_tool unlok takes the block of the target "d" for 512 bytes where it is a page: it guesses from the
+    # address, and that address is one it does not know. The independent tool and abr read the size from the header.)
+    if [ "$t" != d ]; then
+        rd_ck "$n: and what the real loki_tool unlok takes it off to" loki_real_unlok_is "loki_$n.img" "loki_plainb_$n.img"
+    fi
+    "$ABR" repack "loki_u_$n" -o "loki_r_$n.img" >/dev/null 2>&1
+    rd_ck "$n: an untouched repack is identical" cmp -s "loki_$n.img" "loki_r_$n.img"
+    rd_ck "$n: info says there is a patch" said "wrapper: LOKI patch ($k, build" "$ABR" info "loki_$n.img"
+done
+rd_done "LOKI: images of every shape loki_tool makes (six targets, boot and recovery, with and without a device tree, 2048 and 4096 byte pages, a block of 512 bytes or of a page, whole-page sizes, a long cmdline): the independent tool makes the same bytes, identify and info see the patch, the directory is the plain image's plus the patch, without the patch it builds what loki_tool unlok writes, an untouched repack is identical"
+
+# An edit lands in the image, the patch stays as it was, and what comes out is what loki_tool patch makes of the
+# image the directory builds without the patch (the real tool says so too, where it is at hand).
+for v in $LOKI_VARIANTS; do
+    IFS=: read -r n t k p <<<"$v"
+    loki_copy "loki_u_$n" "loki_x_$n"
+    loki_edit "loki_x_$n"
+    rd_ck "$n: repack" rd_repack_unpack "loki_x_$n" "loki_xr_$n"
+    rd_ck "$n: the edit is in the image" loki_edit_is_in "loki_xr_${n}_re"
+    rd_ck "$n: nothing else changed" loki_same_but_edit "loki_u_$n" "loki_xr_${n}_re"
+    rd_ck "$n: the image grew" test "$(loki_size "loki_xr_$n.img")" -gt "$(loki_size "loki_$n.img")"
+    loki_plain_of "loki_x_$n" "loki_xp_$n.img"
+    rd_ck "$n: the independent reader finds it is loki_tool's patch of what the directory builds without it" loki_check "loki_xr_$n.img" "loki_xp_$n.img" "$t"
+    rd_ck "$n: the real loki_tool patches that image into the very same bytes" loki_real_patch_is "loki_xr_$n.img" "$t" "$k" "loki_xp_$n.img"
+    rd_ck "$n: the patch (block, type, build, where the code is) is as it was" loki_same_patch "loki_u_$n" "loki_xr_${n}_re"
+    rd_ck "$n: unpacked again it is a fixed point" "$ABR" repack "loki_xr_${n}_re" -o "loki_xr2_$n.img"
+    rd_ck "$n: ... the same bytes" cmp -s "loki_xr_$n.img" "loki_xr2_$n.img"
+done
+rd_done "LOKI: an edited ramdisk (or kernel) lands in the image; the result is loki_tool's patch of what the directory builds without it (the independent reader, and the real loki_tool where it is at hand); the block and the rest of the patch stay; repacking what that gives is the same image"
+
+# The fields of the header the patch moves: the plain header's are what the patched one follows (kernel_size, the
+# ramdisk address that goes into the patch code, the load address of the ramdisk that goes into the LOKI header).
+for v in b_dt:b:boot:dt e_nodt:e:boot:nodt f_4k_r:f:recovery:p4k; do
+    IFS=: read -r n t k p <<<"$v"
+    loki_copy "loki_u_$n" "loki_h_$n"
+    sed -i -e 's/^kernel_addr=.*/kernel_addr=0x10008000/' -e 's/^ramdisk_addr=.*/ramdisk_addr=0x11000000/' \
+        -e 's/^cmdline=.*/cmdline=quiet loglevel=7 androidboot.test=1/' -e 's/^board_name=.*/board_name=other/' "loki_h_$n/manifest.txt"
+    head -c 7000 /dev/urandom >>"loki_h_$n/kernel"       # the padded kernel grows by pages: kernel_size, the ramdisk's load address
+    rd_ck "$n: repack" "$ABR" repack "loki_h_$n" -o "loki_hr_$n.img"
+    loki_plain_of "loki_h_$n" "loki_hp_$n.img"
+    rd_ck "$n: the image is loki_tool's patch of the plain one (the original ramdisk address is in the patch code)" loki_check "loki_hr_$n.img" "loki_hp_$n.img" "$t"
+    rd_ck "$n: the real loki_tool makes the same bytes" loki_real_patch_is "loki_hr_$n.img" "$t" "$k" "loki_hp_$n.img"
+    rd_ck "$n: the new ramdisk address is the one the independent reader finds in the patch code" test "$(python3 -I "$LKT" unlok "loki_hr_$n.img" "loki_hu_$n.img" && od -An -tx4 -j20 -N4 "loki_hu_$n.img" | tr -d ' ')" = 11000000
+done
+rd_done "LOKI: edits of the header (the load addresses, the cmdline, the name) and of the kernel's size: the patched header and the patch code follow the plain header, the same bytes as loki_tool patch"
+
+# The device tree: it goes behind the block without padding, so its size is what the header says; it may grow and shrink.
+for v in b_dt:b:boot:dt a_dt_r:a:recovery:dt f_dt:f:boot:dt; do
+    IFS=: read -r n t k p <<<"$v"
+    for size in 7000 100 4096; do
+        loki_copy "loki_u_$n" "loki_d_$n"
+        head -c "$size" /dev/urandom >"loki_d_$n/dt.img"
+        rd_ck "$n/$size: repack" rd_repack_unpack "loki_d_$n" "loki_dr_$n"
+        rd_ck "$n/$size: the device tree is in the image, not padded" cmp -s "loki_d_$n/dt.img" "loki_dr_${n}_re/dt.img"
+        loki_plain_of "loki_d_$n" "loki_dp_$n.img"
+        rd_ck "$n/$size: loki_tool's patch of the plain image (independent reader)" loki_check "loki_dr_$n.img" "loki_dp_$n.img" "$t"
+        rd_ck "$n/$size: the real loki_tool makes the same bytes" loki_real_patch_is "loki_dr_$n.img" "$t" "$k" "loki_dp_$n.img"
+        rd_ck "$n/$size: the image ends where the device tree does" test "$(python3 -I "$LKT" list "loki_dr_$n.img" | sed -n 's/.*dt \([0-9]*\),.*tail \([0-9]*\)$/\1:\2/p')" = "$size:0"
+    done
+done
+rd_done "LOKI: a device tree that grows, shrinks or is exactly pages long: it follows the block unpadded, the header's size is right, the same bytes as loki_tool patch"
+
+# What follows the image: other data, or fill up to the size of the partition. Kept, and not touched by an edit.
+python3 -I - <<'PYEOF'
+import random
+r = random.Random(20261015)
+def tail(name, src, data):
+    open("loki_t_%s.img" % name, "wb").write(open(src, "rb").read() + data)
+def fill(name, src, size, byte):
+    d = open(src, "rb").read()
+    open("loki_t_%s.img" % name, "wb").write(d + bytes([byte]) * (size - len(d)))
+tail("data", "loki_a_nodt.img", r.randbytes(3000))
+fill("ff", "loki_b_dt.img", 1048576, 0xFF)
+fill("zero", "loki_e_4k.img", 1048576, 0)
+PYEOF
+tail -c 3000 loki_t_data.img >loki_t_data.tail
+for x in data ff zero; do
+    rd_ck "$x: identify" said "LOKI header" "$ABR" identify "loki_t_$x.img"
+    rd_unpack "loki_t_$x.img" "loki_tu_$x"
+    "$ABR" repack "loki_tu_$x" -o "loki_tr_$x.img" >/dev/null 2>&1
+    rd_ck "$x: an untouched repack is identical" cmp -s "loki_t_$x.img" "loki_tr_$x.img"
+    loki_copy "loki_tu_$x" "loki_tx_$x"
+    loki_edit "loki_tx_$x"
+    rd_ck "$x: repack" rd_repack_unpack "loki_tx_$x" "loki_txr_$x"
+    rd_ck "$x: the edit is in the image" loki_edit_is_in "loki_txr_${x}_re"
+    loki_plain_of "loki_tx_$x" "loki_txp_$x.img"
+    rd_ck "$x: it is loki_tool's patch of the plain image (the tail is behind it)" python3 -I "$LKT" check "loki_txr_$x.img" "loki_txp_$x.img"
+done
+tail -c 3000 loki_txr_data.img >loki_txr_data.tail
+rd_ck "data: the tail is a file of its own" cmp -s loki_t_data.tail loki_tu_data/loki_tail.bin
+rd_ck "data: and follows the edited image" cmp -s loki_t_data.tail loki_txr_data.tail
+rd_ck "info says what follows" said "3000 bytes follow the image" "$ABR" info loki_t_data.img
+for x in ff zero; do
+    rd_ck "$x: the fill is not a file, it is a size" test ! -e "loki_tu_$x/loki_tail.bin"
+    rd_ck "$x: the size of the partition" grep -q '^loki_pad_to=1048576$' "loki_tu_$x/manifest.txt"
+    rd_ck "$x: an edit keeps the size of the partition" test "$(loki_size "loki_txr_$x.img")" = 1048576
+done
+rd_ck "ff: the fill byte" grep -q '^loki_pad_byte=0xff$' loki_tu_ff/manifest.txt
+rd_ck "zero: the fill byte" grep -q '^loki_pad_byte=0x0$' loki_tu_zero/manifest.txt
+rd_ck "ff: the fill goes on behind the edited image" test "$(tail -c 400000 loki_txr_ff.img | tr -d '\377' | wc -c | tr -d ' ')" = 0
+rd_ck "zero: the fill goes on behind the edited image" test "$(tail -c 400000 loki_txr_zero.img | tr -d '\000' | wc -c | tr -d ' ')" = 0
+loki_copy loki_tu_ff loki_tx_big
+head -c 3000000 /dev/urandom >loki_tx_big/ramdisk/loki_huge_file
+"$ABR" repack loki_tx_big -o loki_tx_big.img >loki_tx_big.rlog 2>&1
+rd_ck "an edit that outgrows the partition is built and the size is said" grep -q 'larger than the original' loki_tx_big.rlog
+rd_done "LOKI: what follows the image (data, or 0xFF / 0x00 fill up to the partition's size) is kept, an untouched repack is identical, an edit keeps the size and the fill, one that outgrows it is said"
+
+# Fields that are not what loki_tool writes and that abr keeps as they are: another type, a build that is no text (or
+# has a space at its end, or no NUL), another load address of the ramdisk in the LOKI header, data in the header page,
+# the patch code at the last place of the window loki_tool unlok searches.
+python3 -I - <<'PYEOF'
+import struct
+good = open("loki_b_dt.img", "rb").read()      # page 2048, a block of a page, the patch code 12 bytes in, a device tree
+page = 2048
+pad = lambda n: -(-n // page) * page
+ks, rs = struct.unpack_from("<2I", good, 0x488)
+base = page + pad(ks) + pad(rs)                # where the block starts
+def word(d, off, v): struct.pack_into("<I", d, off, v)
+def make(name, fn):
+    d = bytearray(good)
+    fn(d)
+    open("loki_odd_%s.img" % name, "wb").write(bytes(d))
+def move_code(d, to):                          # the 65 bytes of the patch (code, two words, the NUL) at another place
+    patch = bytes(good[base + 12:base + 12 + 65])
+    d[base + 12:base + 12 + 65] = bytes(65)
+    d[base + to:base + to + 65] = patch
+make("ra", lambda d: word(d, 0x490, 0x12345678))
+make("hex", lambda d: d.__setitem__(slice(0x408, 0x488), b"\x01\x02weird".ljust(128, b"\0")))
+make("full", lambda d: d.__setitem__(slice(0x408, 0x488), b"B" * 128))
+make("space", lambda d: d.__setitem__(slice(0x408, 0x488), b"lead ".ljust(128, b"\0")))
+make("type", lambda d: word(d, 0x404, 7))
+make("junk", lambda d: d.__setitem__(slice(0x700, 0x720), bytes(range(1, 33))))
+make("at15", lambda d: move_code(d, 15))
+make("at0", lambda d: move_code(d, 0))
+PYEOF
+for x in ra hex full space type junk at15 at0; do
+    rd_unpack "loki_odd_$x.img" "loki_ou_$x"
+    "$ABR" repack "loki_ou_$x" -o "loki_orr_$x.img" >/dev/null 2>&1
+    rd_ck "$x: an untouched repack is identical" cmp -s "loki_odd_$x.img" "loki_orr_$x.img"
+done
+rd_ck "a load address in the LOKI header that is not the padded kernel's end is kept" grep -q '^loki_hdr_ramdisk_addr=0x12345678$' loki_ou_ra/manifest.txt
+rd_ck "(an ordinary one is not written)" test -z "$(grep '^loki_hdr_ramdisk_addr' loki_u_b_dt/manifest.txt)"
+for x in hex full space; do
+    rd_ck "$x: a build that is no word is kept as hex" grep -q '^loki_build_hex=' "loki_ou_$x/manifest.txt"
+    rd_ck "$x: and not as text" test -z "$(grep '^loki_build=' "loki_ou_$x/manifest.txt")"
+done
+rd_ck "an ordinary build is text" grep -q '^loki_build=D52010c$' loki_u_b_dt/manifest.txt
+rd_ck "type 7 is kept" grep -q '^loki_recovery=7$' loki_ou_type/manifest.txt
+rd_ck "(identify names it a LOKI image, no type)" said 'LOKI header$' "$ABR" identify loki_odd_type.img
+rd_ck "the patch code at the end of its window is read" grep -q '^loki_shellcode_offset=15$' loki_ou_at15/manifest.txt
+rd_ck "and at its start" grep -q '^loki_shellcode_offset=0$' loki_ou_at0/manifest.txt
+rd_done "LOKI: fields other than loki_tool writes (a load address in the LOKI header, a build that is no text, another type, data in the header page, the patch code at either end of its window) are kept as they are: an untouched repack is identical"
+
+# The manifest's fields: the type and the build are the person's to change; what loki_tool could not put in the
+# image is refused, with the way out (has_loki=false) named.
+loki_copy loki_u_b_dt loki_m_type
+sed -i 's/^loki_recovery=0$/loki_recovery=1/' loki_m_type/manifest.txt
+"$ABR" repack loki_m_type -o loki_m_type.img >/dev/null 2>&1
+loki_plain_of loki_m_type loki_m_type_p.img
+rd_ck "a boot image made a recovery one: the image says it" said "recovery 1," python3 -I "$LKT" list loki_m_type.img
+rd_ck "(identify too)" said "LOKI header (recovery)" "$ABR" identify loki_m_type.img
+rd_ck "and the real loki_tool patch recovery makes the same bytes" loki_real_patch_is loki_m_type.img b recovery loki_m_type_p.img
+loki_copy loki_u_b_dt loki_m_build
+sed -i 's/^loki_build=.*/loki_build=an edited build 7/' loki_m_build/manifest.txt
+rd_ck "an edited build: repack" rd_repack_unpack loki_m_build loki_mb
+rd_ck "the image has it" said "build 'an edited build 7'," python3 -I "$LKT" list loki_mb.img
+rd_ck "and reads back" grep -q '^loki_build=an edited build 7$' loki_mb_re/manifest.txt
+loki_copy loki_u_b_dt loki_m_b127
+sed -i "s/^loki_build=.*/loki_build=$(head -c 127 /dev/zero | tr '\0' B)/" loki_m_b127/manifest.txt
+rd_ck "a build of 127 characters fits (a NUL stays behind it)" rd_repack_unpack loki_m_b127 loki_mb127
+loki_copy loki_u_b_dt loki_m_b128
+sed -i "s/^loki_build=.*/loki_build=$(head -c 128 /dev/zero | tr '\0' B)/" loki_m_b128/manifest.txt
+rd_ck "one of 128 is refused" loki_refuse_repack b128 loki_m_b128 "holds 127 and a zero"
+for off in 3 16; do
+    loki_copy loki_u_b_dt "loki_m_off$off"
+    sed -i "s/^loki_shellcode_offset=.*/loki_shellcode_offset=$off/" "loki_m_off$off/manifest.txt"
+    rd_ck "a patch offset of $off, where the code is not, is refused" loki_refuse_repack "off$off" "loki_m_off$off" "does not have the patch code at the offset"
+done
+loki_copy loki_u_b_dt loki_m_short
+head -c 30 loki_u_b_dt/loki_block.bin >loki_m_short/loki_block.bin
+rd_ck "a block too short for the patch code is refused" loki_refuse_repack short loki_m_short "does not have the patch code at the offset"
+loki_copy loki_u_b_dt loki_m_key
+sed -i '/^loki_recovery=/d' loki_m_key/manifest.txt
+rd_ck "a manifest without the type is refused, has_loki=false is the way out" loki_refuse_repack key loki_m_key "has no loki_recovery"
+loki_copy loki_u_a_nodt loki_m_cmd
+sed -i "s/^cmdline=.*/cmdline=$(head -c 1000 /dev/zero | tr '\0' c)/" loki_m_cmd/manifest.txt
+rd_ck "a command line that runs into the LOKI header is refused" loki_refuse_repack cmd loki_m_cmd "where the LOKI header goes"
+loki_plain_of loki_m_cmd loki_m_cmd_p.img
+rd_ck "(without the patch the same directory builds)" test -s loki_m_cmd_p.img
+loki_copy loki_u_a_nodt loki_m_cmd2
+sed -i "s/^cmdline=.*/cmdline=$(head -c 928 /dev/zero | tr '\0' c)/" loki_m_cmd2/manifest.txt
+rd_ck "one that ends at the last byte before it is not" rd_repack_unpack loki_m_cmd2 loki_mc2
+loki_plain_of loki_m_cmd2 loki_m_cmd2_p.img
+rd_ck "(and is loki_tool's patch of the plain image)" loki_check loki_mc2.img loki_m_cmd2_p.img a
+rd_done "LOKI: the manifest's type and build are written as they are (127 characters at most), the real loki_tool makes the same bytes of a type that was changed; a patch offset or a block that cannot hold the patch code, a missing field, a command line that runs into the LOKI header are refused with the reason and no image"
+
+# The patch under other wrappers: an ASUS blob around a LOKI image, and a DHTB header around that.
+python3 -I "$LKB" make loki_blob.img --secure 0:0 LNX=loki_b_dt.img
+rd_unpack loki_blob.img loki_bu
+rd_ck "both wrappers are in the manifest" grep -q '^has_blob=true$' loki_bu/manifest.txt
+rd_ck "(the patch)" grep -q '^has_loki=true$' loki_bu/manifest.txt
+rd_ck "and are named in the order they come off" grep -q 'unpacked blob-wrapped loki-patched boot' loki_bu.log
+"$ABR" repack loki_bu -o loki_bu_back.img >/dev/null 2>&1
+rd_ck "an untouched repack is identical" cmp -s loki_blob.img loki_bu_back.img
+python3 -I - <<'PYEOF'
+import hashlib, struct
+payload = open("loki_blob.img", "rb").read()
+header = b"DHTB\x01\x00\x00\x00" + hashlib.sha256(payload).digest() + b"\x00" * 8 + struct.pack("<I", len(payload))
+open("loki_dhtb.img", "wb").write(header + b"\x00" * (512 - len(header)) + payload)
+PYEOF
+rd_unpack loki_dhtb.img loki_du
+rd_ck "three wrappers, named in the order they come off" grep -q 'unpacked dhtb-wrapped blob-wrapped loki-patched boot' loki_du.log
+"$ABR" repack loki_du -o loki_du_back.img >/dev/null 2>&1
+rd_ck "an untouched repack is identical" cmp -s loki_dhtb.img loki_du_back.img
+loki_copy loki_du loki_dux
+loki_edit loki_dux
+rd_ck "an edit goes through all three" rd_repack_unpack loki_dux loki_duxr
+rd_ck "the edit is in the image" loki_edit_is_in loki_duxr_re
+rd_ck "and the patch is as it was" loki_same_patch loki_du loki_duxr_re
+rd_done "LOKI under other wrappers (an ASUS blob, and a DHTB header around that): the wrappers are taken off and put back in order, the round trip is exact, an edit goes through"
+
+# An image that has the LOKI header but is not what loki_tool makes is refused, with the reason, and leaves no
+# directory: abr does not read it wrongly. (And what loki_tool unlok finds, abr finds.)
+python3 -I - <<'PYEOF'
+import struct
+good = open("loki_b_dt.img", "rb").read()      # page 2048, a block of a page, the patch code 12 bytes in, a device tree
+page = 2048
+pad = lambda n: -(-n // page) * page
+ks, rs = struct.unpack_from("<2I", good, 0x488)
+base = page + pad(ks) + pad(rs)                # where the block starts
+def word(d, off, v): struct.pack_into("<I", d, off, v)
+def make(name, fn, cut=None):
+    d = bytearray(good)
+    fn(d)
+    open("loki_bad_%s.img" % name, "wb").write(bytes(d if cut is None else d[:cut]))
+make("kernel", lambda d: word(d, 8, struct.unpack_from("<I", d, 8)[0] + 1))
+make("ramdisk", lambda d: word(d, 16, 7))
+make("second", lambda d: word(d, 24, 4096))
+make("version", lambda d: word(d, 40, 1))
+make("page", lambda d: word(d, 36, 1000))
+make("code", lambda d: d.__setitem__(slice(base + 12, base + 12 + 56), bytes(56)))
+make("far", lambda d: (d.__setitem__(slice(base + 12, base + 12 + 65), bytes(65)),
+                       d.__setitem__(slice(base + 16, base + 16 + 65), bytes(good[base + 12:base + 12 + 65]))))
+make("cut", lambda d: None, cut=base + 100)
+make("cutdt", lambda d: None, cut=len(good) - 1)
+PYEOF
+loki_refuse_info() {  # <image> <pattern>: info refuses the image with that reason
+    local out rc
+    out="$("$ABR" info "$1" 2>&1)"
+    rc=$?
+    [ "$rc" -ne 0 ] && grep -q -- "$2" <<<"$out"
+}
+for r in "kernel:of its LOKI header" "ramdisk:neither 0 nor the page size" "second:has a second stage" "version:has a header of version 1" \
+         "page:a page size (1000)" "code:does not have the patch code in the first 16 bytes" "far:does not have the patch code in the first 16 bytes" \
+         "cut:is cut short" "cutdt:is cut short"; do
+    x="${r%%:*}"
+    msg="${r#*:}"
+    rd_ck "$x: unpack refuses, says why, leaves no directory" loki_refuse "$x" "loki_bad_$x.img" "$msg"
+    rd_ck "$x: identify still names the header" said "LOKI header" "$ABR" identify "loki_bad_$x.img"
+done
+rd_ck "info refuses an image like that, too" loki_refuse_info loki_bad_kernel.img "of its LOKI header"
+rd_done "LOKI: an image with a LOKI header that loki_tool could not have made (sizes that do not add up, a second stage, a header of another version, no patch code in the window, cut short) is refused with the reason and leaves no directory"
+
 # ---- images of your own: ABR_REAL_IMAGES=<directory> tests/run_tests.sh <abr> checks every file of it the way
 # the fixtures above are checked -- an untouched repack is identical, every ramdisk archive is a directory that
 # GNU cpio agrees with, and a file put into a directory lands in the image. (Files abr does not take, an ext4
