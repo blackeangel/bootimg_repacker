@@ -85,10 +85,15 @@ VendorBootImage VendorBootImage::parse(const Bytes& image) {
                 break;
             }
     }
+    // Where the content ends (the last byte of a section, or of the header): what the final page padding is
+    // measured from.
+    size_t data_end = r.pos() + img.header_padding.size();
     to_page();
     Bytes ramdisk_section = r.bytes(vendor_ramdisk_size);
+    if (vendor_ramdisk_size) data_end = r.pos();
     to_page();
     img.dtb = r.bytes(dtb_size);
+    if (dtb_size) data_end = r.pos();
     to_page();
 
     if (img.header_version >= 4 && table_entry_num > 0) {
@@ -110,9 +115,11 @@ VendorBootImage VendorBootImage::parse(const Bytes& image) {
             img.ramdisk_fragments.push_back(std::move(e));
         }
         r.seek(table_start + static_cast<size_t>(table_entry_num) * table_entry_size);
+        data_end = r.pos();
         to_page();
         if (bootconfig_size > 0) {
             img.bootconfig = r.bytes(bootconfig_size);
+            data_end = r.pos();
             to_page();
         }
     } else {
@@ -124,14 +131,17 @@ VendorBootImage VendorBootImage::parse(const Bytes& image) {
         img.ramdisk_fragments.push_back(std::move(e));
         if (img.header_version >= 4 && bootconfig_size > 0) {
             img.bootconfig = r.bytes(bootconfig_size);
+            data_end = r.pos();
             to_page();
         }
     }
     img.consumed = r.pos();
     {
         uint64_t nominal = align_up(img.consumed, img.page_size);
-        if (img.consumed == image.size() && nominal > img.consumed)
+        if (img.consumed == image.size() && nominal > img.consumed) {
             img.missing_tail_padding = nominal - img.consumed;
+            img.kept_tail_padding = img.consumed - std::min<uint64_t>(data_end, img.consumed);
+        }
     }
     return img;
 }
@@ -175,10 +185,14 @@ Bytes VendorBootImage::build() const {
         w.le32(static_cast<uint32_t>(bootconfig.size()));
     }
     if (!header_padding.empty()) w.bytes(header_padding);
+    // Where the content ends (the last byte of a section, or of the header): what a cut-off tail is measured from.
+    size_t data_end = w.size();
     w.align(page_sz);
     w.bytes(ramdisk_section);
+    if (!ramdisk_section.empty()) data_end = w.size();
     w.align(page_sz);
     w.bytes(dtb);
+    if (!dtb.empty()) data_end = w.size();
     w.align(page_sz);
 
     if (header_version >= 4) {
@@ -192,16 +206,17 @@ Bytes VendorBootImage::build() const {
                 for (auto b : e.board_id) w.le32(b);
                 running_offset += static_cast<uint32_t>(e.data.size());
             }
+            if (!ramdisk_fragments.empty()) data_end = w.size();
             w.align(page_sz);
         }
         if (!bootconfig.empty()) {
             w.bytes(bootconfig);
+            data_end = w.size();
             w.align(page_sz);
         }
     }
     Bytes out = w.take();
-    if (missing_tail_padding && missing_tail_padding <= out.size())
-        out.resize(out.size() - static_cast<size_t>(missing_tail_padding));
+    trim_missing_padding(out, missing_tail_padding, kept_tail_padding, data_end);
     return out;
 }
 

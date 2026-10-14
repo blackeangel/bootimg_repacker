@@ -19,11 +19,13 @@
 // matters a lot when parsing untrusted/possibly-corrupt images.
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -76,6 +78,20 @@ constexpr uint64_t align_up(uint64_t value, uint64_t alignment) {
 
 constexpr uint64_t padding_for(uint64_t value, uint64_t alignment) {
     return align_up(value, alignment) - value;
+}
+
+// A dump whose last page of padding was cut off by whoever made it: the parser records how many bytes were
+// missing (`missing`) and how many of the padding the file does hold (`kept`, usually none: the file ends where
+// the last component's data ends). The rebuilt image is cut the same way -- by what its own padding allows: an
+// edit of the last component changes how much padding there is, and cutting by the old count would eat into
+// the component itself (or leave padding that the dump did not have). `data_end` is where the content ends in
+// `out`; what lies behind it is padding. Without `kept` (a manifest of an older abr) the count `missing` is the
+// limit of the cut and nothing more.
+inline void trim_missing_padding(Bytes& out, uint64_t missing, std::optional<uint64_t> kept, size_t data_end) {
+    if (missing == 0 || data_end >= out.size()) return;
+    const uint64_t room = out.size() - data_end;
+    const uint64_t cut = kept ? room - std::min(*kept, room) : std::min(missing, room);
+    out.resize(out.size() - static_cast<size_t>(cut));
 }
 
 // ---------------------------------------------------------------------

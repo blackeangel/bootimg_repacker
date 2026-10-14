@@ -66,6 +66,7 @@ struct VendorBootImage {
     std::optional<uint32_t> header_size_field;  // only if not the standard 2112/2128
     Bytes header_padding;                       // non-zero bytes between header struct and page end
     uint64_t missing_tail_padding = 0;          // final page padding absent from the source
+    std::optional<uint64_t> kept_tail_padding;  // with it: the part of that padding the source does hold
     size_t consumed = 0;                        // bytes of the source that belong to the image proper
 
     static VendorBootImage parse(const Bytes& image);

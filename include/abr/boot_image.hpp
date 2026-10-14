@@ -115,6 +115,9 @@ struct BootImage {
     std::array<uint32_t, 4> reserved{};                 // v3-v4 reserved[4]
     Bytes header_padding;                               // non-zero bytes between header struct and page end
     uint64_t missing_tail_padding = 0;                  // final page padding absent from the source file
+    // With missing_tail_padding: how much of that final padding the source file does hold (usually none). An edit
+    // of the last component changes the size of its padding; the rebuilt image keeps this much of it.
+    std::optional<uint64_t> kept_tail_padding;
 
     // Set by parse(): number of bytes of `image` that belong to the boot
     // image proper (end of the last component, page aligned, clipped to

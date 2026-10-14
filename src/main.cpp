@@ -945,6 +945,7 @@ void unpack_boot(const Bytes& whole, const fs::path& dir, const UnpackOptions& u
                                            {&img.second, "second"}});
         record_component(m, "kernel", "kernel", parts[0]);
         record_component(m, "ramdisk", "ramdisk.cpio", parts[1]);
+    if (img.missing_tail_padding && img.kept_tail_padding) m.set_u64("tail_padding_kept", *img.kept_tail_padding);
         record_component(m, "second", "second", parts[2]);
         save_ramdisk_trees(m, dir, {{"ramdisk", "ramdisk.cpio", &parts[1]}}, uo);
     }
@@ -1023,6 +1024,7 @@ Bytes repack_boot(const Manifest& m, const fs::path& dir, const RepackOptions& o
         img.ramdisk = std::move(parts[1]);
         img.second = std::move(parts[2]);
     }
+    if (m.has("tail_padding_kept")) img.kept_tail_padding = m.get_u64("tail_padding_kept", 0);
     img.dt = load_raw(m, dir, "dt");
     img.recovery_dtbo = load_raw(m, dir, "recovery_dtbo");
     img.dtb = load_raw(m, dir, "dtb");
@@ -1068,6 +1070,7 @@ void unpack_vendor_boot(const Bytes& whole, const fs::path& dir, const UnpackOpt
     m.set_u32("ramdisk_count", static_cast<uint32_t>(img.ramdisk_fragments.size()));
     std::vector<ComponentSource> fragment_sources;
     for (size_t i = 0; i < img.ramdisk_fragments.size(); ++i) {
+    if (img.missing_tail_padding && img.kept_tail_padding) m.set_u64("tail_padding_kept", *img.kept_tail_padding);
         const std::string p = "ramdisk" + std::to_string(i);
         fragment_sources.push_back({&img.ramdisk_fragments[i].data, p + ".cpio"});
     }
@@ -1125,6 +1128,7 @@ Bytes repack_vendor_boot(const Manifest& m, const fs::path& dir, const RepackOpt
     uint32_t count = m.get_u32("ramdisk_count", 0);
     std::vector<std::string> fragment_prefixes;
     for (uint32_t i = 0; i < count; ++i) fragment_prefixes.push_back("ramdisk" + std::to_string(i));
+    if (m.has("tail_padding_kept")) img.kept_tail_padding = m.get_u64("tail_padding_kept", 0);
     std::vector<Bytes> fragment_data = load_components(m, dir, fragment_prefixes, opt);
     for (uint32_t i = 0; i < count; ++i) {
         std::string p = "ramdisk" + std::to_string(i);

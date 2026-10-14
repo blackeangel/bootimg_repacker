@@ -341,6 +341,17 @@ def build_all(out):
     ext4[0x438:0x43A] = b"\x53\xef"
     put("ext4_like.img", bytes(ext4))
 
+    # --- trimmed final padding, the last component then edited -----------------
+    # (the RNG is used last, so the images above stay what they were)
+    dt_t = blob(5000)
+    full0 = boot_v012(0, kernel, ramdisk, dt=dt_t, page=2048, cmdline="console=ttyHSL0")
+    put("boot_v0_dt_trimmed.img", full0[:len(full0) - ((-len(dt_t)) % 2048)])  # CAF dt is the last component
+    vb_dtb = blob(900)
+    vb_full = vendor_boot_v4_empty_table(gz(blob(40000)), vb_dtb)
+    put("vendor_boot_v4_trimmed_tail.img", vb_full[:len(vb_full) - ((-len(vb_dtb)) % 2048)])
+    # a dump that ends in the middle of the final padding: 300 of its bytes are there, the other 548 are not
+    put("boot_v2_partial_padding.img", full[:len(full) - ((-len(dtb)) % 2048) + 300])
+
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:

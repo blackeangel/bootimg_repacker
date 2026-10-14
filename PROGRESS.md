@@ -887,6 +887,30 @@ value (0x55), which left the signature unchanged one run in 256 -- an XOR now;
 and the GNU `cpio` oracle needs the package installed in the CI jobs (added to
 the `apt-get` lists of the linux, windows/wine and arm64/qemu jobs).
 
+## The last component of a trimmed dump, edited (fixed 14 Oct 2026)
+
+Found while testing LOKI, in the general builder: a boot or vendor_boot image whose file lacks the padding
+of its last page (whoever dumped it left the final page off: what `loki_tool unlok` writes, and the dumps
+`missing_tail_padding` was made for) came out of a repack **too short** after its last component grew. The
+manifest kept `missing_tail_padding=N`, the number of bytes the file lacked, and `build()` cut exactly N bytes
+off the end of the rebuilt image; with a bigger last component (a 5000-byte device tree made 8000 bytes) the
+padding is smaller than N and the cut went into the data: 952 bytes of the dt were lost, without a word. A
+smaller last component, or a different padding after any edit, came back with padding the dump never had.
+
+The cut is now measured from where the content ends (`trim_missing_padding()` in `byte_io.hpp`): `build()` knows
+the end of the last component's data, the parser records how much of the final padding the dump holds
+(`tail_padding_kept`, usually 0: the file ends where the data ends), and the rebuilt image keeps that much of
+its own padding. A dump that ends in the middle of its padding keeps its bytes (untouched repack: identical);
+a manifest from an older abr (no `tail_padding_kept`) is cut by `missing_tail_padding` but never into the data.
+Both builders have it: `BootImage::build` (v0-v4, PXA) and `VendorBootImage::build`.
+
+Tests: new fixtures (a trimmed boot v0 with a CAF device tree last, a trimmed vendor_boot v4, a boot v2 that
+ends 300 bytes into its padding) round-trip exactly, and the last component of each of the three trimmed images
+is made 3000 bytes bigger, 400 smaller and 1,000,000 bigger: the rebuilt image ends exactly where the component
+ends, and an independent parser (`tests/tools/verify.py boot-part`; vendor_boot: abr's own unpack) reads the
+component back whole. The first version of the fix (cut by N, but at most the padding) failed these tests -- it
+left padding behind -- which is what made `tail_padding_kept` necessary.
+
 ## Rockchip KRNL (done, 11 Oct 2026)
 
 AIK's `unpackimg.sh` takes a `KRNL` file for a ramdisk image (`dd skip=8`, the

@@ -529,6 +529,43 @@ roundtrip_check fx/boot_v2_header_garbage.img "boot v2 (vendor data after the he
 expect_key rt_v2garb header_padding_file "v2: non-zero header page padding kept"
 roundtrip_check fx/boot_v2_trimmed_tail.img "boot v2 (final page padding trimmed by whoever dumped it)" trim
 expect_key rt_trim missing_tail_padding "trimmed dump: missing final padding recorded"
+roundtrip_check fx/boot_v0_dt_trimmed.img "boot v0 (CAF device tree last, its final page padding trimmed)" dttrim
+expect_key rt_dttrim missing_tail_padding "trimmed CAF dt: missing final padding recorded"
+roundtrip_check fx/vendor_boot_v4_trimmed_tail.img "vendor_boot v4 (dtb last, its final page padding trimmed)" vbtrim
+expect_key rt_vbtrim missing_tail_padding "trimmed vendor_boot: missing final padding recorded"
+roundtrip_check fx/boot_v2_partial_padding.img "boot v2 (the dump ends in the middle of the final page padding)" partpad
+expect_line rt_partpad "tail_padding_kept=300" "partly trimmed dump: the 300 padding bytes it holds are recorded"
+
+# The last component of such an image, edited. The padding stays off (the rebuilt image ends where the
+# component ends) and the component is whole: the count of trimmed bytes used to be applied to the new
+# size, which cut into a component that had grown (a 5000-byte dt made 8000 bytes came back 952 short).
+trim_edit() {   # <image> <part (verify.py)> <file in the unpacked directory> <name>
+    local img="$1" part="$2" file="$3" name="$4" delta d old new want ok=1
+    for delta in 3000 -400 1000000; do
+        d="te_${name}_$delta"
+        rm -rf "$d" "$d.img" "$d.part" "$d.re"
+        "$ABR" unpack "$img" -o "$d" >/dev/null 2>&1 || { fail "$name: unpack"; return; }
+        old=$(stat -c %s "$d/$file")
+        if [ "$delta" -gt 0 ]; then head -c "$delta" /dev/urandom >>"$d/$file"; else truncate -s $((old + delta)) "$d/$file"; fi
+        new=$(stat -c %s "$d/$file")
+        "$ABR" repack "$d" -o "$d.img" >/dev/null 2>&1 || { fail "$name: repack after $delta bytes"; return; }
+        want=$(($(stat -c %s "$img") - old + new))
+        if [ "$(stat -c %s "$d.img")" != "$want" ]; then
+            echo "  $name ($delta): $(stat -c %s "$d.img") bytes, expected $want (the old size, $(stat -c %s "$img"), moved by the change of the component)"
+            ok=0
+        fi
+        if [ -n "$part" ]; then
+            python3 "$TOOLS/verify.py" boot-part "$d.img" "$part" "$d.part" && cmp -s "$d.part" "$d/$file" || { echo "  $name ($delta): the component read back by an independent parser differs"; ok=0; }
+        else
+            "$ABR" unpack "$d.img" -o "$d.re" >/dev/null 2>&1 && cmp -s "$d.re/$file" "$d/$file" || { echo "  $name ($delta): the component read back differs"; ok=0; }
+        fi
+    done
+    [ $ok = 1 ] && pass "$name: the last component of a dump without its final padding, made bigger or smaller, is rebuilt whole and still without the padding" \
+        || fail "$name: editing the last component of a dump without its final padding"
+}
+trim_edit fx/boot_v2_trimmed_tail.img dtb dtb "trimmed boot v2 (dtb)"
+trim_edit fx/boot_v0_dt_trimmed.img dt dt.img "trimmed boot v0 (CAF dt)"
+trim_edit fx/vendor_boot_v4_trimmed_tail.img "" dtb "trimmed vendor_boot v4 (dtb)"
 roundtrip_check fx/vendor_boot_v4_emptytable_p2048.img "vendor_boot v4 (empty ramdisk table, page_size 2048, v3-sized header_size)" vbempty
 expect_line rt_vbempty "ramdisk_table=false" "vendor_boot v4: empty ramdisk table recorded"
 expect_key rt_vbempty header_size "vendor_boot v4: non-standard header_size recorded"

@@ -7,6 +7,7 @@ bootimg.h, avbtool) and not from abr's code.
     verify.py avb-footer <image> [pubkey.pem]     every HASH descriptor, size, layout
     verify.py boot-field <image> <field>          print one header field (v0-v2)
     verify.py ramdisk <image> <out>               slice the ramdisk out of a boot image (v0-v4)
+    verify.py boot-part <image> <part> <out>      slice kernel|ramdisk|second|dt|dtbo|dtb out of a v0-v2 image
 
 Exit status 0 = verified, 1 = mismatch (details on stderr), 2 = usage.
 """
@@ -120,6 +121,13 @@ def boot_ramdisk(d):
     return parse_boot_012(d)["ramdisk"]
 
 
+def cmd_boot_part(path, part, out):
+    f = parse_boot_012(Path(path).read_bytes())
+    if part not in ("kernel", "ramdisk", "second", "dt", "dtbo", "dtb"):
+        fail("no such part: " + part)
+    Path(out).write_bytes(f[part])
+
+
 def cmd_ramdisk(path, out):
     # The codec tests decompress this with the real gzip/lz4/zstd/xz/bzip2/lzop,
     # so the slicing has to be independent of abr.
@@ -196,6 +204,8 @@ def main(argv):
             return cmd_boot_field(argv[2], argv[3])
         if argv[1] == "ramdisk" and len(argv) == 4:
             return cmd_ramdisk(argv[2], argv[3])
+        if argv[1] == "boot-part" and len(argv) == 5:
+            return cmd_boot_part(argv[2], argv[3], argv[4])
         if argv[1] == "avb-footer" and len(argv) in (3, 4):
             return cmd_avb_footer(argv[2], argv[3] if len(argv) == 4 else None)
     except IndexError:
