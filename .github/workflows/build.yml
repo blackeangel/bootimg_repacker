@@ -29,8 +29,10 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq cmake ninja-build python3 python3-pip device-tree-compiler \
             u-boot-tools openssl lz4 zstd xz-utils bzip2 lzop liblzo2-dev default-jdk-headless \
-            libbcprov-java g++-14 clang-20 cpio
+            libbcprov-java g++-14 clang-20 cpio vboot-kernel-utils
           pip3 install --break-system-packages python-lzo
+          # (vboot-kernel-utils: `futility`, the tool Android Image Kitchen runs for a ChromeOS kernel blob -- a judge
+          # of the ChromeOS tests, found on the PATH; where it is missing they are judged by the Python tool alone)
 
       # rkcrc of rkflashtool (BSD licence; compiled here, not part of this repository) writes the
       # Rockchip KRNL images: the suite compares abr's with its output. Without it that one comparison
@@ -136,7 +138,7 @@ jobs:
           sudo apt-get install -y -qq cmake ninja-build clang-20 lld-20 mingw-w64 \
             g++-mingw-w64-x86-64-posix wine64 python3 python3-pip device-tree-compiler \
             u-boot-tools openssl lz4 zstd xz-utils bzip2 lzop liblzo2-dev default-jdk-headless \
-            libbcprov-java cpio
+            libbcprov-java cpio vboot-kernel-utils
           pip3 install --break-system-packages python-lzo
 
       - name: Configure
@@ -197,7 +199,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq cmake ninja-build g++-14-aarch64-linux-gnu qemu-user python3 \
             python3-pip device-tree-compiler u-boot-tools openssl lz4 zstd xz-utils bzip2 lzop \
-            liblzo2-dev default-jdk-headless libbcprov-java cpio
+            liblzo2-dev default-jdk-headless libbcprov-java cpio vboot-kernel-utils
           pip3 install --break-system-packages python-lzo
 
       - name: Configure

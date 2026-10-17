@@ -301,9 +301,6 @@ std::string Identity::aik_type() const {
 
 std::string Identity::unsupported_note() const {
     switch (kind) {
-        case Kind::CHROMEOS:
-            return "this is a ChromeOS kernel blob (Android Image Kitchen opens it with futility "
-                   "vbutil_kernel); abr cannot unpack it yet";
         case Kind::SIN1:
         case Kind::SIN2:
         case Kind::SIN3:

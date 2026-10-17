@@ -28,6 +28,7 @@ tools" below.
 | ASUS blob (`"MSM-RADIO-UPDATE"`, with or without the `-SIGNED-BY-SIGNBLOB-` header): AIK's `blobunpack`/`blobpack` | **done + verified** against the real BlobTools `blobpack`/`blobunpack` (compiled, not vendored) and an independent Python tool: a blob that holds one image is a wrapper layer (`has_blob=true`; AIK's case), any other is `type=blob` with a file per partition; the signature is kept, `datalen` follows an edit; only blobpack's layout is read |
 | Intel OSIP boot images (AIK's `mboot`): OSIP header (or none), signature of 0/480/728/1024 bytes, cmdline, image info, bootstub of 4096/8192 bytes, kernel, gzip ramdisk | **done + verified** against the real `mboot` (compiled, not vendored) and an independent Python tool: images with and without a header, unsigned and signed, are packed to the same bytes, `abr` unpacks them into the pieces `mboot -u` writes, an untouched repack is identical, and an edited image (ramdisk, signature taken away or put in) is a fixed point of `mboot`; the header's sector count, "unsigned" bit and checksum follow mboot's rules, but only when the size or the signature changed; the ramdisk is `ramdisk.cpio` + `ramdisk/` |
 | LOKI patch of `loki_tool` (AIK: `loki_tool unlok` / `patch`) on boot and recovery images | **done + verified** against the real `loki_tool` (compiled, not vendored) and an independent Python tool, on synthetic bootloader images: a wrapper layer (`has_loki=true`) that needs no `aboot.img` -- the block of the bootloader's code behind the ramdisk is carried, so an untouched image comes back as it was and an edited one is what `loki_tool patch` makes of the plain repack; the patch code at offsets 0/4/8/12, a block of 512 bytes or of a page, boot and recovery, with and without a device tree, tails and partition fill; `loki patch` itself (the search in an `aboot.img`, loki's table of targets) is not done |
+| ChromeOS (vboot) kernel blobs (AIK: `futility vbutil_kernel --get-vmlinuz` / `--pack`) | **done + verified** against the real `futility` (package `vboot-kernel-utils`, run as an oracle, not vendored) and an independent Python tool: the blob is a wrapper layer around the image in its kernel field (`has_chromeos=true`) or a container of its own (`type=chromeos`); preambles 2.0 / 2.1 / 2.2, RSA of 1024 to 4096 bits with the exponent 65537 or 3, SHA-1 / 256 / 512; an untouched blob comes back byte for byte whoever signed it, an edited one is signed again (with the public developer key of vboot_reference, which abr carries, or with `--chromeos-key` / `--chromeos-keyblock`) and is what `futility --pack` / `--repack` make; x86 blobs and layouts futility does not write are refused with the reason; no real Chromebook partition has been tried, see "ChromeOS kernel blobs" |
 | Marvell PXA boot header (Samsung Galaxy J1 / Core Prime / Tab 4) | **done + verified** against the real `pxa-mkbootimg` / `pxa-unpackbootimg` (compiled, not vendored): 240 images byte-identical, 34 edits equal to the tool's output (commit `0652429`) |
 | `abr identify`: AIK's `androidbootimg.magic` as code | **done + verified**: 98 samples, agree with `file(1)` + AIK's magic file on all (when both are at hand) and with the built-in table; unsupported-but-known formats are named in the refusal (commit `803b820`) |
 | Nook / Nook-tablet signing header in front, LG Bump footer behind | **done** (synthetic fixtures; no real device dump of either yet): header kept as a constant prefix (`prefix_kind=`), footer kept as tail, neither triggers the stale-signature warning (commit `2a76f87`) |
@@ -41,7 +42,7 @@ tools" below.
 | self-contained RSA: BigInt (Knuth D, Montgomery), DER/PEM/X.509, PKCS#1 v1.5 sign/verify, PKCS#8/PKCS#1 key parsing, AVB public-key blob -- **no OpenSSL anywhere in the build** | **done + verified** (Python integers, `openssl dgst -sign`, `avbtool extract_public_key`; see "Self-contained crypto" below) |
 | manifest + CLI (`abr info/unpack/repack`) | **done** |
 | CMake: FetchContent-vendored static zlib/lz4/zstd/xz/bzip2 | **done + build-verified natively on Linux**, both the dynamic and the `-DABR_STATIC_BINARY=ON` fully-static configurations |
-| Test suite (`tests/run_tests.sh`) | **done, 295/295 passing** locally on g++-14 and on clang-20, 294/294 for `abr.exe` under wine (with the optional `pxa-*` / `rkcrc` / `blobpack`+`blobunpack` / `mboot` / `loki_tool` oracles and AIK's magic file); CI runs the matrix (g++-14, clang-20, Windows under wine, arm64 under qemu-user) -- see Verification |
+| Test suite (`tests/run_tests.sh`) | **done, 311/311 passing** locally on g++-14 and on clang-20, 310/310 for `abr.exe` under wine (with the optional `pxa-*` / `rkcrc` / `blobpack`+`blobunpack` / `mboot` / `loki_tool` / `futility` oracles and AIK's magic file); CI runs the matrix (g++-14, clang-20, Windows under wine, arm64 under qemu-user) -- see Verification |
 | CMake cross toolchains (mingw-w64, Android NDK) | **done + verified** (mingw reproduced locally; NDK only provable via CI, see below) |
 | GitHub Actions static build matrix (linux-x86_64, windows-x86_64, android-arm64) | **done + verified**: run 35313499827, all 3 jobs green, all 3 static binaries produced as artifacts (abr-linux-x86_64, abr-windows-x86_64, abr-android-arm64) |
 
@@ -718,7 +719,7 @@ compiled from source and used only as oracles, never as a dependency.
 | AIK's compression defaults (`xz -1 -Ccrc32`, `lz4 -9`) and `--level` | abr uses each codec's usual setting; `<component>_level=N` overrides |
 | `--original` (repack with the stored ramdisk, skip `ramdisk/`), `--origsize` (pad back to the original size), `--forceelf` (repack an ELF as ELF), `--avbkey` | not needed as options: an untouched `ramdisk.cpio` is replayed as it was (compressed bytes included), the recorded partition-size fill (`pad_to`) is always written back, an ELF is always rebuilt as an ELF (AIK's default converts it to an AOSP image instead; abr cannot do that conversion), and `--avb-key` / `--avb1-key` are the signing keys |
 | BLOB (`blobunpack` / `blobpack`, AndroidRoot/BlobTools) | **done**, judged by the real tools: unpack / repack / info; wrapper layer between DHTB and AMONET, or a directory of its own for several partitions; see "BLOB" below |
-| ChromeOS kernel blob (`futility vbutil_kernel`) | recognised, not unpacked; signing is its own project |
+| ChromeOS kernel blob (`futility vbutil_kernel`) | **done**, judged by the real `futility` and a Python tool: unpack / repack / info as the outermost wrapper layer (ChromeOS -> DHTB -> blob -> LOKI -> AMONET) or as a container; the signatures are kept while what they cover is unchanged and made again after an edit (the developer key of vboot_reference, or `--chromeos-key`); x86 refused; see "ChromeOS kernel blobs" below |
 | Sony SIN (`sony_dump`) | recognised, not unpacked |
 | Intel OSIP (`mboot`) | **done**, judged by the real `mboot`: unpack / repack / info, header rules as mboot's, the ramdisk as a directory; see "OSIP" below |
 | Rockchip KRNL (`dd skip=8`, `rkcrc -k`) | **done**, oracle-verified (`rkcrc`): unpack / repack / info; a payload that is a cpio gets the ramdisk directory (AIK treats it as a ramdisk the same way); see "Rockchip KRNL" below |
@@ -1239,10 +1240,121 @@ groups they should -- all but one: leaving the LOKI header in the plain image ch
 generic parser reads the command line only up to its NUL), so that mutant is equivalent. None of the 14 real images
 supplied has a LOKI header: no real LOKI image has been tried.
 
+## ChromeOS kernel blobs (done, 16-17 Oct 2026)
+
+The kernel partition of a Chromebook holds a *vboot* blob; Android Image Kitchen opens it with `futility vbutil_kernel
+--get-vmlinuz` and builds it again with `futility vbutil_kernel --pack image-new.img --keyblock kernel.keyblock
+--signprivate kernel_data_key.vbprivk --version 1 --vmlinuz unsigned-new.img --bootloader empty --config empty --arch arm
+--flags 0x1` (the public developer keys of vboot_reference). The format is vboot_reference's (`2struct.h`,
+`cmd_vbutil_kernel.c`; BSD-3-Clause), read from its sources and from the output of the real `futility`:
+
+- the **keyblock**: `"CHROMEOS"`, version 2.x, its size (u64 at byte 16), a signature and a checksum of its own, flags,
+  the data key (a descriptor at byte 80: offset, size, algorithm, version; the key packed as u32 `arrsize`, u32 `n0inv`,
+  the modulus and `rr`, little endian). abr keeps it as it is;
+- the **preamble**: `preamble_size`, the signature descriptor of the preamble (byte 8), the header version (2.0, 2.1,
+  2.2), the kernel version, the load address of the body, the address and the size of the bootloader, the signature
+  descriptor of the body (byte 72), for 2.1 and 2.2 the vmlinuz header address and size, for 2.2 the flags: 96, 112 or
+  116 bytes; behind it the body signature, the preamble signature and zeros up to `preamble_size`;
+- the keyblock and the preamble together are the verification block, **64 KiB** unless `--pad` says otherwise;
+- the **body**: the kernel (aligned to 4096), the config (4096 bytes: the command line, NUL-terminated), the params
+  (4096 bytes: the boot parameters of x86, zeros on ARM) and the bootloader (its size is in the preamble, a multiple
+  of 4096).
+
+Both signatures are RSA PKCS#1 v1.5 with the *data key* of the keyblock: the body's over the whole body, the preamble's
+over the preamble header and the body signature. The algorithm number is vboot's: `id / 3` is the key size (1024, 2048,
+4096, 8192 bits), `id % 3` the hash (SHA-1, SHA-256, SHA-512); 12 to 14 are 2048 bits with the exponent 3, 15 to 17 are
+3072 bits with the exponent 3.
+
+Code: `include/abr/legacy/chromeos.hpp` + `src/legacy/chromeos.cpp` (`has_chromeos_header`, `strip_chromeos`,
+`apply_chromeos`, `ChromeosInfo`, `ChromeosSigning`, `parse_vbprivk`, `keyblock_data_key`, `chromeos_algorithm`);
+`src/legacy/chromeos_devkeys.cpp` (the developer keyblock and `kernel_data_key.vbprivk` of vboot_reference as arrays,
+generated by `tools/gen_chromeos_devkeys.py`, BSD-3-Clause notice in the file; the suite checks them byte for byte against
+the installed `vboot-kernel-utils`); the ChromeOS part of `src/main.cpp` (`Wrappers::chromeos`, `save_chromeos_fields`,
+`load_chromeos_fields`, `apply_chromeos_wrapper`, `unpack_chromeos` / `repack_chromeos`, `chromeos_description`,
+`--chromeos-key` / `--chromeos-keyblock`, `has_chromeos` in `build_image_once` / `do_unpack`). The wrapper is the
+outermost one: it comes off first (before DHTB, BLOB, LOKI, AMONET) and goes on last. `tests/tools/chromeos_tool.py` is
+the independent tool, written from the layout (its RSA is Python's own integers): `make`, `keyblock`, `vbprivk`,
+`dump`, `verify`, `kernel`, `field`, `algorithms` and `corrupt` (twenty-seven ways to damage a blob).
+
+What is the plain image and what stays: the **kernel field of the body** is the plain image (what `--get-vmlinuz`
+writes, with the zeros up to the 4096 boundary), unpacked as every other image; a boot image (or whatever abr unpacks,
+DHTB header and all) in it makes the blob a wrapper layer, `has_chromeos=true`, and the directory is the image's.
+Anything else is a container of its own (`type=chromeos`, the kernel is `chromeos_kernel.bin`). The rest is the manifest's:
+`chromeos_keyblock_file=chromeos_keyblock.bin`, `chromeos_preamble_version` (2.0 / 2.1 / 2.2),
+`chromeos_kernel_version`, `chromeos_flags` (2.2), `chromeos_body_load_address`, `chromeos_bootloader_address` (only
+when it is not the load address + kernel + config + params, which is what futility writes), `chromeos_bootloader_size`,
+`chromeos_vmlinuz_header_address` (2.1 and 2.2, when not 0), `chromeos_vblock_size`, `chromeos_config_file`
+(`chromeos_config.txt`: the command line), `chromeos_params_file`, `chromeos_bootloader_file` (the last two without the
+zeros that fill their fields), `chromeos_body_signature_file`, `chromeos_preamble_signature_file`,
+`chromeos_signed_sha256`, and what follows the blob as `chromeos_tail_file` or `chromeos_pad_byte` + `chromeos_pad_to`.
+
+Decisions worth knowing:
+- **The signatures are kept while nothing they cover has changed, and made again when something has.**
+  `chromeos_signed_sha256` is the SHA-256 of what the signatures cover (the keyblock, the preamble header with the
+  body signature, the body). At repack the keyblock, the header and the body are built from the manifest and the
+  directory; if that hash is the same, the signatures of the original go back in. So a blob that went through an unpack
+  and a repack comes back byte for byte whoever signed it (a foreign keyblock, bad signatures, an algorithm abr does not
+  know), and an edited one never keeps a signature that no longer fits.
+- **Whom the blob is signed by.** abr has one private key: the public developer data key of vboot_reference. When the
+  keyblock of the blob holds that key (the keyblock is the developer one, or another that carries the same data key) the
+  signatures are made with it. `--chromeos-key <.vbprivk>` signs with a key of one's own, which must be the data key of
+  the keyblock (checked: the algorithm and the modulus; the error says how to give the keyblock made for the key).
+  `--chromeos-keyblock <.keyblock>` puts another keyblock in (checked: starts with `"CHROMEOS"`, its size word is the
+  file's size, its data key can be read); abr **never signs under a keyblock it has no key for** (error, naming
+  `--chromeos-key`).
+- **A keyblock that is somebody else's** and no key of it given: an edit signs the blob with the developer key under the
+  developer keyblock of vboot_reference, with a warning -- this is what AIK does (it replaces the keyblock every
+  time). A Chromebook in developer mode boots such a blob; one that checks the keyblock against its own keys does not.
+  Untouched blobs keep their keyblock.
+- The keyblock is opaque: its own signature (or checksum) is neither checked nor made. `futility vbutil_keyblock` makes
+  one; `--chromeos-keyblock` takes it.
+- A plain image whose manifest gets `has_chromeos=true` (no keyblock in the directory) becomes the blob AIK's line makes:
+  the developer keyblock and key, preamble 2.2 with version 1 and flags 0x1, a config and a bootloader of **one space**
+  each. (futility refuses a zero-byte file for either; what AIK's `empty` file holds could not be looked up -- the
+  repository was not reachable from here -- so one space is the choice. The suite compares abr with `futility --pack` of the
+  same one-space files, byte for byte.) `has_chromeos=false` leaves the blob out: the plain image comes out.
+- **x86 is refused**: a preamble with a vmlinuz header (size not 0) holds a bzImage no Android tool opens (`info` says so,
+  `unpack` leaves no directory). So is any blob that is not laid out the way futility writes it, with the reason:
+  cut short at the keyblock, the preamble or the body, a keyblock of version 3 or a size below its header, a preamble
+  of version 3.2 or 2.3, reserved words that are not zero (in the preamble or in a signature descriptor), signatures
+  anywhere but where futility puts them, an empty signature, data of its own behind the signatures, a bootloader or kernel
+  that is not a multiple of 4096, a body too small for its fields. Nothing is ever read wrongly.
+- On repack: a kernel that is empty, a preamble version that abr does not make, flags without a 2.2 preamble or a vmlinuz
+  header address without 2.1, a verification block too small for the keyblock and the signatures, a config over 4096
+  bytes or params over 4096 are refused with the reason (and `has_chromeos=false` as the way out).
+- A uniform-byte tail behind the blob (zeros up to the size of the partition) is a fill, made again at repack
+  (`chromeos_pad_byte`, `chromeos_pad_to`; an edit that outgrows the partition is refused as for every image); any
+  other tail is the file `chromeos_tail.bin`.
+- The chain is ChromeOS -> DHTB -> BLOB -> LOKI -> AMONET (`peel_wrappers`, one layer inside the other, put back in the
+  opposite order). The blob is a wrapper only when its kernel field is something abr unpacks; otherwise it is the container.
+
+Judged by the Python tool and, where it is installed (`ABR_FUTILITY`, else `futility` on the `PATH`; the CI installs
+`vboot-kernel-utils`, where the suite prints which of the two it used), by the real `futility`. 16 test groups: the
+developer keyblock and key abr embeds are the ones the package ships; nine kinds of blob (preambles 2.0 / 2.1 / 2.2,
+RSA 1024 to 4096, exponent 65537 and 3, SHA-1 / 256 / 512, a kernel that needs padding and one that does not) made by the
+tool -- `futility --verify` accepts them, `abr info` says what they are, unpacked and repacked untouched they are
+identical; the same edited (ramdisk files) -- the blob is the tool's of what the directory builds without the blob, the
+signatures are good, futility verifies it; every field of the manifest changed, one at a time and together; a partition
+dump (the blob, zeros up to the size of the partition); `has_chromeos=false` and `=true` (the blob AIK's `futility --pack`
+line makes, and the same under another keyblock); the version of the preamble and the vmlinuz header address; what the
+manifest cannot say; a blob under somebody else's keyblock (kept, then signed under the developer keyblock with a warning,
+or with the key given); keys that are not the keyblock's, keyblocks without a key, files that are no keys, no keyblocks;
+twenty-one layouts that futility does not write, refused; signatures that are bad (kept by an untouched repack, good after
+an edit); `futility --pack` and `futility --repack` make the same blobs as abr (the command line, a bootloader, the
+version, the flags, the load address and the verification block; the developer and foreign keys; edited images);
+a blob around a DHTB header; a blob of a kernel abr does not unpack (a container). With `ABR_REAL_IMAGES` every
+real image supplied is wrapped in a blob by the tool and round-trips (13 of 14 unpack; the other is ext4).
+The suites: g++-14 311/311, clang-20 311/311, Windows under wine 310/310 (295 / 295 / 294 before).
+Negative controls: twenty-six mutations of the code (the hash taken by the wrong index; the modulus of the data key not reversed; signatures never kept; signatures always kept; the default bootloader address without the params; the kernel aligned to 2048; the flags not written; a verification block of the preamble's size only; an x86 blob accepted; data behind the signatures accepted; the reserved words of a signature descriptor ignored; a swap to the developer keyblock that keeps the foreign one; the fields not trimmed; the tail boundary off by one; the preamble signature over the header only; the body signature over the kernel only; the data size of the preamble signature not checked; the bootloader alignment not checked; the keyblock left out of the hash that decides whether signatures are kept; the developer data key never recognised; flags 0 for a fresh blob; a key given that is not checked against the keyblock; a keyblock without its key accepted; the keyblock version not checked; the signatures never verified; the size of a keyblock given not checked) each fail at least one group, ten of them exactly one, the group made for the case; none survives.
+
+Not done, and not claimed: **no real Chromebook partition has been tried** (none at hand; the blobs in the suite hold Android
+boot images and random bytes); the 8192-bit algorithms (9 to 11) are in the code and not in the tests; the keyblock's own
+signature is not checked; x86 blobs are refused; a FIT image as the kernel field (abr does not read FIT yet) is read as one device-tree blob (the whole FIT, `blob0.dtb`) and round-trips byte for byte; the kernel and the device trees inside it are not taken apart.
+
 ## Next steps (in order)
 
 1. Remaining AIK parity, easiest first: QCDT creation,
-   ChromeOS signing, Sony SIN. The stages 2 and 3 of the user's own spec need a scope
+   Sony SIN. The stages 2 and 3 of the user's own spec need a scope
    decision before anything is built.
 2. Housekeeping: AIK-like default levels as an opt-in, gzip OS-byte
    determinism, UTF-8 `wmain` on Windows, `zlib-ng` for faster gzip, splitting
@@ -1501,8 +1613,8 @@ Useful as a checklist; wrong in places, and much wider than `abr`:
    AOSP test key or `--avb1-key/--avb1-cert`; self-contained RSA).
 2. ~~**CPIO ramdisk as a directory tree**~~ -- **done** for newc and crc
    (see "The ramdisk as a directory"); odc and binary archives stay files.
-3. Remaining AIK parity: QCDT creation, ChromeOS futility signing,
-   SIN (PXA, KRNL/RKCRC, AMONET, BLOB, OSIP, LOKI, NOOK are done).
+3. Remaining AIK parity: QCDT creation, SIN (PXA, KRNL/RKCRC, AMONET, BLOB,
+   OSIP, LOKI, NOOK, ChromeOS are done).
 4. Spec stage 1 leftovers: MBN, FIT/ITB. Spec stages 2/3: scope decision.
 5. Housekeeping: CI should run the quirk suite; `main.cpp` is ~1200 lines
    and should be split per format.

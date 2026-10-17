@@ -6,6 +6,7 @@
 //   abr unpack  <image> [-o <outdir>]
 //   abr repack  <dir>   -o <image> [--avb-key <private_key.pem>]
 //                       [--avb1-key <key[.pk8]> [--avb1-cert <cert.pem|der>]]
+//                       [--chromeos-key <.vbprivk> [--chromeos-keyblock <.keyblock>]]
 //
 // Format is auto-detected from magic bytes; see detect_format() below.
 #include <algorithm>
@@ -35,6 +36,7 @@
 #include "abr/legacy/amonet.hpp"
 #include "abr/legacy/avb1.hpp"
 #include "abr/legacy/blob.hpp"
+#include "abr/legacy/chromeos.hpp"
 #include "abr/legacy/dhtb.hpp"
 #include "abr/legacy/elf_boot.hpp"
 #include "abr/legacy/krnl.hpp"
@@ -57,7 +59,7 @@ namespace {
 
 // ------------------------------------------------------------ detection --
 
-enum class Fmt { BOOT, VENDOR_BOOT, DTBO, DTB, VBMETA, UIMAGE, ELF_BOOT, KRNL, BLOB, OSIP, UNKNOWN };
+enum class Fmt { BOOT, VENDOR_BOOT, DTBO, DTB, VBMETA, UIMAGE, ELF_BOOT, KRNL, BLOB, OSIP, CHROMEOS, UNKNOWN };
 
 // Where the "ANDROID!" container starts: within the first kMagicSearchLimit bytes (a vendor
 // wrapper in front of it), or -- Barnes & Noble Nook images -- right behind the fixed-size
@@ -77,6 +79,7 @@ Fmt detect_format(const Bytes& d) {
     if (d.size() >= 8 && std::memcmp(d.data(), "ANDROID!", 8) == 0) return Fmt::BOOT;
     if (d.size() >= 8 && std::memcmp(d.data(), "VNDRBOOT", 8) == 0) return Fmt::VENDOR_BOOT;
     if (d.size() >= 4 && std::memcmp(d.data(), "AVB0", 4) == 0) return Fmt::VBMETA;
+    if (has_chromeos_header(d)) return Fmt::CHROMEOS;
     if (d.size() >= 4) {
         uint32_t be = (uint32_t(d[0]) << 24) | (uint32_t(d[1]) << 16) | (uint32_t(d[2]) << 8) | d[3];
         if (be == kDtTableMagic || be == kAcpioTableMagic) return Fmt::DTBO;
@@ -148,6 +151,7 @@ const char* fmt_name(Fmt f) {
         case Fmt::KRNL: return "krnl";
         case Fmt::BLOB: return "blob";
         case Fmt::OSIP: return "osip";
+        case Fmt::CHROMEOS: return "chromeos";
         case Fmt::UNKNOWN: return "unknown";
     }
     return "unknown";
@@ -164,38 +168,52 @@ Fmt fmt_from_name(const std::string& s) {
     if (s == "krnl") return Fmt::KRNL;
     if (s == "blob") return Fmt::BLOB;
     if (s == "osip") return Fmt::OSIP;
+    if (s == "chromeos") return Fmt::CHROMEOS;
     return Fmt::UNKNOWN;
 }
 
-// What is put around a plain image and has to come off before anything can be read: a DHTB header
-// (abr/legacy/dhtb.hpp), an ASUS blob whose only partition holds the image (abr/legacy/blob.hpp), and under
-// them the loki patch (abr/legacy/loki.hpp) or the amonet patch (abr/legacy/amonet.hpp). Repack puts them back
-// in the opposite order.
+// What is put around a plain image and has to come off before anything can be read: a ChromeOS kernel blob
+// (abr/legacy/chromeos.hpp), a DHTB header (abr/legacy/dhtb.hpp), an ASUS blob whose only partition holds the
+// image (abr/legacy/blob.hpp), and under them the loki patch (abr/legacy/loki.hpp) or the amonet patch
+// (abr/legacy/amonet.hpp). Repack puts them back in the opposite order.
 struct Wrappers {
+    std::optional<legacy::ChromeosInfo> chromeos;  // its kernel is `chromeos_inner`
     std::optional<legacy::DhtbInfo> dhtb;
     std::optional<legacy::BlobImage> blob;  // its one partition's data is `blob_inner`, not in here
     std::optional<legacy::LokiInfo> loki;
     std::optional<legacy::AmonetInfo> amonet;
-    Bytes dhtb_inner;  // what the wrappers' removal leaves is kept here, if it is not `data` itself
+    Bytes chromeos_inner;  // what the wrappers' removal leaves is kept here, if it is not `data` itself
+    Bytes dhtb_inner;
     Bytes blob_inner;
     Bytes loki_plain;
     Bytes unpatched;
 
-    bool any() const { return dhtb || blob || loki || amonet; }
-    // "dhtb-wrapped ", "blob-wrapped ", "loki-patched ", "amonet-patched ", or several, or nothing: for the
-    // line that says what was unpacked.
+    bool any() const { return chromeos || dhtb || blob || loki || amonet; }
+    // "chromeos-wrapped ", "dhtb-wrapped ", "blob-wrapped ", "loki-patched ", "amonet-patched ", or several, or
+    // nothing: for the line that says what was unpacked.
     std::string adjectives() const {
-        return std::string(dhtb ? "dhtb-wrapped " : "") + (blob ? "blob-wrapped " : "") + (loki ? "loki-patched " : "") +
-               (amonet ? "amonet-patched " : "");
+        return std::string(chromeos ? "chromeos-wrapped " : "") + (dhtb ? "dhtb-wrapped " : "") + (blob ? "blob-wrapped " : "") +
+               (loki ? "loki-patched " : "") + (amonet ? "amonet-patched " : "");
     }
 };
 
 // Takes the wrappers off `data`. The plain image is `data` itself or lives in `w`: the reference is good
 // as long as both are. A blob is a wrapper only if its single partition holds something abr unpacks
-// (what Android Image Kitchen does with it); any other blob is a container of its own (Fmt::BLOB).
+// (what Android Image Kitchen does with it); any other blob is a container of its own (Fmt::BLOB). The same
+// goes for a ChromeOS kernel blob (Fmt::CHROMEOS): its kernel is the plain image if abr knows what it is.
 const Bytes& peel_wrappers(const Bytes& data, Wrappers& w) {
-    w.dhtb = strip_dhtb(data, w.dhtb_inner);
-    const Bytes* inner = w.dhtb ? &w.dhtb_inner : &data;
+    const Bytes* outer = &data;
+    if (legacy::has_chromeos_header(data)) {
+        Bytes kernel;
+        std::optional<legacy::ChromeosInfo> blob = legacy::strip_chromeos(data, kernel);
+        if (blob && detect_format(kernel) != Fmt::UNKNOWN) {
+            w.chromeos = std::move(blob);
+            w.chromeos_inner = std::move(kernel);
+            outer = &w.chromeos_inner;
+        }
+    }
+    w.dhtb = strip_dhtb(*outer, w.dhtb_inner);
+    const Bytes* inner = w.dhtb ? &w.dhtb_inner : outer;
     if (legacy::BlobImage::looks_like(*inner)) {
         legacy::BlobImage blob = legacy::BlobImage::parse(*inner);
         if (blob.parts.size() == 1) {
@@ -219,6 +237,7 @@ const Bytes& peel_wrappers(const Bytes& data, Wrappers& w) {
 struct RepackOptions {
     std::string avb_key_pem;               // --avb-key: AVB 2.0 signing key (file contents)
     std::optional<Signer> avb1_signer;     // --avb1-key/--avb1-cert: AVBv1 boot signature
+    legacy::ChromeosSigning chromeos;      // --chromeos-key/--chromeos-keyblock: a ChromeOS kernel blob's signature
     std::string ramdisk_from;              // --ramdisk-from: "tree" or "cpio" when both could be meant
     // The second try of build_image(): what had to be compressed again is compressed as densely as the
     // decoders allow (dense_level()), because the first try made an image too big for its partition.
@@ -1681,6 +1700,163 @@ Bytes apply_loki_wrapper(const Manifest& m, const fs::path& dir, const Bytes& pl
     return assemble_envelope(m, l.tail, core, false, 0, opt);
 }
 
+// ------------------------------------------------------------ chromeos --
+//
+// A ChromeOS kernel blob (abr/legacy/chromeos.hpp), which Android Image Kitchen opens with `futility vbutil_kernel`.
+// When the kernel in it is something abr unpacks (an Android boot image, ...), the blob is a wrapper around it, like
+// a DHTB header: `has_chromeos=true`, and the directory is the kernel's. Otherwise it is a container of its own
+// (type=chromeos) whose kernel is the file chromeos_kernel.bin. The manifest keeps what the blob adds -- the keyblock,
+// the fields of the preamble, the config (the kernel's command line), the params and the bootloader of the body, the
+// signatures, what follows the blob -- and repack makes the blob again around the kernel the directory builds. The
+// signatures are the original's while nothing they cover has changed, and made again when it has (with the developer
+// key of vboot_reference, or the key of --chromeos-key). `has_chromeos=false` leaves the blob out (a plain image comes
+// out); `has_chromeos=true` on its own (a manifest with no keyblock) makes the blob Android Image Kitchen's command
+// line makes.
+
+void save_chromeos_fields(Manifest& m, const fs::path& dir, const legacy::ChromeosInfo& c) {
+    save_raw(m, dir, "chromeos_keyblock", c.keyblock, "chromeos_keyblock.bin");
+    m.set("chromeos_preamble_version", std::to_string(c.preamble_major) + "." + std::to_string(c.preamble_minor));
+    m.set_u32("chromeos_kernel_version", c.kernel_version);
+    if (c.preamble_minor >= 2) m.set_addr("chromeos_flags", c.flags);
+    m.set_addr("chromeos_body_load_address", c.body_load_address);
+    if (c.bootloader_address) m.set_addr("chromeos_bootloader_address", *c.bootloader_address);
+    m.set_u32("chromeos_bootloader_size", c.bootloader_size);
+    if (c.preamble_minor >= 1 && c.vmlinuz_header_address) m.set_addr("chromeos_vmlinuz_header_address", c.vmlinuz_header_address);
+    m.set_u32("chromeos_vblock_size", c.pad);
+    // The command line, the x86 boot parameters and the bootloader of the body: as they are, without the zeros
+    // that fill their fields.
+    save_raw(m, dir, "chromeos_config", c.config, "chromeos_config.txt");
+    save_raw(m, dir, "chromeos_params", c.params, "chromeos_params.bin");
+    save_raw(m, dir, "chromeos_bootloader", c.bootloader, "chromeos_bootloader.bin");
+    // The signatures, and what they cover: while that is unchanged they are put back as they were.
+    save_raw(m, dir, "chromeos_body_signature", c.body_signature, "chromeos_body_signature.bin");
+    save_raw(m, dir, "chromeos_preamble_signature", c.preamble_signature, "chromeos_preamble_signature.bin");
+    m.set_hex("chromeos_signed_sha256", c.signed_sha256);
+    // What follows the blob: kept as it was, and the fill up to the size of the partition made again.
+    save_raw(m, dir, "chromeos_tail", c.tail.tail, "chromeos_tail.bin");
+    if (c.tail.pad_to) {
+        m.set_addr("chromeos_pad_byte", c.tail.pad_byte);
+        m.set_u64("chromeos_pad_to", c.tail.pad_to);
+    }
+}
+
+legacy::ChromeosInfo load_chromeos_fields(const Manifest& m, const fs::path& dir) {
+    legacy::ChromeosInfo c;
+    // A directory that holds no blob (a plain image with has_chromeos=true added to its manifest) gets what
+    // Android Image Kitchen's `futility vbutil_kernel --pack` line makes: the developer keyblock and key, version 1,
+    // flags 0x1, a config and a bootloader of one space each (futility will not take an empty file for either).
+    const bool fresh = !m.has("chromeos_keyblock_file");
+    c.keyblock = fresh ? legacy::chromeos_dev_keyblock() : load_raw(m, dir, "chromeos_keyblock");
+    if (m.has("chromeos_preamble_version")) {
+        const std::string text = m.get("chromeos_preamble_version");
+        unsigned major = 0, minor = 0;
+        char end = 0;
+        if (std::sscanf(text.c_str(), "%u.%u%c", &major, &minor, &end) != 2)
+            throw FormatError("chromeos_preamble_version in manifest.txt is \"" + text + "\"; it is a version like 2.2");
+        c.preamble_major = major;
+        c.preamble_minor = minor;
+    }
+    c.kernel_version = m.get_u32("chromeos_kernel_version", 1);
+    const uint64_t flags = m.get_addr("chromeos_flags", fresh ? 1 : 0);
+    if (flags > 0xFFFFFFFFull) throw FormatError("chromeos_flags in manifest.txt does not fit in 32 bits");
+    c.flags = static_cast<uint32_t>(flags);
+    c.body_load_address = m.get_addr("chromeos_body_load_address", 0x100000);
+    if (m.has("chromeos_bootloader_address")) c.bootloader_address = m.get_addr("chromeos_bootloader_address", 0);
+    c.bootloader_size = m.get_u32("chromeos_bootloader_size", legacy::kChromeosAlign);
+    c.vmlinuz_header_address = m.get_addr("chromeos_vmlinuz_header_address", 0);
+    c.pad = m.get_u32("chromeos_vblock_size", legacy::kChromeosDefaultPad);
+    const Bytes one_space{' '};
+    c.config = (m.has("chromeos_config_file") || !fresh) ? load_raw(m, dir, "chromeos_config") : one_space;
+    c.params = load_raw(m, dir, "chromeos_params");
+    c.bootloader = (m.has("chromeos_bootloader_file") || !fresh) ? load_raw(m, dir, "chromeos_bootloader") : one_space;
+    c.body_signature = load_raw(m, dir, "chromeos_body_signature");
+    c.preamble_signature = load_raw(m, dir, "chromeos_preamble_signature");
+    c.signed_sha256 = m.get_hex("chromeos_signed_sha256");
+    if (c.body_signature.empty() || c.preamble_signature.empty()) c.signed_sha256.clear();  // nothing to keep
+    c.tail.tail = load_raw(m, dir, "chromeos_tail");
+    c.tail.pad_byte = static_cast<uint8_t>(m.get_u32("chromeos_pad_byte", 0));
+    c.tail.pad_to = m.get_u64("chromeos_pad_to", 0);
+    return c;
+}
+
+// The blob made of `kernel`: the verification block and the body from the manifest, the signatures as described
+// above; what follows the blob as it was. `wrapper` says which sentence an error ends with.
+Bytes apply_chromeos_wrapper(const Manifest& m, const fs::path& dir, const Bytes& kernel, const RepackOptions& opt,
+                             bool wrapper) {
+    const legacy::ChromeosInfo c = load_chromeos_fields(m, dir);
+    legacy::ChromeosSigned how = legacy::ChromeosSigned::KEPT;
+    Bytes core;
+    try {
+        core = legacy::apply_chromeos(kernel, c, opt.chromeos, &how);
+    } catch (const FormatError& e) {
+        throw FormatError(std::string(e.what()) +
+                          (wrapper ? " (has_chromeos=false in manifest.txt leaves the ChromeOS kernel blob out)" : ""));
+    }
+    switch (how) {
+        case legacy::ChromeosSigned::KEPT:
+            break;
+        case legacy::ChromeosSigned::SIGNED: {
+            const std::string with = opt.chromeos.key ? "the key given (--chromeos-key)" : "the developer key of vboot_reference";
+            // (no signatures came with the directory: a plain image with has_chromeos=true, nothing was "changed")
+            note(c.signed_sha256.empty()
+                     ? "the ChromeOS kernel blob is signed with " + with
+                     : "what the signatures of the ChromeOS kernel blob cover has changed: they are made again, with " + with +
+                           (opt.chromeos.key ? "" : ", the data key of the blob's keyblock"));
+            break;
+        }
+        case legacy::ChromeosSigned::NEW_KEYBLOCK:
+            note("the ChromeOS kernel blob is signed under the keyblock given (--chromeos-keyblock)");
+            break;
+        case legacy::ChromeosSigned::DEVELOPER_KEYBLOCK:
+            warn("what the signatures of the ChromeOS kernel blob cover has changed, and its keyblock is somebody else's: "
+                 "abr has no key for it. The blob is signed with the developer key under the developer keyblock of "
+                 "vboot_reference instead, as Android Image Kitchen does; a Chromebook in developer mode boots it, one "
+                 "that checks the keyblock against its own keys does not. --chromeos-key and --chromeos-keyblock sign "
+                 "with keys of your own");
+            break;
+    }
+    return assemble_envelope(m, c.tail, core, false, 0, opt);
+}
+
+void unpack_chromeos(const Bytes& host, const fs::path& dir) {
+    Bytes kernel;
+    std::optional<legacy::ChromeosInfo> c = legacy::strip_chromeos(host, kernel);
+    if (!c) throw FormatError("this is not a ChromeOS kernel blob (it does not start with a keyblock)");
+    Manifest m;
+    m.set("type", "chromeos");
+    save_chromeos_fields(m, dir, *c);
+    save_raw(m, dir, "chromeos_kernel", kernel, "chromeos_kernel.bin");
+    m.save(dir / "manifest.txt", "abr ChromeOS kernel blob manifest -- edit then `abr repack " + dir.string() + " -o out.img`");
+}
+
+Bytes repack_chromeos(const Manifest& m, const fs::path& dir, const RepackOptions& opt) {
+    if (!m.has("chromeos_kernel_file")) throw FormatError("manifest.txt has no chromeos_kernel_file");
+    return apply_chromeos_wrapper(m, dir, load_raw(m, dir, "chromeos_kernel"), opt, false);
+}
+
+// What to say of a blob: the preamble, the data key, the fields of the body, whether the signatures are good.
+std::string chromeos_description(const legacy::ChromeosInfo& c) {
+    char word[32];
+    std::string out = "vboot preamble " + std::to_string(c.preamble_major) + "." + std::to_string(c.preamble_minor) +
+                      ", kernel version " + std::to_string(c.kernel_version);
+    if (c.preamble_minor >= 2) {
+        std::snprintf(word, sizeof word, "0x%x", c.flags);
+        out += std::string(", flags ") + word;
+    }
+    std::snprintf(word, sizeof word, "0x%llx", static_cast<unsigned long long>(c.body_load_address));
+    out += std::string(", loaded at ") + word + "; keyblock " + std::to_string(c.keyblock.size()) + " bytes, data key " +
+           (c.data_key_algorithm ? legacy::chromeos_algorithm_name(*c.data_key_algorithm) : std::string("unreadable")) +
+           (c.data_key_is_dev ? " (the developer key of vboot_reference)" : "") +
+           "; kernel " + std::to_string(c.kernel_size) + " bytes, config " + std::to_string(c.config.size()) + " bytes, bootloader " +
+           std::to_string(c.bootloader_size) + " bytes; ";
+    auto verdict = [](const std::optional<bool>& ok) { return !ok ? "not checked" : *ok ? "valid" : "NOT valid"; };
+    if (c.body_signature_ok == c.preamble_signature_ok)
+        out += std::string("signatures ") + verdict(c.body_signature_ok);
+    else
+        out += std::string("body signature ") + verdict(c.body_signature_ok) + ", preamble signature " + verdict(c.preamble_signature_ok);
+    return out;
+}
+
 // ---------------------------------------------------------------- osip --
 //
 // Intel OSIP boot image (abr/legacy/osip.hpp), which Android Image Kitchen opens with mboot: an OSIP header,
@@ -1932,6 +2108,15 @@ void print_info(const fs::path& path) {
 
     Fmt f = detect_format(data);
     std::cout << "file:   " << path.string() << " (" << raw.size() << " bytes)\n";
+    if (wrap.chromeos) {
+        std::cout << "wrapper: ChromeOS kernel blob (" << chromeos_description(*wrap.chromeos)
+                  << (wrap.chromeos->tail.empty()
+                          ? ""
+                          : "; " + std::to_string(wrap.chromeos->tail.pad_to ? wrap.chromeos->tail.pad_to - wrap.chromeos->core_size
+                                                                              : wrap.chromeos->tail.tail.size()) +
+                                " bytes follow the blob")
+                  << ")\n";
+    }
     if (wrap.dhtb) {
         std::cout << "wrapper: DHTB (" << (wrap.dhtb->has_seandroid_footer ? "+SEAndroid footer " : "")
                    << (wrap.dhtb->has_padding ? "+padding " : "") << ", inner " << wrap.dhtb_inner.size()
@@ -2127,6 +2312,15 @@ void print_info(const fs::path& path) {
                            << ")\n";
             break;
         }
+        case Fmt::CHROMEOS: {
+            Bytes kernel;
+            const std::optional<legacy::ChromeosInfo> c = legacy::strip_chromeos(data, kernel);
+            std::cout << "blob:           " << chromeos_description(*c) << "\n";
+            std::cout << "cmdline:        " << std::string(c->config.begin(), std::find(c->config.begin(), c->config.end(), 0)) << "\n";
+            std::cout << "kernel:         " << kernel.size() << " bytes\n";
+            print_envelope_info(c->tail);
+            break;
+        }
         case Fmt::UNKNOWN: {
             const Identity id = identify(data);
             std::cout << "(unrecognized format"
@@ -2155,15 +2349,18 @@ Bytes build_image_once(const fs::path& dir, const RepackOptions& opt) {
         case Fmt::KRNL: result = repack_krnl(m, dir, opt); break;
         case Fmt::BLOB: result = repack_blob(m, dir); break;
         case Fmt::OSIP: result = repack_osip(m, dir, opt); break;
+        case Fmt::CHROMEOS: result = repack_chromeos(m, dir, opt); break;
         case Fmt::UNKNOWN:
             throw FormatError("manifest.txt has no (or an unrecognized) 'type=' field");
     }
 
     if (opt.avb1_signer && f != Fmt::BOOT)
         warn("--avb1-key/--avb1-cert only apply to boot and recovery images; ignored here");
+    if ((opt.chromeos.key || opt.chromeos.keyblock) && f != Fmt::CHROMEOS && !m.get_bool("has_chromeos", false))
+        warn("--chromeos-key/--chromeos-keyblock only apply to a ChromeOS kernel blob; ignored here");
 
     // The wrappers go on in the opposite order to the one they came off in: the amonet patch, the loki patch, the
-    // blob, then DHTB.
+    // blob, DHTB, then the ChromeOS kernel blob.
     if (m.get_bool("has_amonet", false)) {
         legacy::AmonetInfo amonet;
         amonet.microloader = load_raw(m, dir, "amonet_microloader");
@@ -2189,6 +2386,7 @@ Bytes build_image_once(const fs::path& dir, const RepackOptions& opt) {
         dhtb.trailing_extra = load_raw(m, dir, "dhtb_trailing_extra");
         result = wrap_dhtb(result, dhtb);
     }
+    if (m.get_bool("has_chromeos", false)) result = apply_chromeos_wrapper(m, dir, result, opt, true);
     return result;
 }
 
@@ -2282,6 +2480,7 @@ void do_unpack(const fs::path& in, const fs::path& outdir, const UnpackOptions& 
             case Fmt::KRNL: unpack_krnl(payload, outdir, uo); break;
             case Fmt::BLOB: unpack_blob(payload, outdir); break;
             case Fmt::OSIP: unpack_osip(payload, outdir, uo); break;
+            case Fmt::CHROMEOS: unpack_chromeos(payload, outdir); break;
             case Fmt::UNKNOWN:
                 throw FormatError(in.string() + ": " + describe_unknown(payload));
         }
@@ -2289,12 +2488,17 @@ void do_unpack(const fs::path& in, const fs::path& outdir, const UnpackOptions& 
         if (wrap.any()) {
             Manifest m = Manifest::load(outdir / "manifest.txt");
             std::string what;
+            if (wrap.chromeos) {
+                m.set_bool("has_chromeos", true);
+                save_chromeos_fields(m, outdir, *wrap.chromeos);
+                what = "ChromeOS-wrapped";
+            }
             if (wrap.dhtb) {
                 m.set_bool("has_dhtb", true);
                 m.set_bool("dhtb_seandroid_footer", wrap.dhtb->has_seandroid_footer);
                 m.set_bool("dhtb_padding", wrap.dhtb->has_padding);
                 save_raw(m, outdir, "dhtb_trailing_extra", wrap.dhtb->trailing_extra, "dhtb_trailing_extra.bin");
-                what = "DHTB-wrapped";
+                what += std::string(what.empty() ? "" : ", ") + "DHTB-wrapped";
             }
             if (wrap.blob) {
                 m.set_bool("has_blob", true);
@@ -2368,6 +2572,7 @@ void usage() {
         "  abr [-j N] repack <dir> -o <image> [--avb-key <private_key.pem>]\n"
         "                              [--avb1-key <key> [--avb1-cert <cert.pem|cert.der>]]\n"
         "                              [--ramdisk-from tree|cpio]\n"
+        "                              [--chromeos-key <.vbprivk> [--chromeos-keyblock <.keyblock>]]\n"
         "  abr identify [-b] <file>...    what it is, worded like Android Image Kitchen's\n"
         "                                 `file -m androidbootimg.magic` (-b: the label only)\n\n"
         "  -j N         threads to use (default: the number of cores, at most 16; 1 = one\n"
@@ -2376,6 +2581,10 @@ void usage() {
         "  --avb1-key   key for the old boot_signer signature of a boot image (the public AOSP\n"
         "               test key is used when omitted); <key> may be a PEM/DER file or, as in\n"
         "               Android Image Kitchen, a base name N with N.pk8 and N.x509.pem\n"
+        "  --chromeos-key  key (.vbprivk) to sign a ChromeOS kernel blob with, and\n"
+        "  --chromeos-keyblock  the keyblock (.keyblock) made for it; without them the signatures\n"
+        "               of the original are kept while the content is unchanged, and made with the\n"
+        "               public developer key of vboot_reference (as Android Image Kitchen does) when not\n"
         "  A ramdisk is unpacked twice: ramdisk.cpio (exactly what the image held) and, when it\n"
         "  can be one, the directory ramdisk/ with ramdisk.meta (owners, modes, order). Edit\n"
         "  either; repack takes the one that changed (--ramdisk-from decides if both did).\n"
@@ -2387,10 +2596,11 @@ void usage() {
         "vendor_boot-debug.img/vendor_kernel_boot.img (header v3-v4), dtbo.img,\n"
         "raw dtb, vbmeta.img/vbmeta_system.img (AVB), U-Boot legacy uImage, Sony ELF\n"
         "boot images, Rockchip KRNL (kernel.img / boot.img), ASUS blobs (\"MSM-RADIO-UPDATE\",\n"
-        "signed with the SIGNBLOB header or not), Intel OSIP boot images.\n"
+        "signed with the SIGNBLOB header or not), Intel OSIP boot images, ChromeOS kernel blobs\n"
+        "(the vboot format of a Chromebook's kernel partition).\n"
         "Also transparently handled: a trailing AVB hash footer on boot/\n"
         "vendor_boot/dtbo; a DHTB wrapper (with SEAndroid footer/padding) around\n"
-        "any of them; an ASUS blob around one image; the LOKI patch (loki_tool) of a\n"
+        "any of them; a ChromeOS kernel blob or an ASUS blob around one image; the LOKI patch (loki_tool) of a\n"
         "boot or recovery image; the AMONET patch of Amazon's Fire tablets; a MediaTek\n"
         "(MTK) sub-header on the kernel and/or ramdisk.\n";
 }
@@ -2500,7 +2710,7 @@ int main(int argc, char** argv) {
             fs::path dir = args[0];
             fs::path out;
             RepackOptions opt;
-            std::string avb1_key, avb1_cert;
+            std::string avb1_key, avb1_cert, chromeos_key, chromeos_keyblock;
             for (size_t i = 1; i < args.size(); ++i) {
                 if ((args[i] == "-o" || args[i] == "--output") && i + 1 < args.size())
                     out = args[++i];
@@ -2512,6 +2722,10 @@ int main(int argc, char** argv) {
                     avb1_key = args[++i];
                 else if (args[i] == "--avb1-cert" && i + 1 < args.size())
                     avb1_cert = args[++i];
+                else if (args[i] == "--chromeos-key" && i + 1 < args.size())
+                    chromeos_key = args[++i];
+                else if (args[i] == "--chromeos-keyblock" && i + 1 < args.size())
+                    chromeos_keyblock = args[++i];
                 else if (args[i] == "--ramdisk-from" && i + 1 < args.size()) {
                     opt.ramdisk_from = args[++i];
                     if (opt.ramdisk_from != "tree" && opt.ramdisk_from != "cpio") {
@@ -2528,6 +2742,24 @@ int main(int argc, char** argv) {
             if (out.empty()) { std::cerr << "repack: -o <output image> is required\n"; return 1; }
             if (!avb1_key.empty() || !avb1_cert.empty())
                 opt.avb1_signer = load_avb1_signer(avb1_key, avb1_cert);
+            if (!chromeos_key.empty()) {
+                try {
+                    opt.chromeos.key = parse_vbprivk(read_file(chromeos_key));
+                } catch (const FormatError& e) {
+                    throw FormatError("--chromeos-key " + chromeos_key + ": " + e.what());
+                }
+            }
+            if (!chromeos_keyblock.empty()) {
+                Bytes keyblock = read_file(chromeos_keyblock);
+                if (!has_chromeos_header(keyblock))
+                    throw FormatError("--chromeos-keyblock " + chromeos_keyblock + " is not a keyblock (it does not start with \"CHROMEOS\")");
+                try {
+                    keyblock_data_key(keyblock);  // is it one?
+                } catch (const FormatError& e) {
+                    throw FormatError("--chromeos-keyblock " + chromeos_keyblock + ": " + e.what());
+                }
+                opt.chromeos.keyblock = std::move(keyblock);
+            }
             do_repack(dir, out, opt);
         } else {
             usage();

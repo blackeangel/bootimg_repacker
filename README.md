@@ -31,7 +31,9 @@ moved behind it: `unpack` keeps it as `microloader.bin` and `has_amonet=true`
 in the manifest, reads the boot image under it, and `repack` puts it back;
 the same two manifest lines put it on an ordinary v0 image), the *loki*
 patch of `loki_tool` on a boot or recovery image (a block of the bootloader's
-code behind the ramdisk: `has_loki=true`; see below), the Barnes &
+code behind the ramdisk: `has_loki=true`; see below), a ChromeOS (vboot) kernel
+blob around an image (`has_chromeos=true`: the keyblock, the preamble's fields
+and the signatures are kept in the manifest; see below), the Barnes &
 Noble Nook signing header in front of an image (1 MiB, 256 KiB on the
 tablets), LG's Bump and Samsung's SEAndroid footers behind it, an AVB hash
 footer on boot / vendor_boot / dtbo, and the vendor data described below.
@@ -54,6 +56,7 @@ of a bare "unknown format".
 abr info   <image>
 abr unpack <image> [-o <outdir>] [--no-tree | --tree-only]
 abr repack <dir> -o <image> [--ramdisk-from tree|cpio] [--avb-key <private_key.pem>] [--avb1-key <key> [--avb1-cert <cert>]]
+                            [--chromeos-key <.vbprivk> [--chromeos-keyblock <.keyblock>]]
 abr identify [-b] <file>...   # what is it? worded like Android Image Kitchen's `file -m androidbootimg.magic`
 # with any of them: -j N (or -jN, --threads N) = the most threads to use, 0 = automatic, 1 = none
 ```
@@ -141,8 +144,7 @@ apart with `awk`. `abr` has the same signatures as code, so the same
 question needs no other program: `abr identify boot.img` prints the label
 (`AOSP bootimg`, `AOSP-PXA bootimg`, `NOOK signing (green loader)`,
 `MTK bootimg, KERNEL, ...`, `AVBv2 signing footer`, ...), `-b` leaves the
-file name off. Formats that `abr` recognises but cannot unpack yet (a
-ChromeOS kernel, Sony SIN) are
+file name off. Formats that `abr` recognises but cannot unpack yet (Sony SIN) are
 named in the refusal, together with the AIK tool that opens them, instead
 of "unrecognized format"; a refused `unpack` leaves no empty directory
 behind. The test suite compares 98 synthetic samples with the built-in
@@ -303,6 +305,45 @@ and names `has_loki=false`.
 The 56 bytes of the patch code are the one thing of loki that is in `abr`
 (Copyright (c) 2013 Dan Rosenberg, BSD-2-Clause; the notice is in
 `src/legacy/loki.cpp`); the layout was read from its sources.
+
+### ChromeOS kernel blobs
+
+The kernel partition of a Chromebook holds a *vboot* blob: a keyblock (`"CHROMEOS"`, the data key, a checksum or
+signature of its own), a preamble (the version of the kernel, the load address of the body, the address and size of the
+bootloader, the signature of the body, and its own signature), both padded to 64 KiB, and the body: the kernel
+(aligned to 4096), the config (4096 bytes: the command line), the params (4096 bytes: the boot parameters of x86,
+zeros on ARM) and the bootloader. Android Image Kitchen opens it with `futility vbutil_kernel --get-vmlinuz` and makes it
+again with `futility vbutil_kernel --pack`, always signed with the public developer keys of vboot_reference. `abr` does
+both on its own.
+
+`unpack` takes the kernel field out of the body and unpacks that. A boot image (or whatever else `abr` unpacks, DHTB
+header and all) in it is a directory of its own and the blob is a wrapper layer around it, like a DHTB header:
+`has_chromeos=true` in the manifest. Anything else is a container (`type=chromeos`, the kernel is `chromeos_kernel.bin`).
+The keyblock (`chromeos_keyblock.bin`), the version of the preamble (2.0, 2.1, 2.2), the version of the kernel, the flags,
+the load address, the address and size of the bootloader, the address of the vmlinuz header, the size of the verification
+block, the config (`chromeos_config.txt`), the params and the bootloader (without the zeros that fill their fields), both
+signatures and what follows the blob (other data, or the fill up to the size of the partition) are in the manifest and
+the files beside it. `info` says which key the keyblock holds (the algorithm: 0 to 17 of vboot, RSA of 1024 to 8192 bits,
+the public exponent 65537 or 3, SHA-1, SHA-256 or SHA-512) and whether both signatures are good.
+
+`repack` makes the blob again: the kernel is the image the directory builds, padded with zeros to 4096, and the fields are
+what the manifest says. The signatures are **kept** while nothing they cover has changed -- a blob that was not touched
+comes back byte for byte, whoever signed it, a bad signature included -- and **made again** when something has. `abr`
+has the public developer key of vboot_reference (the one AIK signs with; it protects nothing) and signs with it when the
+blob's keyblock holds the developer data key. When the keyblock is somebody else's, `abr` says so and does what AIK does:
+it signs with the developer key under the developer keyblock (a Chromebook in developer mode boots that; one that checks the
+keyblock against its own keys does not). `--chromeos-key <.vbprivk>` signs with a key of your own, which has to be the data
+key of the keyblock (`abr` refuses one that is not), and `--chromeos-keyblock <.keyblock>` puts another keyblock in: `abr`
+never signs under a keyblock it has no key for. A plain image whose manifest gets `has_chromeos=true` is made into the blob
+that AIK's `futility vbutil_kernel --pack` line makes (version 1, flags 0x1, the developer keys; `futility` makes the
+same bytes). `has_chromeos=false` leaves the blob out.
+
+What `abr` does not do: it keeps the keyblock as it is and neither checks nor makes its own signature (a keyblock is signed
+by the key of whoever vouches for it: `futility vbutil_keyblock` makes one, and `--chromeos-keyblock` takes it); a blob for x86
+(its preamble carries a vmlinuz header: a bzImage that no Android tool opens) is refused, and so is a blob that is not laid
+out the way `futility` writes it (signatures anywhere but behind the preamble header, data behind them, a bootloader or kernel
+that is not a whole number of 4096 bytes, ...), with the reason and nothing left behind. The public developer keyblock and key
+are in `src/legacy/chromeos_devkeys.cpp` (BSD-3-Clause, generated by `tools/gen_chromeos_devkeys.py`; see the licence notes).
 
 ### Threads and compression levels
 
@@ -619,6 +660,20 @@ repacks after an edit of the ramdisk, the kernel, the device tree or the header
 fields is what `loki_tool patch` makes of the plain image the same directory
 builds without the patch. (No real LOKI image has been tried: none was at hand.)
 
+The ChromeOS kernel blobs are judged by a Python tool of the suite (`tests/tools/chromeos_tool.py`, written from
+vboot_reference's `2struct.h` and `cmd_vbutil_kernel.c`, its RSA is Python's own integers) and, where `futility` is
+installed (`ABR_FUTILITY`, or on the `PATH`; the CI installs `vboot-kernel-utils`), by the real `futility vbutil_kernel`.
+Nine kinds of blob -- the preambles 2.0, 2.1 and 2.2; RSA keys of 1024, 2048, 3072 and 4096 bits, public exponents 65537
+and 3, SHA-1, SHA-256 and SHA-512; kernels that need padding up to 4096 and kernels that do not -- are made by the tool,
+verified by `futility`, unpacked and repacked to the same bytes; what `abr` repacks after an edit is the blob the tool makes
+of the image the directory builds without the blob (with every field of the manifest changed, too), and, for what it has
+options for, the blob `futility --pack` makes; `futility --repack` makes the blob `abr` signs under another keyblock; a plain
+image given `has_chromeos=true` becomes the blob of AIK's command line, byte for byte; 21 kinds of layout that `futility`
+does not write are refused with the reason; signatures that are bad stay as they were until an edit; a blob around a DHTB
+header, a container of random bytes, and (with `ABR_REAL_IMAGES`) every real image wrapped by the tool round-trip. (No real
+Chromebook kernel partition has been tried: none was at hand; the blobs hold Android boot images. The 8192-bit algorithms
+are in the code and not in the tests.)
+
 Compression is judged by the real tools. For every codec the suite builds a
 boot image with `abr`, slices the ramdisk out of it with a separate script
 (`tests/tools/verify.py`, not `abr`) and has the real `gzip`, `lz4`, `zstd`,
@@ -673,9 +728,8 @@ Two smaller gaps:
 - Hard links in a ramdisk's cpio archive (the ramdisk then stays one
   `ramdisk.cpio`); a directory tree is made for `newc`/`crc` archives only.
 - The rest of the Android Image Kitchen format list:
-  QCDT tooling, ChromeOS `futility` signing, Sony SIN.
-  `abr identify` already names all of them; what is missing is unpacking
-  and packing them. See `PROGRESS.md` for the plan.
+  QCDT tooling, Sony SIN. `abr identify` already names all of them; what is
+  missing is unpacking and packing them. See `PROGRESS.md` for the plan.
 - U-Boot's newer FIT (Flattened Image Tree) format -- only the older
   legacy `mkimage` container is supported.
 - Filesystems (ext4, F2FS, EROFS, SquashFS) and sparse images: out of
@@ -697,6 +751,11 @@ README explaining exactly what and why -- see those for details:
   BSD-2-Clause; the full notice is kept in that file, and has to go with a
   binary distribution of `abr` (the notice of the licence, in the documentation
   or other material).
+- `src/legacy/chromeos_devkeys.cpp`: the public developer keyblock and signing key of vboot_reference
+  (`tests/devkeys`, https://chromium.googlesource.com/chromiumos/platform/vboot_reference), Copyright (c) 2010 The
+  Chromium OS Authors, BSD-3-Clause; generated by `tools/gen_chromeos_devkeys.py`. The full notice is kept in that file
+  and has to go with a binary distribution of `abr`. The private half has been public for years: the key protects
+  nothing, it is there so that a blob can be signed the way Android Image Kitchen signs it.
 - `tests/reference/mkbootimg/`: AOSP's `mkbootimg.py` and friends,
   Apache-2.0, not linked into the `abr` binary at all.
 - `tests/reference/avb/`: AOSP's `avbtool.py`, MIT, used only as the

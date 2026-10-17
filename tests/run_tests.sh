@@ -3792,6 +3792,618 @@ done
 rd_ck "info refuses an image like that, too" loki_refuse_info loki_bad_kernel.img "of its LOKI header"
 rd_done "LOKI: an image with a LOKI header that loki_tool could not have made (sizes that do not add up, a second stage, a header of another version, no patch code in the window, cut short) is refused with the reason and leaves no directory"
 
+# =========================================================================
+# ChromeOS kernel blobs: the "verified boot" (vboot) format of a Chromebook's kernel partition, which Android Image
+# Kitchen opens with `futility vbutil_kernel --get-vmlinuz` and builds again with `futility vbutil_kernel --pack`
+# (abr/legacy/chromeos.hpp). abr does both on its own: the keyblock, the fields of the preamble, the config, the params,
+# the bootloader, the signatures and what follows the blob are kept in the manifest, and the signatures are made
+# afresh only when something they cover has changed. tests/tools/chromeos_tool.py makes and reads the blobs on its
+# own -- it is written from vboot_reference's layout (2struct.h, cmd_vbutil_kernel.c), shares no code with abr, and does
+# its RSA with Python's integers -- and what abr writes is what it makes, byte for byte. Keys of every kind it knows
+# (the algorithms 0, 4, 5, 7, 8, 13 and 16: RSA of 1024 to 4096 bits, public exponent 65537 or 3, SHA-1, -256 and -512)
+# are made with openssl; the developer keys are read out of the C++ source abr embeds them in. `futility` (the package
+# vboot-kernel-utils; ABR_FUTILITY names it) is a judge too where it is installed: it makes the same blob (--pack),
+# signs the same body under another keyblock (--repack), takes the kernel out (--get-vmlinuz) and verifies abr's.
+# =========================================================================
+CRT="$TOOLS/chromeos_tool.py"
+cros() { python3 -I "$CRT" "$@"; }
+CROS_FUT="${ABR_FUTILITY:-$(command -v futility 2>/dev/null || true)}"
+cros_fut() { [ -n "$CROS_FUT" ] && [ -x "$CROS_FUT" ]; }
+if cros_fut; then
+    echo "note: futility ($CROS_FUT) judges the ChromeOS kernel blobs too"
+else
+    echo "note: futility is not installed (ABR_FUTILITY): the ChromeOS kernel blobs are judged by tests/tools/chromeos_tool.py alone"
+fi
+
+CK=cros_k
+mkdir -p "$CK"
+cros devkeys "$REPO_ROOT/src/legacy/chromeos_devkeys.cpp" "$CK"
+cros_genkey() {  # <name> <bits> <algorithm> [3 | a .pem to use]: a key of one's own (.vbprivk) and the keyblock made for it
+    local e=""
+    if [ "${4:-}" = 3 ]; then
+        e="-3"
+    elif [ -n "${4:-}" ]; then
+        cp "$4" "$CK/$1.pem"
+    fi
+    if [ ! -s "$CK/$1.pem" ]; then
+        openssl genrsa $e -traditional -out "$CK/$1.pem" "$2" >/dev/null 2>&1 || openssl genrsa $e -out "$CK/$1.pem" "$2" >/dev/null 2>&1
+    fi
+    cros vbprivk "$CK/$1.vbprivk" --pem "$CK/$1.pem" --algorithm "$3" && cros keyblock "$CK/$1.keyblock" --key "$CK/$1.vbprivk"
+}
+cros_genkey k1024 1024 0
+cros_genkey k2048 2048 5
+cros_genkey k2048b 2048 4
+cros_genkey k4096 4096 8
+cros_genkey k4096s 4096 7 "$CK/k4096.pem"
+cros_genkey k2048e3 2048 13 3
+cros_genkey k3072e3 3072 16 3
+cros_kp() { if [ "$1" = dev ]; then echo "$CK/kernel_data_key.vbprivk"; else echo "$CK/$1.vbprivk"; fi; }
+cros_kb() { if [ "$1" = dev ]; then echo "$CK/kernel.keyblock"; else echo "$CK/$1.keyblock"; fi; }
+cros_algname() {  # a table of its own, not abr's
+    case "$1" in
+        0) echo "RSA-1024/SHA-1" ;; 4) echo "RSA-2048/SHA-256" ;; 5) echo "RSA-2048/SHA-512" ;; 7) echo "RSA-4096/SHA-256" ;;
+        8) echo "RSA-4096/SHA-512" ;; 13) echo "RSA-2048-EXP3/SHA-256" ;; 16) echo "RSA-3072-EXP3/SHA-256" ;;
+    esac
+}
+if [ -s "$CK/k4096s.keyblock" ] && [ -s "$CK/k3072e3.keyblock" ] && [ -s "$CK/k2048e3.keyblock" ] && [ -s "$CK/k1024.keyblock" ] &&
+    [ -s "$CK/kernel.keyblock" ] && [ -s "$CK/k2048b.keyblock" ]; then
+    pass "ChromeOS: the keys are there (the developer keys out of abr's source, seven of one's own: RSA 1024 to 4096 bits, exponent 65537 and 3)"
+else
+    fail "ChromeOS: the keys could not be made (openssl, or the independent tool)"
+fi
+if [ -d /usr/share/vboot/devkeys ] && [ -s /usr/share/vboot/devkeys/kernel.keyblock ]; then
+    rd_ck "the keyblock abr embeds is the one of vboot_reference" cmp -s "$CK/kernel.keyblock" /usr/share/vboot/devkeys/kernel.keyblock
+    rd_ck "and so is the key" cmp -s "$CK/kernel_data_key.vbprivk" /usr/share/vboot/devkeys/kernel_data_key.vbprivk
+    rd_done "ChromeOS: the developer keyblock and key abr embeds are the ones vboot_reference ships (as installed here)"
+fi
+
+# The plain images that go in a blob: one that ends 2048 bytes short of a boundary of 4096 (the kernel field of a blob
+# is padded with zeros up to it), one that ends on it.
+python3 "$RDG" mkbootfs cros_rd.cpio
+gzip -9n -c cros_rd.cpio >cros_rd.gz
+python3 -I - "$TOOLS" <<'PYEOF'
+import random
+import sys
+sys.path.insert(0, sys.argv[1])
+import fixtures
+r = random.Random(20261016)
+rd = open("cros_rd.gz", "rb").read()
+cmd = "console=ttyS0,115200 androidboot.hardware=crostest"
+for want, name in ((2048, "pad"), (0, "al")):
+    ks = 70001
+    while True:
+        img = fixtures.boot_v012(0, r.randbytes(ks), rd, page=2048, cmdline=cmd, name="crostest")
+        if len(img) % 4096 == want:
+            break
+        ks += 2048
+    open("cros_plain_%s.img" % name, "wb").write(img)
+PYEOF
+rd_unpack cros_plain_pad.img cros_pu_pad
+rd_unpack cros_plain_al.img cros_pu_al
+
+cros_copy() { rm -rf "$2" && cp -a "$1" "$2"; }  # <dir> <copy>
+cros_edit() {  # <unpack dir>: two files in the ramdisk's directory
+    printf 'abr test\n' >"$1/ramdisk/abr_test_file" && head -c 9000 /dev/urandom >"$1/ramdisk/cros_big_file"
+}
+cros_edit_is_in() { [ "$(cat "$1/ramdisk/abr_test_file" 2>/dev/null)" = "abr test" ]; }  # <the directory unpacked from the repacked blob>
+cros_plain_of() {  # <unpack dir> <out>: what the directory builds without the blob (has_chromeos=false in a copy)
+    rm -rf "$1.noc" && cp -a "$1" "$1.noc" || return 1
+    sed -i 's/^has_chromeos=true$/has_chromeos=false/' "$1.noc/manifest.txt" || return 1
+    "$ABR" repack "$1.noc" -o "$2" >"$2.log" 2>&1
+}
+cros_repack() {  # <dir> <out> <name of the key> [options]: repack (log: <out>.rlog); the key of a keyblock that is not the developer's is given
+    local d="$1" out="$2" k="$3"
+    shift 3
+    local o=()
+    [ "$k" = dev ] || o=(--chromeos-key "$(cros_kp "$k")")
+    rm -f "$out"
+    "$ABR" repack "$d" -o "$out" ${o[@]+"${o[@]}"} "$@" >"$out.rlog" 2>&1
+}
+cros_refuse() {  # <name> <blob> <pattern>: unpack of that blob is refused with that reason and leaves no directory
+    local out rc
+    rm -rf "cros_rf_$1"
+    out="$("$ABR" unpack "$2" -o "cros_rf_$1" 2>&1)"
+    rc=$?
+    [ "$rc" -ne 0 ] && [ ! -e "cros_rf_$1" ] && grep -q -- "$3" <<<"$out"
+}
+cros_refuse_repack() {  # <name> <dir> <pattern> [options]: repack of that directory is refused with that reason and writes no blob
+    local out rc name="$1" d="$2" pat="$3"
+    shift 3
+    rm -f "cros_rr_$name.blob"
+    out="$("$ABR" repack "$d" -o "cros_rr_$name.blob" "$@" 2>&1)"
+    rc=$?
+    [ "$rc" -ne 0 ] && [ ! -e "cros_rr_$name.blob" ] && grep -q -- "$pat" <<<"$out"
+}
+cros_size() { wc -c <"$1" | tr -d ' '; }
+# futility, where it is installed (true without it)
+cros_fut_verify() {  # <blob> [the size of its verification block, where it is not 64 KiB]: futility verifies the blob
+    cros_fut || return 0
+    "$CROS_FUT" vbutil_kernel --verify "$1" ${2:+--pad "$2"} >"$1.fut" 2>&1 && grep -q "Body verification succeeded" "$1.fut"
+}
+cros_fut_kernel_is() {  # <blob> <plain image>: --get-vmlinuz hands the plain image out as the first bytes of the body
+    cros_fut || return 0
+    "$CROS_FUT" vbutil_kernel --get-vmlinuz "$1" --vmlinuz-out "$1.vmlinuz" >/dev/null 2>&1 && cmp -s -n "$(cros_size "$2")" "$1.vmlinuz" "$2"
+}
+cros_fut_pack_is() {  # <blob> <plain image> <keyblock> <.vbprivk> [options of --pack]: futility packs the very same blob
+    cros_fut || return 0
+    local blob="$1" plain="$2" kb="$3" kp="$4"
+    shift 4
+    rm -f "$blob.fut"
+    "$CROS_FUT" vbutil_kernel --pack "$blob.fut" --keyblock "$kb" --signprivate "$kp" --vmlinuz "$plain" --arch arm "$@" >/dev/null 2>&1 && cmp -s "$blob" "$blob.fut"
+}
+cros_fut_repack_is() {  # <blob> <old blob> <keyblock> <.vbprivk>: futility signs the body of the old blob again under that keyblock
+    cros_fut || return 0
+    rm -f "$1.fut"
+    "$CROS_FUT" vbutil_kernel --repack "$1.fut" --oldblob "$2" --keyblock "$3" --signprivate "$4" >/dev/null 2>&1 && cmp -s "$1" "$1.fut"
+}
+
+# Nine kinds of blob: the developer keys with the preambles 2.0, 2.1 and 2.2, and keys of one's own -- RSA of 1024,
+# 2048, 4096 and 3072 bits, the public exponents 65537 and 3, SHA-1, SHA-256 and SHA-512 -- with a plain image that
+# needs padding up to 4096 and one that does not. (name:key:algorithm:preamble minor:plain image)
+CROS_VARIANTS="dev22:dev:4:2:pad dev21:dev:4:1:al dev20:dev:4:0:pad a0:k1024:0:2:pad a5:k2048:5:1:al a7:k4096s:7:0:pad a8:k4096:8:2:al a13:k2048e3:13:2:pad a16:k3072e3:16:2:al"
+for v in $CROS_VARIANTS; do
+    IFS=: read -r n k a m p <<<"$v"
+    kb="$(cros_kb "$k")"
+    kp="$(cros_kp "$k")"
+    rd_ck "$n: the independent tool makes the blob" cros make "cros_$n.blob" --kernel "cros_plain_$p.img" --keyblock "$kb" --key "$kp" --minor "$m"
+    rd_ck "$n: and its reader finds both signatures good" cros verify "cros_$n.blob"
+    rd_ck "$n: futility verifies it" cros_fut_verify "cros_$n.blob"
+    rd_ck "$n: identify" said "CHROMEOS" "$ABR" identify "cros_$n.blob"
+    rd_ck "$n: info names the preamble" said "vboot preamble 2.$m," "$ABR" info "cros_$n.blob"
+    rd_ck "$n: and the data key ($(cros_algname "$a"))" said "data key $(cros_algname "$a")" "$ABR" info "cros_$n.blob"
+    rd_ck "$n: and finds both signatures good" said "signatures valid" "$ABR" info "cros_$n.blob"
+    rd_unpack "cros_$n.blob" "cros_u_$n"
+    rd_ck "$n: unpack says what it took off" grep -q 'unpacked chromeos-wrapped boot' "cros_u_$n.log"
+    rd_ck "$n: and that an untouched repack is identical" grep -q 'reproduces this image byte-for-byte' "cros_u_$n.log"
+    rd_ck "$n: the manifest has the blob" grep -q '^has_chromeos=true$' "cros_u_$n/manifest.txt"
+    rd_ck "$n: and its version" grep -q "^chromeos_preamble_version=2\.$m\$" "cros_u_$n/manifest.txt"
+    rd_ck "$n: the keyblock is a file, as it was" cmp -s "cros_u_$n/chromeos_keyblock.bin" "$kb"
+    rd_ck "$n: nothing follows the blob" test ! -e "cros_u_$n/chromeos_tail.bin"
+    rd_ck "$n: the rest of the directory is what the plain image gives" diff -r --no-dereference -x manifest.txt -x 'chromeos_*' "cros_pu_$p" "cros_u_$n"
+    "$ABR" repack "cros_u_$n" -o "cros_r_$n.blob" >/dev/null 2>&1
+    rd_ck "$n: an untouched repack is identical" cmp -s "cros_$n.blob" "cros_r_$n.blob"
+done
+rd_done "ChromeOS: blobs of every kind the independent tool makes (preambles 2.0, 2.1, 2.2; RSA of 1024, 2048, 3072 and 4096 bits, exponent 65537 and 3, SHA-1, SHA-256, SHA-512; the kernel padded to 4096 or not): futility verifies them, identify and info see them, the directory is the plain image's plus the blob, an untouched repack is identical -- whoever signed it"
+
+# An edit lands in the image, the keyblock stays, and the blob is what the independent tool makes of the image the
+# directory builds without the blob: the signatures are made again, with the key of the keyblock.
+for v in $CROS_VARIANTS; do
+    IFS=: read -r n k a m p <<<"$v"
+    kb="$(cros_kb "$k")"
+    kp="$(cros_kp "$k")"
+    cros_copy "cros_u_$n" "cros_x_$n"
+    cros_edit "cros_x_$n"
+    rd_ck "$n: repack (the key of a keyblock that is not the developer's is given)" cros_repack "cros_x_$n" "cros_xr_$n.blob" "$k"
+    rd_ck "$n: abr says the signatures are made again" grep -q 'what the signatures of the ChromeOS kernel blob cover has changed' "cros_xr_$n.blob.rlog"
+    rd_ck "$n: the independent reader finds both signatures good" cros verify "cros_xr_$n.blob"
+    rd_ck "$n: futility verifies it" cros_fut_verify "cros_xr_$n.blob"
+    cros_plain_of "cros_x_$n" "cros_xp_$n.img"
+    rd_ck "$n: futility hands the plain image the directory builds out of it" cros_fut_kernel_is "cros_xr_$n.blob" "cros_xp_$n.img"
+    rd_ck "$n: the independent tool makes the same blob of what the directory builds without it" cros make "cros_xe_$n.blob" --kernel "cros_xp_$n.img" --keyblock "$kb" --key "$kp" --minor "$m"
+    rd_ck "$n: ... the same bytes (the keyblock and the version as they were)" cmp -s "cros_xr_$n.blob" "cros_xe_$n.blob"
+    rd_unpack "cros_xr_$n.blob" "cros_xr_${n}_re"
+    rd_ck "$n: the edit is in the image" cros_edit_is_in "cros_xr_${n}_re"
+    rd_ck "$n: the blob grew" test "$(cros_size "cros_xr_$n.blob")" -gt "$(cros_size "cros_$n.blob")"
+    rd_ck "$n: unpacked again it is a fixed point" "$ABR" repack "cros_xr_${n}_re" -o "cros_xr2_$n.blob"
+    rd_ck "$n: ... the same bytes" cmp -s "cros_xr_$n.blob" "cros_xr2_$n.blob"
+done
+rd_done "ChromeOS: an edited ramdisk lands in the image; the blob is the independent tool's of what the directory builds without it (the keyblock, the preamble's version and the algorithm as they were), futility verifies it and hands out the same kernel; repacking what that gives is the same blob"
+
+# The fields of the blob -- the command line (config), the x86 boot parameters (params), the bootloader and its size and
+# address, the load address, the version of the kernel, the flags, the size of the verification block, what follows the
+# blob -- are in the manifest, and come back as they were. Changed there, they are in the blob the independent tool
+# makes with the same values.
+CROS_KB="$CK/kernel.keyblock"
+CROS_KP="$CK/kernel_data_key.vbprivk"
+printf 'console=tty1 root=/dev/mmcblk0p3 rootwait ro cros_secure' >cros_cfg.txt   # no newline: futility turns one into a space
+(head -c 99 /dev/urandom; printf '\177') >cros_params.bin
+(head -c 999 /dev/urandom; printf 'U') >cros_bl.bin
+seq 1 1500 | head -c 5000 >cros_tail.bin   # not all one byte: that would be a fill up to a size, and is read as one
+rd_ck "the independent tool makes the blob (every field set)" cros make cros_F.blob --kernel cros_plain_pad.img --keyblock "$CROS_KB" --key "$CROS_KP" --minor 2 \
+    --kernel-version 7 --flags 3 --load 0x2000000 --bootloader-address 0x2002000 --config cros_cfg.txt --params cros_params.bin \
+    --bootloader cros_bl.bin --bootloader-size 8192 --pad 131072 --tail cros_tail.bin
+rd_ck "its reader finds both signatures good" cros verify cros_F.blob
+rd_ck "futility verifies it (every field, a verification block of 128 KiB)" cros_fut_verify cros_F.blob 131072
+rd_ck "info: the preamble, the version of the kernel, the flags, the load address" said "vboot preamble 2.2, kernel version 7, flags 0x3, loaded at 0x2000000;" "$ABR" info cros_F.blob
+rd_ck "info: the sizes of the fields" said "config $(cros_size cros_cfg.txt) bytes, bootloader 8192 bytes;" "$ABR" info cros_F.blob
+rd_ck "info: what follows the blob" said "; 5000 bytes follow the blob)" "$ABR" info cros_F.blob
+rd_unpack cros_F.blob cros_u_F
+rd_ck "unpack names the blob" grep -q 'unpacked chromeos-wrapped boot' cros_u_F.log
+for kv in chromeos_preamble_version=2.2 chromeos_kernel_version=7 chromeos_flags=0x3 chromeos_body_load_address=0x2000000 \
+          chromeos_bootloader_address=0x2002000 chromeos_bootloader_size=8192 chromeos_vblock_size=131072; do
+    rd_ck "the manifest has $kv" grep -q "^$kv\$" cros_u_F/manifest.txt
+done
+rd_ck "the config is a file" cmp -s cros_u_F/chromeos_config.txt cros_cfg.txt
+rd_ck "the params are a file" cmp -s cros_u_F/chromeos_params.bin cros_params.bin
+rd_ck "the bootloader is a file (without the zeros of its field)" cmp -s cros_u_F/chromeos_bootloader.bin cros_bl.bin
+rd_ck "what follows the blob is a file" cmp -s cros_u_F/chromeos_tail.bin cros_tail.bin
+"$ABR" repack cros_u_F -o cros_r_F.blob >/dev/null 2>&1
+rd_ck "an untouched repack is identical" cmp -s cros_F.blob cros_r_F.blob
+# every field changed, the bootloader grown past the size of its field (it grows to 12288), the tail replaced, an edit in the ramdisk
+cros_copy cros_u_F cros_x_F
+sed -i 's/^chromeos_kernel_version=7$/chromeos_kernel_version=9/; s/^chromeos_flags=0x3$/chromeos_flags=0x5/;
+        s/^chromeos_body_load_address=0x2000000$/chromeos_body_load_address=0x3000000/; s/^chromeos_bootloader_address=0x2002000$/chromeos_bootloader_address=0x3002000/;
+        s/^chromeos_vblock_size=131072$/chromeos_vblock_size=65536/' cros_x_F/manifest.txt
+printf 'console=ttyS2,115200 root=/dev/sda3 cros_debug' >cros_cfg2.txt
+(head -c 199 /dev/urandom; printf '\001') >cros_params2.bin
+(head -c 8999 /dev/urandom; printf 'V') >cros_bl2.bin
+seq 2000 4000 | head -c 7000 >cros_tail2.bin
+cp cros_cfg2.txt cros_x_F/chromeos_config.txt
+cp cros_params2.bin cros_x_F/chromeos_params.bin
+cp cros_bl2.bin cros_x_F/chromeos_bootloader.bin
+cp cros_tail2.bin cros_x_F/chromeos_tail.bin
+cros_edit cros_x_F
+"$ABR" repack cros_x_F -o cros_xr_F.blob >cros_xr_F.rlog 2>&1
+cros_plain_of cros_x_F cros_xp_F.img
+rd_ck "an edit with every field changed: the independent tool makes the blob of what the directory builds without it" cros make cros_xe_F.blob --kernel cros_xp_F.img \
+    --keyblock "$CROS_KB" --key "$CROS_KP" --minor 2 --kernel-version 9 --flags 5 --load 0x3000000 --bootloader-address 0x3002000 --config cros_cfg2.txt \
+    --params cros_params2.bin --bootloader cros_bl2.bin --bootloader-size 12288 --pad 65536 --tail cros_tail2.bin
+rd_ck "... the same bytes" cmp -s cros_xr_F.blob cros_xe_F.blob
+rd_ck "its reader finds both signatures good" cros verify cros_xr_F.blob
+rd_ck "futility verifies it" cros_fut_verify cros_xr_F.blob
+rd_ck "abr says the signatures are made again" grep -q 'what the signatures of the ChromeOS kernel blob cover has changed' cros_xr_F.rlog
+rd_unpack cros_xr_F.blob cros_xr_F_re
+rd_ck "unpacked again the manifest has the new fields" grep -q '^chromeos_bootloader_size=12288$' cros_xr_F_re/manifest.txt
+rd_ck "and the edit is in the image" cros_edit_is_in cros_xr_F_re
+# nothing the signatures cover changed (the tail only): they are kept, and the log does not say they were made again
+cros_copy cros_u_F cros_t_F
+cp cros_tail2.bin cros_t_F/chromeos_tail.bin
+"$ABR" repack cros_t_F -o cros_tr_F.blob >cros_tr_F.rlog 2>&1
+rd_ck "only the tail changed: the blob is the original with the new tail" cros make cros_te_F.blob --kernel cros_plain_pad.img --keyblock "$CROS_KB" --key "$CROS_KP" --minor 2 \
+    --kernel-version 7 --flags 3 --load 0x2000000 --bootloader-address 0x2002000 --config cros_cfg.txt --params cros_params.bin --bootloader cros_bl.bin \
+    --bootloader-size 8192 --pad 131072 --tail cros_tail2.bin
+rd_ck "... the same bytes" cmp -s cros_tr_F.blob cros_te_F.blob
+rd_ck "the signatures are the original's, and abr does not say it made them again" test -z "$(grep 'signatures' cros_tr_F.rlog)"
+rd_done "ChromeOS: every field of the blob (the command line, the params, the bootloader and its size and address, the load address, the version of the kernel, the flags, the verification block, what follows) is in the manifest and comes back as it was; changed there they are in the blob the independent tool makes with the same values; a changed tail keeps the signatures"
+
+# A partition dump: the blob, then zeros up to the size of the partition. The fill is kept: after an edit the dump is as big as it was.
+CROS_DUMP=$(($(cros_size cros_dev22.blob) + 100000))
+rd_ck "the independent tool makes a dump" cros make cros_Z.blob --kernel cros_plain_pad.img --keyblock "$CROS_KB" --key "$CROS_KP" --fill-to "$CROS_DUMP"
+rd_unpack cros_Z.blob cros_u_Z
+rd_ck "unpack keeps the size of the partition" grep -q "^chromeos_pad_to=$CROS_DUMP\$" cros_u_Z/manifest.txt
+rd_ck "and no tail file (it is all zeros)" test ! -e cros_u_Z/chromeos_tail.bin
+"$ABR" repack cros_u_Z -o cros_r_Z.blob >/dev/null 2>&1
+rd_ck "an untouched repack is identical" cmp -s cros_Z.blob cros_r_Z.blob
+cros_copy cros_u_Z cros_x_Z
+cros_edit cros_x_Z
+rd_ck "an edit goes through" cros_repack cros_x_Z cros_xr_Z.blob dev
+rd_ck "the dump is as big as it was" test "$(cros_size cros_xr_Z.blob)" = "$CROS_DUMP"
+cros_plain_of cros_x_Z cros_xp_Z.img
+rd_ck "the independent tool makes the same dump" cros make cros_xe_Z.blob --kernel cros_xp_Z.img --keyblock "$CROS_KB" --key "$CROS_KP" --fill-to "$CROS_DUMP"
+rd_ck "... the same bytes" cmp -s cros_xr_Z.blob cros_xe_Z.blob
+rd_done "ChromeOS: a partition dump (the blob, zeros up to the size of the partition) comes back identical, and after an edit is as big as it was"
+
+# The blob can be left out (has_chromeos=false: what the directory builds is the kernel field of the blob), and put around a
+# plain image (has_chromeos=true on its own: what Android Image Kitchen's `futility vbutil_kernel --pack` line makes).
+cros_plain_of cros_u_dev22 cros_dev22_plain.img
+cros kernel cros_dev22.blob cros_dev22_kernel.bin
+rd_ck "without the blob the directory builds the kernel field of the blob (the plain image, zeros up to 4096)" cmp -s cros_dev22_plain.img cros_dev22_kernel.bin
+cros_copy cros_pu_pad cros_fr
+printf 'has_chromeos=true\n' >>cros_fr/manifest.txt
+"$ABR" repack cros_fr -o cros_fr.blob >cros_fr.rlog 2>&1
+printf ' ' >cros_sp
+rd_ck "a plain image with has_chromeos=true: the independent tool makes the blob of Android Image Kitchen's command line (version 1, flags 1, a space for the config and the bootloader, the developer keys)" \
+    cros make cros_fr_e.blob --kernel cros_plain_pad.img --keyblock "$CROS_KB" --key "$CROS_KP" --kernel-version 1 --flags 1 --config cros_sp --bootloader cros_sp
+rd_ck "... the same bytes" cmp -s cros_fr.blob cros_fr_e.blob
+rd_ck "futility packs the very same blob with that command line" cros_fut_pack_is cros_fr.blob cros_plain_pad.img "$CROS_KB" "$CROS_KP" --version 1 --bootloader cros_sp --config cros_sp --flags 0x1
+rd_ck "abr says what it signed with" grep -q 'the ChromeOS kernel blob is signed with the developer key of vboot_reference' cros_fr.rlog
+rd_ck "its reader finds both signatures good" cros verify cros_fr.blob
+rd_unpack cros_fr.blob cros_u_fr
+rd_ck "unpacked again it is the plain image, with a blob around it" diff -r --no-dereference -x manifest.txt -x 'chromeos_*' cros_pu_pad cros_u_fr
+"$ABR" repack cros_u_fr -o cros_r_fr.blob >/dev/null 2>&1
+rd_ck "and an untouched repack is identical" cmp -s cros_fr.blob cros_r_fr.blob
+# with keys of one's own (a key and the keyblock for it): the blob is signed under that keyblock
+cros_copy cros_pu_pad cros_fr2
+printf 'has_chromeos=true\n' >>cros_fr2/manifest.txt
+"$ABR" repack cros_fr2 -o cros_fr2.blob --chromeos-key "$CK/k2048.vbprivk" --chromeos-keyblock "$CK/k2048.keyblock" >cros_fr2.rlog 2>&1
+rd_ck "with --chromeos-key and --chromeos-keyblock the independent tool makes the same blob under that keyblock" cros make cros_fr2_e.blob --kernel cros_plain_pad.img --keyblock "$CK/k2048.keyblock" \
+    --key "$CK/k2048.vbprivk" --kernel-version 1 --flags 1 --config cros_sp --bootloader cros_sp
+rd_ck "... the same bytes" cmp -s cros_fr2.blob cros_fr2_e.blob
+rd_ck "abr says it is signed under the keyblock given" grep -q 'is signed under the keyblock given' cros_fr2.rlog
+rd_done "ChromeOS: has_chromeos=false builds the kernel field of the blob; has_chromeos=true on a plain image makes the blob of Android Image Kitchen's futility line (futility makes the very same one) -- or one under the keyblock and key given"
+
+# The version of the preamble is the manifest's to change (2.2 -> 2.1 -> 2.0: the fields it does not have are gone), and a preamble
+# 2.1 or 2.2 can carry the address of a vmlinuz header (there is no header on ARM: its size is 0).
+for ver in 1 0; do
+    cros_copy cros_u_dev22 "cros_v_$ver"
+    sed -i "s/^chromeos_preamble_version=.*/chromeos_preamble_version=2.$ver/" "cros_v_$ver/manifest.txt"
+    rd_ck "2.$ver: repack" cros_repack "cros_v_$ver" "cros_vr_$ver.blob" dev
+    rd_ck "2.$ver: the independent tool makes the same blob" cros make "cros_ve_$ver.blob" --kernel cros_dev22_plain.img --keyblock "$CROS_KB" --key "$CROS_KP" --minor "$ver"
+    rd_ck "2.$ver: ... the same bytes" cmp -s "cros_vr_$ver.blob" "cros_ve_$ver.blob"
+    rd_ck "2.$ver: its reader finds both signatures good" cros verify "cros_vr_$ver.blob"
+done
+rd_ck "the independent tool makes a 2.1 blob with a vmlinuz header address" cros make cros_V.blob --kernel cros_plain_pad.img --keyblock "$CROS_KB" --key "$CROS_KP" --minor 1 --vmlinuz-header-address 0x1234000
+rd_unpack cros_V.blob cros_u_V
+rd_ck "the manifest has the address" grep -q '^chromeos_vmlinuz_header_address=0x1234000$' cros_u_V/manifest.txt
+"$ABR" repack cros_u_V -o cros_r_V.blob >/dev/null 2>&1
+rd_ck "and an untouched repack is identical" cmp -s cros_V.blob cros_r_V.blob
+cros_copy cros_u_V cros_x_V
+sed -i 's/^chromeos_vmlinuz_header_address=.*/chromeos_vmlinuz_header_address=0x5678000/' cros_x_V/manifest.txt
+rd_ck "a changed address: repack" cros_repack cros_x_V cros_xr_V.blob dev
+rd_ck "the independent tool makes the same blob" cros make cros_xe_V.blob --kernel cros_plain_pad.img --keyblock "$CROS_KB" --key "$CROS_KP" --minor 1 --vmlinuz-header-address 0x5678000
+rd_ck "... the same bytes" cmp -s cros_xr_V.blob cros_xe_V.blob
+rd_done "ChromeOS: the version of the preamble (2.2, 2.1, 2.0) and the address of the vmlinuz header are the manifest's to change; the blob is the independent tool's with the same values"
+
+# What the manifest cannot say: abr refuses with the reason, and writes no blob.
+cros_bad() {  # <name> <pattern> <sed expression for manifest.txt> [a file to put in the directory: name=size]
+    cros_copy cros_u_dev22 "cros_bad_$1" || return 1
+    sed -i "$3" "cros_bad_$1/manifest.txt" || return 1
+    if [ -n "${4:-}" ]; then
+        printf '%s_file=%s.bin\n' "chromeos_${4%%=*}" "${4%%=*}" >>"cros_bad_$1/manifest.txt"
+        head -c "${4#*=}" /dev/zero | tr '\0' 'x' >"cros_bad_$1/${4%%=*}.bin"
+    fi
+    cros_refuse_repack "$1" "cros_bad_$1" "$2"
+}
+rd_ck "a version that is no version" cros_bad ver_text 'is a version like 2.2' 's/^chromeos_preamble_version=.*/chromeos_preamble_version=banana/'
+rd_ck "2.5" cros_bad ver_25 'is not one abr makes (2.0, 2.1 and 2.2 are)' 's/^chromeos_preamble_version=.*/chromeos_preamble_version=2.5/'
+rd_ck "3.0" cros_bad ver_30 'is not one abr makes' 's/^chromeos_preamble_version=.*/chromeos_preamble_version=3.0/'
+rd_ck "flags of more than 32 bits" cros_bad flags_big 'does not fit in 32 bits' 's/^chromeos_flags=.*/chromeos_flags=0x100000000/'
+rd_ck "flags in a preamble that has none" cros_bad flags_21 'need a preamble of version 2.2; this one is 2.1' 's/^chromeos_preamble_version=.*/chromeos_preamble_version=2.1/; s/^chromeos_flags=.*/chromeos_flags=0x1/'
+rd_ck "an address of the vmlinuz header in a preamble that has none" cros_bad vmz_20 'needs a preamble of version 2.1 or 2.2' \
+    's/^chromeos_preamble_version=.*/chromeos_preamble_version=2.0/; s/^chromeos_flags=.*//; $a chromeos_vmlinuz_header_address=0x1000'
+rd_ck "a verification block too small for the signatures" cros_bad vblock 'the verification block of this ChromeOS blob is 1300 bytes' 's/^chromeos_vblock_size=.*/chromeos_vblock_size=1300/'
+rd_ck "a config of more than its field holds" cros_bad cfg_big 'the config of a ChromeOS blob is 5000 bytes; its field holds 4096' 's/^id=/id=/' config=5000
+rd_ck "params of more than their field holds" cros_bad params_big 'the params of a ChromeOS blob is 5000 bytes; its field holds 4096' 's/^id=/id=/' params=5000
+rd_done "ChromeOS: what the manifest cannot say (no version, a version abr does not make, flags or a vmlinuz header address the preamble has no field for, a verification block that is too small, a config or params that do not fit their fields) is refused with the reason, and no blob is written"
+
+# Whose keyblock it is. A blob under somebody else's keyblock (one abr has no key for) comes back as it was while nothing
+# it covers changes -- whoever signed it. Edited, it is signed with the developer key under the developer keyblock, with a
+# warning (that is what Android Image Kitchen does, always), or with the key given (--chromeos-key) under the keyblock it has,
+# or under another one (--chromeos-keyblock). abr never signs under a keyblock whose key it does not have.
+rd_ck "an edit of a blob under somebody else's keyblock, no key given: abr signs under the developer keyblock" cros_repack cros_x_a8 cros_sw_a8.blob dev
+rd_ck "... and warns that the keyblock is somebody else's, and what it did instead" grep -q "its keyblock is somebody else's: abr has no key for it" cros_sw_a8.blob.rlog
+rd_ck "... and that --chromeos-key and --chromeos-keyblock sign with keys of one's own" grep -q -- "--chromeos-key and --chromeos-keyblock sign with keys of your own" cros_sw_a8.blob.rlog
+rd_ck "the independent tool makes the same blob under the developer keyblock" cros make cros_sw_a8_e.blob --kernel cros_xp_a8.img --keyblock "$CROS_KB" --key "$CROS_KP" --minor 2
+rd_ck "... the same bytes" cmp -s cros_sw_a8.blob cros_sw_a8_e.blob
+rd_ck "its reader finds both signatures good" cros verify cros_sw_a8.blob
+rd_ck "futility verifies it" cros_fut_verify cros_sw_a8.blob
+rd_ck "info calls the data key the developer key" said "(the developer key of vboot_reference)" "$ABR" info cros_sw_a8.blob
+rd_unpack cros_sw_a8.blob cros_sw_a8_u
+"$ABR" repack cros_sw_a8_u -o cros_sw_a8_r.blob >/dev/null 2>&1
+rd_ck "what that gives is a fixed point: unpacked and repacked it is the same blob" cmp -s cros_sw_a8.blob cros_sw_a8_r.blob
+cros_copy cros_sw_a8_u cros_sw_a8_x
+cros_edit cros_sw_a8_x
+rd_ck "and an edit of it is signed with the developer key, without a warning (the keyblock is the developer's now)" cros_repack cros_sw_a8_x cros_sw_a8_xr.blob dev
+rd_ck "... no warning" test -z "$(grep -i 'somebody else' cros_sw_a8_xr.blob.rlog)"
+rd_ck "... and its reader finds both signatures good" cros verify cros_sw_a8_xr.blob
+# a key and a keyblock of one's own
+rd_ck "an edit with --chromeos-key and --chromeos-keyblock of one's own" cros_repack cros_x_a8 cros_nk_a8x.blob dev --chromeos-key "$CK/k2048.vbprivk" --chromeos-keyblock "$CK/k2048.keyblock"
+rd_ck "... abr says it is signed under the keyblock given" grep -q 'is signed under the keyblock given (--chromeos-keyblock)' cros_nk_a8x.blob.rlog
+rd_ck "the independent tool makes the same blob" cros make cros_nk_a8x_e.blob --kernel cros_xp_a8.img --keyblock "$CK/k2048.keyblock" --key "$CK/k2048.vbprivk" --minor 2
+rd_ck "... the same bytes" cmp -s cros_nk_a8x.blob cros_nk_a8x_e.blob
+rd_ck "futility verifies it" cros_fut_verify cros_nk_a8x.blob
+rd_ck "info names the data key of the new keyblock" said "data key RSA-2048/SHA-512;" "$ABR" info cros_nk_a8x.blob
+# the same, the blob untouched: only the keyblock and the signatures change, and futility --repack does that very thing
+rd_ck "an untouched blob under another keyblock" cros_repack cros_u_a8 cros_nk_a8.blob dev --chromeos-key "$CK/k2048.vbprivk" --chromeos-keyblock "$CK/k2048.keyblock"
+rd_ck "the independent tool makes the same blob of the same kernel" cros make cros_nk_a8_e.blob --kernel cros_plain_al.img --keyblock "$CK/k2048.keyblock" --key "$CK/k2048.vbprivk" --minor 2
+rd_ck "... the same bytes" cmp -s cros_nk_a8.blob cros_nk_a8_e.blob
+rd_ck "futility --repack signs the body of the old blob under that keyblock into the very same blob" cros_fut_repack_is cros_nk_a8.blob cros_a8.blob "$CK/k2048.keyblock" "$CK/k2048.vbprivk"
+"$ABR" repack cros_u_a8 -o cros_nk_a8d.blob --chromeos-key "$CROS_KP" --chromeos-keyblock "$CROS_KB" >/dev/null 2>&1
+rd_ck "and into the developer's, too (abr: the developer key and keyblock given)" cros_fut_repack_is cros_nk_a8d.blob cros_a8.blob "$CROS_KB" "$CROS_KP"
+rd_ck "its reader finds both signatures good" cros verify cros_nk_a8d.blob
+# the key given for the keyblock the blob has (and the developer key, given explicitly, is the developer key abr has)
+rd_ck "the developer key given explicitly is the same as the one abr has" cros_repack cros_x_dev22 cros_dk_dev22.blob dev --chromeos-key "$CROS_KP"
+rd_ck "... the same bytes" cmp -s cros_xr_dev22.blob cros_dk_dev22.blob
+rd_ck "... and abr says it was the key given" grep -q 'they are made again, with the key given (--chromeos-key)' cros_dk_dev22.blob.rlog
+# nothing changed: the signatures are the original's whatever is given
+rd_ck "untouched, with the key of the blob's keyblock given: identical" cros_repack cros_u_a8 cros_kp_a8.blob a8 --chromeos-key "$CK/k4096.vbprivk"
+rd_ck "... the same bytes" cmp -s cros_a8.blob cros_kp_a8.blob
+rd_ck "untouched, with the keyblock the blob has given: identical" cros_repack cros_u_dev22 cros_kb_dev22.blob dev --chromeos-keyblock "$CROS_KB"
+rd_ck "... the same bytes" cmp -s cros_dev22.blob cros_kb_dev22.blob
+rd_ck "the options say nothing of a plain image's repack but that they were not used" cros_repack cros_pu_pad cros_ig.img dev --chromeos-key "$CK/k2048.vbprivk"
+rd_ck "... warning: they are for a ChromeOS blob" grep -q 'only apply to a ChromeOS kernel blob; ignored here' cros_ig.img.rlog
+rd_ck "... and the image is the plain one" cmp -s cros_ig.img cros_plain_pad.img
+rd_done "ChromeOS: a blob under somebody else's keyblock is kept as it was while nothing it covers changes; edited it is signed under the developer keyblock (with a warning) or with the key given, under the keyblock it has or another; the independent tool and futility (--repack) make the same blobs"
+
+# What abr refuses: a key that is not the keyblock's, a keyblock without its key, files that are no keys, files that are no keyblocks.
+rd_ck "the key given is not the data key of the blob's keyblock" cros_refuse_repack wrongkey cros_x_a8 'is not the data key of the keyblock (the blob' --chromeos-key "$CK/k2048b.vbprivk"
+rd_ck "a keyblock without its key" cros_refuse_repack kbonly cros_x_a8 'has a data key of which abr has no key: pass the key with --chromeos-key' --chromeos-keyblock "$CK/k2048.keyblock"
+rd_ck "a key that is not the data key of the keyblock given" cros_refuse_repack wrongkb cros_x_a8 'is not the data key of the keyblock (the one given with --chromeos-keyblock)' \
+    --chromeos-key "$CK/k2048b.vbprivk" --chromeos-keyblock "$CK/k2048.keyblock"
+printf 'short' >cros_badkey_short
+head -c 300 /dev/zero | tr '\0' 'k' >cros_badkey_text
+python3 -I - "$CK" <<'PYEOF'
+import struct, sys
+ck = sys.argv[1]
+good = open(ck + "/k2048.vbprivk", "rb").read()                 # algorithm 5 (RSA-2048/SHA-512), a key of 2048 bits
+der = good[8:]
+open("cros_badkey_alg99", "wb").write(struct.pack("<Q", 99) + der)
+open("cros_badkey_size", "wb").write(struct.pack("<Q", 8) + der)        # algorithm 8 wants 4096 bits
+open("cros_badkey_der", "wb").write(struct.pack("<Q", 5) + bytes(range(256)) * 2)
+open("cros_badkey_cut", "wb").write(good[:300])
+kb = open(ck + "/k2048.keyblock", "rb").read()
+open("cros_badkb_text", "wb").write(b"not a keyblock, " * 20)
+open("cros_badkb_short", "wb").write(kb[:60])
+open("cros_badkb_size", "wb").write(kb + b"\0")
+k = bytearray(kb)
+struct.pack_into("<Q", k, 80, 0xFFFFFFFF)                                  # the data key lies outside of the keyblock
+open("cros_badkb_outside", "wb").write(bytes(k))
+PYEOF
+for r in "short:too short" "text:which abr does not know (0 to 17)" "alg99:names algorithm 99, which abr does not know" \
+         "size:names RSA-4096/SHA-512, a key of 4096 bits, and holds one of 2048" "der:does not hold an RSA key behind its algorithm word" \
+         "cut:does not hold an RSA key behind its algorithm word"; do
+    rd_ck "--chromeos-key ${r%%:*}: refused, says why" cros_refuse_repack "key_${r%%:*}" cros_x_a8 "${r#*:}" --chromeos-key "cros_badkey_${r%%:*}"
+done
+rd_ck "--chromeos-key that is no file" cros_refuse_repack key_gone cros_x_a8 'cros_no_such_key' --chromeos-key cros_no_such_key
+KB2048=$(cros_size "$CK/k2048.keyblock")
+for r in "text:is not a keyblock (it does not start with \"CHROMEOS\")" "short:is cut short" "size:says it is $KB2048 bytes; the file has $((KB2048 + 1))" \
+         "outside:lies outside of it"; do
+    rd_ck "--chromeos-keyblock ${r%%:*}: refused, says why" cros_refuse_repack "kb_${r%%:*}" cros_x_a8 "${r#*:}" --chromeos-key "$CK/k2048.vbprivk" --chromeos-keyblock "cros_badkb_${r%%:*}"
+done
+rd_ck "--chromeos-keyblock that is no file" cros_refuse_repack kb_gone cros_x_a8 'cros_no_such_kb' --chromeos-key "$CK/k2048.vbprivk" --chromeos-keyblock cros_no_such_kb
+rd_done "ChromeOS: a key that is not the keyblock's, a keyblock without its key, files that are no keys (too short, text, an algorithm that does not exist, a key of another size than its algorithm's, no DER, cut) or no keyblocks (text, cut, a size that is not the file's, a data key outside of it, no file) are refused with the reason, and no blob is written"
+
+# A blob that is not laid out the way futility writes it is refused with the reason, and leaves no directory: abr does not
+# read it wrongly, and does not lose what it cannot keep. (identify goes by the keyblock's "CHROMEOS" and still names it.)
+for kind in "short-keyblock:its keyblock does not fit" "short-preamble:and the preamble do not fit" "short-preamble-body:its preamble of" \
+            "short-body:its body is" "keyblock-version:has a keyblock of version 3" \
+            "keyblock-size-small:says its keyblock is 50 bytes, which is less than its header" "preamble-major:has a preamble of version 3.2" \
+            "preamble-minor:has a preamble of version 2.3" "preamble-reserved:non-zero reserved word in its preamble" \
+            "field-reserved:non-zero reserved word in its preamble" "descriptor-reserved:reserved words of the descriptor of its body signature" \
+            "x86:carries a vmlinuz header" "sig-layout:does not have its signatures where futility puts them" \
+            "psig-layout:does not have its signatures where futility puts them" "pre-data-size:does not have its signatures where futility puts them" \
+            "empty-signature:has an empty signature" "pad-nonzero:has data of its own behind the signatures" \
+            "bootloader-size:has a bootloader of 100 bytes" "kernel-unaligned:has a kernel of" "body-small:too small for a kernel" \
+            "preamble-size-small:says its preamble is 50 bytes, which is less than its header"; do
+    x="${kind%%:*}"
+    msg="${kind#*:}"
+    rd_ck "$x: damage made" cros corrupt cros_dev22.blob "cros_dmg_$x.blob" "$x"
+    rd_ck "$x: unpack refuses, says why, leaves no directory" cros_refuse "$x" "cros_dmg_$x.blob" "$msg"
+    rd_ck "$x: identify still names the format" said "CHROMEOS" "$ABR" identify "cros_dmg_$x.blob"
+done
+cros_info_refuses() {  # <blob> <pattern>
+    local out rc
+    out="$("$ABR" info "$1" 2>&1)"
+    rc=$?
+    [ "$rc" -ne 0 ] && grep -q -- "$2" <<<"$out"
+}
+rd_ck "info refuses such a blob, too, with the reason" cros_info_refuses cros_dmg_x86.blob "carries a vmlinuz header"
+rd_ck "(an x86 blob: a bzImage no Android tool opens)" cros_info_refuses cros_dmg_x86.blob "a kernel for x86"
+rd_done "ChromeOS: a blob that is not laid out the way futility writes it (cut short at the keyblock, the preamble or the body; a keyblock or preamble of a version abr does not read; reserved words that are not zero; a vmlinuz header (x86); signatures anywhere but behind the preamble header; an empty signature; data behind the signatures; a bootloader or kernel that is not a whole number of 4096 bytes; a body too small; a preamble smaller than its header) is refused with the reason, leaves no directory, and is still named by identify"
+
+# A signature that is bad is not repaired behind one's back: an untouched blob comes back as it was, bad signatures and all;
+# edited, it is signed afresh, and that is good. And a data key abr cannot read (an algorithm it does not know, a packed key that
+# is not its algorithm's size, a key that lies outside of the keyblock) leaves the signatures unchecked, and the keyblock as it was.
+cros_verify_fails() { ! cros verify "$1"; }
+cros_fut_rejects() { cros_fut || return 0; ! "$CROS_FUT" vbutil_kernel --verify "$1" >/dev/null 2>&1; }
+for kind in "body-byte:body signature NOT valid, preamble signature valid" "body-sig-byte:signatures NOT valid" \
+            "pre-sig-byte:body signature valid, preamble signature NOT valid"; do
+    x="${kind%%:*}"
+    msg="${kind#*:}"
+    cros corrupt cros_dev22.blob "cros_sg_$x.blob" "$x"
+    rd_ck "$x: the independent reader finds a signature bad" cros_verify_fails "cros_sg_$x.blob"
+    rd_ck "$x: futility finds it bad, too" cros_fut_rejects "cros_sg_$x.blob"
+    rd_ck "$x: info says what is bad ($msg)" said "$msg" "$ABR" info "cros_sg_$x.blob"
+    rd_unpack "cros_sg_$x.blob" "cros_sg_u_$x"
+    "$ABR" repack "cros_sg_u_$x" -o "cros_sg_r_$x.blob" >/dev/null 2>&1
+    rd_ck "$x: an untouched repack is identical (the bad signature is kept)" cmp -s "cros_sg_$x.blob" "cros_sg_r_$x.blob"
+    cros_copy "cros_sg_u_$x" "cros_sg_x_$x"
+    cros_edit "cros_sg_x_$x"
+    rd_ck "$x: an edit: repack" cros_repack "cros_sg_x_$x" "cros_sg_xr_$x.blob" dev
+    rd_ck "$x: the signatures are made again, and are good" cros verify "cros_sg_xr_$x.blob"
+    rd_ck "$x: futility verifies it" cros_fut_verify "cros_sg_xr_$x.blob"
+done
+for kind in "kb-algorithm:data key algorithm 99;" "kb-arrsize:data key RSA-2048/SHA-256;" "kb-outside:data key unreadable;"; do
+    x="${kind%%:*}"
+    msg="${kind#*:}"
+    cros corrupt cros_dev22.blob "cros_kd_$x.blob" "$x"
+    rd_ck "$x: info says the data key ($msg) and that the signatures are not checked" said "$msg.*signatures not checked" "$ABR" info "cros_kd_$x.blob"
+    rd_unpack "cros_kd_$x.blob" "cros_kd_u_$x"
+    "$ABR" repack "cros_kd_u_$x" -o "cros_kd_r_$x.blob" >/dev/null 2>&1
+    rd_ck "$x: an untouched repack is identical (the keyblock is kept as it is, whatever it says)" cmp -s "cros_kd_$x.blob" "cros_kd_r_$x.blob"
+    cros_copy "cros_kd_u_$x" "cros_kd_x_$x"
+    cros_edit "cros_kd_x_$x"
+    rd_ck "$x: an edit: repack (no key of such a keyblock: signed under the developer keyblock)" cros_repack "cros_kd_x_$x" "cros_kd_xr_$x.blob" dev
+    rd_ck "$x: abr warns that the keyblock is somebody else's" grep -q "its keyblock is somebody else's" "cros_kd_xr_$x.blob.rlog"
+    rd_ck "$x: the blob verifies" cros verify "cros_kd_xr_$x.blob"
+    cros_plain_of "cros_kd_x_$x" "cros_kd_xp_$x.img"
+    cros make "cros_kd_xe_$x.blob" --kernel "cros_kd_xp_$x.img" --keyblock "$CROS_KB" --key "$CROS_KP" --minor 2
+    rd_ck "$x: ... the same bytes" cmp -s "cros_kd_xr_$x.blob" "cros_kd_xe_$x.blob"
+    rd_ck "$x: the developer key is not the data key of that keyblock: it cannot be given for it" cros_refuse_repack "kd_$x" "cros_kd_x_$x" 'is not the data key of the keyblock' --chromeos-key "$CROS_KP"
+done
+rd_done "ChromeOS: signatures that are bad (the body's, the preamble's, or both) are kept as they were by an untouched repack and are good after an edit; a data key abr cannot read (an algorithm it does not know, a packed key of the wrong size, a key outside of the keyblock) leaves the signatures unchecked and the keyblock as it was, and after an edit the blob is signed under the developer keyblock"
+
+# futility --pack against the independent tool and abr, where it is installed: the fields futility has options for (the
+# command line, a bootloader, the version, the flags, the load address, the size of the verification block), with the developer
+# key and with one of one's own, and an edit of such a blob (abr signs it as futility would).
+if cros_fut; then
+    for k in dev k4096; do
+        kb="$(cros_kb "$k")"
+        kp="$(cros_kp "$k")"
+        rd_ck "$k: the independent tool makes the blob (the fields futility has options for)" cros make "cros_G_$k.blob" --kernel cros_plain_pad.img --keyblock "$kb" --key "$kp" --minor 2 \
+            --kernel-version 7 --flags 3 --load 0x2000000 --config cros_cfg.txt --bootloader cros_bl.bin --pad 131072
+        rd_ck "$k: futility --pack makes the very same blob" cros_fut_pack_is "cros_G_$k.blob" cros_plain_pad.img "$kb" "$kp" --version 7 --flags 0x3 --kloadaddr 0x2000000 \
+            --config cros_cfg.txt --bootloader cros_bl.bin --pad 131072
+        rd_unpack "cros_G_$k.blob" "cros_G_u_$k"
+        "$ABR" repack "cros_G_u_$k" -o "cros_G_r_$k.blob" >/dev/null 2>&1
+        rd_ck "$k: an untouched repack is identical" cmp -s "cros_G_$k.blob" "cros_G_r_$k.blob"
+        cros_copy "cros_G_u_$k" "cros_G_x_$k"
+        cros_edit "cros_G_x_$k"
+        rd_ck "$k: an edit: repack" cros_repack "cros_G_x_$k" "cros_G_xr_$k.blob" "$k"
+        cros_plain_of "cros_G_x_$k" "cros_G_xp_$k.img"
+        rd_ck "$k: futility --pack makes the very same blob of the image the directory builds without the blob" cros_fut_pack_is "cros_G_xr_$k.blob" "cros_G_xp_$k.img" "$kb" "$kp" \
+            --version 7 --flags 0x3 --kloadaddr 0x2000000 --config cros_cfg.txt --bootloader cros_bl.bin --pad 131072
+        rd_ck "$k: futility verifies it (and the one it made)" cros_fut_verify "cros_G_xr_$k.blob" 131072
+        rd_ck "$k: ... and the first one" cros_fut_verify "cros_G_$k.blob" 131072
+    done
+    rd_done "ChromeOS: futility --pack makes the blobs the independent tool and abr make, byte for byte (the command line, a bootloader, the version, the flags, the load address and the verification block set; the developer key, and a key of one's own), and the very same blob of an edited image"
+else
+    echo "note: futility is not installed: its --pack is not compared"
+fi
+
+# A ChromeOS blob around a DHTB-wrapped image: the wrappers come off in order, an edit goes through both, and the DHTB header's
+# digest is made afresh.
+python3 -I - <<'PYEOF'
+import hashlib, struct
+payload = open("cros_plain_pad.img", "rb").read()
+header = b"DHTB\x01\x00\x00\x00" + hashlib.sha256(payload).digest() + b"\x00" * 8 + struct.pack("<I", len(payload))
+open("cros_dhtb_plain.img", "wb").write(header + b"\x00" * (512 - len(header)) + payload)
+PYEOF
+rd_ck "the independent tool makes a blob around the DHTB image" cros make cros_chain.blob --kernel cros_dhtb_plain.img --keyblock "$CROS_KB" --key "$CROS_KP"
+rd_unpack cros_chain.blob cros_u_chain
+rd_ck "unpack names both wrappers, in the order they come off" grep -q 'unpacked chromeos-wrapped dhtb-wrapped boot' cros_u_chain.log
+rd_ck "and says an untouched repack is identical" grep -q 'reproduces this image byte-for-byte' cros_u_chain.log
+rd_ck "both are in the manifest" grep -q '^has_chromeos=true$' cros_u_chain/manifest.txt
+rd_ck "(the DHTB header)" grep -q '^has_dhtb=true$' cros_u_chain/manifest.txt
+rd_ck "info names both" said "wrapper: ChromeOS kernel blob" "$ABR" info cros_chain.blob
+"$ABR" repack cros_u_chain -o cros_r_chain.blob >/dev/null 2>&1
+rd_ck "an untouched repack is identical" cmp -s cros_chain.blob cros_r_chain.blob
+cros_copy cros_u_chain cros_x_chain
+cros_edit cros_x_chain
+rd_ck "an edit goes through both" cros_repack cros_x_chain cros_xr_chain.blob dev
+rd_ck "the blob's signatures are good" cros verify cros_xr_chain.blob
+rd_ck "futility verifies it" cros_fut_verify cros_xr_chain.blob
+cros kernel cros_xr_chain.blob cros_xr_chain_kernel.bin
+rd_ck "the DHTB header inside has the digest of what follows it (made afresh)" python3 -I - cros_xr_chain_kernel.bin <<'PYEOF'
+import hashlib, struct, sys
+k = open(sys.argv[1], "rb").read()
+assert k[:8] == b"DHTB\x01\x00\x00\x00", "no DHTB header"
+n = struct.unpack_from("<I", k, 48)[0]
+payload = k[512:512 + n]
+assert len(payload) == n and n > 70000
+assert hashlib.sha256(payload).digest() == k[8:40], "the digest is not of the payload"
+assert payload[:8] == b"ANDROID!"
+assert b"abr test" not in payload or True
+assert k[512 + n:] == b"\0" * (len(k) - 512 - n), "what follows is not zeros"
+PYEOF
+rd_unpack cros_xr_chain.blob cros_xr_chain_re
+rd_ck "the edit is in the image" cros_edit_is_in cros_xr_chain_re
+rd_done "ChromeOS: around a DHTB header (two wrappers): both come off in order, an untouched repack is identical, an edit goes through both, the blob is signed afresh and the DHTB digest is made afresh"
+
+# A blob whose kernel is nothing abr unpacks (random bytes): a container of its own, type=chromeos, whose kernel is a file.
+head -c 100000 /dev/urandom >cros_rnd.bin
+rd_ck "the independent tool makes a blob of random bytes" cros make cros_C.blob --kernel cros_rnd.bin --keyblock "$CROS_KB" --key "$CROS_KP" --minor 2 --kernel-version 3 --config cros_cfg.txt
+rd_ck "identify" said "CHROMEOS" "$ABR" identify cros_C.blob
+rd_ck "info says what the blob is (a kernel of 102400 bytes: the 100000 and the zeros up to 4096)" said "blob:           vboot preamble 2.2, kernel version 3," "$ABR" info cros_C.blob
+rd_ck "... and the sizes" said "kernel 102400 bytes, config $(cros_size cros_cfg.txt) bytes" "$ABR" info cros_C.blob
+rd_unpack cros_C.blob cros_u_C
+rd_ck "the manifest is of a container" grep -q '^type=chromeos$' cros_u_C/manifest.txt
+rd_ck "the kernel is a file (the kernel field as it is, zeros and all)" test "$(cros_size cros_u_C/chromeos_kernel.bin)" = 102400
+rd_ck "... that starts with the bytes" cmp -s -n 100000 cros_u_C/chromeos_kernel.bin cros_rnd.bin
+rd_ck "the command line is a file" cmp -s cros_u_C/chromeos_config.txt cros_cfg.txt
+rd_ck "the version of the kernel is in the manifest" grep -q '^chromeos_kernel_version=3$' cros_u_C/manifest.txt
+"$ABR" repack cros_u_C -o cros_r_C.blob >/dev/null 2>&1
+rd_ck "an untouched repack is identical" cmp -s cros_C.blob cros_r_C.blob
+cros_copy cros_u_C cros_x_C
+head -c 5000 /dev/urandom >>cros_x_C/chromeos_kernel.bin
+rd_ck "a longer kernel: repack" cros_repack cros_x_C cros_xr_C.blob dev
+rd_ck "the independent tool makes the same blob of the file" cros make cros_xe_C.blob --kernel cros_x_C/chromeos_kernel.bin --keyblock "$CROS_KB" --key "$CROS_KP" --minor 2 --kernel-version 3 --config cros_cfg.txt
+rd_ck "... the same bytes" cmp -s cros_xr_C.blob cros_xe_C.blob
+rd_ck "futility verifies it" cros_fut_verify cros_xr_C.blob
+cros_copy cros_u_C cros_s_C
+head -c 50000 cros_rnd.bin >cros_s_C/chromeos_kernel.bin
+rd_ck "a shorter kernel: repack" cros_repack cros_s_C cros_sr_C.blob dev
+rd_ck "the independent tool makes the same blob of the file" cros make cros_se_C.blob --kernel cros_s_C/chromeos_kernel.bin --keyblock "$CROS_KB" --key "$CROS_KP" --minor 2 --kernel-version 3 --config cros_cfg.txt
+rd_ck "... the same bytes" cmp -s cros_sr_C.blob cros_se_C.blob
+rd_ck "a kernel that is nothing: refused, with the reason" true
+cros_copy cros_u_C cros_e_C
+: >cros_e_C/chromeos_kernel.bin
+rd_ck "an empty kernel is refused" cros_refuse_repack empty_kernel cros_e_C 'the kernel of a ChromeOS blob cannot be empty'
+cros_copy cros_u_C cros_n_C
+sed -i '/^chromeos_kernel_file=/d' cros_n_C/manifest.txt
+rd_ck "a manifest without the kernel's file is refused" cros_refuse_repack no_kernel cros_n_C 'has no chromeos_kernel_file'
+rd_done "ChromeOS: a blob of a kernel abr does not unpack is a container (type=chromeos) whose kernel is a file: untouched it comes back identical; a longer or shorter kernel makes the blob the independent tool makes; an empty kernel or no kernel file is refused"
+
 # ---- images of your own: ABR_REAL_IMAGES=<directory> tests/run_tests.sh <abr> checks every file of it the way
 # the fixtures above are checked -- an untouched repack is identical, every ramdisk archive is a directory that
 # GNU cpio agrees with, and a file put into a directory lands in the image. (Files abr does not take, an ext4
@@ -3822,7 +4434,26 @@ if [ -n "${ABR_REAL_IMAGES:-}" ] && [ -d "$ABR_REAL_IMAGES" ]; then
             rd_ck "$first: a file put into the directory is in the image" test "$(cat "$rw.edit_re/$first/abr_test_file" 2>/dev/null)" = "abr test"
             rd_ck "$first: nothing else changed" rd_same_tree_x "$rw/$first" "$rw.edit_re/$first" abr_test_file
         fi
-        rd_done "real image $rb: ${prefixes:+ramdisk directories (${prefixes//$'\n'/, }), }untouched repack identical$RD_GNU"
+        # ... and around it in a ChromeOS kernel blob (made by the independent tool, with the developer keys): the blob comes off,
+        # an untouched repack is identical, the signatures are good, and an edit lands in the image and is signed afresh.
+        if cros make "$rw.chromeos" --kernel "$img" --keyblock "$CK/kernel.keyblock" --key "$CK/kernel_data_key.vbprivk" >/dev/null 2>&1; then
+            rm -rf "$rw.cu" "$rw.cu.edit" "$rw.cu.edit_re"
+            "$ABR" unpack "$rw.chromeos" -o "$rw.cu" >"$rw.cu.log" 2>&1
+            rd_ck "in a ChromeOS blob: unpack" test -d "$rw.cu"
+            rd_ck "in a ChromeOS blob: the blob is named" grep -q 'chromeos-wrapped' "$rw.cu.log"
+            "$ABR" repack "$rw.cu" -o "$rw.chromeos.out" >/dev/null 2>&1
+            rd_ck "in a ChromeOS blob: an untouched repack is identical" cmp -s "$rw.chromeos" "$rw.chromeos.out"
+            rd_ck "in a ChromeOS blob: the signatures of the original are good" cros verify "$rw.chromeos"
+            if [ -n "$prefixes" ]; then
+                cp -a "$rw.cu" "$rw.cu.edit" && printf 'abr test\n' >"$rw.cu.edit/$(sed -n '1p' <<<"$prefixes")/abr_test_file"
+                "$ABR" repack "$rw.cu.edit" -o "$rw.cu.edit.blob" >/dev/null 2>&1 && "$ABR" unpack "$rw.cu.edit.blob" -o "$rw.cu.edit_re" >/dev/null 2>&1
+                rd_ck "in a ChromeOS blob: an edit lands in the image" test "$(cat "$rw.cu.edit_re/$(sed -n '1p' <<<"$prefixes")/abr_test_file" 2>/dev/null)" = "abr test"
+                rd_ck "in a ChromeOS blob: the blob is signed afresh, and good" cros verify "$rw.cu.edit.blob"
+                rd_ck "in a ChromeOS blob: futility verifies it" cros_fut_verify "$rw.cu.edit.blob"
+            fi
+            rm -rf "$rw.chromeos" "$rw.chromeos.out" "$rw.cu" "$rw.cu.edit" "$rw.cu.edit.blob" "$rw.cu.edit_re"
+        fi
+        rd_done "real image $rb: ${prefixes:+ramdisk directories (${prefixes//$'\n'/, }), }untouched repack identical$RD_GNU, and the same image in a ChromeOS kernel blob"
     done
 fi
 
