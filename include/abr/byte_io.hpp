@@ -63,6 +63,27 @@ void write_file(const std::filesystem::path& path, const uint8_t* data, size_t s
 // as it does on every other platform instead of CRLF (the console still shows it correctly).
 void set_binary_stdio();
 
+// The command line as UTF-8 text, without the program name. On Windows the C runtime hands main() the
+// version in the ANSI code page, in which whatever that code page cannot hold has become '?' (Cyrillic on a
+// Western system, Chinese, emoji): this asks Windows for the wide command line and converts it, so such a
+// path arrives as it is. (std::filesystem reads a narrow path as UTF-8 in the library abr is built with on
+// Windows, so nothing else has to change.) Elsewhere: argv as it is.
+std::vector<std::string> command_line_utf8(int argc, char** argv);
+
+// Windows only (a no-op elsewhere, and where the output is not a console): the console shows UTF-8 -- the
+// paths abr names in its messages -- for as long as this object lives, then gets its code page back. A pipe
+// or a file gets the bytes as they are in any case.
+class Utf8Console {
+public:
+    Utf8Console();
+    ~Utf8Console();
+    Utf8Console(const Utf8Console&) = delete;
+    Utf8Console& operator=(const Utf8Console&) = delete;
+
+private:
+    unsigned saved_ = 0;  // the code page to put back; 0: nothing was changed
+};
+
 // Windows only: gives a file the System attribute, which is how Cygwin and MSYS2 mark the files that
 // stand for their symbolic links. A no-op elsewhere. False when Windows refused (the file is still there).
 bool mark_system_file(const std::filesystem::path& path);

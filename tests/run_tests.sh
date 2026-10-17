@@ -59,7 +59,8 @@ case "$ABR" in
         for pair in "$ABR:abr" "$(dirname "$ABR")/abr_unit_tests.exe:abr_unit_tests"; do
             exe="${pair%:*}"
             [ -f "$exe" ] || continue
-            printf '#!/bin/sh\nexec wine "%s" "$@"\n' "$exe" >"$WORK/winebin/${pair##*:}"
+            # (a UTF-8 locale: that is how wine hands a name with letters outside ASCII to the program)
+            printf '#!/bin/sh\nLC_ALL=C.UTF-8\nexport LC_ALL\nexec wine "%s" "$@"\n' "$exe" >"$WORK/winebin/${pair##*:}"
             chmod +x "$WORK/winebin/${pair##*:}"
         done
         ABR="$WORK/winebin/abr"
@@ -4403,6 +4404,36 @@ cros_copy cros_u_C cros_n_C
 sed -i '/^chromeos_kernel_file=/d' cros_n_C/manifest.txt
 rd_ck "a manifest without the kernel's file is refused" cros_refuse_repack no_kernel cros_n_C 'has no chromeos_kernel_file'
 rd_done "ChromeOS: a blob of a kernel abr does not unpack is a container (type=chromeos) whose kernel is a file: untouched it comes back identical; a longer or shorter kernel makes the blob the independent tool makes; an empty kernel or no kernel file is refused"
+
+# ---- paths that are not ASCII --------------------------------------------------------------------------------
+# Cyrillic, an accent, Chinese and an emoji (four bytes in UTF-8, a surrogate pair on Windows) in the names of the
+# image, of the directory it is unpacked to and of the file it is packed to, and in a file name the manifest holds.
+# On Windows the C runtime hands main() the command line in the ANSI code page, in which every one of these characters
+# is a '?': abr asks Windows for the wide command line instead (Wine needs a UTF-8 locale to pass the characters on:
+# the wrapper above sets it). Elsewhere a name is bytes and this passes with any locale.
+U8_ROOT="каталог-ü-日本-😀"
+U8_IMG="$U8_ROOT/загрузка-ü-日本-😀.img"
+U8_DIR="$U8_ROOT/распаковано-日本-😀"
+U8_OUT="$U8_ROOT/результат-ü-😀.img"
+mkdir -p "$U8_ROOT"
+cp boot_v2.img "$U8_IMG"
+rd_fails=""
+rd_ck "unpack of an image whose name is not ASCII into a directory whose name is not" "$ABR" unpack "$U8_IMG" -o "$U8_DIR"
+rd_ck "the directory has the name it was given" test -f "$U8_DIR/manifest.txt"
+rd_ck "and nothing is left under a '?' name" test "$(find . -name '*\?*' | wc -l)" = 0
+rd_ck "the manifest's first lines name the directory as it was given" grep -q -F -- "$U8_DIR" "$U8_DIR/manifest.txt"
+rd_ck "repack into a file whose name is not ASCII" "$ABR" repack "$U8_DIR" -o "$U8_OUT"
+rd_ck "... is the image it came from" cmp -s "$U8_IMG" "$U8_OUT"
+rd_ck "info names the file as it is" said "file:   $U8_IMG " "$ABR" info "$U8_IMG"
+rd_ck "identify names it, too" said "^$U8_IMG: " "$ABR" identify "$U8_IMG"
+rd_ck "identify -b says what it is" said "AOSP" "$ABR" identify -b "$U8_IMG"
+# a file name that only the manifest knows
+U8_FILE="ядро-ü-日本-😀.bin"
+rd_ck "a kernel file with a name that is not ASCII (and its raw twin): moved there" sh -c "mv '$U8_DIR/kernel' '$U8_DIR/$U8_FILE' && mv '$U8_DIR/.abr_raw/kernel.raw' '$U8_DIR/.abr_raw/$U8_FILE.raw' && sed -i 's/^kernel_file=.*/kernel_file=$U8_FILE/' '$U8_DIR/manifest.txt'"
+rd_ck "repacked from the manifest's name" "$ABR" repack "$U8_DIR" -o "$U8_ROOT/из-манифеста.img"
+rd_ck "... the same image" cmp -s "$U8_IMG" "$U8_ROOT/из-манифеста.img"
+rd_ck "a name that is not there is named as it was written" said "ядро-ü-日本-😀.bin" sh -c "rm '$U8_DIR/$U8_FILE' '$U8_DIR/.abr_raw/$U8_FILE.raw'; ! '$ABR' repack '$U8_DIR' -o '$U8_ROOT/нет.img' 2>&1; true"
+rd_done "paths that are not ASCII: the image, the directory, the output file and a name of the manifest (Cyrillic, an accent, Chinese, an emoji) come through the command line and the messages as they are"
 
 # ---- images of your own: ABR_REAL_IMAGES=<directory> tests/run_tests.sh <abr> checks every file of it the way
 # the fixtures above are checked -- an untouched repack is identical, every ramdisk archive is a directory that

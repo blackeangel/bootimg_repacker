@@ -65,6 +65,11 @@ abr identify [-b] <file>...   # what is it? worded like Android Image Kitchen's 
 one file per component (kernel, ramdisk, dtb, ...) into the output
 directory. Edit whatever you need to, then `repack`.
 
+Paths may hold any characters. On Windows `abr.exe` reads the wide command line (the C runtime's `argv` holds a `?` for
+every character outside the ANSI code page: Cyrillic on a Western system, Chinese, an emoji) and works in UTF-8 from
+there, and a console is switched to UTF-8 while it runs, so a path like `C:\Users\Павел\загрузка.img` comes through
+exactly as typed. (The test suite unpacks and repacks images with such names, under wine as well.)
+
 **An unpack/repack round trip is byte-for-byte identical to the
 original if you don't touch any of the extracted files** -- and `unpack`
 checks this itself (it rebuilds the image in memory and compares), saying
@@ -571,7 +576,7 @@ See `.github/workflows/build.yml` for the exact CI recipe (including
 where it gets the NDK from) and prebuilt binaries under this repo's
 Actions tab / Releases. CI builds Linux with both g++-14 and clang-20, runs
 the whole test suite on both, and runs the Windows `abr.exe` through the same
-suite under wine. The `.exe` imports only `KERNEL32.dll` and `msvcrt.dll`.
+suite under wine. The `.exe` imports only `KERNEL32.dll`, `msvcrt.dll` and `SHELL32.dll` (for the wide command line).
 
 **Note on "static" for Android:** bionic has no static libc, so an
 Android executable is never fully static -- that's expected, not a

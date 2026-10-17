@@ -42,7 +42,7 @@ tools" below.
 | self-contained RSA: BigInt (Knuth D, Montgomery), DER/PEM/X.509, PKCS#1 v1.5 sign/verify, PKCS#8/PKCS#1 key parsing, AVB public-key blob -- **no OpenSSL anywhere in the build** | **done + verified** (Python integers, `openssl dgst -sign`, `avbtool extract_public_key`; see "Self-contained crypto" below) |
 | manifest + CLI (`abr info/unpack/repack`) | **done** |
 | CMake: FetchContent-vendored static zlib/lz4/zstd/xz/bzip2 | **done + build-verified natively on Linux**, both the dynamic and the `-DABR_STATIC_BINARY=ON` fully-static configurations |
-| Test suite (`tests/run_tests.sh`) | **done, 311/311 passing** locally on g++-14 and on clang-20, 310/310 for `abr.exe` under wine (with the optional `pxa-*` / `rkcrc` / `blobpack`+`blobunpack` / `mboot` / `loki_tool` / `futility` oracles and AIK's magic file); CI runs the matrix (g++-14, clang-20, Windows under wine, arm64 under qemu-user) -- see Verification |
+| Test suite (`tests/run_tests.sh`) | **done, 312/312 passing** locally on g++-14 and on clang-20, 311/311 for `abr.exe` under wine (with the optional `pxa-*` / `rkcrc` / `blobpack`+`blobunpack` / `mboot` / `loki_tool` / `futility` oracles and AIK's magic file); CI runs the matrix (g++-14, clang-20, Windows under wine, arm64 under qemu-user) -- see Verification |
 | CMake cross toolchains (mingw-w64, Android NDK) | **done + verified** (mingw reproduced locally; NDK only provable via CI, see below) |
 | GitHub Actions static build matrix (linux-x86_64, windows-x86_64, android-arm64) | **done + verified**: run 35313499827, all 3 jobs green, all 3 static binaries produced as artifacts (abr-linux-x86_64, abr-windows-x86_64, abr-android-arm64) |
 
@@ -1351,20 +1351,48 @@ Not done, and not claimed: **no real Chromebook partition has been tried** (none
 boot images and random bytes); the 8192-bit algorithms (9 to 11) are in the code and not in the tests; the keyblock's own
 signature is not checked; x86 blobs are refused; a FIT image as the kernel field (abr does not read FIT yet) is read as one device-tree blob (the whole FIT, `blob0.dtb`) and round-trips byte for byte; the kernel and the device trees inside it are not taken apart.
 
+## Windows: the command line in UTF-8 (done, 17 Oct 2026)
+
+Looked for what the first Windows user with a Cyrillic folder would hit, and found it. A small program built with the
+same toolchain (mingw-w64's libstdc++), run under wine with a UTF-8 locale, showed two things:
+- the C runtime's `argv` is lossy: every character outside the ANSI code page (1252 under wine) is a `?` (0x3f) and `ü`
+  is a lone 0xfc byte, so `abr.exe unpack загрузка.img` looked for a file named `????????.img`. The wide command line
+  (`GetCommandLineW` + `CommandLineToArgvW`) has every character, an emoji as a surrogate pair;
+- libstdc++'s `std::filesystem::path` reads a narrow string as UTF-8 and `string()` gives UTF-8 back (`fs::path` of the
+  UTF-8 bytes held the right wide characters; the `?`-ridden narrow `argv` threw "Cannot convert character sequence"),
+  so none of the two dozen `path.string()` / `dir / name` places needed a change: the entry point was all that was wrong.
+
+What changed: `command_line_utf8(argc, argv)` (`src/byte_io.cpp`) returns the UTF-8 of the wide command line on Windows
+(argv as it is elsewhere, and where the number of words does not match), `Utf8Console` switches the output code page of a
+console to UTF-8 while abr runs (when stdout or stderr is a console; it is put back at the end; a pipe or a file gets the
+bytes as they are), and `main` uses both. The `.exe` imports `SHELL32.dll` for `CommandLineToArgvW` now, besides
+`KERNEL32.dll` and `msvcrt.dll` (the CI's check of the imports lists it among the system DLLs it accepts).
+
+Tests: one group, "paths that are not ASCII": Cyrillic, an accent, Chinese and an emoji in the names of the image, of the
+directory it is unpacked to, of the file it is packed to and of a file the manifest names; unpack, repack (identical),
+info, identify, and no file under a `?` name is left behind. The wine wrapper of the suite sets `LC_ALL=C.UTF-8` now (wine
+decodes its Unix command line with the locale; in the C locale the characters arrive as garbage). Negative control: with
+`main` reading `argv` as before, exactly this group fails under wine (310 pass, 1 fails). The suites: g++-14 312/312,
+clang-20 312/312, Windows under wine 311/311.
+
+Not done: paths over 260 characters (Windows wants `\\?\` or a manifest for them; an unpack directory deep in a tree
+could meet that); the console part cannot be exercised under wine (it has no console); a name that is not valid Unicode
+(a lone surrogate, which NTFS allows) arrives with the replacement character.
+
 ## Next steps (in order)
 
 1. Remaining AIK parity, easiest first: QCDT creation,
    Sony SIN. The stages 2 and 3 of the user's own spec need a scope
    decision before anything is built.
 2. Housekeeping: AIK-like default levels as an opt-in, gzip OS-byte
-   determinism, UTF-8 `wmain` on Windows, `zlib-ng` for faster gzip, splitting
-   `main.cpp`.
+   determinism, `zlib-ng` for faster gzip, splitting `main.cpp`.
 3. Run the CI matrix on every push (the workflow only runs on `main`, pull
    requests and manual dispatch: dispatch it with
    `gh api -X POST repos/<repo>/actions/workflows/build.yml/dispatches -f ref=<branch>`).
 
-CI status of the branch: run 37254228679 (commit `5d04345`) green on all
-jobs; run 37428759045 (commit `2a76f87`) dispatched, result below when known.
+CI status of the branch: run 39020243483 (commit `750530f`, ChromeOS kernel blobs) green on all five jobs
+(linux g++-14 and clang-20, Windows under wine, arm64 under qemu-user, android-arm64); the earlier runs 38652019847
+(`ccf6c3c`, LOKI), 38360970941 (`786c44a`) and 37254228679 (`5d04345`) are green as well.
 
 ### CI status: green as of commit `ea0206d` (run 35313499827)
 

@@ -2638,17 +2638,19 @@ std::string take_threads_option(std::vector<std::string>& v) {
 
 int main(int argc, char** argv) {
     set_binary_stdio();
+    const Utf8Console utf8_console;  // (Windows: the console shows the paths in the messages as they are)
     if (!hash::sha_selftest()) {
         std::cerr << "internal error: bundled SHA implementation failed its self-test; "
                      "refusing to run since boot ids and AVB hashes would be silently wrong\n";
         return 2;
     }
     try {
-        if (argc < 2) {
+        // (UTF-8 on Windows, too: the C runtime's argv would hold '?' for every character outside the ANSI code page)
+        std::vector<std::string> args = command_line_utf8(argc, argv);
+        if (args.empty()) {
             usage();
             return 1;
         }
-        std::vector<std::string> args(argv + 1, argv + argc);
         if (std::string err = take_threads_option(args); !err.empty()) {
             std::cerr << "error: " << err << "\n";
             return 1;
