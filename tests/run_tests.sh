@@ -4405,6 +4405,158 @@ sed -i '/^chromeos_kernel_file=/d' cros_n_C/manifest.txt
 rd_ck "a manifest without the kernel's file is refused" cros_refuse_repack no_kernel cros_n_C 'has no chromeos_kernel_file'
 rd_done "ChromeOS: a blob of a kernel abr does not unpack is a container (type=chromeos) whose kernel is a file: untouched it comes back identical; a longer or shorter kernel makes the blob the independent tool makes; an empty kernel or no kernel file is refused"
 
+# =========================================================================
+# Sony SIN containers, versions 1 to 3: the packaging Xperia firmware (.ftf) puts its images in (kernel.sin, boot.sin,
+# FOTAKernel.sin, loader.sin ...). Android Image Kitchen opens one with `sony_dump` (github.com/munjeni/anyxperia_dumper)
+# and forgets the container -- unpackimg.sh deletes the signature type, so repackimg.sh writes the plain image. A SIN is
+# Sony's (the header carries hashes and a signature), nothing here could make one for an edited image, so abr does what
+# AIK does and says so: the layer comes off, the image inside is unpacked as any image is, a repack writes that image
+# (abr/legacy/sin.hpp). tests/tools/sin_tool.py makes the containers and reads them on its own -- written from the source
+# of sony_dump, sharing no code with abr -- around two images of its own making (a boot image and a Sony ELF boot image,
+# tests/tools/elf_tool.py). There is no real .sin among the fixtures: what is checked is the layout as the source of
+# sony_dump has it, in 45 containers (every version; the image behind the header, a loader, data in front of the image,
+# MMCF with ADDR and LZ4A parts, the gaps that are filled with 0xFF, parts that start too early, entries with more
+# than their fields, parts decoded on several threads; what is not a boot image; what is damaged in each of its fields).
+# Where sony_dump itself is at hand (ABR_SONY_DUMP, built from that source: it has no licence file, so it is only run,
+# never copied) it converts every container as well and its output is compared byte for byte.
+# =========================================================================
+SIN_T="$TOOLS/sin_tool.py"
+sint() { python3 -I "$SIN_T" "$@"; }
+SIN_DUMP="${ABR_SONY_DUMP:-$(command -v sony_dump 2>/dev/null || true)}"
+sin_dump_ok() { [ -n "$SIN_DUMP" ] && [ -x "$SIN_DUMP" ]; }
+if sin_dump_ok; then
+    echo "note: sony_dump ($SIN_DUMP) converts the Sony SIN containers too"
+else
+    echo "note: sony_dump is not at hand (ABR_SONY_DUMP): the Sony SIN containers are judged by tests/tools/sin_tool.py alone"
+fi
+sin_says() {  # <text> <command...>: the command succeeds and its output has the text as it is (not as a pattern)
+    local text="$1" out
+    shift
+    out="$("$@" 2>&1)" || return 1
+    grep -q -F -- "$text" <<<"$out"
+}
+sin_refuses() {  # <text> <command...>: the command fails and says the text
+    local text="$1" out
+    shift
+    out="$("$@" 2>&1)" && return 1
+    grep -q -F -- "$text" <<<"$out"
+}
+sin_reader() { sint convert "$1" sin_rd.img && cmp -s sin_rd.img "$2"; }  # <sin> <image>: the independent reader makes it
+sin_dump_makes() {  # <sin> <image>: what sony_dump writes for the container is the image
+    rm -rf sin_or
+    mkdir sin_or
+    local t=""
+    command -v timeout >/dev/null 2>&1 && t="timeout 60"
+    $t "$SIN_DUMP" sin_or "$1" >/dev/null 2>&1 || return 1
+    local f
+    for f in sin_or/*; do
+        [ -f "$f" ] && cmp -s "$f" "$2" && return 0
+    done
+    return 1
+}
+sin_not_sin() {  # <file>: it does not start the way a SIN does (01 00 00 00, 02 00 00 00, "\x03SIN")
+    local h
+    h="$(head -c 4 "$1" | od -An -tx1 | tr -d ' \n')"
+    [ "$h" != 01000000 ] && [ "$h" != 02000000 ] && [ "$h" != 0353494e ]
+}
+sin_tree_is_plain() {  # <dir> <dir of the plain image>: the same files, the same manifest but for its first line
+    diff -r --no-dereference -x manifest.txt "$1" "$2" >/dev/null &&
+        [ "$(tail -n +2 "$1/manifest.txt")" = "$(tail -n +2 "$2/manifest.txt")" ]
+}
+
+mkdir -p sin_k
+if sint payloads sin_k && sint cases sin_k/c --aosp sin_k/aosp.img --elf sin_k/elf.img --big sin_k/big.img; then
+    pass "Sony SIN: the containers are made ($(wc -l <sin_k/c/index.txt | tr -d ' ') of them, around a boot image and a Sony ELF boot image)"
+else
+    fail "Sony SIN: the containers could not be made (tests/tools/sin_tool.py)"
+fi
+sin_n=0
+while IFS=$'\t' read -r sin_status sin_name sin_pat; do
+    sin_f="sin_k/c/$sin_name.sin"
+    sin_u="sin_u_$sin_name"
+    sin_n=$((sin_n + 1))
+    case "$sin_status" in
+        ok)
+            sin_want="sin_k/c/$sin_name.expect"
+            rd_unpack "$sin_f" "$sin_u"
+            rd_ck "$sin_name: unpack" test -d "$sin_u"
+            rd_ck "$sin_name: the container is named" rd_has_text "$sin_u.log" "unpacked sin-wrapped"
+            rd_ck "$sin_name: the check says it is the image inside the SIN that comes back" rd_has_text "$sin_u.log" "reproduces the image inside the SIN byte-for-byte"
+            rd_unpack "$sin_want" "$sin_u.plain"
+            rd_ck "$sin_name: the directory is the one of the plain image" sin_tree_is_plain "$sin_u" "$sin_u.plain"
+            "$ABR" repack "$sin_u" -o "$sin_u.img" >"$sin_u.rlog" 2>&1
+            rd_ck "$sin_name: a repack writes the image inside" cmp -s "$sin_u.img" "$sin_want"
+            rd_ck "$sin_name: ... and no container" sin_not_sin "$sin_u.img"
+            rd_ck "$sin_name: info shows the container ($sin_pat)" sin_says "$sin_pat" "$ABR" info "$sin_f"
+            rd_ck "$sin_name: identify names the signature of the file" sin_says "SINv" "$ABR" identify "$sin_f"
+            rd_ck "$sin_name: the independent reader makes the same image" sin_reader "$sin_f" "$sin_want"
+            sin_dump_ok && rd_ck "$sin_name: sony_dump makes the same image" sin_dump_makes "$sin_f" "$sin_want"
+            ;;
+        nonboot | refuse)
+            rm -rf "$sin_u"
+            rd_ck "$sin_name: unpack is refused with the reason ($sin_pat)" sin_refuses "$sin_pat" "$ABR" unpack "$sin_f" -o "$sin_u"
+            rd_ck "$sin_name: no directory is left" test ! -e "$sin_u"
+            ;;
+    esac
+done <sin_k/c/index.txt
+rd_done "Sony SIN: $sin_n containers (v1, v2, v3: the image behind the header, a loader, data in front of it, MMCF with ADDR and LZ4A parts, gaps filled with 0xFF, parts put at the end, longer entries, 60 parts, 18 MiB on several threads) unpack as the plain image does, a repack writes that image and no container, and the independent reader${SIN_DUMP:+ and sony_dump} make the same image; what is not a boot image or is damaged is refused with the reason and leaves no directory"
+
+# ---- an edit lands in the image, and the repack is the plain image again (no container)
+sin_edit() {  # <case> : append to the kernel of the unpacked container, repack, unpack that: the change is there
+    local name="$1" d="sin_e_$1" f
+    rm -rf "$d" "$d.img" "${d}_re"
+    cp -a "sin_u_$name" "$d"
+    f="$(ls "$d/kernel" "$d/segment0_kernel.bin" 2>/dev/null | head -n 1)"
+    [ -n "$f" ] || return 1
+    printf 'abr test' >>"$f"
+    "$ABR" repack "$d" -o "$d.img" >"$d.rlog" 2>&1 || return 1
+    sin_not_sin "$d.img" || return 1
+    "$ABR" unpack "$d.img" -o "${d}_re" >"${d}_re.log" 2>&1 || return 1
+    cmp -s "$f" "${d}_re/$(basename "$f")" || return 1
+    ! grep -q 'sin-wrapped' "${d}_re.log"
+}
+for sin_name in v1_raw_aosp v3_mmcf_mixed_aosp v2_loader_elf v3_mmcf_lz4_elf v3_first_elf; do
+    rd_ck "$sin_name: an edit of the kernel is in the image that is written, and it is not a container" sin_edit "$sin_name"
+done
+rd_done "Sony SIN: what is edited in the directory of a container lands in the plain image that a repack writes (boot and ELF images, every kind of container)"
+
+# ---- the same directory, whatever the number of threads decoding the parts of the 18 MiB container
+rm -rf sin_t1 sin_t4
+ABR_THREADS=1 "$ABR" unpack sin_k/c/v3_mmcf_big_aosp.sin -o sin_t1 >/dev/null 2>&1
+ABR_THREADS=4 "$ABR" unpack sin_k/c/v3_mmcf_big_aosp.sin -o sin_t4 >/dev/null 2>&1
+rd_ck "one thread unpacks it" test -f sin_t1/manifest.txt
+rd_ck "four threads unpack it" test -f sin_t4/manifest.txt
+rd_ck "the directories are the same" sin_tree_is_plain sin_t1 sin_t4
+rd_ck "and the image inside is what a repack writes" sh -c "'$ABR' repack sin_t4 -o sin_t4.img >/dev/null 2>&1 && cmp -s sin_t4.img sin_k/c/v3_mmcf_big_aosp.expect"
+rd_done "Sony SIN: the parts of a container are decoded on as many threads as there are, and the result is the same for one"
+
+# ---- notes: a part that starts before the end of the image is put at the end, as sony_dump does -- and the unpack says so
+rm -rf sin_n1
+"$ABR" unpack sin_k/c/v3_mmcf_append_elf.sin -o sin_n1 >sin_n1.log 2>&1
+rd_ck "the unpack says where the part went" rd_has_text sin_n1.log "it is put at the end, as sony_dump does"
+rd_ck "and what the repack is" rd_has_text sin_n1.log "the container is not kept, a repack writes the plain elf_boot image"
+rd_ck "info says it as well" sin_says "it is put at the end, as sony_dump does" "$ABR" info sin_k/c/v3_mmcf_append_elf.sin
+rd_ck "a container that is as it should be has no such note" sh -c "! '$ABR' info sin_k/c/v3_mmcf_mixed_elf.sin 2>&1 | grep -q 'note:'"
+rd_done "Sony SIN: the unpack tells what it did that is not plain (a part put at the end) and what a repack will write"
+
+# ---- a container around an image that is wrapped (DHTB, here): the container is not kept, the wrapper is
+python3 - <<'PYEOF'
+import hashlib, struct
+inner = open("sin_k/aosp.img", "rb").read()
+payload = inner + b"SEANDROIDENFORCE" + b"\xff\xff\xff\xff"
+header = b"DHTB\x01\x00\x00\x00" + hashlib.sha256(payload).digest() + b"\x00" * 8 + struct.pack("<I", len(payload))
+open("sin_k/dhtb.img", "wb").write(header + b"\x00" * (512 - len(header)) + payload)
+PYEOF
+sint wrap sin_k/dhtb.img sin_k/dhtb.sin --version 2 --mmcf mixed
+rd_unpack sin_k/dhtb.sin sin_d
+rd_ck "both layers are named" rd_has_text sin_d.log "unpacked sin-wrapped dhtb-wrapped boot"
+rd_ck "the DHTB wrapper is in the manifest" grep -q '^has_dhtb=true$' sin_d/manifest.txt
+rd_ck "the container is not (nothing of it is kept)" sh -c "! grep -q '^sin' sin_d/manifest.txt"
+rd_ck "the round trip is checked against what the container held" rd_has_text sin_d.log "reproduces the image inside the SIN byte-for-byte"
+"$ABR" repack sin_d -o sin_d.img >/dev/null 2>&1
+rd_ck "a repack writes the DHTB-wrapped image that was inside" cmp -s sin_d.img sin_k/dhtb.img
+rd_done "Sony SIN: around a DHTB-wrapped image only the container comes off; the DHTB header stays and is written again"
+
 # ---- paths that are not ASCII --------------------------------------------------------------------------------
 # Cyrillic, an accent, Chinese and an emoji (four bytes in UTF-8, a surrogate pair on Windows) in the names of the
 # image, of the directory it is unpacked to and of the file it is packed to, and in a file name the manifest holds.
@@ -4484,7 +4636,22 @@ if [ -n "${ABR_REAL_IMAGES:-}" ] && [ -d "$ABR_REAL_IMAGES" ]; then
             fi
             rm -rf "$rw.chromeos" "$rw.chromeos.out" "$rw.cu" "$rw.cu.edit" "$rw.cu.edit.blob" "$rw.cu.edit_re"
         fi
-        rd_done "real image $rb: ${prefixes:+ramdisk directories (${prefixes//$'\n'/, }), }untouched repack identical$RD_GNU, and the same image in a ChromeOS kernel blob"
+        # ... and in a Sony SIN (the image behind a v3 header; as an LZ4A part of a v1 container): the container comes off, an
+        # untouched repack is the image that was inside.
+        for sin_v in "3:" "1:lz4"; do
+            sin_ver="${sin_v%%:*}"
+            sin_mm="${sin_v#*:}"
+            rm -rf "$rw.su" "$rw.sin" "$rw.sin.out"
+            if sint wrap "$img" "$rw.sin" --version "$sin_ver" ${sin_mm:+--mmcf "$sin_mm"} >/dev/null 2>&1; then
+                "$ABR" unpack "$rw.sin" -o "$rw.su" >"$rw.su.log" 2>&1
+                rd_ck "in a Sony SIN v$sin_ver${sin_mm:+ ($sin_mm)}: unpack" test -d "$rw.su"
+                rd_ck "in a Sony SIN v$sin_ver${sin_mm:+ ($sin_mm)}: the container is named" grep -q 'sin-wrapped' "$rw.su.log"
+                "$ABR" repack "$rw.su" -o "$rw.sin.out" >/dev/null 2>&1
+                rd_ck "in a Sony SIN v$sin_ver${sin_mm:+ ($sin_mm)}: an untouched repack is the image that was inside" cmp -s "$img" "$rw.sin.out"
+            fi
+            rm -rf "$rw.su" "$rw.sin" "$rw.sin.out"
+        done
+        rd_done "real image $rb: ${prefixes:+ramdisk directories (${prefixes//$'\n'/, }), }untouched repack identical$RD_GNU, and the same image in a ChromeOS kernel blob and in Sony SIN containers"
     done
 fi
 

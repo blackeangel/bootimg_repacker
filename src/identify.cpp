@@ -305,7 +305,7 @@ std::string Identity::unsupported_note() const {
         case Kind::SIN2:
         case Kind::SIN3:
             return "this looks like a Sony SIN container (" + aik_type() +
-                   "; Android Image Kitchen opens it with sony_dump); abr cannot unpack it yet";
+                   "; Android Image Kitchen opens it with sony_dump); abr unpacks one that holds a boot-family image";
         case Kind::OSIP_HEADERLESS:
             return "this has the bootstub of an Intel OSIP image without its header (Android Image Kitchen opens "
                    "such an image with mboot), but not where the layout puts it (4096 bytes behind the cmdline, which "

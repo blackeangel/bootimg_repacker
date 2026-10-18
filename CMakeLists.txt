@@ -131,6 +131,7 @@ add_library(abr_core STATIC
   src/legacy/loki.cpp
   src/legacy/chromeos.cpp
   src/legacy/chromeos_devkeys.cpp
+  src/legacy/sin.cpp
   src/legacy/avb1.cpp
   src/legacy/avb1_aosp_key.cpp
 )

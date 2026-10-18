@@ -43,6 +43,7 @@
 #include "abr/legacy/loki.hpp"
 #include "abr/legacy/mtk.hpp"
 #include "abr/legacy/osip.hpp"
+#include "abr/legacy/sin.hpp"
 #include "abr/manifest.hpp"
 #include "abr/parallel.hpp"
 #include "abr/ramdisk_tree.hpp"
@@ -91,6 +92,12 @@ Fmt detect_format(const Bytes& d) {
     if (ElfBootImage::looks_like(d)) return Fmt::ELF_BOOT;
     if (KrnlImage::looks_like(d)) return Fmt::KRNL;
     if (OsipImage::looks_like(d)) return Fmt::OSIP;
+    // What starts like a Sony SIN container is never an ordinary image behind a vendor wrapper, even if an
+    // "ANDROID!" can be found in the first 64 KiB: when the container holds a boot-family image,
+    // peel_wrappers() has taken it off before this is asked, and when it does not (a system.sin) or is damaged,
+    // describe_unknown() says what is wrong with it -- Android Image Kitchen, which names such a file a SIN by its
+    // first four bytes as well, does not open it either.
+    if (legacy::has_sin_header(d)) return Fmt::UNKNOWN;
     // A vendor wrapper in front of an ordinary image (Spreadtrum BFBF/SSSS,
     // for one): the container's magic is not at offset 0 but close to it.
     // This is only consulted once nothing else matched, so a stray
@@ -105,6 +112,21 @@ Fmt detect_format(const Bytes& d) {
 // A clear message for the things people commonly feed to a boot-image tool
 // by mistake, instead of a bare "unrecognized format".
 std::string describe_unknown(const Bytes& d) {
+    // Sony SIN: the container is described, and what is inside it, when abr cannot open that.
+    if (legacy::has_sin_header(d)) {
+        try {
+            const legacy::SinInfo s = legacy::parse_sin(d);
+            const std::string what = "this is a " + legacy::describe_sin(s);
+            if (s.payload_size > legacy::kSinMaxPayload)
+                return what + ". abr opens a SIN that holds a boot-family image (what Android Image Kitchen does with it); "
+                              "this one holds a partition image (system, vendor, userdata ...), far too large for one";
+            const Bytes inside = legacy::extract_sin(d, s);
+            return what + ", and what is inside is not an image abr unpacks: " +
+                   (legacy::has_sin_header(inside) ? std::string("another SIN container") : describe_unknown(inside));
+        } catch (const FormatError& e) {
+            return "this looks like a Sony SIN container (" + identify(d).aik_type() + ") that abr cannot read: " + e.what();
+        }
+    }
     auto u32le = [&](size_t off) -> uint32_t {
         if (off + 4 > d.size()) return 0;
         return uint32_t(d[off]) | (uint32_t(d[off + 1]) << 8) | (uint32_t(d[off + 2]) << 16) |
@@ -177,23 +199,30 @@ Fmt fmt_from_name(const std::string& s) {
 // image (abr/legacy/blob.hpp), and under them the loki patch (abr/legacy/loki.hpp) or the amonet patch
 // (abr/legacy/amonet.hpp). Repack puts them back in the opposite order.
 struct Wrappers {
+    // A Sony SIN container comes off first, and unlike the others it is not put back: it is Sony's, signed and
+    // hashed, and nothing here could make one for an edited image (Android Image Kitchen forgets it as well).
+    // The image it held is `sin_payload`.
+    std::optional<legacy::SinInfo> sin;
     std::optional<legacy::ChromeosInfo> chromeos;  // its kernel is `chromeos_inner`
     std::optional<legacy::DhtbInfo> dhtb;
     std::optional<legacy::BlobImage> blob;  // its one partition's data is `blob_inner`, not in here
     std::optional<legacy::LokiInfo> loki;
     std::optional<legacy::AmonetInfo> amonet;
+    Bytes sin_payload;
     Bytes chromeos_inner;  // what the wrappers' removal leaves is kept here, if it is not `data` itself
     Bytes dhtb_inner;
     Bytes blob_inner;
     Bytes loki_plain;
     Bytes unpatched;
 
-    bool any() const { return chromeos || dhtb || blob || loki || amonet; }
-    // "chromeos-wrapped ", "dhtb-wrapped ", "blob-wrapped ", "loki-patched ", "amonet-patched ", or several, or
-    // nothing: for the line that says what was unpacked.
+    bool any() const { return sin || recorded(); }
+    // The wrappers the manifest records and a repack puts back: all but the SIN.
+    bool recorded() const { return chromeos || dhtb || blob || loki || amonet; }
+    // "sin-wrapped ", "chromeos-wrapped ", "dhtb-wrapped ", "blob-wrapped ", "loki-patched ", "amonet-patched ", or
+    // several, or nothing: for the line that says what was unpacked.
     std::string adjectives() const {
-        return std::string(chromeos ? "chromeos-wrapped " : "") + (dhtb ? "dhtb-wrapped " : "") + (blob ? "blob-wrapped " : "") +
-               (loki ? "loki-patched " : "") + (amonet ? "amonet-patched " : "");
+        return std::string(sin ? "sin-wrapped " : "") + (chromeos ? "chromeos-wrapped " : "") + (dhtb ? "dhtb-wrapped " : "") +
+               (blob ? "blob-wrapped " : "") + (loki ? "loki-patched " : "") + (amonet ? "amonet-patched " : "");
     }
 };
 
@@ -203,9 +232,26 @@ struct Wrappers {
 // goes for a ChromeOS kernel blob (Fmt::CHROMEOS): its kernel is the plain image if abr knows what it is.
 const Bytes& peel_wrappers(const Bytes& data, Wrappers& w) {
     const Bytes* outer = &data;
-    if (legacy::has_chromeos_header(data)) {
+    // A Sony SIN container is a wrapper only when what it holds is a boot-family image (what sony_dump hands to
+    // Android Image Kitchen); a partition image in a SIN, or one that cannot be read, stays what it is, and
+    // describe_unknown() says why it cannot be unpacked.
+    if (legacy::has_sin_header(data)) {
+        try {
+            legacy::SinInfo info = legacy::parse_sin(data);
+            if (info.payload_size <= legacy::kSinMaxPayload) {
+                Bytes inside = legacy::extract_sin(data, info);
+                if (detect_format(inside) != Fmt::UNKNOWN) {
+                    w.sin = std::move(info);
+                    w.sin_payload = std::move(inside);
+                    outer = &w.sin_payload;
+                }
+            }
+        } catch (const FormatError&) {
+        }
+    }
+    if (legacy::has_chromeos_header(*outer)) {
         Bytes kernel;
-        std::optional<legacy::ChromeosInfo> blob = legacy::strip_chromeos(data, kernel);
+        std::optional<legacy::ChromeosInfo> blob = legacy::strip_chromeos(*outer, kernel);
         if (blob && detect_format(kernel) != Fmt::UNKNOWN) {
             w.chromeos = std::move(blob);
             w.chromeos_inner = std::move(kernel);
@@ -2108,6 +2154,11 @@ void print_info(const fs::path& path) {
 
     Fmt f = detect_format(data);
     std::cout << "file:   " << path.string() << " (" << raw.size() << " bytes)\n";
+    if (wrap.sin) {
+        std::cout << "wrapper: " << legacy::describe_sin(*wrap.sin)
+                  << " (abr unpacks the image inside; a repack writes that image, not a SIN)\n";
+        for (const std::string& n : wrap.sin->notes) std::cout << "  note: " << n << "\n";
+    }
     if (wrap.chromeos) {
         std::cout << "wrapper: ChromeOS kernel blob (" << chromeos_description(*wrap.chromeos)
                   << (wrap.chromeos->tail.empty()
@@ -2325,7 +2376,8 @@ void print_info(const fs::path& path) {
             const Identity id = identify(data);
             std::cout << "(unrecognized format"
                       << (id.kind == Kind::UNKNOWN ? std::string() : ": " + id.label) << ")\n";
-            if (std::string note = id.unsupported_note(); !note.empty()) std::cout << note << "\n";
+            if (legacy::has_sin_header(data)) std::cout << describe_unknown(data) << "\n";
+            else if (std::string note = id.unsupported_note(); !note.empty()) std::cout << note << "\n";
             break;
         }
     }
@@ -2438,15 +2490,15 @@ size_t first_difference(const Bytes& a, const Bytes& b) {
 // compare it with the source. Every byte the tool failed to model shows up
 // here, so a repack of an untouched image is either provably identical or
 // the user is told, at once, where it is not.
-void self_check(const fs::path& outdir, const Bytes& original) {
+void self_check(const fs::path& outdir, const Bytes& original, const char* what = "this image") {
     try {
         Bytes rebuilt = build_image(outdir, RepackOptions{});
         if (rebuilt == original) {
-            std::cout << "round-trip: an untouched repack reproduces this image byte-for-byte\n";
+            std::cout << "round-trip: an untouched repack reproduces " << what << " byte-for-byte\n";
             return;
         }
         std::ostringstream os;
-        os << "an untouched repack does NOT reproduce this image exactly (source " << original.size()
+        os << "an untouched repack does NOT reproduce " << what << " exactly (source " << original.size()
            << " bytes, rebuilt " << rebuilt.size() << " bytes, first difference at offset 0x"
            << std::hex << first_difference(original, rebuilt) << std::dec
            << "). The unpacked files are still usable, but please report this image.";
@@ -2485,7 +2537,7 @@ void do_unpack(const fs::path& in, const fs::path& outdir, const UnpackOptions& 
                 throw FormatError(in.string() + ": " + describe_unknown(payload));
         }
 
-        if (wrap.any()) {
+        if (wrap.recorded()) {
             Manifest m = Manifest::load(outdir / "manifest.txt");
             std::string what;
             if (wrap.chromeos) {
@@ -2528,7 +2580,14 @@ void do_unpack(const fs::path& in, const fs::path& outdir, const UnpackOptions& 
 
     std::cout << "unpacked " << wrap.adjectives() << fmt_name(f)
               << " -> " << outdir.string() << "/\n";
-    self_check(outdir, data);
+    if (wrap.sin) {
+        for (const std::string& n : wrap.sin->notes) warn(n);
+        note(legacy::describe_sin(*wrap.sin) + ": the container is not kept, a repack writes the plain " + fmt_name(f) +
+             " image (as Android Image Kitchen does: the SIN is signed by Sony and cannot be made again)");
+        self_check(outdir, wrap.sin_payload, "the image inside the SIN");
+    } else {
+        self_check(outdir, data);
+    }
 }
 
 void do_repack(const fs::path& dir, const fs::path& out, const RepackOptions& opt) {
