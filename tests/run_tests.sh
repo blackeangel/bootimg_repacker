@@ -4915,6 +4915,44 @@ for kind in blob:SIGNBLOB chromeos:ChromeOS sin2:Sony osip:OSIP; do
     fi
 done
 
+# =========================================================================
+# Judges that have to be there. A judge that is not (rkcrc, mboot, sony_dump, ...) is a note in its section and the
+# comparisons with it are skipped, which is right on a machine that has not got it and wrong in a run that is meant to have
+# them all (the CI): a skipped comparison passes unseen. ABR_REQUIRE_ORACLES=<names, separated by commas> makes the absence
+# of the named judges a failure: futility, cpio, rkcrc, blobtools, mboot, loki, pxa, sony_dump, elftool. A name that is not
+# on this list is a failure too (a misspelt name would otherwise check nothing).
+# =========================================================================
+oracle_have() {
+    case "$1" in
+        futility) cros_fut ;;
+        cpio) [ "$HAVE_GNU_CPIO" = 1 ] ;;
+        rkcrc) [ -n "${ABR_RKCRC:-}" ] && [ -x "$ABR_RKCRC" ] ;;
+        blobtools) blob_real ;;
+        mboot) osip_real ;;
+        loki) loki_real ;;
+        pxa) [ -n "${PXA_MKBOOTIMG:-}" ] && [ -x "$PXA_MKBOOTIMG" ] && [ -n "${PXA_UNPACKBOOTIMG:-}" ] && [ -x "$PXA_UNPACKBOOTIMG" ] ;;
+        sony_dump) [ -n "${SIN_DUMP:-}" ] && [ -x "$SIN_DUMP" ] ;;
+        elftool) elf_tool_ok ;;
+        *) return 2 ;;
+    esac
+}
+if [ -n "${ABR_REQUIRE_ORACLES:-}" ]; then
+    oracle_n=0
+    IFS=',' read -r -a oracle_want <<<"$ABR_REQUIRE_ORACLES"
+    for oracle in "${oracle_want[@]}"; do
+        oracle="${oracle//[[:space:]]/}"
+        [ -n "$oracle" ] || continue
+        oracle_n=$((oracle_n + 1))
+        oracle_have "$oracle"
+        case $? in
+            0) pass "the judge '$oracle' is there (ABR_REQUIRE_ORACLES)" ;;
+            2) fail "ABR_REQUIRE_ORACLES names '$oracle', which is not a judge of this suite (futility, cpio, rkcrc, blobtools, mboot, loki, pxa, sony_dump, elftool)" ;;
+            *) fail "the judge '$oracle' is required (ABR_REQUIRE_ORACLES) and is not there: its comparisons were skipped" ;;
+        esac
+    done
+    [ "$oracle_n" -gt 0 ] || fail "ABR_REQUIRE_ORACLES is set and names no judge"
+fi
+
 echo ""
 echo "===== $PASS passed, $FAIL failed ====="
 exit "$FAIL"

@@ -602,6 +602,15 @@ default-jdk-headless libbcprov-java`).
 They are used only as independent reference implementations to compare
 `abr` against -- none of them is needed to build or use `abr`.
 
+Beyond those, the suite compares `abr` with the programs Android Image Kitchen runs for the formats `abr` opens by
+itself -- `rkcrc`, `blobpack` / `blobunpack`, `mboot`, `loki_tool`, `pxa-mkbootimg` / `pxa-unpackbootimg`, `sony_dump`,
+`elftool` (and `futility`, GNU `cpio`). They are not part of this repository (several have no licence file):
+`.github/scripts/build_oracles.sh <directory>` fetches them at the commits the tests were written against, compiles
+them and prints the variables that tell the suite where they are (`ABR_RKCRC`, `ABR_BLOBPACK`, `ABR_BLOBUNPACK`,
+`ABR_MBOOT`, `ABR_LOKI_TOOL`, `PXA_MKBOOTIMG`, `PXA_UNPACKBOOTIMG`, `ABR_SONY_DUMP`, `ABR_ELFTOOL`). A judge that is not
+there is a note in its section and the comparisons with it are skipped; `ABR_REQUIRE_ORACLES=futility,cpio,rkcrc,blobtools,mboot,loki,pxa,sony_dump,elftool`
+(any of those names) makes a missing one a failure instead, which is how the CI runs the suite.
+
 ### Cross-compiling
 
 ```sh
@@ -826,7 +835,9 @@ Two smaller gaps:
 
 ## License
 
-GPL-3.0-or-later, see `LICENSE`. A few directories are vendored
+GPL-3.0-or-later, see `LICENSE`. A binary of `abr` contains code of zlib, LZ4, Zstandard, liblzma and bzip2 (and the
+runtime of the toolchain): their notices are in `THIRD_PARTY_NOTICES.md`, which the CI publishes next to the binaries.
+A few directories are vendored
 third-party code, used only by parts of `abr` (`third_party/minilzo`)
 or only by the test suite (`tests/reference/mkbootimg`,
 `tests/reference/avb`, `tests/reference/boot_signer`), each with its own

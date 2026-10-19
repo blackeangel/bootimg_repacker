@@ -1453,6 +1453,28 @@ segment without data in 13 positions x 5 edits for each class, fallbacks, 40,000
 killed every mutant but the equivalent ones (the 13 mutants of the code that moves an empty segment's offset included). **No real
 `kernel.elf` was at hand**: what is judged is the layout elftool writes and what an ELF can be.
 
+## CI: judges built from pinned sources, required; notices (20 Oct 2026)
+
+- `.github/scripts/build_oracles.sh <dir> [name ...]` fetches the programs the suite compares abr with (`rkcrc`, BlobTools'
+  `blobpack`/`blobunpack`, `mboot`, `loki_tool`, `pxa-mkbootimg`/`pxa-unpackbootimg`, `sony_dump`, `elftool`) at pinned commits,
+  compiles them and prints the `ABR_*` / `PXA_*` variables the suite reads (the workflow appends them to `$GITHUB_ENV`). The
+  commits are the ones the tests were written against (rkflashtool `fc2181c`, BlobTools `6186e33`, mboot `39f59a4`, loki
+  `784e86f`, pxa-mkbootimg `97d9e1f`, anyxperia_dumper `2171258`, elftool `363653e`). `sony_dump` is linked with the system zlib
+  instead of the zlib-1.2.11 its makefile downloads. Nothing of them is in the repository: several have no licence file.
+- The three test jobs (linux-x86_64 x2, windows-x86_64 under wine, linux-arm64 under qemu-user) all run the script: the judges
+  are programs of the build machine, and `abr.exe` / the arm64 `abr` are compared with the same native programs. Before, only
+  the Linux job built four of them and `pxa-*` was in no job at all.
+- `ABR_REQUIRE_ORACLES=futility,cpio,rkcrc,blobtools,mboot,loki,pxa,sony_dump,elftool` (workflow-level `env`) makes the suite
+  fail when a named judge is missing (and for a name it does not know), where it used to print a note and skip the comparison --
+  a skipped comparison passed unseen. The build step has `continue-on-error`, so a judge that cannot be built is reported by the
+  test step with the full test results beside it. (Job logs cannot be read from this sandbox: the check is that the jobs are green.)
+- `THIRD_PARTY_NOTICES.md`: the licence texts of the libraries a binary contains (zlib, LZ4, Zstandard, liblzma 0BSD, bzip2),
+  the other vendored pieces, and which toolchain runtimes are linked statically per platform; the CI copies it and `LICENSE` next
+  to every published binary. README's licence section points to it.
+- Disk: a run of the suite with `ABR_REAL_IMAGES` needs several GB of scratch space (the real vendor_boot images are unpacked
+  into directories of about 1 GB each, several copies at a time); with less than ~5 GB free one check of a real image failed
+  ("an edit lands in the image" in a ChromeOS blob) and passed with 19 GB free. Not a defect of abr.
+
 ## Next steps (in order)
 
 1. Remaining AIK parity: QCDT creation (Sony SIN and the ELF layouts are

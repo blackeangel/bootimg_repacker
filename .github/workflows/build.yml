@@ -9,6 +9,11 @@ on:
 permissions:
   contents: write
 
+env:
+  # tests/run_tests.sh skips the comparisons with a judge that is not there; here, where every judge is built or installed,
+  # a missing one is a failure (a skipped comparison would pass unseen).
+  ABR_REQUIRE_ORACLES: futility,cpio,rkcrc,blobtools,mboot,loki,pxa,sony_dump,elftool
+
 # abr is C++26: GCC >= 14 and Clang >= 17 have the mode, the Ubuntu 24.04 default
 # GCC 13 does not (see CMakeLists.txt), so every job names its compiler.
 jobs:
@@ -29,55 +34,18 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq cmake ninja-build python3 python3-pip device-tree-compiler \
             u-boot-tools openssl lz4 zstd xz-utils bzip2 lzop liblzo2-dev default-jdk-headless \
-            libbcprov-java g++-14 clang-20 cpio vboot-kernel-utils
+            libbcprov-java g++-14 clang-20 cpio vboot-kernel-utils zlib1g-dev
           pip3 install --break-system-packages python-lzo
           # (vboot-kernel-utils: `futility`, the tool Android Image Kitchen runs for a ChromeOS kernel blob -- a judge
           # of the ChromeOS tests, found on the PATH; where it is missing they are judged by the Python tool alone)
 
-      # rkcrc of rkflashtool (BSD licence; compiled here, not part of this repository) writes the
-      # Rockchip KRNL images: the suite compares abr's with its output. Without it that one comparison
-      # is skipped (the independent Python tool still judges the CRC).
-      - name: Compile rkcrc, a judge of the Rockchip KRNL images
+      # The judges of the suite -- rkcrc, blobpack and blobunpack, mboot, loki_tool, pxa-mkbootimg and pxa-unpackbootimg,
+      # sony_dump, elftool -- are fetched at pinned commits and compiled here (.github/scripts/build_oracles.sh). None is
+      # part of this repository and several have no licence file: the suite only runs them, nothing of them goes into abr.
+      # A judge that cannot be built does not stop the job here; ABR_REQUIRE_ORACLES makes the test step fail for it.
+      - name: Build the judges of the test suite from their sources
         continue-on-error: true
-        run: |
-          git clone --depth 1 https://github.com/linux-rockchip/rkflashtool.git "$RUNNER_TEMP/rkflashtool"
-          gcc -O2 -o "$RUNNER_TEMP/rkcrc" "$RUNNER_TEMP/rkflashtool/rkcrc.c"
-          echo "ABR_RKCRC=$RUNNER_TEMP/rkcrc" >> "$GITHUB_ENV"
-
-      # blobpack and blobunpack of AndroidRoot's BlobTools (Apache-2.0; compiled here, not part of this
-      # repository) are what Android Image Kitchen runs for an ASUS blob: the suite has them make and read
-      # the blobs abr writes. Without them those comparisons are skipped (the independent Python tool
-      # still judges the layout).
-      - name: Compile blobpack and blobunpack, judges of the ASUS blobs
-        continue-on-error: true
-        run: |
-          git clone --depth 1 https://github.com/AndroidRoot/BlobTools.git "$RUNNER_TEMP/BlobTools"
-          g++ -O2 -w -I "$RUNNER_TEMP/BlobTools/shared" -o "$RUNNER_TEMP/blobpack" "$RUNNER_TEMP/BlobTools/src/blobpack.cpp"
-          g++ -O2 -w -I "$RUNNER_TEMP/BlobTools/shared" -o "$RUNNER_TEMP/blobunpack" "$RUNNER_TEMP/BlobTools/src/blobunpack.cpp"
-          echo "ABR_BLOBPACK=$RUNNER_TEMP/blobpack" >> "$GITHUB_ENV"
-          echo "ABR_BLOBUNPACK=$RUNNER_TEMP/blobunpack" >> "$GITHUB_ENV"
-
-      # mboot of osm0sis (GPL-2.0; compiled here, not part of this repository) is what Android Image Kitchen
-      # runs for an Intel OSIP boot image: the suite has it pack the same pieces as the independent Python
-      # tool, read what abr unpacked, and take an image abr wrote apart and pack it again. Without it those
-      # comparisons are skipped (the independent Python tool still judges the layout).
-      - name: Compile mboot, a judge of the Intel OSIP boot images
-        continue-on-error: true
-        run: |
-          git clone --depth 1 https://github.com/osm0sis/mboot.git "$RUNNER_TEMP/mboot-src"
-          gcc -O2 -w -o "$RUNNER_TEMP/mboot-bin" "$RUNNER_TEMP/mboot-src/mboot.c"
-          echo "ABR_MBOOT=$RUNNER_TEMP/mboot-bin" >> "$GITHUB_ENV"
-
-      # loki_tool of Dan Rosenberg's loki (BSD-2-Clause; compiled here, not part of this repository) is what
-      # Android Image Kitchen runs for a LOKI-patched boot or recovery image: the suite has it patch the same plain
-      # images as the independent Python tool (against synthetic bootloader images), take the patch off, and patch
-      # what abr repacked. Without it those comparisons are skipped (the independent Python tool still judges).
-      - name: Compile loki_tool, a judge of the LOKI-patched images
-        continue-on-error: true
-        run: |
-          git clone --depth 1 https://github.com/djrbliss/loki.git "$RUNNER_TEMP/loki-src"
-          (cd "$RUNNER_TEMP/loki-src" && gcc -O2 -w -o "$RUNNER_TEMP/loki_tool" main.c loki_flash.c loki_find.c loki_patch.c loki_unlok.c)
-          echo "ABR_LOKI_TOOL=$RUNNER_TEMP/loki_tool" >> "$GITHUB_ENV"
+        run: .github/scripts/build_oracles.sh "$RUNNER_TEMP/oracles" | tee -a "$GITHUB_ENV"
 
       - name: Configure
         run: >
@@ -117,12 +85,16 @@ jobs:
         run: |
           mkdir -p dist
           cp build/abr dist/abr-linux-x86_64
+          cp LICENSE THIRD_PARTY_NOTICES.md dist/
 
       - uses: actions/upload-artifact@v4
         if: matrix.package
         with:
           name: abr-linux-x86_64
-          path: dist/abr-linux-x86_64
+          path: |
+            dist/abr-linux-x86_64
+            dist/LICENSE
+            dist/THIRD_PARTY_NOTICES.md
 
   windows-x86_64:
     runs-on: ubuntu-24.04
@@ -138,8 +110,16 @@ jobs:
           sudo apt-get install -y -qq cmake ninja-build clang-20 lld-20 mingw-w64 \
             g++-mingw-w64-x86-64-posix wine64 python3 python3-pip device-tree-compiler \
             u-boot-tools openssl lz4 zstd xz-utils bzip2 lzop liblzo2-dev default-jdk-headless \
-            libbcprov-java cpio vboot-kernel-utils
+            libbcprov-java cpio vboot-kernel-utils zlib1g-dev
           pip3 install --break-system-packages python-lzo
+
+      # The judges of the suite -- rkcrc, blobpack and blobunpack, mboot, loki_tool, pxa-mkbootimg and pxa-unpackbootimg,
+      # sony_dump, elftool -- are fetched at pinned commits and compiled here (.github/scripts/build_oracles.sh). None is
+      # part of this repository and several have no licence file: the suite only runs them, nothing of them goes into abr.
+      # A judge that cannot be built does not stop the job here; ABR_REQUIRE_ORACLES makes the test step fail for it.
+      - name: Build the judges of the test suite from their sources
+        continue-on-error: true
+        run: .github/scripts/build_oracles.sh "$RUNNER_TEMP/oracles" | tee -a "$GITHUB_ENV"
 
       - name: Configure
         run: >
@@ -180,11 +160,15 @@ jobs:
         run: |
           mkdir -p dist
           cp build-windows/abr.exe dist/abr-windows-x86_64.exe
+          cp LICENSE THIRD_PARTY_NOTICES.md dist/
 
       - uses: actions/upload-artifact@v4
         with:
           name: abr-windows-x86_64
-          path: dist/abr-windows-x86_64.exe
+          path: |
+            dist/abr-windows-x86_64.exe
+            dist/LICENSE
+            dist/THIRD_PARTY_NOTICES.md
 
   # The arm64 code (ARMv8 SHA instructions, NEON, the 64-bit ARM ABI) is run for
   # real: a static aarch64 build executed under qemu-user through the same suite.
@@ -199,8 +183,16 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq cmake ninja-build g++-14-aarch64-linux-gnu qemu-user python3 \
             python3-pip device-tree-compiler u-boot-tools openssl lz4 zstd xz-utils bzip2 lzop \
-            liblzo2-dev default-jdk-headless libbcprov-java cpio vboot-kernel-utils
+            liblzo2-dev default-jdk-headless libbcprov-java cpio vboot-kernel-utils zlib1g-dev
           pip3 install --break-system-packages python-lzo
+
+      # The judges of the suite -- rkcrc, blobpack and blobunpack, mboot, loki_tool, pxa-mkbootimg and pxa-unpackbootimg,
+      # sony_dump, elftool -- are fetched at pinned commits and compiled here (.github/scripts/build_oracles.sh). None is
+      # part of this repository and several have no licence file: the suite only runs them, nothing of them goes into abr.
+      # A judge that cannot be built does not stop the job here; ABR_REQUIRE_ORACLES makes the test step fail for it.
+      - name: Build the judges of the test suite from their sources
+        continue-on-error: true
+        run: .github/scripts/build_oracles.sh "$RUNNER_TEMP/oracles" | tee -a "$GITHUB_ENV"
 
       - name: Configure
         run: >
@@ -267,8 +259,12 @@ jobs:
         run: |
           mkdir -p dist
           cp build-android/abr dist/abr-android-arm64
+          cp LICENSE THIRD_PARTY_NOTICES.md dist/
 
       - uses: actions/upload-artifact@v4
         with:
           name: abr-android-arm64
-          path: dist/abr-android-arm64
+          path: |
+            dist/abr-android-arm64
+            dist/LICENSE
+            dist/THIRD_PARTY_NOTICES.md
