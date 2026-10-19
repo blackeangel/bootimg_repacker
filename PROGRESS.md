@@ -22,7 +22,8 @@ tools" below.
 | dtb (raw/concatenated FDT) | **done + verified** |
 | vbmeta (AVB): vbmeta.img, vbmeta_system.img, footer-on-other-partitions | **done + verified**, incl. RSA signing (images made by the real `avbtool` round-trip exactly; images `abr` re-signed pass `avbtool verify_image`) |
 | uboot: U-Boot legacy uImage | **done + verified** |
-| ELF boot images (Sony/Xperia) | **done + verified** against real elftool (commit `67157cf`) |
+| ELF boot images (Sony/Xperia `kernel.elf`) | **done + verified** against the real `elftool` (compiled, not vendored) and an independent Python tool and C++ writer: kernel / ramdisk (a directory) / `ipl` / `rpm` / command line by `p_flags`, positional roles for unflagged segments, ELF32 and ELF64; an image in elftool's layout is built from the manifest alone, any other layout (padding, another start of the data, own `e_entry`/OS-ABI/`p_align`/`p_memsz`/`p_paddr`, data in another order, empty segments) is kept and written back; 16 layouts in the CLI suite, 60,000+ unit checks; no real `kernel.elf` has been tried, see "Sony ELF boot images" |
+| Sony SIN containers v1-v3 (AIK: `sony_dump`) | **done + verified** against the real `sony_dump` (compiled from its source, not vendored: no licence file) and an independent Python tool: the container comes off and is never put back (AIK forgets it too), what is inside is unpacked as it is on its own; MMCF with `ADDR` / `LZ4A` parts (decoded on several threads when large), loader, data in front; damaged containers are refused with the reason; no real `.sin` has been tried, see "Sony SIN containers" |
 | Rockchip KRNL images (`kernel.img`, SDK `boot.img`) | **done + verified** against the real `rkcrc -k` (compiled, not vendored) and an independent Python tool: the payload (kernel, or a compressed cpio ramdisk -> `ramdisk.cpio` + `ramdisk/`), Rockchip's own CRC (polynomial 0x04C10DB7), partition fill, wrong stored CRC kept |
 | AMONET patch (Amazon Fire, MediaTek): microloader + boot header moved to 1024 | **done + verified** against AIK's own `dd`/`truncate`/`cat` commands (copied into the suite): `microloader.bin`, `has_amonet=true`, refuses what the patch would overwrite; layered under DHTB |
 | ASUS blob (`"MSM-RADIO-UPDATE"`, with or without the `-SIGNED-BY-SIGNBLOB-` header): AIK's `blobunpack`/`blobpack` | **done + verified** against the real BlobTools `blobpack`/`blobunpack` (compiled, not vendored) and an independent Python tool: a blob that holds one image is a wrapper layer (`has_blob=true`; AIK's case), any other is `type=blob` with a file per partition; the signature is kept, `datalen` follows an edit; only blobpack's layout is read |
@@ -708,7 +709,7 @@ compiled from source and used only as oracles, never as a dependency.
 |---|---|
 | AOSP boot / recovery, header v0-v4; vendor_boot / vendor_kernel_boot | done |
 | AOSP-PXA (`pxa-unpackbootimg`) | done, oracle-verified |
-| ELF (`unpackelf` / `elftool`) | done, oracle-verified |
+| ELF (`unpackelf` / `elftool`) | done, oracle-verified; layouts other than elftool's are kept (see "Sony ELF boot images" below) |
 | U-Boot legacy uImage (`dumpimage` / `mkimage`) | done; FIT (flattened image tree) not |
 | MTK 512-byte header on kernel/ramdisk (`mkmtkhdr`) | done, oracle-verified |
 | DHTB wrapper (`dhtbsign`) | done, oracle-verified |
@@ -717,10 +718,10 @@ compiled from source and used only as oracles, never as a dependency.
 | ramdisk codecs gzip / lzop / xz / lzma / bzip2 / lz4 / lz4-legacy | done, all judged by the real tools; plus zstd |
 | **ramdisk as a directory tree** (`cpio -i` / `find . | cpio -H newc`) | **done** for newc/crc, including several archives one after the other; owners/modes live in `ramdisk.meta`, links work on Windows; odc/binary/hard links stay a `ramdisk.cpio` (see "The ramdisk as a directory" below) |
 | AIK's compression defaults (`xz -1 -Ccrc32`, `lz4 -9`) and `--level` | abr uses each codec's usual setting; `<component>_level=N` overrides |
-| `--original` (repack with the stored ramdisk, skip `ramdisk/`), `--origsize` (pad back to the original size), `--forceelf` (repack an ELF as ELF), `--avbkey` | not needed as options: an untouched `ramdisk.cpio` is replayed as it was (compressed bytes included), the recorded partition-size fill (`pad_to`) is always written back, an ELF is always rebuilt as an ELF (AIK's default converts it to an AOSP image instead; abr cannot do that conversion), and `--avb-key` / `--avb1-key` are the signing keys |
+| `--original` (repack with the stored ramdisk, skip `ramdisk/`), `--origsize` (pad back to the original size), `--forceelf` (repack an ELF as ELF), `--avbkey` | not needed as options: an untouched `ramdisk.cpio` is replayed as it was (compressed bytes included), the recorded partition-size fill (`pad_to`) is always written back, an ELF is always rebuilt as an ELF (AIK's default converts an image without an `rpm` segment to an AOSP image instead; abr cannot do that conversion), and `--avb-key` / `--avb1-key` are the signing keys |
 | BLOB (`blobunpack` / `blobpack`, AndroidRoot/BlobTools) | **done**, judged by the real tools: unpack / repack / info; wrapper layer between DHTB and AMONET, or a directory of its own for several partitions; see "BLOB" below |
 | ChromeOS kernel blob (`futility vbutil_kernel`) | **done**, judged by the real `futility` and a Python tool: unpack / repack / info as the outermost wrapper layer (ChromeOS -> DHTB -> blob -> LOKI -> AMONET) or as a container; the signatures are kept while what they cover is unchanged and made again after an edit (the developer key of vboot_reference, or `--chromeos-key`); x86 refused; see "ChromeOS kernel blobs" below |
-| Sony SIN (`sony_dump`) | recognised, not unpacked |
+| Sony SIN (`sony_dump`) | **done**, judged by the real `sony_dump`: v1, v2, v3; a wrapper layer that comes off and is not put back (as in AIK); see "Sony SIN containers" below |
 | Intel OSIP (`mboot`) | **done**, judged by the real `mboot`: unpack / repack / info, header rules as mboot's, the ramdisk as a directory; see "OSIP" below |
 | Rockchip KRNL (`dd skip=8`, `rkcrc -k`) | **done**, oracle-verified (`rkcrc`): unpack / repack / info; a payload that is a cpio gets the ramdisk directory (AIK treats it as a ramdisk the same way); see "Rockchip KRNL" below |
 | AMONET (microloader in the first 1024 bytes, `dd`/`truncate`/`cat`) | **done**, judged by AIK's own commands: unpack / repack / info, wrapper layer under DHTB; see "AMONET" below |
@@ -1379,10 +1380,83 @@ Not done: paths over 260 characters (Windows wants `\\?\` or a manifest for them
 could meet that); the console part cannot be exercised under wine (it has no console); a name that is not valid Unicode
 (a lone surrogate, which NTFS allows) arrives with the replacement character.
 
+## Sony SIN containers (done, 17-18 Oct 2026)
+
+What Android Image Kitchen does (`unpackimg.sh`): a file whose signature is `SIN*` goes through `sony_dump . "$img"`, the result is
+renamed to the image and `rm -f "$file-sigtype"` forgets that there was a container -- `repackimg.sh` then writes the plain image.
+abr does the same without the program: the container is the first wrapper layer to come off (`peel_wrappers`: SIN -> ChromeOS ->
+DHTB -> blob -> LOKI -> AMONET), it is **never put back** (header, hash tables and signature are Sony's; nothing here could make
+them for an edited image), the unpack says so, and the self-check is about the image inside. A container whose content is not a
+boot-family image (a `system.sin`, a SIN in a SIN), a content above 512 MiB or a damaged container is not a wrapper: `unpack` refuses
+it, and the message says what it is (or what is wrong), with no directory left behind.
+
+Source of the layout: the user's link, `munjeni/anyxperia_dumper`'s `sony_dump.c` (no licence file: nothing of it is in abr or in the
+repository, the layout is described in `include/abr/legacy/sin.hpp`; the test suite runs the program, compiled from its source by
+whoever runs the suite, as an oracle: `ABR_SONY_DUMP`). It is **v1, v2 and v3**: v1 and v2 (`01 00 00 00`, `02 00 00 00`) differ
+only in the first byte, the header is the size at byte 2 plus 16, v3 (`"\x03SIN"`) has the size of the header at byte 4 and the size of the
+data at 0x18. Behind the header: an MMCF block (`ADDR` parts as they are, `LZ4A` parts as raw LZ4 blocks, put one behind the other
+with 0xFF in the gaps; a part that starts before the end of what there is goes to the end, as `sony_dump` does, and the unpack says
+so), a loader (an ELF; the image behind it), or the image itself, possibly with data in front of it (v3). There is no SIN v4 / v5 in AIK's
+magic file (and the user found no documentation of the format on the Internet either), so nothing is done for them. Where `sony_dump` reads
+uninitialised memory or does not stop (an entry shorter than its own fields, a part outside the file, an LZ4 block that does not decode
+to the size its entry says) abr refuses with the reason. What abr leaves out of `sony_dump`: the padding of a partition image to the size of
+the ext4 file system it finds (partition images are not in scope; the test payloads have no `53 EF` at byte 1080 so that
+`sony_dump` does not take them for one).
+
+`LZ4A` parts are decoded on several threads (`par::for_each`) when there are two or more and the image is 16 MiB or more; the result is
+the same for one thread (tested with two parts of 9 MiB each, 1 thread against 4).
+
+Tests: `tests/tools/sin_tool.py` (written from the layout, no code of abr) makes the catalogue (v1/v2/v3, the image behind the header, a
+loader, data in front, MMCF with ADDR and LZ4A parts, gaps, a part put at the end, longer entries, 60 parts, 18 MiB, damaged ones of
+every kind) and `sony_dump` converts the same files to the same images; the suite also wraps every real image of `ABR_REAL_IMAGES` as
+v3 and as v1 (LZ4A) and compares; `abr_unit_tests legacy` (`tests/unit/legacy_test.cpp`) holds the unit checks, the thread
+comparison and 40,000 mutated containers. Mutation testing of the reader (79 mutants of `sin.cpp` and `elf_boot.cpp` in the first round)
+found two weak checks (an error message that another error also satisfied; a damage test that did not cover a duplicate with every
+other kind) and both are fixed; two mutants are equivalent. **No real `.sin` file was at hand**: the containers are made by the tool
+from the layout of `sony_dump`, the confirmation of the real world is missing.
+
+## Sony ELF boot images (reworked, 18-19 Oct 2026)
+
+The first version wrote only elftool's layout. An image laid out otherwise was unpacked, and its repack was a different file (the
+round-trip check said so). The second version keeps what is around the segments:
+
+- `ElfBootImage` (`include/abr/legacy/elf_boot.hpp`, `src/legacy/elf_boot.cpp`): segments with role, flags, address and data;
+  `parse()` records a `layout` (the block in front of the data, the order of the data, the bytes behind each segment) only when
+  elftool's layout does not give the file back **and** the kept layout does; `build()` writes elftool's layout, or puts the segments
+  into the kept one, patching `p_flags`, `p_vaddr`, `p_paddr` (only if it followed `p_vaddr`), `p_filesz`, `p_memsz` (follows `p_filesz` only
+  if it did, else never below it), `p_offset`, `e_machine` and `e_entry` (follows the first address unless the image has its own).
+  A segment that was empty keeps its `p_offset` -- moved along with the data it was behind -- and may not gain data (that has no
+  place in the layout: the repack says so and writes elftool's layout). ELF32 addresses that do not fit are refused.
+- Roles: by `p_flags` (ramdisk `0x80000000`, ipl `0x40000000`, rpm `0x01000000`, cmdline `0x20000000`); unflagged segments by position:
+  the first is the kernel, then the ramdisk (unless a flagged one exists: fixed this round, the old code named a second "ramdisk"),
+  then `extraN`. The ramdisk is a directory like everywhere. A segment with no data is no file.
+- ELF64: read, and written in the layout elftool would have with 56-byte program headers and the ELF64 header (data from byte 4096). That
+  is **abr's own generalisation**: elftool does ELF32 only, no real 64-bit image or tool is at hand.
+- Manifest: `type=elf_boot`, `is_64bit`, `machine`, `elf_entry` (when not the first address), `segment_count`, `segmentN_role/_flags/_addr/_prefix`,
+  `elf_layout=kept` with `elf_layout_order`, `elf_layout_sizes` and `.abr_raw/elf_layout.bin`; a manifest without them is elftool's layout.
+
+Findings about the oracle (the real `elftool`, osm0sis's, compiled from its sources, not vendored): `pack` needs a header file and cannot
+make an image of one part or an ELF64 file; `unpack` has no `break` after `case p_flags_rpm` (the rpm segment is written to the file
+`ramdisk`, over the ramdisk if that comes first) and reads `p_memsz` bytes. The suite uses it for what it can do (images in elftool's layout
+with the parts it handles; `ABR_ELFTOOL`).
+
+Differences from AIK: AIK's magic file calls an ELF a boot image only when its OS/ABI byte is 0x61 (and `unpackimg.sh` says "Unrecognized
+format." otherwise); abr opens it all the same, `identify` says "ELF (ARM)" as `file` does. AIK repacks an ELF image that has no `rpm`
+segment as an **AOSP** image ("ELF format without RPM detected; will be repacked using AOSP format!"); abr writes the ELF it unpacked.
+
+Tests: `tests/tools/elf_tool.py` (independent writer/reader/oracle driver, 16 layouts: elftool3, elftool5, kernel_only, ramdisk_empty,
+unflagged3, elf64, start8k, tight, pads_tail, entry_abi, order, hdr_fill, paddr, phoff, empty_kept, elf64_all), the CLI section of
+`tests/run_tests.sh` (unpack, what the independent reader finds, the ramdisk directory and GNU cpio, an untouched repack, an edited
+kernel, an edited ramdisk directory and another address against the independent writer, the elftool oracle, addresses beyond 32 bits, damaged layouts that
+fall back to elftool's), and `abr_unit_tests legacy` (an independent C++ writer with every layout knob, 9-10 kept layouts x 6 edits, a
+segment without data in 13 positions x 5 edits for each class, fallbacks, 40,000 mutated images; also clean under ASAN/UBSAN). Unit-level mutation testing of `elf_boot.cpp`
+killed every mutant but the equivalent ones (the 13 mutants of the code that moves an empty segment's offset included). **No real
+`kernel.elf` was at hand**: what is judged is the layout elftool writes and what an ELF can be.
+
 ## Next steps (in order)
 
-1. Remaining AIK parity, easiest first: QCDT creation,
-   Sony SIN. The stages 2 and 3 of the user's own spec need a scope
+1. Remaining AIK parity: QCDT creation (Sony SIN and the ELF layouts are
+   done). The stages 2 and 3 of the user's own spec need a scope
    decision before anything is built.
 2. Housekeeping: AIK-like default levels as an opt-in, gzip OS-byte
    determinism, `zlib-ng` for faster gzip, splitting `main.cpp`.
@@ -1641,7 +1715,7 @@ Useful as a checklist; wrong in places, and much wider than `abr`:
    AOSP test key or `--avb1-key/--avb1-cert`; self-contained RSA).
 2. ~~**CPIO ramdisk as a directory tree**~~ -- **done** for newc and crc
    (see "The ramdisk as a directory"); odc and binary archives stay files.
-3. Remaining AIK parity: QCDT creation, SIN (PXA, KRNL/RKCRC, AMONET, BLOB,
+3. Remaining AIK parity: QCDT creation (SIN, PXA, KRNL/RKCRC, AMONET, BLOB,
    OSIP, LOKI, NOOK, ChromeOS are done).
 4. Spec stage 1 leftovers: MBN, FIT/ITB. Spec stages 2/3: scope decision.
 5. Housekeeping: CI should run the quirk suite; `main.cpp` is ~1200 lines

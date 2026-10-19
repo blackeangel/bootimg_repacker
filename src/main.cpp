@@ -1412,26 +1412,102 @@ Bytes repack_uimage(const Manifest& m, const fs::path& dir) {
 }
 
 // ----------------------------------------------------------- elf_boot --
+//
+// A Sony ELF boot image (abr/legacy/elf_boot.hpp): every segment is a component. The kernel is `kernel`, the ramdisk is
+// `ramdisk.cpio` and the directory `ramdisk/` (as in every other image that has one), the others (ipl, rpm, cmdline,
+// whatever else there is) are files named for their role. The first segment of a role has the role's name for its
+// component; a second one with the same role (never seen) is `segmentN` and a file `segmentN_<role>.bin`. What is around the
+// segments -- the header block, padding between them, what follows them -- is recorded only where elftool's layout would
+// not give the image back (`elf_layout=kept`, and .abr_raw/elf_layout.bin).
 
-void unpack_elf_boot(const Bytes& data, const fs::path& dir) {
+struct ElfNames {
+    std::vector<std::string> prefix;    // the component's name in the manifest ("kernel", "ramdisk", ... or "segment3")
+    std::vector<std::string> filename;  // its file
+};
+
+ElfNames elf_names(const std::vector<legacy::ElfSegment>& segments) {
+    ElfNames n;
+    std::set<std::string> seen;
+    for (size_t i = 0; i < segments.size(); ++i) {
+        const std::string& role = segments[i].role;
+        if (seen.insert(role).second) {
+            n.prefix.push_back(role);
+            n.filename.push_back(role == "ramdisk" ? "ramdisk.cpio" : role);
+        } else {
+            n.prefix.push_back("segment" + std::to_string(i));
+            n.filename.push_back("segment" + std::to_string(i) + "_" + role + ".bin");
+        }
+    }
+    return n;
+}
+
+std::string join_numbers(const std::vector<uint64_t>& v) {
+    std::string out;
+    for (size_t i = 0; i < v.size(); ++i) out += (i ? "," : "") + std::to_string(v[i]);
+    return out;
+}
+
+std::vector<uint64_t> split_numbers(const std::string& s) {
+    std::vector<uint64_t> out;
+    size_t at = 0;
+    while (at <= s.size() && !s.empty()) {
+        const size_t comma = s.find(',', at);
+        const std::string part = s.substr(at, comma == std::string::npos ? std::string::npos : comma - at);
+        out.push_back(std::strtoull(part.c_str(), nullptr, 10));
+        if (comma == std::string::npos) break;
+        at = comma + 1;
+    }
+    return out;
+}
+
+void unpack_elf_boot(const Bytes& data, const fs::path& dir, const UnpackOptions& uo) {
     legacy::ElfBootImage img = legacy::ElfBootImage::parse(data);
     Manifest m;
     m.set("type", "elf_boot");
     m.set_bool("is_64bit", img.is_64bit);
     m.set_u32("machine", img.machine);
+    if (img.entry) m.set_addr("elf_entry", *img.entry);  // (without it e_entry is the address of the first segment, as elftool writes it)
     m.set_u32("segment_count", static_cast<uint32_t>(img.segments.size()));
+    const ElfNames names = elf_names(img.segments);
     std::vector<ComponentSource> segment_sources;
-    for (size_t i = 0; i < img.segments.size(); ++i)
-        segment_sources.push_back(
-            {&img.segments[i].data, "segment" + std::to_string(i) + "_" + img.segments[i].role + ".bin"});
+    for (size_t i = 0; i < img.segments.size(); ++i) segment_sources.push_back({&img.segments[i].data, names.filename[i]});
     auto segment_parts = save_components(dir, segment_sources);
     for (size_t i = 0; i < img.segments.size(); ++i) {
         auto& s = img.segments[i];
-        std::string p = "segment" + std::to_string(i);
+        const std::string p = "segment" + std::to_string(i);
         m.set(p + "_role", s.role);
         m.set_u32(p + "_flags", s.flags);
         m.set_addr(p + "_addr", s.addr);
-        record_component(m, p, segment_sources[i].filename, segment_parts[i]);
+        if (names.prefix[i] != p) m.set(p + "_prefix", names.prefix[i]);
+        record_component(m, names.prefix[i], names.filename[i], segment_parts[i]);
+    }
+    std::vector<TreeJob> tree_jobs;
+    for (size_t i = 0; i < img.segments.size(); ++i)
+        if (names.prefix[i] == "ramdisk") tree_jobs.push_back({"ramdisk", names.filename[i], &segment_parts[i]});
+    save_ramdisk_trees(m, dir, tree_jobs, uo);
+    if (img.layout) {
+        const legacy::ElfLayout& L = *img.layout;
+        std::vector<uint64_t> order(L.order.begin(), L.order.end());
+        std::vector<uint64_t> sizes{L.header.size()};
+        Bytes blob = L.header;
+        for (const Bytes& a : L.after) {
+            sizes.push_back(a.size());
+            blob.insert(blob.end(), a.begin(), a.end());
+        }
+        fs::create_directories(dir / ".abr_raw");
+        write_file(dir / ".abr_raw" / "elf_layout.bin", blob);
+        m.set("elf_layout", "kept");
+        m.set("elf_layout_order", join_numbers(order));
+        m.set("elf_layout_sizes", join_numbers(sizes));
+        const bool padded = std::any_of(L.after.begin(), L.after.end(), [](const Bytes& a) { return !a.empty(); });
+        const bool reordered = !std::is_sorted(L.order.begin(), L.order.end());
+        std::string what = std::to_string(L.header.size()) + " bytes in front of the first segment's data";
+        if (padded) what += ", padding or something else behind the segments";
+        if (reordered) what += ", the data is not in the order of the program headers";
+        if (L.header.size() == legacy::kElfDataStartOffset && !padded && !reordered)
+            what += ", but that block (the ELF header, the program headers, what is between them) is not what elftool writes: an e_entry or OS/ABI of its own, p_align, p_memsz, p_paddr, fill bytes ...";
+        note("this image is not laid out the way elftool lays an image out (" + what +
+             "): the bytes around the segments are kept in .abr_raw/elf_layout.bin, the image is built in that layout");
     }
     m.save(dir / "manifest.txt",
            "abr elf_boot manifest -- edit then `abr repack " + dir.string() + " -o out.img`");
@@ -1441,20 +1517,53 @@ Bytes repack_elf_boot(const Manifest& m, const fs::path& dir, const RepackOption
     legacy::ElfBootImage img;
     img.is_64bit = m.get_bool("is_64bit", false);
     img.machine = static_cast<uint16_t>(m.get_u32("machine", 40));
+    if (m.has("elf_entry")) img.entry = m.get_addr("elf_entry");
     uint32_t count = m.get_u32("segment_count", 0);
     std::vector<std::string> segment_prefixes;
-    for (uint32_t i = 0; i < count; ++i) segment_prefixes.push_back("segment" + std::to_string(i));
+    for (uint32_t i = 0; i < count; ++i)
+        segment_prefixes.push_back(m.get("segment" + std::to_string(i) + "_prefix", "segment" + std::to_string(i)));
     std::vector<Bytes> segment_data = load_components(m, dir, segment_prefixes, opt);
     for (uint32_t i = 0; i < count; ++i) {
         std::string p = "segment" + std::to_string(i);
         legacy::ElfSegment s;
         s.role = m.get(p + "_role", "kernel");
         s.flags = m.get_u32(p + "_flags", 0);
-        s.addr = static_cast<uint32_t>(m.get_addr(p + "_addr", 0));
+        s.addr = m.get_addr(p + "_addr", 0);
         s.data = std::move(segment_data[i]);
         img.segments.push_back(std::move(s));
     }
-    return img.build();
+    if (m.get("elf_layout", "") == "kept") {
+        // The bytes around the segments, as the unpack found them: .abr_raw/elf_layout.bin, cut up by the sizes the manifest has.
+        const std::vector<uint64_t> order = split_numbers(m.get("elf_layout_order", ""));
+        const std::vector<uint64_t> sizes = split_numbers(m.get("elf_layout_sizes", ""));
+        const fs::path file = dir / ".abr_raw" / "elf_layout.bin";
+        try {
+            if (!fs::exists(file)) throw FormatError(file.generic_string() + " is not there");
+            const Bytes blob = read_file(file);
+            uint64_t total = 0;
+            for (uint64_t n : sizes) total += n;
+            if (sizes.size() != order.size() + 1 || total != blob.size())
+                throw FormatError("elf_layout_sizes does not fit " + file.generic_string());
+            legacy::ElfLayout L;
+            size_t at = 0;
+            L.header.assign(blob.begin(), blob.begin() + static_cast<std::ptrdiff_t>(sizes[0]));
+            at = static_cast<size_t>(sizes[0]);
+            for (size_t k = 0; k < order.size(); ++k) {
+                L.order.push_back(static_cast<uint32_t>(order[k]));
+                L.after.emplace_back(blob.begin() + static_cast<std::ptrdiff_t>(at),
+                                     blob.begin() + static_cast<std::ptrdiff_t>(at + sizes[k + 1]));
+                at += static_cast<size_t>(sizes[k + 1]);
+            }
+            img.layout = std::move(L);
+        } catch (const std::exception& e) {
+            warn(std::string("the layout of the image that was unpacked cannot be used (") + e.what() +
+                 "); the image is written in elftool's layout");
+        }
+    }
+    std::string why;
+    Bytes out = img.build(&why);
+    if (!why.empty()) warn(why + "; the image is written in elftool's layout");
+    return out;
 }
 
 // ---------------------------------------------------------------- krnl --
@@ -2355,12 +2464,23 @@ void print_info(const fs::path& path) {
             legacy::ElfBootImage img = legacy::ElfBootImage::parse(data);
             std::cout << "class:    " << (img.is_64bit ? "ELF64" : "ELF32") << "\n";
             std::cout << "machine:  " << img.machine << "\n";
+            if (img.entry) std::cout << "entry:    0x" << std::hex << *img.entry << std::dec << "\n";
             std::cout << "segments: " << img.segments.size() << "\n";
             for (auto& s : img.segments)
                 std::cout << "  - " << s.role << " (flags=0x" << std::hex << s.flags << std::dec
                            << ") addr=0x" << std::hex << s.addr << std::dec
                            << " size=" << s.data.size() << " (" << codec_name(detect_codec(s.data))
                            << ")\n";
+            if (img.layout) {
+                size_t behind = 0;
+                for (const Bytes& a : img.layout->after) behind += a.size();
+                std::cout << "layout:   kept as found (" << img.layout->header.size() << " bytes in front of the data, " << behind
+                          << " bytes between and behind the segments); it is not elftool's\n";
+            } else if (img.build() == data) {
+                std::cout << "layout:   elftool's (data from byte " << legacy::kElfDataStartOffset << ", one segment behind the other)\n";
+            } else {
+                std::cout << "layout:   not elftool's, and not one abr can keep: an untouched repack writes elftool's\n";
+            }
             break;
         }
         case Fmt::CHROMEOS: {
@@ -2528,7 +2648,7 @@ void do_unpack(const fs::path& in, const fs::path& outdir, const UnpackOptions& 
             case Fmt::DTB: unpack_dtb(payload, outdir); break;
             case Fmt::VBMETA: unpack_vbmeta(payload, outdir); break;
             case Fmt::UIMAGE: unpack_uimage(payload, outdir); break;
-            case Fmt::ELF_BOOT: unpack_elf_boot(payload, outdir); break;
+            case Fmt::ELF_BOOT: unpack_elf_boot(payload, outdir, uo); break;
             case Fmt::KRNL: unpack_krnl(payload, outdir, uo); break;
             case Fmt::BLOB: unpack_blob(payload, outdir); break;
             case Fmt::OSIP: unpack_osip(payload, outdir, uo); break;

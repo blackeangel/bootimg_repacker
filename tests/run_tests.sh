@@ -1527,6 +1527,14 @@ if [ -x "$UNIT" ]; then
     fi
 fi
 
+if [ -x "$UNIT" ]; then
+    if out=$("$UNIT" legacy 2>&1); then
+        pass "Sony SIN and ELF boot image unit tests ($(tail -n 1 <<<"$out"))"
+    else
+        fail "Sony SIN and ELF boot image unit tests: $(grep -E 'FAIL|failure' <<<"$out" | head -n 4 | tr '\n' ' ')"
+    fi
+fi
+
 # ---- archives that become directories: untouched round trip, the directory, GNU cpio's verdict
 for style in mkbootfs crc upper uppercrc owners aik dotroot explicit tail weird big volumes2 volumes3 volumes_tail; do
     if ! rd_image "$style"; then fail "ramdisk directory: could not make the $style fixture"; continue; fi
@@ -4556,6 +4564,222 @@ rd_ck "the round trip is checked against what the container held" rd_has_text si
 "$ABR" repack sin_d -o sin_d.img >/dev/null 2>&1
 rd_ck "a repack writes the DHTB-wrapped image that was inside" cmp -s sin_d.img sin_k/dhtb.img
 rd_done "Sony SIN: around a DHTB-wrapped image only the container comes off; the DHTB header stays and is written again"
+
+# =========================================================================
+# Sony ELF boot images: the kernel.elf of an Xperia, an ELF executable whose program headers hold the kernel, the
+# ramdisk and the rest (abr/legacy/elf_boot.hpp). Android Image Kitchen unpacks one with elftool (osm0sis/elftool,
+# srl3gx's elfboot.h) and packs it with that tool again. tests/tools/elf_tool.py writes and reads the images on its own
+# (it shares no code with abr), in elftool's layout and in the other layouts an ELF can have: another size of the block
+# in front of the data, padding between the segments and bytes behind them, an e_entry or an OS/ABI byte of its own,
+# p_align, p_memsz beyond p_filesz, a p_paddr that is not the p_vaddr, the data in another order than the program
+# headers, program headers that are not behind the ELF header, an ELF64 header, an empty segment. No image of a real
+# device was at hand: what is judged is the layout elftool writes (against the real elftool where it is built,
+# ABR_ELFTOOL) and what an ELF in general can be. For every layout: the unpack, what is in the directory (the parts the
+# independent reader finds, the ramdisk directory and GNU cpio's verdict on it), an untouched repack (the same bytes),
+# an edited kernel, an edited ramdisk directory and another address in the manifest (each the image the independent
+# writer makes of the same layout), and what happens when the layout kept for the repack is damaged.
+# =========================================================================
+ELF_T="$TOOLS/elf_tool.py"
+elft() { python3 -I "$ELF_T" "$@"; }
+ELF_TOOL="${ABR_ELFTOOL:-$(command -v elftool 2>/dev/null || true)}"
+elf_tool_ok() { [ -n "$ELF_TOOL" ] && [ -x "$ELF_TOOL" ]; }
+if elf_tool_ok; then
+    echo "note: elftool ($ELF_TOOL) packs and unpacks the Sony ELF boot images in its layout too"
+else
+    echo "note: elftool is not at hand (ABR_ELFTOOL): the Sony ELF boot images are judged by tests/tools/elf_tool.py alone"
+fi
+elf_says() {  # <text> <command...>: the command succeeds and its output has the text as it is (not as a pattern)
+    local text="$1" out
+    shift
+    out="$("$@" 2>&1)" || return 1
+    grep -q -F -- "$text" <<<"$out"
+}
+elf_refuses() {  # <text> <command...>: the command fails and says the text
+    local text="$1" out
+    shift
+    out="$("$@" 2>&1)" && return 1
+    grep -q -F -- "$text" <<<"$out"
+}
+elf_manifest() { sed -n "s/^$2=//p" "$1/manifest.txt"; }  # <directory> <key>
+elf_parts_match() {  # <image> <unpacked directory>: every segment the independent reader finds is a file of the directory, as it was stored
+    local img="$1" d="$2" n i p f
+    rm -rf elf_rd
+    elft parts "$img" elf_rd || return 1
+    n="$(elf_manifest "$d" segment_count)"
+    [ "$n" = "$(wc -l <elf_rd/index.txt | tr -d ' ')" ] || return 1
+    i=0
+    while [ "$i" -lt "$n" ]; do
+        p="$(elf_manifest "$d" "segment${i}_prefix")"
+        [ -n "$p" ] || p="$(elf_manifest "$d" "segment${i}_role")"
+        f="$(elf_manifest "$d" "${p}_file")"
+        if [ -s "elf_rd/seg$i" ]; then
+            [ -n "$f" ] && cmp -s "elf_rd/seg$i" "$d/.abr_raw/$f.raw" || return 1
+        else
+            [ -z "$f" ] || return 1  # (a segment with no data is no file)
+        fi
+        i=$((i + 1))
+    done
+}
+elf_edit_kernel() {  # <case>: 8 bytes more in the kernel: the image is what the independent writer makes of the same layout
+    local en="$1" d="elf_ek_$1"
+    rm -rf "$d" "$d.img" "$d.expect"
+    cp -a "elf_u_$en" "$d" || return 1
+    printf 'abr test' >>"$d/kernel"
+    "$ABR" repack "$d" -o "$d.img" >"$d.rlog" 2>&1 || return 1
+    elft rebuild "elf_k/c/$en.json" "elf_k/c/$en.img" "$d.expect" --kernel "$d/kernel" || return 1
+    cmp -s "$d.img" "$d.expect" && ! cmp -s "$d.img" "elf_k/c/$en.img"
+}
+elf_edit_ramdisk() {  # <case>: a file put into ramdisk/ lands in the image; the rest is the layout of the image that was unpacked
+    local en="$1" d="elf_er_$1"
+    rm -rf "$d" "$d.img" "$d.expect" "${d}_re"
+    cp -a "elf_u_$en" "$d" || return 1
+    printf 'abr test\n' >"$d/ramdisk/abr_test_file"
+    "$ABR" repack "$d" -o "$d.img" >"$d.rlog" 2>&1 || return 1
+    elft rebuild "elf_k/c/$en.json" "$d.img" "$d.expect" || return 1  # the segments of this image in the layout of the original
+    cmp -s "$d.img" "$d.expect" || return 1
+    "$ABR" unpack "$d.img" -o "${d}_re" >/dev/null 2>&1 || return 1
+    [ "$(cat "${d}_re/ramdisk/abr_test_file")" = "abr test" ] || return 1
+    rd_same_tree_x "elf_u_$en/ramdisk" "${d}_re/ramdisk" abr_test_file
+}
+elf_edit_addr() {  # <case>: the first segment gets another address in the manifest; e_entry follows it unless the image has its own
+    local en="$1" d="elf_ea_$1"
+    rm -rf "$d" "$d.img" "$d.expect"
+    cp -a "elf_u_$en" "$d" || return 1
+    sed -i 's/^segment0_addr=.*/segment0_addr=0x80300000/' "$d/manifest.txt"
+    "$ABR" repack "$d" -o "$d.img" >"$d.rlog" 2>&1 || return 1
+    elft rebuild "elf_k/c/$en.json" "elf_k/c/$en.img" "$d.expect" --addr0 80300000 || return 1
+    cmp -s "$d.img" "$d.expect" && ! cmp -s "$d.img" "elf_k/c/$en.img"
+}
+
+mkdir -p elf_k
+python3 "$RDG" mkbootfs elf_k/rd.cpio
+if elft catalog elf_k/c elf_k/rd.cpio; then
+    pass "Sony ELF: the images are made ($(wc -l <elf_k/c/index.txt | tr -d ' ') layouts, in elftool's and in others)"
+else
+    fail "Sony ELF: the images could not be made (tests/tools/elf_tool.py)"
+fi
+elf_n=0
+ELF_ORC=""
+elf_tool_ok && ELF_ORC=", and elftool takes the images that are in its layout"
+while IFS=$'\t' read -r en el eo ed; do
+    elf_n=$((elf_n + 1))
+    ei="elf_k/c/$en.img"
+    eu="elf_u_$en"
+    elf_cls=ELF32
+    case "$en" in elf64*) elf_cls=ELF64 ;; esac
+    elf_segs="$(elft list "$ei" | tail -n +2 | wc -l | tr -d ' ')"
+    rd_unpack "$ei" "$eu"
+    rd_ck "$en: unpack" test -d "$eu"
+    rd_ck "$en: the unpack says what it is" rd_has_text "$eu.log" "unpacked elf_boot"
+    rd_ck "$en: the self-check says an untouched repack is the image" rd_has_text "$eu.log" "an untouched repack reproduces this image byte-for-byte"
+    elf_name="ELF bootimg"
+    case "$en" in entry_abi) elf_name="ELF (ARM)" ;; esac  # (the magic file of AIK calls an ELF a boot image only when its OS/ABI byte is 0x61)
+    rd_ck "$en: identify names it" elf_says "$elf_name" "$ABR" identify "$ei"
+    rd_ck "$en: info: the format, the class and the number of segments" sh -c "'$ABR' info '$ei' >'$eu.info' 2>&1 && grep -q -F 'format: elf_boot' '$eu.info' && grep -q -F 'class:    $elf_cls' '$eu.info' && grep -q -F 'segments: $elf_segs' '$eu.info'"
+    rd_ck "$en: the segments are what the independent reader finds" elf_parts_match "$ei" "$eu"
+    if [ -f "$eu/ramdisk.cpio" ]; then
+        rd_ck "$en: the ramdisk is a directory" test -d "$eu/ramdisk"
+        rd_ck "$en: GNU cpio agrees with the directory" rd_oracle "$eu" ramdisk
+    else
+        rd_ck "$en: no ramdisk, no directory" test ! -e "$eu/ramdisk"
+    fi
+    case "$el" in
+        elftool)
+            rd_ck "$en: info: the layout is elftool's" elf_says "layout:   elftool's (data from byte 4096" "$ABR" info "$ei"
+            rd_ck "$en: nothing of the layout is kept" sh -c "! grep -q '^elf_layout' '$eu/manifest.txt' && test ! -e '$eu/.abr_raw/elf_layout.bin'"
+            ;;
+        kept)
+            rd_ck "$en: info: the layout is kept as found" elf_says "layout:   kept as found" "$ABR" info "$ei"
+            rd_ck "$en: the unpack says why" rd_has_text "$eu.log" "is not laid out the way elftool lays an image out"
+            rd_ck "$en: the manifest and .abr_raw/elf_layout.bin have it" sh -c "grep -q '^elf_layout=kept\$' '$eu/manifest.txt' && test -s '$eu/.abr_raw/elf_layout.bin'"
+            ;;
+    esac
+    case "$en" in
+        unflagged3)
+            rd_ck "$en: the roles are by position: kernel, ramdisk, extra0" sh -c "test \"\$(sed -n 's/^segment[0-9]_role=//p' '$eu/manifest.txt' | tr '\\n' ' ')\" = 'kernel ramdisk extra0 '"
+            ;;
+        elftool5)
+            rd_ck "$en: ipl and rpm are files" sh -c "test -s '$eu/ipl' && test -s '$eu/rpm'"
+            ;;
+        elf64*)
+            rd_ck "$en: is_64bit in the manifest" grep -q '^is_64bit=true$' "$eu/manifest.txt"
+            ;;
+        ramdisk_empty | empty_kept)
+            rd_ck "$en: an empty segment is no file" test ! -e "$eu/ramdisk.cpio"
+            ;;
+    esac
+    "$ABR" repack "$eu" -o "$eu.out" >"$eu.rlog" 2>&1
+    rd_ck "$en: an untouched repack is the image" cmp -s "$ei" "$eu.out"
+    rd_ck "$en: an edited kernel: the image the independent writer makes of the same layout" elf_edit_kernel "$en"
+    if [ -d "$eu/ramdisk" ]; then
+        rd_ck "$en: a file in ramdisk/: it is in the image, the rest is the layout it had, nothing else changed" elf_edit_ramdisk "$en"
+    fi
+    rd_ck "$en: another address in the manifest: the image the independent writer makes of the same layout" elf_edit_addr "$en"
+    if [ "$eo" = yes ] && elf_tool_ok; then
+        rd_ck "$en: elftool packs the parts of the image into the image, and unpacks them as they are" elft oracle "$ELF_TOOL" "$ei" "elf_or_$en"
+        rd_ck "$en: ... and the same for the image abr writes after an edit of the kernel" elft oracle "$ELF_TOOL" "elf_ek_$en.img" "elf_or_k_$en"
+        if [ -d "$eu/ramdisk" ]; then
+            rd_ck "$en: ... and after an edit of the ramdisk" elft oracle "$ELF_TOOL" "elf_er_$en.img" "elf_or_r_$en"
+        fi
+    fi
+    rd_done "Sony ELF $en ($ed): unpacks (class, segments, layout), the segments are what the independent reader finds, the ramdisk directory${RD_GNU}, an untouched repack is the image, an edit of the kernel, of the ramdisk directory or of an address in the manifest gives the image the independent writer makes of the same layout${ELF_ORC}"
+done <elf_k/c/index.txt
+
+# ---- an address an ELF32 header cannot hold is refused, an ELF64 header takes it
+rm -rf elf_big elf_big.img elf_big_k elf_big_k.img elf_big64 elf_big64.img
+cp -a elf_u_elftool3 elf_big
+sed -i 's/^segment0_addr=.*/segment0_addr=0x100000000/' elf_big/manifest.txt
+rd_ck "ELF32 in elftool's layout: an address beyond 32 bits is refused with the reason" elf_refuses "does not fit an ELF32 image" "$ABR" repack elf_big -o elf_big.img
+rd_ck "... and no file is left" test ! -e elf_big.img
+cp -a elf_u_start8k elf_big_k
+sed -i 's/^segment0_addr=.*/segment0_addr=0x100000000/' elf_big_k/manifest.txt
+rd_ck "ELF32 in a layout that is kept: the same" elf_refuses "does not fit an ELF32" "$ABR" repack elf_big_k -o elf_big_k.img
+rd_ck "... and no file is left" test ! -e elf_big_k.img
+cp -a elf_u_elf64 elf_big64
+sed -i 's/^segment0_addr=.*/segment0_addr=0x100000000/' elf_big64/manifest.txt
+"$ABR" repack elf_big64 -o elf_big64.img >/dev/null 2>&1
+rd_ck "ELF64: the address is taken" elf_says "kernel flags=0x00000000 offset=4096 address=0x100000000 " elft list elf_big64.img
+rd_done "Sony ELF: an address beyond 32 bits is refused for an ELF32 header (elftool's layout and a kept one: with the reason, no file left) and written into an ELF64 one"
+
+# ---- the layout that is kept for the repack cannot be used: the repack says so and writes elftool's layout of the same segments
+elf_dmg_gone() { rm -f "$1/.abr_raw/elf_layout.bin"; }
+elf_dmg_cut() { head -c 100 "$1/.abr_raw/elf_layout.bin" >"$1/cut.tmp" && mv "$1/cut.tmp" "$1/.abr_raw/elf_layout.bin"; }
+elf_dmg_sizes() { sed -i 's/^elf_layout_sizes=.*/elf_layout_sizes=1,2/' "$1/manifest.txt"; }
+elf_dmg_order() { sed -i 's/^elf_layout_order=.*/elf_layout_order=0,1,7/' "$1/manifest.txt"; }
+elf_dmg_twice() { sed -i 's/^elf_layout_order=.*/elf_layout_order=0,0,2/' "$1/manifest.txt"; }
+elf_dmg_count() { sed -i 's/^segment_count=.*/segment_count=2/' "$1/manifest.txt"; }
+elf_fallback() {  # <case> <label> <text of the warning> <damage function>: the damage is done to a copy of the directory of the case
+    local en="$1" label="$2" text="$3" damage="$4" d="elf_fb_$1_$2"
+    rm -rf "$d" "$d.img" "$d.expect"
+    cp -a "elf_u_$en" "$d" || return 1
+    "$damage" "$d" || return 1
+    "$ABR" repack "$d" -o "$d.img" >"$d.rlog" 2>&1 || return 1
+    grep -q -F -- "$text" "$d.rlog" || return 1
+    grep -q -F -- "the image is written in elftool's layout" "$d.rlog" || return 1
+    if [ "$damage" = elf_dmg_count ]; then  # two segments are written, in elftool's layout
+        [ "$(elft list "$d.img" | tail -n +2 | wc -l | tr -d ' ')" = 2 ] || return 1
+        elf_says "layout:   elftool's" "$ABR" info "$d.img"
+    else
+        elft rebuild "elf_k/c/$en.json" "elf_k/c/$en.img" "$d.expect" --canonical || return 1
+        cmp -s "$d.img" "$d.expect"
+    fi
+}
+rd_ck "the file with the bytes around the segments is gone" elf_fallback pads_tail gone "is not there" elf_dmg_gone
+rd_ck "the file is cut short" elf_fallback pads_tail cut "elf_layout_sizes does not fit" elf_dmg_cut
+rd_ck "the sizes in the manifest are not the file's" elf_fallback pads_tail sizes "elf_layout_sizes does not fit" elf_dmg_sizes
+rd_ck "the order names a segment that is not there" elf_fallback pads_tail order "the layout kept for this image is damaged (the order of its segments)" elf_dmg_order
+rd_ck "the order names a segment twice" elf_fallback pads_tail twice "the layout kept for this image is damaged (the order of its segments)" elf_dmg_twice
+rd_ck "the number of segments is not the one of the layout" elf_fallback pads_tail count "has 3 program headers, the image has 2 segments" elf_dmg_count
+rd_ck "an elftool layout needs no file: a manifest that says nothing of it is as good" sh -c "! grep -q '^elf_layout' elf_u_elftool3/manifest.txt && '$ABR' repack elf_u_elftool3 -o elf_fb_none.img >/dev/null 2>&1 && cmp -s elf_fb_none.img elf_k/c/elftool3.img"
+# a segment that had no data in the image gets some: no layout has room for it
+rm -rf elf_gain elf_gain.img
+cp -a elf_u_empty_kept elf_gain
+printf 'hello' >elf_gain/ramdisk.cpio
+printf 'ramdisk_file=ramdisk.cpio\nramdisk_compression=none\n' >>elf_gain/manifest.txt
+"$ABR" repack elf_gain -o elf_gain.img >elf_gain.rlog 2>&1
+rd_ck "a segment that had no data and has some: the repack says so" rd_has_text elf_gain.rlog "had no data in the image that was unpacked and has some now; the image is written in elftool's layout"
+rd_ck "... the data is in the image (and the layout is elftool's)" sh -c "'$ABR' info elf_gain.img >elf_gain.info 2>&1 && grep -q -F 'ramdisk (flags=0x80000000) addr=0x81800000 size=5 (none)' elf_gain.info && grep -q -F \"layout:   elftool's\" elf_gain.info"
+rd_done "Sony ELF: a layout that cannot be used for the repack (the file gone, cut short, sizes that do not fit, an order naming a segment that is not there or one twice, another number of segments, a segment that had no data and has some) is said in a warning and the image is written in elftool's layout of the same segments"
 
 # ---- paths that are not ASCII --------------------------------------------------------------------------------
 # Cyrillic, an accent, Chinese and an emoji (four bytes in UTF-8, a surrogate pair on Windows) in the names of the
