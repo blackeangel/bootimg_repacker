@@ -9,6 +9,12 @@ on:
 permissions:
   contents: write
 
+# `shell: bash` is "bash -eo pipefail": a step that pipes a command into `tee` fails when the command does. Without it
+# (the default shell is "bash -e") the status of `./tests/run_tests.sh ... | tee test.log` is tee's, and a failed test passes.
+defaults:
+  run:
+    shell: bash
+
 env:
   # tests/run_tests.sh skips the comparisons with a judge that is not there; here, where every judge is built or installed,
   # a missing one is a failure (a skipped comparison would pass unseen).
@@ -73,12 +79,20 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python3 .github/scripts/post_failure_log.py "linux-x86_64 (${{ matrix.cxx }}) test" test.log
 
+      - name: Test result (an annotation of the job)
+        if: ${{ always() && hashFiles('test.log') != '' }}
+        run: python3 .github/scripts/test_summary.py "linux-x86_64 (${{ matrix.cxx }})" test.log
+
       - name: Verify static linking
         run: |
           file build/abr
-          ldd build/abr 2>&1 | grep -q "not a dynamic executable" \
-            && echo "OK: fully static" \
-            || { echo "expected a fully static binary"; exit 1; }
+          # (ldd says "not a dynamic executable" and exits 1 for what is static: its status is not the answer)
+          ldd_said=$(ldd build/abr 2>&1 || true)
+          if grep -q "not a dynamic executable" <<<"$ldd_said"; then
+            echo "OK: fully static"
+          else
+            echo "expected a fully static binary:"; echo "$ldd_said"; exit 1
+          fi
 
       - name: Package
         if: matrix.package
@@ -95,6 +109,105 @@ jobs:
             dist/abr-linux-x86_64
             dist/LICENSE
             dist/THIRD_PARTY_NOTICES.md
+
+  # The suite, and then a short run of tests/tools/fuzz_images.py on the images the suite made, against a build with
+  # AddressSanitizer and UndefinedBehaviorSanitizer (abr's own code: -DABR_SANITIZE=address,undefined). What a green suite
+  # does not show -- a read past the end of a damaged image, a size that is trusted before it is checked, a signed overflow in
+  # an offset, a leak -- stops a run with a report. During the suite the reports go to files (a test that expects an error
+  # would take the sanitizer's exit status for the error it wants) and any file there fails the job; the fuzzer reads them
+  # from the stderr of the runs itself.
+  linux-x86_64-sanitizers:
+    name: linux-x86_64 (g++-14, ASan+UBSan)
+    runs-on: ubuntu-24.04
+    env:
+      ASAN_OPTIONS: detect_leaks=1:strict_string_checks=1:detect_stack_use_after_return=1:check_initialization_order=1:log_path=/tmp/abr-sanitizer/asan
+      UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1:log_path=/tmp/abr-sanitizer/ubsan
+      ABR_KEEP_WORK: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools + test-suite oracles
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cmake ninja-build python3 python3-pip device-tree-compiler \
+            u-boot-tools openssl lz4 zstd xz-utils bzip2 lzop liblzo2-dev default-jdk-headless \
+            libbcprov-java g++-14 cpio vboot-kernel-utils zlib1g-dev
+          pip3 install --break-system-packages python-lzo
+
+      - name: Build the judges of the test suite from their sources
+        continue-on-error: true
+        run: .github/scripts/build_oracles.sh "$RUNNER_TEMP/oracles" | tee -a "$GITHUB_ENV"
+
+      - name: Configure
+        run: >
+          cmake -S . -B build-asan -G Ninja
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_C_COMPILER=gcc-14
+          -DCMAKE_CXX_COMPILER=g++-14
+          -DABR_SANITIZE=address,undefined
+
+      - name: Build
+        run: cmake --build build-asan -j 2>&1 | tee build.log
+
+      - name: Post build log on failure
+        if: failure()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 .github/scripts/post_failure_log.py "linux-x86_64 (g++-14, ASan+UBSan)" build.log
+
+      - name: Test (the suite against the sanitizer build)
+        run: |
+          mkdir -p /tmp/abr-sanitizer
+          ./tests/run_tests.sh build-asan/abr 2>&1 | tee test.log
+
+      - name: Post test log on failure
+        if: failure()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 .github/scripts/post_failure_log.py "linux-x86_64 (g++-14, ASan+UBSan) test" test.log
+
+      - name: Test result (an annotation of the job)
+        if: ${{ always() && hashFiles('test.log') != '' }}
+        run: python3 .github/scripts/test_summary.py "linux-x86_64 (g++-14, ASan+UBSan)" test.log
+
+      - name: Sanitizer reports of the suite
+        if: always()
+        run: |
+          if compgen -G "/tmp/abr-sanitizer/*" >/dev/null; then
+            for f in /tmp/abr-sanitizer/*; do echo "=== $f"; head -c 6000 "$f"; done | tee sanitizer.log
+            exit 1
+          fi
+          echo "no sanitizer report"
+
+      - name: Post sanitizer reports on failure
+        if: failure()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          [ -f sanitizer.log ] && python3 .github/scripts/post_failure_log.py "linux-x86_64 (g++-14, ASan+UBSan) sanitizer reports" sanitizer.log || true
+
+      # Damaged copies of every image the suite made (it keeps its work directory under ABR_KEEP_WORK): abr must refuse or
+      # take each one, not crash, hang, run out of memory or make a sanitizer say anything.
+      - name: Fuzz the images the suite made
+        run: |
+          work=$(sed -n 's/^note: the work directory is kept: //p' test.log | head -n 1)
+          test -d "$work"
+          python3 tests/tools/fuzz_images.py --abr build-asan/abr --seeds "$work" --iterations 4 \
+            --time-limit 1200 --timeout 120 --findings fuzz-findings 2>&1 | tee fuzz.log
+
+      - name: Post fuzz findings on failure
+        if: failure()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          [ -f fuzz.log ] && python3 .github/scripts/post_failure_log.py "linux-x86_64 (g++-14, ASan+UBSan) fuzz" fuzz.log || true
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-findings
+          path: fuzz-findings
+          if-no-files-found: ignore
 
   windows-x86_64:
     runs-on: ubuntu-24.04
@@ -147,6 +260,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python3 .github/scripts/post_failure_log.py "windows-x86_64 test" test.log
+
+      - name: Test result (an annotation of the job)
+        if: ${{ always() && hashFiles('test.log') != '' }}
+        run: python3 .github/scripts/test_summary.py "windows-x86_64" test.log
 
       - name: Verify the executable is self-contained
         run: |
@@ -220,6 +337,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python3 .github/scripts/post_failure_log.py "linux-arm64-qemu test" test.log
+
+      - name: Test result (an annotation of the job)
+        if: ${{ always() && hashFiles('test.log') != '' }}
+        run: python3 .github/scripts/test_summary.py "linux-arm64 (g++-14, qemu-user)" test.log
 
   android-arm64:
     runs-on: ubuntu-24.04

@@ -41,7 +41,14 @@ for tool in python3 dtc mkimage openssl; do
 done
 
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+# ABR_KEEP_WORK=1 leaves the directory the suite works in (every image it made, every directory it unpacked) in place, to look at
+# a failure or to take the images as the seeds of tests/tools/fuzz_images.py.
+if [ -n "${ABR_KEEP_WORK:-}" ]; then
+    echo "note: the work directory is kept: $WORK"
+    trap '' EXIT
+else
+    trap 'rm -rf "$WORK"' EXIT
+fi
 cd "$WORK"
 
 # A Windows build (abr.exe, cross-compiled) is run under wine, so every check
@@ -1532,6 +1539,14 @@ if [ -x "$UNIT" ]; then
         pass "Sony SIN and ELF boot image unit tests ($(tail -n 1 <<<"$out"))"
     else
         fail "Sony SIN and ELF boot image unit tests: $(grep -E 'FAIL|failure' <<<"$out" | head -n 4 | tr '\n' ' ')"
+    fi
+fi
+
+if [ -x "$UNIT" ]; then
+    if out=$("$UNIT" manifest 2>&1); then
+        pass "manifest.txt unit tests: quoting of values, reading, file names ($(tail -n 1 <<<"$out"))"
+    else
+        fail "manifest.txt unit tests: $(grep -E 'FAIL|failure' <<<"$out" | head -n 4 | tr '\n' ' ')"
     fi
 fi
 
@@ -3285,7 +3300,8 @@ rd_done "OSIP: an image in a partition (0xFF or 0x00 fill): an untouched repack 
 # (a file of its own) as long as the text is the one that was there.
 osip_make osip_sp.img u none 4 " init=/init quiet"
 osip_make osip_nl.img u none 4 $'console=ttyS0\tquiet\n'
-for k in sp:"init=/init quiet" nl:$'console=ttyS0\tquiet'; do
+# (a tab inside the text is a control character, which manifest.txt writes as an escape in double quotes)
+for k in sp:"init=/init quiet" nl:'"console=ttyS0\tquiet"'; do
     f="${k%%:*}"
     text="${k#*:}"
     rd_unpack "osip_$f.img" "osip_cu_$f"
@@ -4780,6 +4796,258 @@ printf 'ramdisk_file=ramdisk.cpio\nramdisk_compression=none\n' >>elf_gain/manife
 rd_ck "a segment that had no data and has some: the repack says so" rd_has_text elf_gain.rlog "had no data in the image that was unpacked and has some now; the image is written in elftool's layout"
 rd_ck "... the data is in the image (and the layout is elftool's)" sh -c "'$ABR' info elf_gain.img >elf_gain.info 2>&1 && grep -q -F 'ramdisk (flags=0x80000000) addr=0x81800000 size=5 (none)' elf_gain.info && grep -q -F \"layout:   elftool's\" elf_gain.info"
 rd_done "Sony ELF: a layout that cannot be used for the repack (the file gone, cut short, sizes that do not fit, an order naming a segment that is not there or one twice, another number of segments, a segment that had no data and has some) is said in a warning and the image is written in elftool's layout of the same segments"
+
+# ---- manifest.txt: values that are not plain text, and the names of files --------------------------------------
+# manifest.txt used to hold a value as it was, and its reader dropped the white space around a value: a command line with a
+# space at its end (there are such images) did not come back, and the repack was not the image. A line break in a value was
+# worse: what followed it was read as more lines of the manifest -- keys of whoever made the image, among them the names of
+# the files that repack reads. A value that would not read back the same as plain text is written in double quotes with
+# the escapes of C now (the same as ramdisk.meta does for a path), and the files a manifest names have to lie in the
+# directory it is in: not '..', not an absolute path, not a drive.
+head -c 30000 /dev/urandom >mf_kernel.bin
+head -c 12000 /dev/urandom >mf_ramdisk.bin
+mf_cmds=(
+    "console=ttyS0 "
+    " console=ttyS0"
+    "   "
+    $'tab\tinside'
+    $'ends with a tab\t'
+    '"quoted"'
+    '"'
+    'back\slash'
+    'ends with a backslash\'
+    '#not a comment'
+    'key=value=more'
+    $'line one\nline two'
+    $'with a carriage return\r\nand a line break'
+    $'x\nramdisk_file=/etc/passwd\nkernel_file=../../.ssh/id_rsa'
+    $'\x1b]0;a title\x07 and an escape sequence'
+    $'caf\xc3\xa9 \xd0\x94 utf-8'
+)
+mf_n=0
+mf_bad=""
+for mf_hv in 0 4; do
+    mf_lines=""
+    for mf_cl in "${mf_cmds[@]}"; do
+        mf_n=$((mf_n + 1))
+        python3 "$MKBOOTIMG" >/dev/null 2>&1 --header_version $mf_hv --kernel mf_kernel.bin --ramdisk mf_ramdisk.bin \
+            --cmdline "$mf_cl" --output mf_in.img || { mf_bad="$mf_bad [v$mf_hv #$mf_n: mkbootimg]"; continue; }
+        rm -rf mf_dir
+        "$ABR" unpack mf_in.img -o mf_dir >mf_dir.log 2>&1 || { mf_bad="$mf_bad [v$mf_hv #$mf_n: unpack]"; continue; }
+        "$ABR" repack mf_dir -o mf_out.img >mf_out.log 2>&1 || { mf_bad="$mf_bad [v$mf_hv #$mf_n: repack]"; continue; }
+        cmp -s mf_in.img mf_out.img || mf_bad="$mf_bad [v$mf_hv #$mf_n: the repack is not the image]"
+        grep -q -i "warning" mf_dir.log mf_out.log && mf_bad="$mf_bad [v$mf_hv #$mf_n: a warning]"
+        # one line more or less than the others, or a line that is neither a comment nor key=value, is what a line break
+        # in the command line would have made; and the keys that name files are the two of this image and name them in the directory
+        [ -z "$mf_lines" ] && mf_lines=$(wc -l <mf_dir/manifest.txt)
+        [ "$(wc -l <mf_dir/manifest.txt)" = "$mf_lines" ] || mf_bad="$mf_bad [v$mf_hv #$mf_n: the manifest has other lines]"
+        grep -q -v -E '^(#|[a-z0-9_]+=)' mf_dir/manifest.txt && mf_bad="$mf_bad [v$mf_hv #$mf_n: a line of the manifest is not key=value]"
+        [ "$(grep -c -E '^(kernel|ramdisk)_file=[a-z.]+$' mf_dir/manifest.txt)" = 2 ] || mf_bad="$mf_bad [v$mf_hv #$mf_n: the keys that name files]"
+        # what `info` shows of it has no control character (a terminal would obey one), and a plain command line is shown as it is
+        "$ABR" info mf_in.img >mf_info.txt 2>&1
+        sed 's/\r$//' mf_info.txt | tr -d '\n' | LC_ALL=C grep -q '[[:cntrl:]]' && mf_bad="$mf_bad [v$mf_hv #$mf_n: info prints a control character]"
+        grep -q '^cmdline:  ' mf_info.txt || mf_bad="$mf_bad [v$mf_hv #$mf_n: info has no cmdline]"
+    done
+done
+printf 'console=ttyS0,115200 androidboot.hardware=plain' >mf_plain.txt
+python3 "$MKBOOTIMG" >/dev/null 2>&1 --header_version 0 --kernel mf_kernel.bin --ramdisk mf_ramdisk.bin \
+    --cmdline "$(cat mf_plain.txt)" --output mf_in.img
+rm -rf mf_dir
+"$ABR" unpack mf_in.img -o mf_dir >/dev/null 2>&1
+"$ABR" info mf_in.img 2>&1 | grep -q -x "cmdline:        $(cat mf_plain.txt)" || mf_bad="$mf_bad [a plain command line is shown as it is]"
+grep -q -x "cmdline=$(cat mf_plain.txt)" mf_dir/manifest.txt || mf_bad="$mf_bad [a plain command line is written as it is]"
+# the manifest of an earlier version, and what a person writes: white space around, CRLF, comments, no quotes
+{
+    printf '# written by hand\r\n\r\n'
+    sed -e 's/^cmdline=.*/  cmdline = console=ttyS0 hand-written   /' -e 's/$/\r/' mf_dir/manifest.txt
+} >mf_hand.txt
+cp mf_hand.txt mf_dir/manifest.txt
+"$ABR" repack mf_dir -o mf_hand.img >mf_hand.log 2>&1 || mf_bad="$mf_bad [a manifest written by hand: repack]"
+"$ABR" info mf_hand.img 2>&1 | grep -q -x "cmdline:        console=ttyS0 hand-written" || mf_bad="$mf_bad [a manifest written by hand: the command line]"
+# a quoted value that is wrong: an error that says where
+rm -rf mf_dir
+"$ABR" unpack mf_in.img -o mf_dir >/dev/null 2>&1
+printf 'cmdline="never closed\n' >>mf_dir/manifest.txt
+rm -f mf_syn.img
+if "$ABR" repack mf_dir -o mf_syn.img >mf_syn.log 2>&1 || [ -e mf_syn.img ] || ! grep -q "not closed" mf_syn.log || ! grep -q "line " mf_syn.log; then
+    mf_bad="$mf_bad [a quoted value that is not closed: $(head -c 200 mf_syn.log)]"
+fi
+[ -z "$mf_bad" ] &&
+    pass "manifest.txt: $mf_n command lines (a space or a tab at the ends, quotes, backslashes, a hash, line breaks that try to add keys, an escape sequence, UTF-8) in boot v0 and v4 come back as the image they were, with no warning, in a manifest of the same lines; info prints no control character; a manifest written by hand reads as it did; a quoted value that is not closed is an error with its line" ||
+    fail "manifest.txt: values that are not plain text:$mf_bad"
+
+# The names of files: every key of a manifest that names a file or a directory, with a name that leaves the directory.
+mf_names_bad=""
+mf_checked=0
+for mf_img in boot_v2.img vendor_boot_v4.img vbmeta_signed.img dtbo_built.img v2.dtb blob_multi.img elf_big64.img cros_dev22.blob; do
+    if [ ! -f "$mf_img" ]; then mf_names_bad="$mf_names_bad [$mf_img is not there]"; continue; fi
+    rm -rf mf_nm
+    "$ABR" unpack "$mf_img" -o mf_nm >/dev/null 2>&1 || { mf_names_bad="$mf_names_bad [$mf_img: unpack]"; continue; }
+    "$ABR" repack mf_nm -o mf_nm_ok.img >/dev/null 2>&1 || { mf_names_bad="$mf_names_bad [$mf_img: repack of the unchanged directory]"; continue; }
+    mf_first=1
+    for mf_key in $(grep -o -E '^[a-z0-9_]+_(file|tree)=' mf_nm/manifest.txt | tr -d '='); do
+        mf_values=('../escape.bin' '/etc/hostname')
+        # (every kind of name once, on the first key of each image)
+        [ "$mf_first" = 1 ] && mf_values+=('sub//x.bin' 'a\b' 'C:x.bin' '..')
+        mf_first=0
+        for mf_v in "${mf_values[@]}"; do
+            rm -rf mf_nm_bad mf_nm_bad.img
+            cp -r mf_nm mf_nm_bad
+            K="$mf_key" V="$mf_v" awk 'BEGIN { FS = "="; k = ENVIRON["K"]; v = ENVIRON["V"] } $1 == k { print k "=" v; next } { print }' mf_nm/manifest.txt >mf_nm_bad/manifest.txt
+            mf_checked=$((mf_checked + 1))
+            if "$ABR" repack mf_nm_bad -o mf_nm_bad.img >mf_nm_bad.log 2>&1; then
+                mf_names_bad="$mf_names_bad [$mf_img: $mf_key=$mf_v was taken]"
+            elif [ -e mf_nm_bad.img ]; then
+                mf_names_bad="$mf_names_bad [$mf_img: $mf_key=$mf_v: an image was written]"
+            elif ! grep -q -F "$mf_key" mf_nm_bad.log || ! grep -q -F "directory" mf_nm_bad.log; then
+                mf_names_bad="$mf_names_bad [$mf_img: $mf_key=$mf_v: the message $(head -c 150 mf_nm_bad.log)]"
+            fi
+        done
+    done
+done
+[ -z "$mf_names_bad" ] && [ "$mf_checked" -ge 40 ] &&
+    pass "manifest.txt: $mf_checked names that leave the directory ('..', an absolute path, a drive, a backslash, a doubled slash) in the file and directory keys of boot, vendor_boot, vbmeta, dtbo, dtb, ASUS blob, Sony ELF and ChromeOS images are refused, with the key, and nothing is written" ||
+    fail "manifest.txt: file names that leave the directory ($mf_checked tried):$mf_names_bad"
+
+# ---- a page size that cannot be one: refused with a reason, not gigabytes of zeros ---------------------------------------
+# page_size is the word of a header that the padding of every part is worked out from. 0xFFFFFFFF in it made the check at the
+# end of `unpack` ask for 4 GiB of zeros (found by tests/tools/fuzz_images.py under AddressSanitizer). A flash page size is a
+# power of two from 512 bytes to 16 MiB.
+ps_patch() {  # <in> <out> <offset> <value>: the image with the 32-bit little-endian word at <offset> replaced
+    python3 -I - "$@" <<'PYEOF'
+import struct, sys
+src, dst, off, val = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4], 0)
+d = bytearray(open(src, "rb").read())
+d[off:off + 4] = struct.pack("<I", val)
+open(dst, "wb").write(d)
+PYEOF
+}
+ps_bad=""
+ps_n=0
+for ps_case in boot_v2.img:36:boot vendor_boot_v4.img:12:vendor_boot; do
+    IFS=: read -r ps_file ps_off ps_what <<<"$ps_case"
+    for ps_v in 0xFFFFFFFF 0x80000000 0x1000001 0x2000000 3 1000 256 0x7FFFFFF; do
+        ps_n=$((ps_n + 1))
+        ps_patch "$ps_file" ps_bad.img "$ps_off" "$ps_v"
+        rm -rf ps_bad_dir
+        if "$ABR" unpack ps_bad.img -o ps_bad_dir >ps_bad.log 2>&1; then
+            ps_bad="$ps_bad [$ps_what $ps_v was taken]"
+        elif ! grep -q "not a flash page size" ps_bad.log; then
+            ps_bad="$ps_bad [$ps_what $ps_v: $(head -c 120 ps_bad.log)]"
+        fi
+    done
+done
+[ -z "$ps_bad" ] &&
+    pass "damaged headers: $ps_n page sizes that cannot be one (0xFFFFFFFF, over 16 MiB, under 512, not a power of two) in a boot and a vendor_boot header are refused with the reason" ||
+    fail "damaged headers: page sizes that cannot be one:$ps_bad"
+
+# ---- what `info` says of the text in the fields of an image: no control character, whatever the format ------------------------
+# A command line, a name, a partition, a release, a configuration: the text an image has in such a field is written to a terminal by
+# `info`, and the bytes of an escape sequence in it would be obeyed there (the title of the window changes, the screen is cleared, a line
+# is overwritten). `info` writes such text the way manifest.txt does: as it is when it is plain, else in double quotes with escapes.
+# Every field of every format that has one, with an escape sequence and a bell in it (boot's command line is in the section before).
+ix_bad=""
+ix_n=0
+ix_es=$'x\x1b[2Jy\x07z'
+ix_shown='"x\x1b[2Jy\x07z"'          # (what `info` must say of it)
+ix_expect() {  # <image> <what it is> <text that `info` must say>...: `info` of the image says each text and prints no control character
+    local img="$1" what="$2" t
+    shift 2
+    "$ABR" info "$img" >ix_info.txt 2>&1 || { ix_bad="$ix_bad [$what: info failed: $(head -c 100 ix_info.txt)]"; return; }
+    # (a carriage return before a line break is how a Windows program ends a line; one inside a line is a control character)
+    if sed 's/\r$//' ix_info.txt | tr -d '\n' | LC_ALL=C grep -q '[[:cntrl:]]'; then ix_bad="$ix_bad [$what: info prints a control character]"; fi
+    for t in "$@"; do
+        ix_n=$((ix_n + 1))
+        grep -q -F -- "$t" ix_info.txt || ix_bad="$ix_bad [$what: info does not say $t]"
+    done
+}
+head -c 20000 /dev/urandom >ix_frag.bin
+python3 "$MKBOOTIMG" >/dev/null 2>&1 --header_version 3 --vendor_cmdline "$ix_es" --vendor_ramdisk ix_frag.bin --vendor_boot ix_vb3.img
+ix_expect ix_vb3.img "vendor_boot v3" "cmdline:        $ix_shown"
+python3 "$MKBOOTIMG" >/dev/null 2>&1 --header_version 4 --vendor_cmdline "$ix_es" --ramdisk_type platform --ramdisk_name "$ix_es" \
+    --vendor_ramdisk_fragment ix_frag.bin --vendor_boot ix_vb4.img
+ix_expect ix_vb4.img "vendor_boot v4" "cmdline:        $ix_shown" "name=$ix_shown size=20000"
+head -c 5000 /dev/urandom >ix_payload.bin
+mkimage -q -A arm64 -O linux -T kernel -C none -a 0x80080000 -e 0x80080000 -n "$ix_es" -d ix_payload.bin ix_ui.img >/dev/null 2>&1
+ix_expect ix_ui.img "uImage" "name:        $ix_shown"
+# vbmeta: the release string, and a descriptor of each kind with the text in the fields that name something
+mkdir -p ix_vbmeta
+python3 -I - <<'PYEOF'
+import struct
+es = b"x\x1b[2Jy\x07z"
+algo = (es + b"\0" * 32)[:32]
+def pad8(b):
+    return b + b"\0" * ((-len(b)) % 8)
+d = [
+    struct.pack(">QQ", len(es), 5) + es + b"\0" + b"value\0",                                                       # property
+    struct.pack(">IQQQIIIQQ32sIIII60s", 1, 8192, 8192, 4096, 4096, 4096, 0, 0, 0, algo, len(es), 4, 32, 0, b"")
+        + es + b"salt" + b"r" * 32,                                                                               # hashtree
+    struct.pack(">Q32sIIII60s", 4096, algo, len(es), 4, 32, 0, b"") + es + b"salt" + b"d" * 32,                      # hash
+    struct.pack(">II", 0, len(es)) + es,                                                                          # kernel_cmdline
+    struct.pack(">IIII60s", 1, len(es), 8, 0, b"") + es + b"\1" * 8,                                              # chain_partition
+]
+manifest = ["type=vbmeta", "required_libavb_version_major=1", "required_libavb_version_minor=0", "algorithm_type=0",
+            "rollback_index=0", "flags=0", "rollback_index_location=0", 'release_string="x\\x1b[2Jy\\x07z"',
+            "descriptor_count=%d" % len(d)]
+for i, payload in enumerate(d):
+    open("ix_vbmeta/d%d.bin" % i, "wb").write(pad8(payload))
+    manifest += ["descriptor%d_tag=%d" % (i, i), "descriptor%d_file=d%d.bin" % (i, i)]       # (the tags are the order above: 0 to 4)
+open("ix_vbmeta/manifest.txt", "w").write("\n".join(manifest) + "\n")
+PYEOF
+"$ABR" repack ix_vbmeta -o ix_vbmeta.img >ix_vbmeta.log 2>&1 || ix_bad="$ix_bad [vbmeta: repack: $(head -c 150 ix_vbmeta.log)]"
+ix_expect ix_vbmeta.img "vbmeta" "release:    $ix_shown" "property: $ix_shown" "hashtree: partition=$ix_shown algo=$ix_shown image_size=8192" \
+    "hash: partition=$ix_shown algo=$ix_shown image_size=4096" "kernel_cmdline: $ix_shown" "chain_partition: $ix_shown (pubkey 8B)"
+# OSIP (a command line with a tab and a line break: the one the OSIP tests made), ChromeOS (the configuration of a blob around a kernel abr does not unpack)
+ix_expect osip_nl.img "OSIP" 'cmdline:        "console=ttyS0\tquiet\n"'
+rm -rf ix_cros
+"$ABR" unpack cros_C.blob -o ix_cros >/dev/null 2>&1 && printf 'x\033[2Jy\007z' >ix_cros/chromeos_config.txt &&
+    "$ABR" repack ix_cros -o ix_cros.blob >/dev/null 2>&1 || ix_bad="$ix_bad [ChromeOS: the blob with the text could not be made]"
+ix_expect ix_cros.blob "ChromeOS" "cmdline:        $ix_shown"
+[ -z "$ix_bad" ] && [ "$ix_n" -eq 12 ] &&
+    pass "info: an escape sequence and a bell in the command line, a name, a partition, a release or a configuration of a vendor_boot v3 and v4, uImage, vbmeta (release, property, hash, hashtree, kernel command line and chain partition descriptors), OSIP and ChromeOS image are written as escapes in quotes ($ix_n lines), and no control character is printed" ||
+    fail "info: text in the fields of an image ($ix_n lines checked):$ix_bad"
+
+# ---- the filter every message passes: what a terminal would act on is written as an escape ---------------------------------
+# Whatever abr prints goes through a filter (TerminalSafeBuf in textquote.hpp): control characters but the line break and the tab, the C1
+# controls and what is not UTF-8 are written as \xNN. The sections above are about text out of images, which is escaped where it is
+# printed; a name from the command line is a way into a message that needs no image, and a message that forgot to escape something is a
+# bug that the filter keeps from being a hole. ABR_UNFILTERED_OUTPUT=1 turns the filter off (tests/tools/fuzz_images.py does, to find
+# the messages that do not escape), which is how this test knows that the message did have the byte.
+of_bad=""
+of_n=0
+for of_case in $'no\x1b[2Jsuch.img'@'no\x1b[2Jsuch.img' $'no\x07such.img'@'no\x07such.img' $'no\xc2\x9bsuch.img'@'no\xc2\x9bsuch.img'; do
+    of_name="${of_case%@*}"
+    of_shown="${of_case#*@}"
+    for of_cmd in "info" "identify" "unpack"; do
+        of_n=$((of_n + 1))
+        "$ABR" $of_cmd "$of_name" >of_out.txt 2>&1 && of_bad="$of_bad [$of_cmd: a file that is not there was taken]"
+        grep -q -F -- "$of_shown" of_out.txt || of_bad="$of_bad [$of_cmd $of_shown: the message does not have the escape: $(head -c 120 of_out.txt)]"
+        if sed 's/\r$//' of_out.txt | tr -d '\n' | LC_ALL=C grep -q -P '[\x00-\x08\x0b-\x1f\x7f]|\xc2[\x80-\x9f]'; then
+            of_bad="$of_bad [$of_cmd $of_shown: the message has a control character]"
+        fi
+        ABR_UNFILTERED_OUTPUT=1 "$ABR" $of_cmd "$of_name" >of_raw.txt 2>&1
+        grep -q -F -- "$of_name" of_raw.txt || of_bad="$of_bad [$of_cmd $of_shown: without the filter the message has no raw name: $(head -c 120 of_raw.txt)]"
+    done
+done
+"$ABR" repack $'no\x1b' -o of_out.img >of_out.txt 2>&1 && of_bad="$of_bad [repack: a directory that is not there was taken]"
+grep -q -F -- 'no\x1b' of_out.txt || of_bad="$of_bad [repack: the message does not have the escape: $(head -c 120 of_out.txt)]"
+# the messages of what worked are on stdout (a C1 control is a name that Windows has too: U+009B is no character that it refuses)
+rm -rf of_dir
+"$ABR" unpack boot_v2.img -o $'of_dir\xc2\x9bx' 2>of_err.txt >of_out.txt || of_bad="$of_bad [unpack into a directory with a C1 control in its name: $(head -c 120 of_err.txt)]"
+grep -q -F -- 'of_dir\xc2\x9bx' of_out.txt || of_bad="$of_bad [unpack: stdout does not have the escape: $(head -c 120 of_out.txt)]"
+"$ABR" repack $'of_dir\xc2\x9bx' -o $'of_re\xc2\x9b.img' 2>of_err.txt >of_out.txt || of_bad="$of_bad [repack: $(head -c 120 of_err.txt)]"
+grep -q -F -- 'of_re\xc2\x9b.img' of_out.txt || of_bad="$of_bad [repack: stdout does not have the escape: $(head -c 120 of_out.txt)]"
+ABR_UNFILTERED_OUTPUT=1 "$ABR" repack $'of_dir\xc2\x9bx' -o $'of_re\xc2\x9b.img' 2>/dev/null >of_raw.txt
+grep -q -F -- $'of_re\xc2\x9b.img' of_raw.txt || of_bad="$of_bad [repack: without the filter stdout has no raw name]"
+rm -rf $'of_dir\xc2\x9bx' $'of_re\xc2\x9b.img'
+# "0" and nothing are not a request to turn the filter off
+for of_val in 0 ""; do
+    ABR_UNFILTERED_OUTPUT="$of_val" "$ABR" info $'no\x1b[2Jsuch.img' >of_out.txt 2>&1
+    grep -q -F -- 'no\x1b[2Jsuch.img' of_out.txt || of_bad="$of_bad [ABR_UNFILTERED_OUTPUT=\"$of_val\" turned the filter off]"
+done
+[ -z "$of_bad" ] &&
+    pass "output filter: an escape sequence, a bell and a C1 control in a name from the command line come out as \\xNN in the messages of info, identify, unpack and repack ($of_n runs), and without the filter (ABR_UNFILTERED_OUTPUT=1) the same messages have the raw bytes" ||
+    fail "output filter:$of_bad"
 
 # ---- paths that are not ASCII --------------------------------------------------------------------------------
 # Cyrillic, an accent, Chinese and an emoji (four bytes in UTF-8, a surrogate pair on Windows) in the names of the

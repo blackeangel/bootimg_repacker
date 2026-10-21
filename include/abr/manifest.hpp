@@ -4,7 +4,10 @@
 // `unpack` writes next to the extracted component files and `repack`
 // reads back. One flat namespace, insertion order preserved (so a
 // human reading the file sees fields in a sensible order rather than
-// alphabetized), `#`-prefixed lines and blank lines ignored on read.
+// alphabetized), `#`-prefixed lines and blank lines ignored on read. A value that
+// cannot be written as plain text and read back the same (a line break, white
+// space at an end, a leading quote, control bytes) is written in double quotes
+// with the escapes of C (abr/textquote.hpp).
 //
 // This class only knows about text/hex/bool/address encoding; mapping
 // specific keys to a specific image format's fields lives in main.cpp,
@@ -29,6 +32,11 @@ public:
     bool has(const std::string& key) const;
     void set(const std::string& key, const std::string& value);
     std::string get(const std::string& key, const std::string& def = "") const;
+    // A value that names a file or a directory of the unpack (`kernel_file`, `ramdisk_tree`, ...): what repack opens. It
+    // must lie in the directory of the manifest -- a relative path, without '..', a drive, a colon or a backslash -- or
+    // FormatError says so. (The directory may have come from anyone; a manifest that points at /etc/passwd or at
+    // ../../.ssh/id_rsa must not get that file built into an image.)
+    std::string get_path(const std::string& key, const std::string& def = "") const;
 
     void set_u32(const std::string& key, uint32_t v);
     void set_u64(const std::string& key, uint64_t v);

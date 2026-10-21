@@ -3,6 +3,7 @@
 
 #include "abr/rsa.hpp"
 #include "abr/sha.hpp"
+#include "abr/textquote.hpp"
 
 #include <algorithm>
 #include <optional>
@@ -82,6 +83,17 @@ std::string cstr_from(const uint8_t* p, size_t max_len) {
     while (n < max_len && p[n] != 0) ++n;
     return std::string(reinterpret_cast<const char*>(p), n);
 }
+
+// The text at `offset` of a descriptor's content: at most `len` bytes of it (a number out of the image: it can be
+// anything), up to a NUL, and never past the end of the content.
+std::string text_at(const Bytes& content, size_t offset, uint64_t len) {
+    if (offset >= content.size()) return {};
+    return cstr_from(content.data() + offset, static_cast<size_t>(std::min<uint64_t>(len, content.size() - offset)));
+}
+
+// A name or a command line out of an image, for a line of text that people read: as it is when it is plain, else in
+// quotes with escapes (an image can hold anything there, among it the control sequences of a terminal).
+std::string shown(const std::string& s) { return textquote::quote_shown(s); }
 }  // namespace
 
 // Decodes the well-known descriptor payloads (struct layouts from
@@ -96,8 +108,8 @@ std::string AvbDescriptor::describe() const {
             case AvbDescriptorTag::PROPERTY: {
                 uint64_t klen = r.be64();
                 r.be64();  // value length (not needed for the summary)
-                std::string key = cstr_from(content.data() + r.pos(), klen);
-                return "property: " + key;
+                std::string key = text_at(content, r.pos(), klen);
+                return "property: " + shown(key);
             }
             case AvbDescriptorTag::HASH: {
                 uint64_t image_size = r.be64();
@@ -107,8 +119,8 @@ std::string AvbDescriptor::describe() const {
                 uint32_t digest_len = r.be32();
                 r.be32();  // flags
                 r.skip(60);
-                std::string pname = cstr_from(content.data() + r.pos(), pn_len);
-                return "hash: partition=" + pname + " algo=" + cstr_from(algo.data(), 32) +
+                std::string pname = text_at(content, r.pos(), pn_len);
+                return "hash: partition=" + shown(pname) + " algo=" + shown(cstr_from(algo.data(), 32)) +
                        " image_size=" + std::to_string(image_size) +
                        " digest=" + std::to_string(digest_len) + "B";
             }
@@ -128,15 +140,15 @@ std::string AvbDescriptor::describe() const {
                 r.be32();  // root_digest_len
                 r.be32();  // flags
                 r.skip(60);
-                std::string pname = cstr_from(content.data() + r.pos(), pn_len);
-                return "hashtree: partition=" + pname + " algo=" + cstr_from(algo.data(), 32) +
+                std::string pname = text_at(content, r.pos(), pn_len);
+                return "hashtree: partition=" + shown(pname) + " algo=" + shown(cstr_from(algo.data(), 32)) +
                        " image_size=" + std::to_string(image_size);
             }
             case AvbDescriptorTag::KERNEL_CMDLINE: {
                 r.be32();  // flags
                 uint32_t clen = r.be32();
-                std::string cmd = cstr_from(content.data() + r.pos(), clen);
-                return "kernel_cmdline: " + cmd;
+                std::string cmd = text_at(content, r.pos(), clen);
+                return "kernel_cmdline: " + shown(cmd);
             }
             case AvbDescriptorTag::CHAIN_PARTITION: {
                 r.be32();  // rollback_index_location
@@ -144,8 +156,8 @@ std::string AvbDescriptor::describe() const {
                 uint32_t pk_len = r.be32();
                 r.be32();  // flags
                 r.skip(60);
-                std::string pname = cstr_from(content.data() + r.pos(), pn_len);
-                return "chain_partition: " + pname + " (pubkey " + std::to_string(pk_len) + "B)";
+                std::string pname = text_at(content, r.pos(), pn_len);
+                return "chain_partition: " + shown(pname) + " (pubkey " + std::to_string(pk_len) + "B)";
             }
         }
     } catch (const FormatError&) {

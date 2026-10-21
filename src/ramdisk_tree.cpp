@@ -16,6 +16,7 @@
 
 #include "abr/cpio.hpp"
 #include "abr/sha.hpp"
+#include "abr/textquote.hpp"
 
 namespace abr {
 
@@ -157,62 +158,12 @@ Extras parse_extras(std::string_view s, size_t line) {
 }
 
 // A path is written as it is unless that would not read back the same: then in quotes, with the
-// escapes of C.
-std::string quote_path(const std::string& p) {
-    bool plain = !p.empty() && p.front() != ' ' && p.front() != '\t' && p.front() != '"' && p.back() != ' ' &&
-                 p.back() != '\t';
-    for (unsigned char c : p)
-        if (c < 0x20 || c == 0x7F || c == '\\') plain = false;
-    if (plain) return p;
-    std::string out = "\"";
-    for (unsigned char c : p) {
-        switch (c) {
-            case '\\': out += "\\\\"; break;
-            case '"': out += "\\\""; break;
-            case '\n': out += "\\n"; break;
-            case '\t': out += "\\t"; break;
-            case '\r': out += "\\r"; break;
-            default:
-                if (c < 0x20 || c == 0x7F) {
-                    char buf[8];
-                    std::snprintf(buf, sizeof buf, "\\x%02x", c);
-                    out += buf;
-                } else {
-                    out += static_cast<char>(c);
-                }
-        }
-    }
-    return out + "\"";
-}
+// escapes of C (abr/textquote.hpp, which manifest.txt uses as well).
+std::string quote_path(const std::string& p) { return textquote::quote(p, true); }
 
 std::string unquote_path(std::string_view s, size_t line) {
-    if (s.empty() || s.front() != '"') {
-        while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r')) s.remove_suffix(1);
-        return std::string(s);
-    }
-    std::string out;
-    size_t i = 1;
-    for (; i < s.size() && s[i] != '"'; ++i) {
-        if (s[i] != '\\') {
-            out += s[i];
-            continue;
-        }
-        if (++i >= s.size()) meta_error(line, "a quoted path ends in a backslash");
-        switch (s[i]) {
-            case '\\': out += '\\'; break;
-            case '"': out += '"'; break;
-            case 'n': out += '\n'; break;
-            case 't': out += '\t'; break;
-            case 'r': out += '\r'; break;
-            case 'x':
-                if (i + 2 >= s.size()) meta_error(line, "a quoted path ends in a \\x escape");
-                out += static_cast<char>(parse_u32(s.substr(i + 1, 2), 16, line, "\\x escape"));
-                i += 2;
-                break;
-            default: meta_error(line, std::string("unknown escape \\") + s[i] + " in a quoted path");
-        }
-    }
-    if (i >= s.size()) meta_error(line, "a quoted path is not closed");
+    std::string out, why;
+    if (!textquote::unquote(s, out, why)) meta_error(line, why);
     return out;
 }
 
@@ -481,7 +432,12 @@ uint32_t most_common(const std::vector<uint32_t>& v, uint32_t fallback) {
     return best;
 }
 
-std::string squote(const std::string& s) { return "'" + s + "'"; }
+// A name from the archive, for a message: in single quotes when it is plain text; one that has control characters
+// in it (an archive can hold any bytes there) in double quotes with escapes, so that no terminal obeys it.
+std::string squote(const std::string& s) {
+    const std::string q = textquote::quote_shown(s);
+    return q == s ? "'" + s + "'" : q;
+}
 
 // "a, b, c and 7 more" -- the first `cap` of them.
 std::string list_some(const std::vector<std::string>& items, size_t cap) {

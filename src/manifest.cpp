@@ -4,6 +4,8 @@
 #include <cstdio>
 #include <fstream>
 
+#include "abr/textquote.hpp"
+
 namespace abr {
 
 namespace {
@@ -20,12 +22,18 @@ Manifest Manifest::load(const std::filesystem::path& path) {
     if (!f) throw FormatError("cannot open manifest: " + path.string());
     Manifest m;
     std::string line;
+    size_t number = 0;
     while (std::getline(f, line)) {
+        ++number;
         std::string t = trim(line);
         if (t.empty() || t[0] == '#') continue;
         size_t eq = t.find('=');
         if (eq == std::string::npos) continue;
-        m.set(trim(t.substr(0, eq)), trim(t.substr(eq + 1)));
+        // A value that would not read back the same as plain text is written in double quotes (save() below).
+        std::string value, why;
+        if (!textquote::unquote(trim(t.substr(eq + 1)), value, why))
+            throw FormatError(path.string() + ", line " + std::to_string(number) + ": " + why);
+        m.set(trim(t.substr(0, eq)), value);
     }
     return m;
 }
@@ -37,7 +45,8 @@ void Manifest::save(const std::filesystem::path& path, const std::string& header
     std::ofstream f(path, std::ios::binary | std::ios::trunc);
     if (!f) throw FormatError("cannot write manifest: " + path.string());
     if (!header_comment.empty()) f << "# " << header_comment << "\n";
-    for (auto& [k, v] : entries_) f << k << "=" << v << "\n";
+    // (a value with a line break in it would be taken for more lines, and one with white space at an end would lose it)
+    for (auto& [k, v] : entries_) f << k << "=" << textquote::quote(v, false) << "\n";
 }
 
 bool Manifest::has(const std::string& key) const {
@@ -60,6 +69,35 @@ std::string Manifest::get(const std::string& key, const std::string& def) const 
     for (auto& [k, v] : entries_)
         if (k == key) return v;
     return def;
+}
+
+// What a name that is to be found in the directory of the unpack must not be, or "" when it is fine.
+static const char* path_problem(const std::string& v) {
+    if (v.empty()) return "";
+    for (unsigned char c : v)
+        if (c < 0x20 || c == 0x7F) return "has a control character in it";
+    if (v.front() == '/' || v.front() == '\\') return "is an absolute path";
+    if (v.find('\\') != std::string::npos) return "has a backslash in it (the parts of a path are separated by '/')";
+    if (v.find(':') != std::string::npos) return "has a colon in it (a drive, or a stream of a file on Windows)";
+    size_t from = 0;
+    while (true) {
+        const size_t to = v.find('/', from);
+        const std::string part = v.substr(from, to == std::string::npos ? std::string::npos : to - from);
+        if (part.empty()) return "has an empty part (a doubled or a trailing slash)";
+        if (part == "..") return "goes through '..'";
+        if (to == std::string::npos) break;
+        from = to + 1;
+    }
+    return "";
+}
+
+std::string Manifest::get_path(const std::string& key, const std::string& def) const {
+    std::string v = get(key, def);
+    if (const char* why = path_problem(v); *why)
+        throw FormatError("manifest.txt: " + key + "=" + textquote::quote(v, true) + " " + why +
+                          ". A file the manifest names has to be in the directory it is in (a relative path "
+                          "without '..'); copy it there");
+    return v;
 }
 
 void Manifest::set_u32(const std::string& key, uint32_t v) { set(key, std::to_string(v)); }

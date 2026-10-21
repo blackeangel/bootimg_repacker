@@ -65,6 +65,28 @@ target_compile_options(abr_cxx_std INTERFACE "$<$<COMPILE_LANGUAGE:CXX>:${ABR_CX
 
 option(ABR_BUILD_TESTS
        "Build abr_unit_tests, the driver tests/run_tests.sh uses to check the self-contained crypto (BigInt/RSA/DER/SHA), the thread helper, the cpio/ramdisk-directory code and the Sony SIN/ELF readers. Off for cross builds." ON)
+# A build for the test suite to run against with the sanitizers of GCC/Clang: what a green suite does not show -- a read past
+# the end of a damaged image, an overflow in a size that is checked too late, a signed overflow in an offset -- stops the run
+# with a report. Only abr's own code is instrumented (the vendored libraries are not: their reports are not abr's to fix, and
+# with -fno-sanitize-recover they would end the run); not for the shipping binaries, and not together with a static link.
+#   cmake -S . -B build-asan -DABR_SANITIZE=address,undefined && cmake --build build-asan -j && tests/run_tests.sh build-asan/abr
+set(ABR_SANITIZE "" CACHE STRING "Sanitizers to build abr's own code with, e.g. address,undefined (empty: none)")
+add_library(abr_sanitize INTERFACE)
+if(ABR_SANITIZE)
+  if(MSVC OR WIN32)
+    message(FATAL_ERROR "ABR_SANITIZE is for GCC/Clang on Linux")
+  endif()
+  if(ABR_STATIC_BINARY)
+    message(FATAL_ERROR "ABR_SANITIZE cannot be combined with ABR_STATIC_BINARY (the sanitizer runtimes are not linked statically)")
+  endif()
+  target_compile_options(abr_sanitize INTERFACE -fsanitize=${ABR_SANITIZE} -fno-omit-frame-pointer)
+  target_link_options(abr_sanitize INTERFACE -fsanitize=${ABR_SANITIZE})
+  if(ABR_SANITIZE MATCHES "undefined")
+    target_compile_options(abr_sanitize INTERFACE -fno-sanitize-recover=undefined)
+  endif()
+  message(STATUS "abr: built with -fsanitize=${ABR_SANITIZE}")
+endif()
+
 option(ABR_VENDOR_DEPS
        "Fetch and statically build zlib/lz4/zstd/xz/bzip2 from source (the shipping default). Turn OFF to use system dev packages instead, for fast local iteration." ON)
 option(ABR_STATIC_BINARY
@@ -114,6 +136,7 @@ add_library(abr_core STATIC
   src/vbmeta.cpp
   src/uimage.cpp
   src/manifest.cpp
+  src/textquote.cpp
   src/envelope.cpp
   src/cpio.cpp
   src/ramdisk_tree.cpp
@@ -138,6 +161,7 @@ add_library(abr_core STATIC
 target_include_directories(abr_core PUBLIC include)
 target_link_libraries(abr_core PUBLIC
   abr_cxx_std
+  abr_sanitize
   abr_zlib_iface
   abr_lz4_iface
   abr_zstd_iface
@@ -193,7 +217,7 @@ abr_link_statically(abr)
 
 if(ABR_BUILD_TESTS)
   add_executable(abr_unit_tests tests/unit/crypto_test.cpp tests/unit/par_test.cpp tests/unit/cpio_test.cpp
-               tests/unit/legacy_test.cpp)
+               tests/unit/legacy_test.cpp tests/unit/manifest_test.cpp)
   target_link_libraries(abr_unit_tests PRIVATE abr_core)
   abr_link_statically(abr_unit_tests)
 endif()

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "abr/legacy/blob.hpp"
+#include "abr/textquote.hpp"
 
 #include <cstring>
 #include <string>
@@ -74,7 +75,7 @@ BlobImage BlobImage::parse(const Bytes& data) {
         const uint32_t offset = r.le32();
         const uint32_t size = r.le32();
         part.version = r.le32();
-        const std::string label = "partition " + std::to_string(i) + " (" + name_of(part.name) + ")";
+        const std::string label = "partition " + std::to_string(i) + " (" + textquote::quote_shown(name_of(part.name)) + ")";
         if (offset != expected)
             throw FormatError("this blob has " + label + " at offset " + std::to_string(offset) + ", where blobpack puts it at " +
                               std::to_string(expected) + " (the partitions one after the other, right behind the table); " +

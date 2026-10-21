@@ -43,7 +43,7 @@ tools" below.
 | self-contained RSA: BigInt (Knuth D, Montgomery), DER/PEM/X.509, PKCS#1 v1.5 sign/verify, PKCS#8/PKCS#1 key parsing, AVB public-key blob -- **no OpenSSL anywhere in the build** | **done + verified** (Python integers, `openssl dgst -sign`, `avbtool extract_public_key`; see "Self-contained crypto" below) |
 | manifest + CLI (`abr info/unpack/repack`) | **done** |
 | CMake: FetchContent-vendored static zlib/lz4/zstd/xz/bzip2 | **done + build-verified natively on Linux**, both the dynamic and the `-DABR_STATIC_BINARY=ON` fully-static configurations |
-| Test suite (`tests/run_tests.sh`) | **done, 312/312 passing** locally on g++-14 and on clang-20, 311/311 for `abr.exe` under wine (with the optional `pxa-*` / `rkcrc` / `blobpack`+`blobunpack` / `mboot` / `loki_tool` / `futility` oracles and AIK's magic file); CI runs the matrix (g++-14, clang-20, Windows under wine, arm64 under qemu-user) -- see Verification |
+| Test suite (`tests/run_tests.sh`) | **done, 353/353 passing** on g++-14 (all judges required, as in the CI), under AddressSanitizer + UndefinedBehaviorSanitizer (no report), and on clang-20 and for `abr.exe` under wine (see "Hardening" for those two counts); CI runs the matrix (g++-14, clang-20, ASan+UBSan with a fuzz run, Windows under wine, arm64 under qemu-user, android-arm64) -- see Verification |
 | CMake cross toolchains (mingw-w64, Android NDK) | **done + verified** (mingw reproduced locally; NDK only provable via CI, see below) |
 | GitHub Actions static build matrix (linux-x86_64, windows-x86_64, android-arm64) | **done + verified**: run 35313499827, all 3 jobs green, all 3 static binaries produced as artifacts (abr-linux-x86_64, abr-windows-x86_64, abr-android-arm64) |
 
@@ -1474,6 +1474,98 @@ killed every mutant but the equivalent ones (the 13 mutants of the code that mov
 - Disk: a run of the suite with `ABR_REAL_IMAGES` needs several GB of scratch space (the real vendor_boot images are unpacked
   into directories of about 1 GB each, several copies at a time); with less than ~5 GB free one check of a real image failed
   ("an edit lands in the image" in a ChromeOS blob) and passed with 19 GB free. Not a defect of abr.
+
+## Hardening: sanitizers, a fuzzer, the text of manifest.txt, what reaches a terminal (20-22 Oct 2026)
+
+A green suite shows that what the tests ask for works. This part is about what they do not ask: damaged images,
+hostile ones, and text that goes into a file or onto a terminal. It found real bugs; each is pinned by a test now.
+
+### AddressSanitizer + UndefinedBehaviorSanitizer
+
+- `-DABR_SANITIZE=address,undefined` (CMake option, an interface target `abr_sanitize` that `abr_core` links; abr's own
+  code is instrumented, the vendored libraries are not; refused with MSVC, Windows and `ABR_STATIC_BINARY`).
+- The whole suite runs on that build with the sanitizers' reports written to files (a test that expects an error would
+  take a sanitizer's exit status for the error it wanted): **353 of 353, no report**. The CI has a job for it
+  (`linux-x86_64 (g++-14, ASan+UBSan)`): the suite, the reports of the suite, and a short fuzz run on the images the suite made.
+- `ABR_KEEP_WORK=1 tests/run_tests.sh` keeps the directory the suite worked in: every image it made is a seed for the fuzzer.
+
+### `tests/tools/fuzz_images.py`
+
+- Damages images the ways they are damaged (fields of 8-64 bits, little and big endian, with the values that break size
+  arithmetic; bit flips; a cut-off file; a block taken out, doubled, zeroed or swapped; a piece of another seed spliced in;
+  the 13 fields of a cpio header; a control byte, an escape sequence or a byte that is not UTF-8 put into a piece of text) and runs
+  `identify`, `info`, `unpack` (with random `-j`, `--no-tree`, `--tree-only`) and `repack` of what `unpack` wrote. A run is
+  determined by `--rng-seed`, the seed and the iteration; a finding keeps the damaged file, the command and the output.
+- What counts as a finding: a sanitizer's report, a timeout, a signal, an exit status that is not 0 or 1, an exception of the
+  standard library that nobody meant to reach, a control character, a C1 control or a byte that is not UTF-8 in the output
+  (class `terminal`), and **`silent-roundtrip`**: `unpack` took the image without a word and the `repack` is not that image.
+  Images that come back as something else are counted by format, and abr said so in every one of them (the repack is
+  not byte-for-byte when a damaged field is not one abr can model; `unpack` warns).
+- Campaigns on the 747 seeds the suite makes (kept corpus): 100 188 runs, then 14 994, 15 048 (filtered output) and 21 071
+  (`--mutators text`, unfiltered output) after the fixes: nothing found. Everything the fuzzer found:
+  1. **`page_size` of 0xFFFFFFFF** in a boot or vendor_boot header: the check at the end of `unpack` asked for 4 GiB of zeros
+     (AddressSanitizer: allocation too big). A page size is a power of two from 512 bytes to 16 MiB now, and a header with
+     another is refused with the reason (`is_flash_page_size`, tests: 16 sizes in 2 formats).
+  2. **The name of a partition in the error of an ASUS blob** was printed as the bytes the image had (found by the `terminal`
+     class on its first run, against a build whose `info` did not escape): the message escapes it.
+- Positive controls matter: the `terminal` judge is run against a build whose `info` does not escape and must report
+  (24 findings in two minutes), and it has a self-test on made-up outputs.
+
+### manifest.txt: values, and the names of files
+
+- **Bug found while thinking about the fuzzer's `silent-roundtrip`:** a command line that ends in a space (there are such
+  images) did not come back, because the manifest's reader trimmed every value; and a line break in a command line made
+  what followed it **more lines of the manifest**, among them `kernel_file=` and the other keys that name the files `repack`
+  reads: an image could make `repack` read `../../.ssh/id_rsa` into the image it builds.
+- `include/abr/textquote.hpp`: a value that would not read back as it was (a blank at either end, a leading `"`, a line
+  break, a tab, a backslash, a control byte, DEL) is written in double quotes with `\\ \" \n \t \r \xNN`; everything else as
+  it is (UTF-8 stays readable). `ramdisk.meta` uses the same scheme for paths. A manifest by hand, or by an earlier
+  version, reads as before (blanks around, CRLF, comments, no quotes); a quoted value that is wrong is an error with the line.
+- `Manifest::get_path`: a name that a manifest gives to a file or a directory (`kernel_file=`, `ramdisk_tree=`,
+  `blob0_file=`, `blob_part0_file=`, `dtb_file=` ...) lies in the directory of the manifest: no `..`, no absolute path, no
+  drive, no backslash, no empty part. Refused with the key and the reason, before anything is written. Six places read such a
+  name; the suite takes every `*_file` and `*_tree` key of boot, vendor_boot, vbmeta, dtbo, dtb, ASUS blob, Sony ELF and
+  ChromeOS images and puts 2 to 6 bad names into each (80 runs).
+- Tests: `abr_unit_tests manifest` (169 104 checks: every byte alone and at the edges of a text, 20 000 random texts, random
+  manifests with several keys, a manifest by hand, wrong quotes, names that are fine and names that are not) and two CLI sections (32 command lines in boot v0
+  and v4, 80 names). Mutation tests (each mutant one change of the sources, built alone and judged by the new tests): the
+  unit tests kill all but equivalent mutants; at the CLI level every `get_path` -> `get` change is killed, and the two places
+  that guard one and the same file (`load_component` and the size probe before it) only together, since each covers the
+  other.
+
+### What reaches a terminal
+
+- `info` and the messages print text out of images (command lines, names, partitions, releases, configurations) with
+  `textquote::quote_shown`: plain text as it is, anything else in double quotes with escapes, and **also** bytes that are
+  not UTF-8 and the **C1 controls** (U+0080-U+009F: a terminal in UTF-8 mode takes U+009B for the start of an escape
+  sequence, as it takes `ESC [`). Covered: boot, vendor_boot (command line, ramdisk fragment names), uImage name, vbmeta
+  (release, property keys, partition and algorithm names, kernel command line), OSIP and ChromeOS command lines, names out of
+  cpio archives in messages. One test builds an image of each of those with an escape sequence and a bell in each field.
+- **Last line of defence:** every byte abr prints goes through `textquote::TerminalSafeBuf` (stdout and stderr): control
+  characters but the line break and the tab, C1 controls and what is not UTF-8 come out as `\xNN`. A message that takes a name
+  from the command line (no image involved) is escaped by it. `ABR_UNFILTERED_OUTPUT=1` turns it off: the fuzzer does that, to
+  find the messages that forgot to escape (a filter that hides a leak is the wrong tool for finding it). 22 mutants
+  of the filter and its wiring: all killed.
+- A CLI-level test for the filter uses names with ESC, BEL and U+009B in `info`, `identify`, `unpack` and `repack` (stdout and
+  stderr, and the raw bytes without the filter, so that the test is known to see the leak it looks for).
+
+### CI: a test step that could not fail (found 20 Oct 2026)
+
+- GitHub Actions' default shell is `bash -e` **without `pipefail`**, so `./tests/run_tests.sh ... | tee test.log` took tee's
+  exit status: a test run with failures was green. The five jobs of commit `25bf6c9` were green, but with that shell a
+  failing suite would have been green too, so they do not show that the suite passed there. `defaults: run: shell: bash` (that is `bash -eo pipefail`) fixes it; the "Verify static linking"
+  step, which relied on `ldd` succeeding, was rewritten (`ldd` exits 1 for a static binary).
+- Each job that runs the suite now has a step with `.github/scripts/test_summary.py`, which turns the suite's last line into an annotation of the
+  job (the Actions logs cannot be fetched from where this was developed; annotations can:
+  `GET /repos/{owner}/{repo}/check-runs/{job id}/annotations`) and fails when the summary line says otherwise or is missing.
+
+### Ideas not done
+
+- **Header fidelity:** a boot header keeps what abr models; bytes it does not model (garbage after the NUL in a name or command
+  line field) are not kept, so such an image repacks as another one and `unpack` says so ("said so" in the fuzzer's table).
+  Keeping those bytes would make damaged and odd images round-trip exactly.
+- In-process libFuzzer targets for the parsers (the fuzzer above is a command-line fuzzer: slow, but it sees `main`).
+- A fuzz mode that damages `manifest.txt` and the component files of an unpacked directory (`repack` side).
 
 ## Next steps (in order)
 

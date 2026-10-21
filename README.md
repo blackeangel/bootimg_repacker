@@ -491,7 +491,19 @@ this in the manifest / as side files and writes it back:
 - where a **long command line** was cut between the header's two fields:
   AOSP's `mkbootimg.py` fills all 512 bytes of the first one, the old C
   `mkbootimg` keeps a NUL at its end and continues after 511 (`cmdline_split`);
-- a **Marvell PXA** header (`pxa=true`, and its `unknown` word).
+- a **Marvell PXA** header (`pxa=true`, and its `unknown` word);
+- the text of `manifest.txt` itself. It is plain text, one `key=value` per line, and a value that would not read
+  back as it was -- white space at either end (a command line that ends in a space: there are such images), a line
+  break, a quote or a backslash, a control byte -- is written in double quotes with the escapes of C (`\n`, `\t`,
+  `\"`, `\\`, `\x1b`), the way `ramdisk.meta` writes a path. Everything else stays as it was, and a manifest written by
+  hand or by an earlier `abr` (no quotes, white space around the value, CRLF line ends, `#` comments) reads as before.
+  A line break in a command line used to turn what followed it into more keys of the manifest -- among them the names of
+  the files `repack` reads. Those names have to lie in the directory of the manifest now: a name with `..`, an
+  absolute path, a drive, a backslash or an empty part is refused with the key it came from, and nothing is written;
+  `info` and the messages show the text an image has in a name or a command line the same way (also escaping the C1
+  controls and bytes that are not UTF-8), and everything abr prints passes a last filter that writes such bytes as `\xNN`:
+  a terminal never gets the control bytes of an image, or of a name from the command line.
+  (`ABR_UNFILTERED_OUTPUT=1` turns the filter off; the fuzzer below does, to find a message that forgot to escape.)
 
 If you edit an image that sits inside a vendor wrapper or signature
 trailer, `abr` warns: the wrapper is kept as it was, so a signature or
@@ -601,6 +613,45 @@ cross-check against the real AOSP `boot_signer` is skipped unless `javac`,
 default-jdk-headless libbcprov-java`).
 They are used only as independent reference implementations to compare
 `abr` against -- none of them is needed to build or use `abr`.
+
+`ABR_KEEP_WORK=1 ./tests/run_tests.sh build/abr` keeps the directory the suite worked in (every image it made,
+every directory it unpacked) and says where it is, to look at a failure or to take the images as the seeds of the
+fuzzer below.
+
+#### Sanitizers and fuzzing
+
+```sh
+cmake -S . -B build-asan -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-14 \
+      -DABR_SANITIZE=address,undefined
+cmake --build build-asan
+```
+
+builds abr's own code with AddressSanitizer and UndefinedBehaviorSanitizer (GCC or Clang, a dynamic build: not
+with MSVC, for Windows, or together with `ABR_STATIC_BINARY`; the vendored libraries are not instrumented). The suite
+runs on it as it is. A test that expects an error would take a sanitizer's exit status for the error it wanted, so let
+the sanitizers write their reports to files and look at the directory afterwards:
+
+```sh
+mkdir -p asan-logs
+ASAN_OPTIONS=log_path=$PWD/asan-logs/asan:detect_leaks=1:strict_string_checks=1:detect_stack_use_after_return=1 \
+UBSAN_OPTIONS=log_path=$PWD/asan-logs/ubsan:print_stacktrace=1:halt_on_error=1 \
+    ./tests/run_tests.sh build-asan/abr          # (an empty asan-logs/ is a clean run)
+```
+
+`tests/tools/fuzz_images.py` damages images the ways images are damaged (a size field that is too big, a cut-off
+file, a flipped bit, a block taken out or doubled, a piece of another image spliced in; the fields of a cpio header)
+and runs `identify`, `info`, `unpack` and `repack` on every damaged copy. It does not ask what abr says: an image may be
+refused or taken, but abr must not crash, hang, run out of memory, stop with an exception nobody meant to reach, print
+a control character (a mutator puts escape sequences into the text an image holds), say nothing and then write another
+image from what it unpacked, or give the sanitizers something to report:
+
+```sh
+ABR_KEEP_WORK=1 ./tests/run_tests.sh build-asan/abr      # (the images of the suite are the seeds; the last note names the directory)
+tests/tools/fuzz_images.py --abr build-asan/abr --seeds <that directory> --iterations 20 --rng-seed 1 --jobs 2
+```
+
+A run is determined by `--rng-seed`, the seed and the iteration, so a finding is rebuilt by the same command; the
+damaged file is kept with the command and abr's output, and `--repro FILE` runs the commands on a file again.
 
 Beyond those, the suite compares `abr` with the programs Android Image Kitchen runs for the formats `abr` opens by
 itself -- `rkcrc`, `blobpack` / `blobunpack`, `mboot`, `loki_tool`, `pxa-mkbootimg` / `pxa-unpackbootimg`, `sony_dump`,

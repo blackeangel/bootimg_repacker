@@ -48,6 +48,7 @@
 #include "abr/parallel.hpp"
 #include "abr/ramdisk_tree.hpp"
 #include "abr/sha.hpp"
+#include "abr/textquote.hpp"
 #include "abr/uimage.hpp"
 #include "abr/vbmeta.hpp"
 #include "abr/vendor_boot.hpp"
@@ -57,6 +58,11 @@ using namespace abr;
 using namespace abr::legacy;
 
 namespace {
+
+// A command line, a name or a release string out of an image, for a line of `info` or of a message: as it is when it is
+// plain text, else in double quotes with the escapes of C. An image can hold anything there, among it the control
+// sequences of a terminal, and a space at the end of a command line is not to be missed.
+std::string shown(std::string_view s) { return textquote::quote_shown(s); }
 
 // ------------------------------------------------------------ detection --
 
@@ -542,7 +548,7 @@ Bytes load_component(const Manifest& m, const fs::path& dir, const std::string& 
                      const RepackOptions& opt) {
     const std::string key = prefix + "_file";
     if (!m.has(key)) return {};
-    const std::string filename = m.get(key);
+    const std::string filename = m.get_path(key);
     const fs::path file = dir / filename;
     const fs::path raw_path = dir / ".abr_raw" / (filename + ".raw");
     const Bytes stored_hash = m.get_hex(prefix + "_orig_hash");
@@ -564,7 +570,7 @@ Bytes load_component(const Manifest& m, const fs::path& dir, const std::string& 
     std::string tree_name;
     PackReport report;  // what building from the directories had to say (notes are said only if it is used)
     if (has_tree_entry && opt.ramdisk_from != "cpio") {
-        tree_name = m.get(prefix + "_tree");
+        tree_name = m.get_path(prefix + "_tree");
         // The directories of all the archives (see ramdisk_tree.hpp): one that is gone leaves its archive
         // out, and only when every one is gone is the directory as good as not there.
         const size_t volumes = recorded_volumes(m, prefix);
@@ -627,7 +633,7 @@ std::vector<Bytes> load_components(const Manifest& m, const fs::path& dir,
         order[i] = i;
         std::error_code ec;
         if (m.has(prefixes[i] + "_file")) {
-            auto n = fs::file_size(dir / m.get(prefixes[i] + "_file"), ec);
+            auto n = fs::file_size(dir / m.get_path(prefixes[i] + "_file"), ec);
             if (!ec) size[i] = n;
         }
     }
@@ -651,7 +657,7 @@ void save_raw(Manifest& m, const fs::path& dir, const std::string& prefix, const
 Bytes load_raw(const Manifest& m, const fs::path& dir, const std::string& prefix) {
     std::string key = prefix + "_file";
     if (!m.has(key)) return {};
-    return read_file(dir / m.get(key));
+    return read_file(dir / m.get_path(key));
 }
 
 // ------------------------------------------------- envelope (prefix/tail) --
@@ -1293,7 +1299,7 @@ Bytes repack_dtb(const Manifest& m, const fs::path& dir) {
     uint32_t count = m.get_u32("blob_count", 0);
     std::vector<Bytes> blobs;
     for (uint32_t i = 0; i < count; ++i)
-        blobs.push_back(read_file(dir / m.get("blob" + std::to_string(i) + "_file")));
+        blobs.push_back(read_file(dir / m.get_path("blob" + std::to_string(i) + "_file")));
     return join_fdt_blobs(blobs);
 }
 
@@ -1756,7 +1762,7 @@ Bytes repack_blob(const Manifest& m, const fs::path& dir) {
     for (size_t i = 0; i < b.parts.size(); ++i) {
         const std::string key = "blob_part" + std::to_string(i) + "_file";
         if (!m.has(key)) throw FormatError("manifest.txt has no " + key);
-        b.parts[i].data = read_file(dir / m.get(key));
+        b.parts[i].data = read_file(dir / m.get_path(key));
     }
     return pack_blob(m, std::move(b));
 }
@@ -2319,7 +2325,7 @@ void print_info(const fs::path& path) {
             if (img.header_version <= 2) std::cout << "page_size:      " << img.page_size << "\n";
             std::cout << "os_version:     " << img.os_version.to_string() << "\n";
             std::cout << "patch_level:    " << img.os_version.patch_level_string() << "\n";
-            std::cout << "cmdline:        " << img.cmdline << "\n";
+            std::cout << "cmdline:        " << shown(img.cmdline) << "\n";
             std::cout << "kernel:         " << img.kernel.size() << " bytes ("
                        << codec_name(detect_codec(img.kernel)) << ")\n";
             std::cout << "ramdisk:        " << img.ramdisk.size() << " bytes ("
@@ -2347,14 +2353,14 @@ void print_info(const fs::path& path) {
                 VendorBootImage::parse(Bytes(host.begin() + static_cast<long>(off), host.end()));
             std::cout << "header_version: " << img.header_version << "\n";
             std::cout << "page_size:      " << img.page_size << "\n";
-            std::cout << "cmdline:        " << img.cmdline << "\n";
+            std::cout << "cmdline:        " << shown(img.cmdline) << "\n";
             std::cout << "dtb:            " << img.dtb.size() << " bytes\n";
             std::cout << "bootconfig:     " << img.bootconfig.size() << " bytes\n";
             std::cout << "ramdisk fragments: " << img.ramdisk_fragments.size() << "\n";
             for (size_t i = 0; i < img.ramdisk_fragments.size(); ++i) {
                 auto& e = img.ramdisk_fragments[i];
                 std::cout << "  [" << i << "] type=" << vendor_ramdisk_type_name(e.type)
-                          << " name=" << (e.name.empty() ? "-" : e.name) << " size=" << e.data.size()
+                          << " name=" << (e.name.empty() ? "-" : shown(e.name)) << " size=" << e.data.size()
                           << " (" << codec_name(detect_codec(e.data)) << ")\n";
             }
             print_envelope_info(Envelope::capture(host, off, img.consumed));
@@ -2388,7 +2394,7 @@ void print_info(const fs::path& path) {
             std::cout << "flags:      " << v.flags << "\n";
             std::cout << "rollback:   " << v.rollback_index << " @location "
                        << v.rollback_index_location << "\n";
-            std::cout << "release:    " << v.release_string << "\n";
+            std::cout << "release:    " << shown(v.release_string) << "\n";
             std::cout << "has_footer: " << (v.has_footer ? "yes" : "no") << "\n";
             std::cout << "descriptors: " << v.descriptors.size() << "\n";
             for (auto& d : v.descriptors) std::cout << "  - " << d.describe() << "\n";
@@ -2396,7 +2402,7 @@ void print_info(const fs::path& path) {
         }
         case Fmt::UIMAGE: {
             UImage img = UImage::parse(data);
-            std::cout << "name:        " << img.name << "\n";
+            std::cout << "name:        " << shown(img.name) << "\n";
             std::cout << "os/arch:     " << uboot_os_name(img.os) << "/" << uboot_arch_name(img.arch)
                        << "\n";
             std::cout << "type:        " << uboot_type_name(img.type) << "\n";
@@ -2446,7 +2452,7 @@ void print_info(const fs::path& path) {
             }
             std::cout << "signature:      "
                       << (img.signature.empty() ? std::string("none") : std::to_string(img.signature.size()) + " bytes") << "\n";
-            std::cout << "cmdline:        " << img.cmdline_text() << "\n";
+            std::cout << "cmdline:        " << shown(img.cmdline_text()) << "\n";
             std::cout << "bootstub:       " << img.bootstub.size() << " bytes\n";
             std::cout << "kernel:         " << img.kernel.size() << " bytes\n";
             std::cout << "ramdisk:        " << img.ramdisk.size() << " bytes (" << codec_name(detect_codec(img.ramdisk)) << ")\n";
@@ -2487,7 +2493,7 @@ void print_info(const fs::path& path) {
             Bytes kernel;
             const std::optional<legacy::ChromeosInfo> c = legacy::strip_chromeos(data, kernel);
             std::cout << "blob:           " << chromeos_description(*c) << "\n";
-            std::cout << "cmdline:        " << std::string(c->config.begin(), std::find(c->config.begin(), c->config.end(), 0)) << "\n";
+            std::cout << "cmdline:        " << shown(std::string(c->config.begin(), std::find(c->config.begin(), c->config.end(), 0))) << "\n";
             std::cout << "kernel:         " << kernel.size() << " bytes\n";
             print_envelope_info(c->tail);
             break;
@@ -2815,9 +2821,43 @@ std::string take_threads_option(std::vector<std::string>& v) {
 
 }  // namespace
 
+namespace {
+
+// Everything abr prints passes a filter that writes what a terminal would act on -- control characters, the C1 controls, what is
+// not UTF-8 -- as escapes (textquote.hpp): the last line of defence for text that an image holds and a message forgot to escape.
+// ABR_UNFILTERED_OUTPUT=1 turns it off; tests/tools/fuzz_images.py does that to find such a message.
+class OutputFilter {
+public:
+    OutputFilter() {
+        const char* off = std::getenv("ABR_UNFILTERED_OUTPUT");
+        if (off != nullptr && *off != '\0' && std::string_view(off) != "0") return;
+        out_.emplace(std::cout.rdbuf());
+        err_.emplace(std::cerr.rdbuf());
+        out_before_ = std::cout.rdbuf(&*out_);
+        err_before_ = std::cerr.rdbuf(&*err_);
+    }
+    ~OutputFilter() {
+        if (!out_) return;
+        std::cout.flush();
+        std::cerr.flush();
+        std::cout.rdbuf(out_before_);
+        std::cerr.rdbuf(err_before_);
+    }
+    OutputFilter(const OutputFilter&) = delete;
+    OutputFilter& operator=(const OutputFilter&) = delete;
+
+private:
+    std::optional<textquote::TerminalSafeBuf> out_, err_;
+    std::streambuf* out_before_ = nullptr;
+    std::streambuf* err_before_ = nullptr;
+};
+
+}  // namespace
+
 int main(int argc, char** argv) {
     set_binary_stdio();
     const Utf8Console utf8_console;  // (Windows: the console shows the paths in the messages as they are)
+    const OutputFilter output_filter;
     if (!hash::sha_selftest()) {
         std::cerr << "internal error: bundled SHA implementation failed its self-test; "
                      "refusing to run since boot ids and AVB hashes would be silently wrong\n";

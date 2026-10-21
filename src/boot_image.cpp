@@ -212,6 +212,9 @@ BootImage BootImage::parse(const Bytes& image) {
         if (!part2.empty() && part1.size() != kBootArgsSize)
             img.cmdline_split = static_cast<uint32_t>(part1.size());
 
+        if (!is_flash_page_size(img.page_size))
+            throw FormatError("boot image page_size " + std::to_string(img.page_size) +
+                              " is not a flash page size (a power of two from 512 bytes to 16 MiB)");
         keep_header_padding(r.pos(), img.page_size);
         data_end = r.pos() + img.header_padding.size();
         to_page(img.page_size);
@@ -261,6 +264,9 @@ BootImage BootImage::parse(const Bytes& image) {
         }
 
         if (img.page_size == 0) throw FormatError("boot image page_size is zero");
+        if (!is_flash_page_size(img.page_size))
+            throw FormatError("boot image page_size " + std::to_string(img.page_size) +
+                              " is not a flash page size (a power of two from 512 bytes to 16 MiB)");
 
         keep_header_padding(r.pos(), img.page_size);
         data_end = r.pos() + img.header_padding.size();

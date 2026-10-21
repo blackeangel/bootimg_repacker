@@ -101,6 +101,11 @@ constexpr uint64_t padding_for(uint64_t value, uint64_t alignment) {
     return align_up(value, alignment) - value;
 }
 
+// A flash page size as a header may give it: a power of two from 512 bytes to 16 MiB (mkbootimg's own list is 2 KiB to
+// 16 KiB). Anything else is a header that is damaged -- or not a header -- and the padding of every part that is worked
+// out from it would be nonsense, or gigabytes of zeros.
+constexpr bool is_flash_page_size(uint64_t v) { return v >= 512 && v <= (uint64_t{16} << 20) && (v & (v - 1)) == 0; }
+
 // A dump whose last page of padding was cut off by whoever made it: the parser records how many bytes were
 // missing (`missing`) and how many of the padding the file does hold (`kept`, usually none: the file ends where
 // the last component's data ends). The rebuilt image is cut the same way -- by what its own padding allows: an
