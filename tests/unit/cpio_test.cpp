@@ -1610,7 +1610,11 @@ public:
                 case 0: fill = 0; break;
                 case 1: fill = align_up(end, 256) - end; break;
                 case 2: fill = align_up(end, 4096) - end; break;
-                default: fill = pick(12) * 4 + (last ? pick(4) : 0); break;
+                default: {  // (the two picks one after the other: the operands of + are not ordered, and then g++ and clang would draw other numbers)
+                    fill = pick(12) * 4;
+                    if (last) fill += pick(4);
+                    break;
+                }
             }
             b.resize(b.size() + fill, 0);
             out.wire.insert(out.wire.end(), b.begin(), b.end());
@@ -1682,7 +1686,8 @@ private:
                     ++files;
                     if (pick(8) == 0) data = std::string("#!/bin/sh\n") + data;
                 } else if (kind == 'l') {
-                    data = random_name() + (pick(2) ? "/" + random_name() : std::string());
+                    data = random_name();  // (not one expression with the second name: the operands of + are not ordered, and g++ and clang would draw other numbers)
+                    if (pick(2)) data += "/" + random_name();
                     if (pick(4) == 0) data = "/" + data;
                 }
                 nodes.push_back({path, kind, data});
