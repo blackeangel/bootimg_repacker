@@ -43,7 +43,7 @@ tools" below.
 | self-contained RSA: BigInt (Knuth D, Montgomery), DER/PEM/X.509, PKCS#1 v1.5 sign/verify, PKCS#8/PKCS#1 key parsing, AVB public-key blob -- **no OpenSSL anywhere in the build** | **done + verified** (Python integers, `openssl dgst -sign`, `avbtool extract_public_key`; see "Self-contained crypto" below) |
 | manifest + CLI (`abr info/unpack/repack`) | **done** |
 | CMake: FetchContent-vendored static zlib/lz4/zstd/xz/bzip2 | **done + build-verified natively on Linux**, both the dynamic and the `-DABR_STATIC_BINARY=ON` fully-static configurations |
-| Test suite (`tests/run_tests.sh`) | **done, 353/353 passing** on g++-14 (all judges required, as in the CI), under AddressSanitizer + UndefinedBehaviorSanitizer (no report), and on clang-20 and for `abr.exe` under wine (see "Hardening" for those two counts); CI runs the matrix (g++-14, clang-20, ASan+UBSan with a fuzz run, Windows under wine, arm64 under qemu-user, android-arm64) -- see Verification |
+| Test suite (`tests/run_tests.sh`) | **done, 353/353 passing** on g++-14 (all judges required, as in the CI) and under AddressSanitizer + UndefinedBehaviorSanitizer (no report), 344/344 on clang-20 (the nine "the judge is there" checks belong to `ABR_REQUIRE_ORACLES`, which that run did not set), 352/352 for `abr.exe` under wine (the platform's own tests differ); CI runs the matrix (g++-14, clang-20, ASan+UBSan with a fuzz run, Windows under wine, arm64 under qemu-user, android-arm64) -- see Verification |
 | CMake cross toolchains (mingw-w64, Android NDK) | **done + verified** (mingw reproduced locally; NDK only provable via CI, see below) |
 | GitHub Actions static build matrix (linux-x86_64, windows-x86_64, android-arm64) | **done + verified**: run 35313499827, all 3 jobs green, all 3 static binaries produced as artifacts (abr-linux-x86_64, abr-windows-x86_64, abr-android-arm64) |
 
@@ -1578,9 +1578,11 @@ hostile ones, and text that goes into a file or onto a terminal. It found real b
    requests and manual dispatch: dispatch it with
    `gh api -X POST repos/<repo>/actions/workflows/build.yml/dispatches -f ref=<branch>`).
 
-CI status of the branch: run 39020243483 (commit `750530f`, ChromeOS kernel blobs) green on all five jobs
-(linux g++-14 and clang-20, Windows under wine, arm64 under qemu-user, android-arm64); the earlier runs 38652019847
-(`ccf6c3c`, LOKI), 38360970941 (`786c44a`) and 37254228679 (`5d04345`) are green as well.
+CI status of the branch: run 39689458222 (commit `6e3ddd9`, hardening) green on all **six** jobs -- and, with `pipefail` in
+the workflow's shell, a green that means something: the annotations of the jobs say "353 passed, 0 failed" for linux
+g++-14, clang-20, arm64 under qemu-user and the ASan+UBSan build (whose fuzz step found nothing too) and "352 passed, 0
+failed" for Windows under wine; android-arm64 only builds. The runs before it (39020243483 for `750530f`, 38652019847,
+38360970941, 37254228679) were green under the old shell, which could not have shown a failing suite.
 
 ### CI status: green as of commit `ea0206d` (run 35313499827)
 
