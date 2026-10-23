@@ -73,7 +73,7 @@ UImage UImage::parse(const Bytes& image) {
     img.arch = r.u8();
     img.type = r.u8();
     img.comp = r.u8();
-    img.name = r.asciiz(kUimageNameSize);
+    img.name = r.asciiz(kUimageNameSize, img.name_tail);
 
     Bytes header_zeroed(image.begin(), image.begin() + kUimageHeaderSize);
     header_zeroed[4] = header_zeroed[5] = header_zeroed[6] = header_zeroed[7] = 0;
@@ -106,7 +106,7 @@ Bytes UImage::build() const {
     w.u8(arch);
     w.u8(type);
     w.u8(comp);
-    w.asciiz(name, kUimageNameSize);
+    w.asciiz(name, kUimageNameSize, name_tail);
     // w now holds exactly the 64-byte header, with the crc field still zero.
     uint32_t hcrc = static_cast<uint32_t>(crc32(0, w.data().data(), static_cast<uInt>(w.data().size())));
     w.patch_be32(4, hcrc);

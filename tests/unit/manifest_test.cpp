@@ -592,6 +592,189 @@ void test_manifest_paths() {
     EXPECT_HAS(said, "'..'");
 }
 
+// ---- the bytes behind the NUL that ends the text of a header field ------------------------------------------------------
+
+Bytes bytes_of(std::string_view s) { return Bytes(s.begin(), s.end()); }
+
+void test_text_field_tails() {
+    std::puts("text fields of a header: what is behind the NUL that ends the text");
+
+    // reading: the text, and the tail up to its last non-zero byte
+    struct Read {
+        std::string field;     // the N bytes of the field
+        std::string text;
+        std::string tail;
+    };
+    const std::vector<Read> reads = {
+        {std::string("abc\0\0\0\0\0", 8), "abc", ""},
+        {std::string("abc\0XY\0\0", 8), "abc", "XY"},
+        {std::string("abc\0\0Z\0\0", 8), "abc", std::string("\0Z", 2)},     // a zero inside the tail stays
+        {std::string("abc\0\0\0\0Z", 8), "abc", std::string("\0\0\0Z", 4)},   // a tail that reaches the end of the field
+        {std::string("abc\0Z\0\0\0", 8), "abc", "Z"},
+        {"abcdefgh", "abcdefgh", ""},                                   // no NUL at all: the text fills the field
+        {std::string("abcdefg\0", 8), "abcdefg", ""},                   // a NUL at the very end: nothing behind it
+        {std::string("\0\0\0\0\0\0\0\0", 8), "", ""},
+        {std::string("\0junk\0\0\0", 8), "", "junk"},                  // no text, junk behind the first NUL
+        {std::string("\0\0\0\0\0\0\0Z", 8), "", std::string("\0\0\0\0\0\0Z", 7)},
+        {std::string("ab\0cdef", 7), "ab", "cdef"},
+        {std::string("a\0", 2), "a", ""},
+        {std::string("\0", 1), "", ""},
+    };
+    for (const Read& r : reads) {
+        const Bytes field = bytes_of(r.field);
+        Bytes framed = bytes_of("12");  // (something in front, and something behind: the field is exactly N bytes)
+        framed.insert(framed.end(), field.begin(), field.end());
+        framed.push_back('9');
+        BinaryReader reader(framed);
+        reader.skip(2);
+        Bytes tail = bytes_of("stale");  // (a tail from an earlier field must not stay)
+        const std::string text = reader.asciiz(field.size(), tail);
+        EXPECT(text == r.text);
+        EXPECT(tail == bytes_of(r.tail));
+        EXPECT(reader.pos() == 2 + field.size());
+        // and the old call, without a tail, says the same of the text
+        BinaryReader again(framed);
+        again.skip(2);
+        EXPECT(again.asciiz(field.size()) == r.text);
+        EXPECT(again.pos() == 2 + field.size());
+    }
+
+    // writing: always exactly N bytes; the text, its NUL, then as much of the tail as the field holds
+    struct Write {
+        std::string text;
+        std::string tail;
+        size_t size;
+        std::string field;
+    };
+    const std::vector<Write> writes = {
+        {"abc", "", 8, std::string("abc\0\0\0\0\0", 8)},
+        {"abc", "XY", 8, std::string("abc\0XY\0\0", 8)},
+        {"abc", std::string("\0Z", 2), 8, std::string("abc\0\0Z\0\0", 8)},
+        {"abc", "123456789", 8, std::string("abc\0" "1234", 8)},        // too long for the field: cut
+        {"abc", "1234", 8, std::string("abc\0" "1234", 8)},             // exactly what the field holds
+        {"abcdefg", "XY", 8, std::string("abcdefg\0", 8)},              // text and NUL fill the field: no room
+        {"abcdefgh", "XY", 8, "abcdefgh"},                              // the text fills it: no NUL, no tail
+        {"abcdefghij", "XY", 8, "abcdefgh"},                            // a text that is too long is cut, as it was
+        {"", "XY", 8, std::string("\0XY\0\0\0\0\0", 8)},
+        {"", "", 8, std::string(8, '\0')},
+        {"a", "XY", 2, std::string("a\0", 2)},
+        {"", "XY", 1, std::string("\0", 1)},
+        {"abc", "XY", 0, ""},                                           // (no field)
+    };
+    for (const Write& w : writes) {
+        BinaryWriter out;
+        out.asciiz(w.text, w.size, bytes_of(w.tail));
+        EXPECT(out.size() == w.size);
+        EXPECT(out.data() == bytes_of(w.field));
+        if (w.tail.empty()) {  // the same as the call that has no tail
+            BinaryWriter plain;
+            plain.asciiz(w.text, w.size);
+            EXPECT(plain.data() == out.data());
+        }
+    }
+
+    {   // a tail very much longer than the field: what fits is written, and nothing past the end of the field
+        BinaryWriter out;
+        out.asciiz("abc", 8, Bytes(16u << 20, 'x'));
+        EXPECT(out.data() == bytes_of(std::string("abc\0xxxx", 8)));
+    }
+
+    // any field is read and written back as it was: text, NUL, then whatever -- zeros, junk, the rest of an old text
+    std::mt19937 rng(20261022);
+    for (int round = 0; round < 20000; ++round) {
+        const size_t n = 1 + rng() % 40;
+        Bytes field(n, 0);
+        const unsigned density = 1 + rng() % 4;  // how many of the bytes are zero: about 1/density
+        const unsigned style = rng() % 3;
+        for (auto& b : field) {
+            if (rng() % density == 0 && style != 2) b = 0;
+            else if (style == 0) b = static_cast<uint8_t>('a' + rng() % 26);
+            else b = static_cast<uint8_t>(rng());
+        }
+        if (rng() % 3 == 0) field[rng() % n] = 0;  // a NUL somewhere
+        if (rng() % 3 == 0) field.back() = 0;
+        Bytes framed = field;
+        BinaryReader reader(framed);
+        Bytes tail;
+        const std::string text = reader.asciiz(n, tail);
+        EXPECT(reader.pos() == n);
+        BinaryWriter out;
+        out.asciiz(text, n, tail);
+        EXPECT(out.data() == field);
+        // a tail never ends in a zero (it is trimmed) and never starts in the text
+        EXPECT(tail.empty() || tail.back() != 0);
+        EXPECT(text.find('\0') == std::string::npos);
+        EXPECT(text.size() + (tail.empty() ? 0 : 1 + tail.size()) <= n);
+    }
+
+    // the manifest: a printable tail is text, anything else is hex, nothing is nothing
+    TempDir dir;
+    const fs::path file = dir.path / "manifest.txt";
+    struct InManifest {
+        std::string tail;
+        bool as_text;
+    };
+    const std::vector<InManifest> tails = {
+        {"115200 androidboot.selinux=permissive", true},
+        {" leading and trailing blanks ", true},          // (blanks at the ends are quoted, and come back)
+        {"\"quoted\" and \\ and # and = and ' '", true},
+        {"x", true},
+        {std::string("\0", 1), false},
+        {std::string("\0Z", 2), false},
+        {"\xff\xff\xff", false},
+        {"\xc3\xbc", false},                                // UTF-8 is not printable ASCII
+        {"line one\nkernel_file=/etc/passwd", false},        // a line break would add a key to the manifest
+        {"tab\there", false},
+        {"\x1b]0;title\x07", false},
+        {"\x7f", false},
+        {"~", true},                                      // the last printable ASCII character,
+        {"\x1f", false},                                  // the control character before the first,
+        {"\x80", false},                                  // and the first byte above ASCII
+    };
+    for (const InManifest& t : tails) {
+        Manifest m;
+        m.set("type", "boot");
+        m.set_tail("cmdline_tail", bytes_of(t.tail));
+        m.set("after", "next");
+        EXPECT(m.has("cmdline_tail") == t.as_text);
+        EXPECT(m.has("cmdline_tail_hex") == !t.as_text);
+        EXPECT(m.get_tail("cmdline_tail") == bytes_of(t.tail));
+        m.save(file);
+        const std::string written = read_text(file);
+        // nothing a line of the file could be taken for but the lines the manifest wrote
+        size_t lines = 0;
+        for (char c : written) lines += c == '\n';
+        EXPECT(lines == 3);  // type, the tail, after
+        Manifest back = Manifest::load(file);
+        EXPECT(back.get_tail("cmdline_tail") == bytes_of(t.tail));
+        EXPECT(back.get("after") == "next");
+        EXPECT(!back.has("kernel_file"));
+    }
+    {
+        Manifest none;
+        none.set_tail("cmdline_tail", Bytes());
+        EXPECT(!none.has("cmdline_tail"));
+        EXPECT(!none.has("cmdline_tail_hex"));
+        EXPECT(none.get_tail("cmdline_tail").empty());
+    }
+    {   // both, from a manifest somebody edited: the hex one is read
+        Manifest both;
+        both.set("cmdline_tail", "text");
+        both.set_hex("cmdline_tail_hex", bytes_of("hex"));
+        EXPECT(both.get_tail("cmdline_tail") == bytes_of("hex"));
+    }
+    std::mt19937 rng2(7);
+    for (int round = 0; round < 3000; ++round) {
+        Bytes tail(1 + rng2() % 60);
+        const bool printable_only = rng2() % 2;
+        for (auto& b : tail) b = printable_only ? static_cast<uint8_t>(0x20 + rng2() % 95) : static_cast<uint8_t>(rng2());
+        Manifest m;
+        m.set_tail("t", tail);
+        m.save(file);
+        EXPECT(Manifest::load(file).get_tail("t") == tail);
+    }
+}
+
 }  // namespace
 
 int run_manifest_tests() {
@@ -603,6 +786,7 @@ int run_manifest_tests() {
     test_manifest_roundtrip();
     test_manifest_reading();
     test_manifest_paths();
+    test_text_field_tails();
     if (g_failures == 0) std::printf("manifest: ok (%d checks)\n", g_checks);
     else std::printf("manifest: %d failure(s)\n", g_failures);
     return g_failures == 0 ? 0 : 1;

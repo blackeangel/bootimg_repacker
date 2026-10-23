@@ -49,9 +49,9 @@ VendorBootImage VendorBootImage::parse(const Bytes& image) {
     img.kernel_addr = r.le32();
     img.ramdisk_addr = r.le32();
     uint32_t vendor_ramdisk_size = r.le32();
-    img.cmdline = r.asciiz(kVendorBootArgsSize);
+    img.cmdline = r.asciiz(kVendorBootArgsSize, img.cmdline_tail);
     img.tags_addr = r.le32();
-    img.board_name = r.asciiz(kVendorBootNameSize);
+    img.board_name = r.asciiz(kVendorBootNameSize, img.board_name_tail);
     uint32_t header_size_found = r.le32();
     uint32_t dtb_size = r.le32();
     img.dtb_addr = r.le64();
@@ -108,7 +108,7 @@ VendorBootImage VendorBootImage::parse(const Bytes& image) {
             uint32_t rsize = er.le32();
             uint32_t roffset = er.le32();
             e.type = er.le32();
-            e.name = er.asciiz(kVendorRamdiskNameSize);
+            e.name = er.asciiz(kVendorRamdiskNameSize, e.name_tail);
             for (auto& b : e.board_id) b = er.le32();
             if (static_cast<uint64_t>(roffset) + rsize > ramdisk_section.size())
                 throw FormatError("vendor ramdisk table entry " + std::to_string(i) +
@@ -172,9 +172,9 @@ Bytes VendorBootImage::build() const {
     w.le32(ramdisk_addr);
     Bytes ramdisk_section = concatenated_ramdisk();
     w.le32(static_cast<uint32_t>(ramdisk_section.size()));
-    w.asciiz(cmdline, kVendorBootArgsSize);
+    w.asciiz(cmdline, kVendorBootArgsSize, cmdline_tail);
     w.le32(tags_addr);
-    w.asciiz(board_name, kVendorBootNameSize);
+    w.asciiz(board_name, kVendorBootNameSize, board_name_tail);
     w.le32(header_size_field.value_or(header_version == 3 ? kHeaderSizeV3 : kHeaderSizeV4));
     w.le32(static_cast<uint32_t>(dtb.size()));
     w.le64(dtb_addr);
@@ -205,7 +205,7 @@ Bytes VendorBootImage::build() const {
                 w.le32(static_cast<uint32_t>(e.data.size()));
                 w.le32(running_offset);
                 w.le32(e.type);
-                w.asciiz(e.name, kVendorRamdiskNameSize);
+                w.asciiz(e.name, kVendorRamdiskNameSize, e.name_tail);
                 for (auto b : e.board_id) w.le32(b);
                 running_offset += static_cast<uint32_t>(e.data.size());
             }

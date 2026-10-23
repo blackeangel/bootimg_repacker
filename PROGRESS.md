@@ -43,7 +43,7 @@ tools" below.
 | self-contained RSA: BigInt (Knuth D, Montgomery), DER/PEM/X.509, PKCS#1 v1.5 sign/verify, PKCS#8/PKCS#1 key parsing, AVB public-key blob -- **no OpenSSL anywhere in the build** | **done + verified** (Python integers, `openssl dgst -sign`, `avbtool extract_public_key`; see "Self-contained crypto" below) |
 | manifest + CLI (`abr info/unpack/repack`) | **done** |
 | CMake: FetchContent-vendored static zlib/lz4/zstd/xz/bzip2 | **done + build-verified natively on Linux**, both the dynamic and the `-DABR_STATIC_BINARY=ON` fully-static configurations |
-| Test suite (`tests/run_tests.sh`) | **done, 353/353 passing** on g++-14 (all judges required, as in the CI) and under AddressSanitizer + UndefinedBehaviorSanitizer (no report), 344/344 on clang-20 (the nine "the judge is there" checks belong to `ABR_REQUIRE_ORACLES`, which that run did not set), 352/352 for `abr.exe` under wine (the platform's own tests differ); CI runs the matrix (g++-14, clang-20, ASan+UBSan with a fuzz run, Windows under wine, arm64 under qemu-user, android-arm64) -- see Verification |
+| Test suite (`tests/run_tests.sh`) | **done, 403/403 passing** on g++-14 (all judges required, as in the CI) and under AddressSanitizer + UndefinedBehaviorSanitizer (no report), 394/394 on clang-20 (the nine "the judge is there" checks belong to `ABR_REQUIRE_ORACLES`, which that run did not set), 402/402 for `abr.exe` under wine (the platform's own tests differ); CI runs the matrix (g++-14, clang-20, ASan+UBSan with a fuzz run, Windows under wine, arm64 under qemu-user, android-arm64) -- see Verification |
 | CMake cross toolchains (mingw-w64, Android NDK) | **done + verified** (mingw reproduced locally; NDK only provable via CI, see below) |
 | GitHub Actions static build matrix (linux-x86_64, windows-x86_64, android-arm64) | **done + verified**: run 35313499827, all 3 jobs green, all 3 static binaries produced as artifacts (abr-linux-x86_64, abr-windows-x86_64, abr-android-arm64) |
 
@@ -1485,7 +1485,7 @@ hostile ones, and text that goes into a file or onto a terminal. It found real b
 - `-DABR_SANITIZE=address,undefined` (CMake option, an interface target `abr_sanitize` that `abr_core` links; abr's own
   code is instrumented, the vendored libraries are not; refused with MSVC, Windows and `ABR_STATIC_BINARY`).
 - The whole suite runs on that build with the sanitizers' reports written to files (a test that expects an error would
-  take a sanitizer's exit status for the error it wanted): **353 of 353, no report**. The CI has a job for it
+  take a sanitizer's exit status for the error it wanted): **403 of 403 now, no report** (353 when the build was added). The CI has a job for it
   (`linux-x86_64 (g++-14, ASan+UBSan)`): the suite, the reports of the suite, and a short fuzz run on the images the suite made.
 - `ABR_KEEP_WORK=1 tests/run_tests.sh` keeps the directory the suite worked in: every image it made is a seed for the fuzzer.
 
@@ -1561,11 +1561,78 @@ hostile ones, and text that goes into a file or onto a terminal. It found real b
 
 ### Ideas not done
 
-- **Header fidelity:** a boot header keeps what abr models; bytes it does not model (garbage after the NUL in a name or command
-  line field) are not kept, so such an image repacks as another one and `unpack` says so ("said so" in the fuzzer's table).
-  Keeping those bytes would make damaged and odd images round-trip exactly.
+- **Header fidelity:** the bytes behind the NUL of a text field are kept now (next section). What is still not kept, and
+  why, is listed there.
 - In-process libFuzzer targets for the parsers (the fuzzer above is a command-line fuzzer: slow, but it sees `main`).
 - A fuzz mode that damages `manifest.txt` and the component files of an unpacked directory (`repack` side).
+
+## Header fidelity: the bytes behind the NUL of a text field (done, 22-23 Oct 2026)
+
+The fuzzer's `--report-roundtrip` table (4482 runs, `--rng-seed 31`, 553 images that did not come back as they were) showed
+what a round trip still lost. About 250 of those were one thing: a fixed-size text field (a command line, a board name, a
+release string) with **bytes behind the NUL** that ends its text. Such bytes are real: a text cut short in place, or a tool
+that never clears the field, leaves what stood there before, and `mkbootimg`-family tools differ in what they do about it.
+abr read the text up to the NUL, and wrote it back with zeros behind it -- so the image came back as another one, which
+`unpack` said ("does NOT reproduce"), but it was a loss that could be avoided.
+
+### Design
+
+- A **tail** is what lies behind the first NUL of an N-byte field, without the zeros at its end (they are what the field
+  would have anyway). `BinaryReader::asciiz(field_size, tail)` returns the text and the tail; `BinaryWriter::asciiz(text,
+  field_size, tail)` writes the text, a NUL and the tail, cut to the room the field has left (`field_size - text.size() - 1`;
+  a text that fills the field has no NUL and no tail). With that, **write(read(f)) == f for every N-byte field** -- a unit test
+  checks it for 20 000 random fields (and for a 16 MiB tail, which must not be copied beyond the field).
+- In `manifest.txt` a tail is `<key>=<text>` when every byte is printable ASCII (0x20-0x7E), otherwise `<key>_hex=<hex>`; the
+  hex key wins when both are there; **no key at all when there is no tail**, so the manifest of a clean image is what it was
+  (the 13 real device dumps that unpack get no new key and no note; the suite looks at every directory it unpacks and
+  fails on a `*_tail` key where no such bytes exist).
+- The fields: boot `board_name_tail` (v0-v2 and PXA), `cmdline_tail`, `extra_cmdline_tail` (v3/v4 have one command line of
+  1536 bytes: `cmdline_tail` only); vendor_boot `board_name_tail`, `cmdline_tail`, `ramdisk<i>_name_tail` (the 32-byte name
+  of a fragment); vbmeta `release_string_tail`; the footer of a boot-family image `avb_release_string_tail`; uImage
+  `name_tail`.
+- **vbmeta's `reserved`** (the 80 bytes after the release string) was not read at all: a signed vbmeta covers them, so a
+  vbmeta with something there came back with a hash that no longer matched. `reserved=` (hex) is written when they are not all
+  zero (`avb_reserved=` for a footer); shorter or longer than 80 bytes is made to fit like a tail.
+- **Edit semantics:** the tail follows the NUL of the new text and is cut to the room that is left (a longer command line
+  pushes the tail out, a shorter one lets more of it show); remove the key to drop it.
+- `unpack` says so when an image has tails (`bytes behind the NUL that ends the text of a header field (cmdline 37,
+  board_name 3) are kept in manifest.txt (*_tail)`; for a vbmeta: the hash and the signature cover them), `info` has a line
+  (`field tails:`, `unmodeled:`, `name tail:`). No tail, no word.
+
+### Verified by
+
+- 13 new fixtures (`tests/tools/fixtures.py`: `boot_v2_tails` and its plain / short / long / full variants,
+  `boot_v0_longcmd_tails`, `boot_v3_tails`, `boot_v4_tails`, `boot_pxa_tails`, `vendor_boot_v3_tails`,
+  `vendor_boot_v4_tails`, `vendor_boot_v4_tails_plain`, `uimage_tails`; vbmeta and footer images are patched from the
+  existing ones in the suite). **Synthetic**: made from the format descriptions, no real device image has a tail that
+  abr has seen (the 13 real dumps that unpack have none) -- so those are a control that nothing changed for clean images,
+  not evidence for this feature. The binary of before the change fails the new round-trip checks.
+- A section of the CLI suite ("bytes behind the NUL that ends the text of a field"): every format round-trips byte for byte and says
+  so (`unpack` self-check, `info`), a clean image has no key and no word, edits (a shorter text, a longer one, the
+  tail removed, the tail as hex) give the images that the rules above say, a signed vbmeta (key from Python+openssl)
+  still verifies after an untouched round trip and after an edit that re-signs it.
+- Unit tests (`abr_unit_tests manifest`, **272 307 checks** now): the read/write table of the codec, 20 000 random fields,
+  16 MiB tail, the manifest in both spellings and the edges of the printable range, a tail that is a line break (must not
+  make a second key), both keys present, 3000 random tails through save and load.
+- **Mutation tests** (the harness is not in the repository: it is a script that applies one change of the source at a time,
+  builds it alone, and runs only the new tests): 90 mutants of the codec, the manifest keys and the wiring in `main.cpp` /
+  the four formats; all killed. The first pass left six alive and each pointed at a missing test, now there: an unbounded
+  copy of the tail (16 MiB case), the edges of the printable range, `reserved` stored when all zero, `reserved` not padded
+  to 80 bytes, `info` printing for an empty tail, and the four notes of `unpack`.
+
+### What is still not kept (the fuzz table with `--rng-seed 31` told these apart)
+
+- **Non-zero bytes in the padding between the sections** (after the header page, between kernel and ramdisk, ...): about 100
+  of the 553. abr writes zeros there; `unpack` says the repack is not identical (the existing test
+  `boot_v2_dirty_padding.img` pins that on purpose). Keeping them is possible -- a stored blob per gap, "as far as it
+  fits" -- but each edit that moves a section decides which gap's bytes go where, so it was left; no image seen so far
+  has any.
+- **Sony ELF boot images** (110 of them in that table): abr writes the layout it understands; what does not fit its model is
+  said, by design (see "Sony ELF boot images").
+- **Wrappers abr cannot take apart** (a SIN container's data, a blob, a ChromeOS preamble of a layout futility does
+  not write) and **truncated or self-contradicting images**: refused or said, never written as if whole.
+- The MTK header's raw 512 bytes (only the fields abr models are kept; unchanged images are replayed byte for byte, edited ones
+  get a header made from the fields).
 
 ## Next steps (in order)
 

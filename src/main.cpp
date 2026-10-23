@@ -64,6 +64,19 @@ namespace {
 // sequences of a terminal, and a space at the end of a command line is not to be missed.
 std::string shown(std::string_view s) { return textquote::quote_shown(s); }
 
+// The text fields of a header that hold bytes behind the NUL that ends their text (BinaryReader::asciiz), as
+// "cmdline 37, board_name 3" -- empty when none does. What `unpack` and `info` say of them; the bytes themselves are
+// kept (the `*_tail` keys of manifest.txt) and an untouched repack writes them back.
+std::string tails_text(std::initializer_list<std::pair<const char*, const Bytes*>> fields) {
+    std::string out;
+    for (const auto& [name, tail] : fields) {
+        if (tail->empty()) continue;
+        if (!out.empty()) out += ", ";
+        out += std::string(name) + " " + std::to_string(tail->size());
+    }
+    return out;
+}
+
 // ------------------------------------------------------------ detection --
 
 enum class Fmt { BOOT, VENDOR_BOOT, DTBO, DTB, VBMETA, UIMAGE, ELF_BOOT, KRNL, BLOB, OSIP, CHROMEOS, UNKNOWN };
@@ -814,6 +827,8 @@ void save_avb_footer(Manifest& m, const fs::path& dir, const AvbFooter& f, const
     m.set_u32("avb_flags", v.flags);
     m.set_u32("avb_rollback_index_location", v.rollback_index_location);
     m.set("avb_release_string", v.release_string);
+    m.set_tail("avb_release_string_tail", v.release_string_tail);
+    if (!v.reserved.empty()) m.set_hex("avb_reserved", v.reserved);
     m.set_hex("avb_hash", v.hash);
     m.set_hex("avb_signature", v.signature);
     save_raw(m, dir, "avb_public_key", v.public_key, "avb_public_key.bin");
@@ -849,6 +864,8 @@ Bytes reattach_avb_footer(const Manifest& m, const fs::path& dir, Bytes host,
     v.flags = m.get_u32("avb_flags", 0);
     v.rollback_index_location = m.get_u32("avb_rollback_index_location", 0);
     v.release_string = m.get("avb_release_string");
+    v.release_string_tail = m.get_tail("avb_release_string_tail");
+    v.reserved = m.get_hex("avb_reserved");
     v.hash = m.get_hex("avb_hash");
     v.signature = m.get_hex("avb_signature");
     v.public_key = load_raw(m, dir, "avb_public_key");
@@ -987,6 +1004,7 @@ void unpack_boot(const Bytes& whole, const fs::path& dir, const UnpackOptions& u
         m.set_addr("second_addr", img.second_addr);
         m.set_addr("tags_addr", img.tags_addr);
         m.set("board_name", img.board_name);
+        m.set_tail("board_name_tail", img.board_name_tail);
         bool any_id = false;
         for (auto v : img.id)
             if (v) any_id = true;
@@ -1014,6 +1032,13 @@ void unpack_boot(const Bytes& whole, const fs::path& dir, const UnpackOptions& u
     m.set("os_version", img.os_version.to_string());
     m.set("os_patch_level", img.os_version.patch_level_string());
     m.set("cmdline", img.cmdline);
+    m.set_tail("cmdline_tail", img.cmdline_tail);
+    m.set_tail("extra_cmdline_tail", img.extra_cmdline_tail);
+    if (const std::string t = tails_text({{"board_name", &img.board_name_tail},
+                                          {"cmdline", &img.cmdline_tail},
+                                          {"extra_cmdline", &img.extra_cmdline_tail}});
+        !t.empty())
+        note("bytes behind the NUL that ends the text of a header field (" + t + ") are kept in manifest.txt (*_tail)");
     if (img.cmdline_split) m.set_u32("cmdline_split", img.cmdline_split);
     if (img.missing_tail_padding) m.set_u64("missing_tail_padding", img.missing_tail_padding);
     if (img.missing_tail_padding && img.kept_tail_padding) m.set_u64("tail_padding_kept", *img.kept_tail_padding);
@@ -1072,6 +1097,7 @@ Bytes repack_boot(const Manifest& m, const fs::path& dir, const RepackOptions& o
         img.second_addr = static_cast<uint32_t>(m.get_addr("second_addr", 0x00f00000));
         img.tags_addr = static_cast<uint32_t>(m.get_addr("tags_addr", 0x00000100));
         img.board_name = m.get("board_name");
+        img.board_name_tail = m.get_tail("board_name_tail");
         if (img.header_version >= 2) img.dtb_addr = m.get_addr("dtb_addr", 0);
         Bytes idb = m.get_hex("id");
         for (size_t i = 0; i < img.id.size() && i * 4 + 3 < idb.size(); ++i)
@@ -1093,6 +1119,8 @@ Bytes repack_boot(const Manifest& m, const fs::path& dir, const RepackOptions& o
     auto ov = OsVersion::parse(m.get("os_version"), m.get("os_patch_level"));
     if (ov) img.os_version = *ov;
     img.cmdline = m.get("cmdline");
+    img.cmdline_tail = m.get_tail("cmdline_tail");
+    img.extra_cmdline_tail = m.get_tail("extra_cmdline_tail");
     img.cmdline_split = m.get_u32("cmdline_split", 0);
     img.missing_tail_padding = m.get_u64("missing_tail_padding", 0);
     if (m.has("tail_padding_kept")) img.kept_tail_padding = m.get_u64("tail_padding_kept", 0);
@@ -1136,7 +1164,22 @@ void unpack_vendor_boot(const Bytes& whole, const fs::path& dir, const UnpackOpt
     m.set_addr("ramdisk_addr", img.ramdisk_addr);
     m.set_addr("tags_addr", img.tags_addr);
     m.set("board_name", img.board_name);
+    m.set_tail("board_name_tail", img.board_name_tail);
     m.set("cmdline", img.cmdline);
+    m.set_tail("cmdline_tail", img.cmdline_tail);
+    {
+        std::vector<std::pair<std::string, const Bytes*>> tails = {{"board_name", &img.board_name_tail},
+                                                                    {"cmdline", &img.cmdline_tail}};
+        for (size_t i = 0; i < img.ramdisk_fragments.size(); ++i)
+            tails.push_back({"ramdisk" + std::to_string(i) + "_name", &img.ramdisk_fragments[i].name_tail});
+        std::string t;
+        for (const auto& [name, tail] : tails) {
+            if (tail->empty()) continue;
+            t += (t.empty() ? "" : ", ") + name + " " + std::to_string(tail->size());
+        }
+        if (!t.empty())
+            note("bytes behind the NUL that ends the text of a header field (" + t + ") are kept in manifest.txt (*_tail)");
+    }
     m.set_addr("dtb_addr", img.dtb_addr);
     if (img.header_size_field) m.set_u32("header_size", *img.header_size_field);
     if (img.header_version >= 4 && !img.has_ramdisk_table) m.set_bool("ramdisk_table", false);
@@ -1158,6 +1201,7 @@ void unpack_vendor_boot(const Bytes& whole, const fs::path& dir, const UnpackOpt
         std::string p = "ramdisk" + std::to_string(i);
         m.set(p + "_type", std::string(vendor_ramdisk_type_name(e.type)));
         m.set(p + "_name", e.name);
+        m.set_tail(p + "_name_tail", e.name_tail);
         bool any_board_id = false;
         for (auto v : e.board_id)
             if (v) any_board_id = true;
@@ -1194,7 +1238,9 @@ Bytes repack_vendor_boot(const Manifest& m, const fs::path& dir, const RepackOpt
     img.ramdisk_addr = static_cast<uint32_t>(m.get_addr("ramdisk_addr", 0x01000000));
     img.tags_addr = static_cast<uint32_t>(m.get_addr("tags_addr", 0x00000100));
     img.board_name = m.get("board_name");
+    img.board_name_tail = m.get_tail("board_name_tail");
     img.cmdline = m.get("cmdline");
+    img.cmdline_tail = m.get_tail("cmdline_tail");
     img.dtb_addr = m.get_addr("dtb_addr", 0);
     if (m.has("header_size")) img.header_size_field = m.get_u32("header_size");
     img.has_ramdisk_table = m.get_bool("ramdisk_table", true);
@@ -1213,6 +1259,7 @@ Bytes repack_vendor_boot(const Manifest& m, const fs::path& dir, const RepackOpt
         VendorRamdiskEntry e;
         e.type = vendor_ramdisk_type_from_name(m.get(p + "_type", "platform"));
         e.name = m.get(p + "_name");
+        e.name_tail = m.get_tail(p + "_name_tail");
         Bytes b = m.get_hex(p + "_board_id");
         for (size_t j = 0; j < e.board_id.size() && j * 4 + 3 < b.size(); ++j)
             e.board_id[j] = uint32_t(b[j * 4]) | (uint32_t(b[j * 4 + 1]) << 8) |
@@ -1317,6 +1364,11 @@ void unpack_vbmeta(const Bytes& data, const fs::path& dir) {
     m.set_u32("flags", v.flags);
     m.set_u32("rollback_index_location", v.rollback_index_location);
     m.set("release_string", v.release_string);
+    m.set_tail("release_string_tail", v.release_string_tail);
+    if (!v.reserved.empty()) m.set_hex("reserved", v.reserved);
+    if (const std::string t = tails_text({{"release_string", &v.release_string_tail}, {"reserved", &v.reserved}});
+        !t.empty())
+        note("the header holds bytes that nothing models (" + t + "): kept in manifest.txt, the hash and the signature cover them");
     m.set_hex("hash", v.hash);
     m.set_hex("signature", v.signature);
     save_raw(m, dir, "public_key", v.public_key, "public_key.bin");
@@ -1352,6 +1404,8 @@ Bytes repack_vbmeta(const Manifest& m, const fs::path& dir, const RepackOptions&
     v.flags = m.get_u32("flags", 0);
     v.rollback_index_location = m.get_u32("rollback_index_location", 0);
     v.release_string = m.get("release_string");
+    v.release_string_tail = m.get_tail("release_string_tail");
+    v.reserved = m.get_hex("reserved");
     v.hash = m.get_hex("hash");
     v.signature = m.get_hex("signature");
     v.public_key = load_raw(m, dir, "public_key");
@@ -1390,6 +1444,9 @@ void unpack_uimage(const Bytes& data, const fs::path& dir) {
     m.set("image_type", std::string(uboot_type_name(img.type)));
     m.set("compression", std::string(uboot_comp_name(img.comp)));
     m.set("name", img.name);
+    m.set_tail("name_tail", img.name_tail);
+    if (const std::string t = tails_text({{"name", &img.name_tail}}); !t.empty())
+        note("bytes behind the NUL that ends the text of a header field (" + t + ") are kept in manifest.txt (*_tail)");
     save_raw(m, dir, "data", img.data, "data.bin");
     m.save(dir / "manifest.txt",
            "abr uimage manifest -- edit then `abr repack " + dir.string() + " -o out.img`\n"
@@ -1413,6 +1470,7 @@ Bytes repack_uimage(const Manifest& m, const fs::path& dir) {
     img.type = lookup(m.get("image_type", "kernel"), uboot_type_name, 12);
     img.comp = lookup(m.get("compression", "none"), uboot_comp_name, 6);
     img.name = m.get("name");
+    img.name_tail = m.get_tail("name_tail");
     img.data = load_raw(m, dir, "data");
     return img.build();
 }
@@ -2326,6 +2384,11 @@ void print_info(const fs::path& path) {
             std::cout << "os_version:     " << img.os_version.to_string() << "\n";
             std::cout << "patch_level:    " << img.os_version.patch_level_string() << "\n";
             std::cout << "cmdline:        " << shown(img.cmdline) << "\n";
+            if (const std::string t = tails_text({{"board_name", &img.board_name_tail},
+                                                  {"cmdline", &img.cmdline_tail},
+                                                  {"extra_cmdline", &img.extra_cmdline_tail}});
+                !t.empty())
+                std::cout << "field tails:    " << t << " (bytes behind the NUL that ends the text, kept)\n";
             std::cout << "kernel:         " << img.kernel.size() << " bytes ("
                        << codec_name(detect_codec(img.kernel)) << ")\n";
             std::cout << "ramdisk:        " << img.ramdisk.size() << " bytes ("
@@ -2354,6 +2417,9 @@ void print_info(const fs::path& path) {
             std::cout << "header_version: " << img.header_version << "\n";
             std::cout << "page_size:      " << img.page_size << "\n";
             std::cout << "cmdline:        " << shown(img.cmdline) << "\n";
+            if (const std::string t = tails_text({{"board_name", &img.board_name_tail}, {"cmdline", &img.cmdline_tail}});
+                !t.empty())
+                std::cout << "field tails:    " << t << " (bytes behind the NUL that ends the text, kept)\n";
             std::cout << "dtb:            " << img.dtb.size() << " bytes\n";
             std::cout << "bootconfig:     " << img.bootconfig.size() << " bytes\n";
             std::cout << "ramdisk fragments: " << img.ramdisk_fragments.size() << "\n";
@@ -2395,6 +2461,9 @@ void print_info(const fs::path& path) {
             std::cout << "rollback:   " << v.rollback_index << " @location "
                        << v.rollback_index_location << "\n";
             std::cout << "release:    " << shown(v.release_string) << "\n";
+            if (const std::string t = tails_text({{"release_string", &v.release_string_tail}, {"reserved", &v.reserved}});
+                !t.empty())
+                std::cout << "unmodeled:  " << t << " (bytes of the header behind the release text and in the reserved area, kept)\n";
             std::cout << "has_footer: " << (v.has_footer ? "yes" : "no") << "\n";
             std::cout << "descriptors: " << v.descriptors.size() << "\n";
             for (auto& d : v.descriptors) std::cout << "  - " << d.describe() << "\n";
@@ -2403,6 +2472,8 @@ void print_info(const fs::path& path) {
         case Fmt::UIMAGE: {
             UImage img = UImage::parse(data);
             std::cout << "name:        " << shown(img.name) << "\n";
+            if (const std::string t = tails_text({{"name", &img.name_tail}}); !t.empty())
+                std::cout << "name tail:   " << t << " (bytes behind the NUL that ends the text, kept)\n";
             std::cout << "os/arch:     " << uboot_os_name(img.os) << "/" << uboot_arch_name(img.arch)
                        << "\n";
             std::cout << "type:        " << uboot_type_name(img.type) << "\n";

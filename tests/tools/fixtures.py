@@ -35,6 +35,17 @@ def page_pad(b, page):
     return b + b"\0" * ((-len(b)) % page)
 
 
+def with_tail(field, tail):
+    """A text field (text, zero filled) with `tail` behind the NUL that ends its text, as far as the field has room
+    for it: what a command line that was cut short in place leaves in an image (the rest of the old one), and what a
+    tool that never clears the field leaves."""
+    b = bytearray(field)
+    n = b.index(0) if 0 in b else len(b)
+    for i, c in enumerate(tail[:max(0, len(b) - n - 1)]):
+        b[n + 1 + i] = c
+    return bytes(b)
+
+
 # --------------------------------------------------------------- boot ----
 
 def boot_id(hash_ctor, version, kernel, ramdisk, second, dt=None, dtbo=b"", dtb=b""):
@@ -61,7 +72,8 @@ def boot_id(hash_ctor, version, kernel, ramdisk, second, dt=None, dtbo=b"", dtb=
 
 def boot_v012(version, kernel, ramdisk, second=b"", dt=b"", dtbo=b"", dtb=b"", *, page=2048,
               cmdline="", name="", os_version=0, id_bytes=b"", dtbo_offset=None,
-              hdr_size=None, dtb_addr=0, dirty_padding=False, hdr_garbage=b"", split=512):
+              hdr_size=None, dtb_addr=0, dirty_padding=False, hdr_garbage=b"", split=512,
+              name_tail=b"", cmd_tail=b"", extra_tail=b""):
     """boot.img header v0/v1/v2. A non-empty `dt` on a v0 header is the
     Qualcomm/CAF layout: word 10 holds the dt size instead of the version."""
     word10 = len(dt) if (version == 0 and dt) else version
@@ -69,11 +81,11 @@ def boot_v012(version, kernel, ramdisk, second=b"", dt=b"", dtbo=b"", dtb=b"", *
     hdr = b"ANDROID!"
     hdr += struct.pack("<10I", len(kernel), 0x8000, len(ramdisk), 0x1000000, len(second),
                        0xF00000, 0x100, page, word10, os_version)
-    hdr += name.encode().ljust(16, b"\0")
+    hdr += with_tail(name.encode().ljust(16, b"\0"), name_tail)
     first, extra = split_cmdline(cmdline, split)
-    hdr += first
+    hdr += with_tail(first, cmd_tail)
     hdr += id_bytes.ljust(32, b"\0")
-    hdr += extra
+    hdr += with_tail(extra, extra_tail)
     if version >= 1:
         pages = lambda n: -(-n // page)
         off = dtbo_offset
@@ -108,7 +120,8 @@ def split_cmdline(cmdline, split):
 
 
 def boot_pxa(kernel, ramdisk, second=b"", dt=b"", *, page=2048, unknown=0x03000000, cmdline="",
-             name="", id_bytes=b"", split=511, hdr_garbage=b"", signature=b""):
+             name="", id_bytes=b"", split=511, hdr_garbage=b"", signature=b"",
+             name_tail=b"", cmd_tail=b"", extra_tail=b""):
     """Marvell PXA1088/PXA1908 boot image (osm0sis/pxa-mkbootimg's bootimg.h): a v0 header
     with `unknown` after dt_size, so tags_addr/page_size sit at 40/44, the board name has
     24 bytes and the id is at 584. Pages: kernel, ramdisk, second, dt, then an optional
@@ -117,10 +130,10 @@ def boot_pxa(kernel, ramdisk, second=b"", dt=b"", *, page=2048, unknown=0x030000
     hdr = b"ANDROID!"
     hdr += struct.pack("<10I", len(kernel), 0x10008000, len(ramdisk), 0x11000000, len(second),
                        0x10F00000, len(dt), unknown, 0x10000100, page)
-    hdr += name.encode().ljust(24, b"\0")
-    hdr += first
+    hdr += with_tail(name.encode().ljust(24, b"\0"), name_tail)
+    hdr += with_tail(first, cmd_tail)
     hdr += id_bytes.ljust(32, b"\0")
-    hdr += extra
+    hdr += with_tail(extra, extra_tail)
     assert len(hdr) == 1640
     hdr += hdr_garbage
     out = page_pad(hdr, page)
@@ -132,12 +145,12 @@ def boot_pxa(kernel, ramdisk, second=b"", dt=b"", *, page=2048, unknown=0x030000
 
 
 def boot_v34(version, kernel, ramdisk, *, cmdline="", os_version=0, reserved=(0, 0, 0, 0),
-             hdr_size=None, signature=b""):
+             hdr_size=None, signature=b"", cmd_tail=b""):
     hdr = b"ANDROID!"
     hdr += struct.pack("<4I", len(kernel), len(ramdisk), os_version,
                        hdr_size or (1580 if version == 3 else 1584))
     hdr += struct.pack("<4I", *reserved) + le32(version)
-    hdr += cmdline.encode().ljust(1536, b"\0")
+    hdr += with_tail(cmdline.encode().ljust(1536, b"\0"), cmd_tail)
     if version == 4:
         hdr += le32(len(signature))
     out = page_pad(hdr, 4096) + page_pad(kernel, 4096) + page_pad(ramdisk, 4096)
@@ -157,6 +170,41 @@ def vendor_boot_v4_empty_table(ramdisk, dtb, *, page=2048, hdr_size=2112, dtb_ad
     hdr += struct.pack("<IIQ", hdr_size, len(dtb), dtb_addr)
     hdr += struct.pack("<4I", 0, 0, 0, 0)  # table size, entries, entry size, bootconfig
     return page_pad(hdr, page) + page_pad(ramdisk, page) + page_pad(dtb, page)
+
+
+def vendor_boot(version, fragments, *, dtb=b"", bootconfig=b"", page=4096, cmdline="", name="",
+                cmd_tail=b"", name_tail=b"", kernel_addr=0x8000, ramdisk_addr=0x1000000,
+                tags_addr=0x100, dtb_addr=0x1F00000):
+    """vendor_boot v3 (the ramdisk is `fragments[0][3]`) or v4 (`fragments` is the vendor ramdisk table:
+    (type, name, name_tail, data) each). Header, ramdisk section, dtb, table, bootconfig, each from a page boundary
+    (AOSP vendor_boot.h)."""
+    section = b"".join(f[3] for f in fragments) if version == 4 else fragments[0][3]
+    hdr = b"VNDRBOOT" + struct.pack("<5I", version, page, kernel_addr, ramdisk_addr, len(section))
+    hdr += with_tail(cmdline.encode().ljust(2048, b"\0"), cmd_tail)
+    hdr += le32(tags_addr) + with_tail(name.encode().ljust(16, b"\0"), name_tail)
+    hdr += struct.pack("<IIQ", 2112 if version == 3 else 2128, len(dtb), dtb_addr)
+    table = b""
+    if version == 4:
+        off = 0
+        for typ, nm, nt, data in fragments:
+            table += struct.pack("<III", len(data), off, typ)
+            table += with_tail(nm.encode().ljust(32, b"\0"), nt) + b"\0" * 64  # (board_id: 16 words)
+            off += len(data)
+        hdr += struct.pack("<4I", len(table), len(fragments), 108, len(bootconfig))
+    out = page_pad(hdr, page) + page_pad(section, page) + page_pad(dtb, page)
+    if version == 4:
+        out += page_pad(table, page) + page_pad(bootconfig, page)
+    return out
+
+
+# ------------------------------------------------------------- uImage ----
+
+def uimage(data, name, name_tail=b"", *, os_=5, arch=2, typ=2, comp=0, load=0x8000, entry=0x8000, stamp=0x5F000000):
+    """U-Boot legacy image (image.h): 64-byte header, big-endian, two CRC-32s."""
+    import zlib
+    hdr = struct.pack(">7I4B", 0x27051956, 0, stamp, len(data), load, entry, zlib.crc32(data), os_, arch, typ, comp)
+    hdr += with_tail(name.encode().ljust(32, b"\0"), name_tail)
+    return hdr[:4] + struct.pack(">I", zlib.crc32(hdr)) + hdr[8:] + data
 
 
 # ---------------------------------------------------------------- AVB ----
@@ -351,6 +399,42 @@ def build_all(out):
     put("vendor_boot_v4_trimmed_tail.img", vb_full[:len(vb_full) - ((-len(vb_dtb)) % 2048)])
     # a dump that ends in the middle of the final padding: 300 of its bytes are there, the other 548 are not
     put("boot_v2_partial_padding.img", full[:len(full) - ((-len(dtb)) % 2048) + 300])
+
+    # --- bytes behind the NUL that ends the text of a field ---------------------------------------------------------------
+    # A command line cut short in place leaves the rest of the old one behind its NUL ("console=ttyS0" over
+    # "console=ttyS0,115200 androidboot.selinux=permissive" -> NUL where the comma was), a tool that never clears
+    # the field leaves whatever was there. None of it is text, all of it is part of the image.
+    tk, tr, td = blob(20000), gz(blob(30000)), blob(800)
+    tid = boot_id(hashlib.sha1, 2, tk, tr, b"", dtb=td)
+    old_text = "115200 androidboot.selinux=permissive"
+    tails = dict(name_tail=b"OLDNAME", cmd_tail=old_text.encode(), extra_tail=b"\xff" * 30)
+    put("boot_v2_tails.img", boot_v012(2, tk, tr, dtb=td, cmdline="console=ttyS0", name="tailtest", id_bytes=tid, **tails))
+    put("boot_v2_tails_plain.img", boot_v012(2, tk, tr, dtb=td, cmdline="console=ttyS0", name="tailtest", id_bytes=tid))
+    # the same image after the command line was edited: the tail stays behind the NUL of the new text, as far as it fits
+    put("boot_v2_tails_short.img", boot_v012(2, tk, tr, dtb=td, cmdline="con", name="tailtest", id_bytes=tid, **tails))
+    put("boot_v2_tails_long.img", boot_v012(2, tk, tr, dtb=td, cmdline="x" * 500, name="tailtest", id_bytes=tid, **tails))
+    put("boot_v2_tails_full.img", boot_v012(2, tk, tr, dtb=td, cmdline="y" * 511, name="tailtest", id_bytes=tid, **tails))
+    # a command line that continues in the second field (cut at 511 by the old C mkbootimg): a tail behind each text
+    long_cmd2 = "androidboot.hardware=qcom " + "x" * 700
+    put("boot_v0_longcmd_tails.img", boot_v012(
+        0, tk, tr, cmdline=long_cmd2, split=511, name="tailtest", extra_tail=b"LEFTOVER", name_tail=b"\x01\x02",
+        id_bytes=boot_id(hashlib.sha1, 0, tk, tr, b"")))
+    put("boot_v3_tails.img", boot_v34(3, tk, tr, cmdline="bootconfig", cmd_tail=old_text.encode()))
+    put("boot_v4_tails.img", boot_v34(4, tk, tr, cmdline="bootconfig", cmd_tail=b"\x00\x00old\x00text"))
+    put("boot_pxa_tails.img", boot_pxa(
+        tk, tr, cmdline="console=ttyS0", name="SM-G531F", unknown=0x03000000, name_tail=b"\xaa" * 10, cmd_tail=old_text.encode(),
+        extra_tail=b"EXTRA", id_bytes=boot_id(hashlib.sha1, 0, tk, tr, b"")))
+    vr0, vr1 = gz(blob(9000)), gz(blob(7000))
+    put("vendor_boot_v3_tails.img", vendor_boot(
+        3, [(0, "", b"", vr0)], dtb=td, cmdline="console=ttyMSM0", name="vendtail", cmd_tail=old_text.encode(),
+        name_tail=b"\x07"))
+    put("vendor_boot_v4_tails.img", vendor_boot(
+        4, [(1, "platform_rd", b"old", vr0), (3, "dlkm_rd", b"\xde\xad\xbe\xef", vr1)], dtb=td,
+        cmdline="console=ttyMSM0", name="vendtail", cmd_tail=old_text.encode(), name_tail=b"zz", bootconfig=b"androidboot.x=1\n"))
+    put("vendor_boot_v4_tails_plain.img", vendor_boot(
+        4, [(1, "platform_rd", b"", vr0), (3, "dlkm_rd", b"", vr1)], dtb=td,
+        cmdline="console=ttyMSM0", name="vendtail", bootconfig=b"androidboot.x=1\n"))
+    put("uimage_tails.img", uimage(tk, "kernel-tail", name_tail=b"old-name"))
 
 
 if __name__ == "__main__":

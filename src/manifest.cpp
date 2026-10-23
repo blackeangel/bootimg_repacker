@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "abr/manifest.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <fstream>
 
@@ -138,6 +139,21 @@ void Manifest::set_hex(const std::string& key, const Bytes& data) {
         s.push_back(hex[b & 0xf]);
     }
     set(key, s);
+}
+
+void Manifest::set_tail(const std::string& key, const Bytes& tail) {
+    if (tail.empty()) return;
+    const bool text = std::all_of(tail.begin(), tail.end(), [](uint8_t b) { return b >= 0x20 && b < 0x7F; });
+    if (text)
+        set(key, std::string(tail.begin(), tail.end()));
+    else
+        set_hex(key + "_hex", tail);
+}
+
+Bytes Manifest::get_tail(const std::string& key) const {
+    if (has(key + "_hex")) return get_hex(key + "_hex");
+    const std::string s = get(key);
+    return Bytes(s.begin(), s.end());
 }
 
 Bytes Manifest::get_hex(const std::string& key) const {

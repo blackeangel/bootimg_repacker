@@ -184,11 +184,25 @@ public:
     // Reads exactly N bytes and returns them as a NUL-trimmed string
     // (Android headers store asciiz strings in fixed-size fields).
     std::string asciiz(size_t field_size) {
+        Bytes tail;
+        return asciiz(field_size, tail);
+    }
+
+    // The same, and what the field holds behind the NUL that ends the text goes to `tail`, up to its last non-zero byte:
+    // nothing in a field that a tool wrote as text and zeros, the rest of an older text in one that was cut short in place
+    // (a hex editor, a tool that never clears the field). It is no part of the text, but it is part of the image.
+    std::string asciiz(size_t field_size, Bytes& tail) {
         require(field_size);
-        const char* p = reinterpret_cast<const char*>(data_ + pos_);
+        const uint8_t* p = data_ + pos_;
         size_t len = 0;
-        while (len < field_size && p[len] != '\0') ++len;
-        std::string out(p, len);
+        while (len < field_size && p[len] != 0) ++len;
+        tail.clear();
+        if (len < field_size) {  // there is a NUL; is there anything behind it?
+            size_t end = field_size;
+            while (end > len + 1 && p[end - 1] == 0) --end;
+            if (end > len + 1) tail.assign(p + len + 1, p + end);
+        }
+        std::string out(reinterpret_cast<const char*>(p), len);
         pos_ += field_size;
         return out;
     }
@@ -244,6 +258,16 @@ public:
         size_t n = std::min(s.size(), field_size);
         buf_.insert(buf_.end(), s.begin(), s.begin() + n);
         buf_.insert(buf_.end(), field_size - n, 0);
+    }
+
+    // The same, with `tail` behind the NUL that ends the text (BinaryReader::asciiz gives it): as much of it as the
+    // field has room for -- a text that grew pushes it out, a text that shrank leaves it where it was in the image.
+    void asciiz(const std::string& s, size_t field_size, const Bytes& tail) {
+        asciiz(s, field_size);
+        if (s.size() + 1 >= field_size) return;  // no room behind the text's NUL
+        const size_t room = field_size - s.size() - 1;
+        std::copy_n(tail.begin(), std::min(room, tail.size()),
+                    buf_.end() - static_cast<std::ptrdiff_t>(room));
     }
 
     void zeros(size_t n) { buf_.insert(buf_.end(), n, 0); }

@@ -204,10 +204,10 @@ BootImage BootImage::parse(const Bytes& image) {
         img.pxa_unknown = r.le32();
         img.tags_addr = r.le32();
         img.page_size = r.le32();
-        img.board_name = r.asciiz(kPxaNameSize);
-        std::string part1 = r.asciiz(kBootArgsSize);
+        img.board_name = r.asciiz(kPxaNameSize, img.board_name_tail);
+        std::string part1 = r.asciiz(kBootArgsSize, img.cmdline_tail);
         for (auto& w : img.id) w = r.le32();
-        std::string part2 = r.asciiz(kBootExtraArgsSize);
+        std::string part2 = r.asciiz(kBootExtraArgsSize, img.extra_cmdline_tail);
         img.cmdline = part1 + part2;
         if (!part2.empty() && part1.size() != kBootArgsSize)
             img.cmdline_split = static_cast<uint32_t>(part1.size());
@@ -241,10 +241,10 @@ BootImage BootImage::parse(const Bytes& image) {
         img.page_size = r.le32();
         r.le32();  // header_version / dt_size, already known
         img.os_version = OsVersion::unpack(r.le32());
-        img.board_name = r.asciiz(kBootNameSize);
-        std::string part1 = r.asciiz(kBootArgsSize);
+        img.board_name = r.asciiz(kBootNameSize, img.board_name_tail);
+        std::string part1 = r.asciiz(kBootArgsSize, img.cmdline_tail);
         for (auto& w : img.id) w = r.le32();
-        std::string part2 = r.asciiz(kBootExtraArgsSize);
+        std::string part2 = r.asciiz(kBootExtraArgsSize, img.extra_cmdline_tail);
         img.cmdline = part1 + part2;
         if (!part2.empty() && part1.size() != kBootArgsSize)
             img.cmdline_split = static_cast<uint32_t>(part1.size());
@@ -305,7 +305,7 @@ BootImage BootImage::parse(const Bytes& image) {
         if (hs != standard_header_size(header_version)) img.header_size_field = hs;
         for (auto& w : img.reserved) w = r.le32();
         r.le32();  // header_version, already known
-        img.cmdline = r.asciiz(kBootArgsSize + kBootExtraArgsSize);
+        img.cmdline = r.asciiz(kBootArgsSize + kBootExtraArgsSize, img.cmdline_tail);
         uint32_t signature_size = 0;
         if (header_version == 4) signature_size = r.le32();
         img.page_size = 4096;
@@ -364,11 +364,12 @@ Bytes BootImage::build() const {
         w.le32(pxa_unknown);
         w.le32(tags_addr);
         w.le32(page_sz);
-        w.asciiz(board_name, kPxaNameSize);
+        w.asciiz(board_name, kPxaNameSize, board_name_tail);
         const size_t split = cmdline_split ? cmdline_split : kBootArgsSize;
-        w.asciiz(cmdline.substr(0, std::min(cmdline.size(), split)), kBootArgsSize);
+        w.asciiz(cmdline.substr(0, std::min(cmdline.size(), split)), kBootArgsSize, cmdline_tail);
         for (auto v : id) w.le32(v);
-        w.asciiz(cmdline.size() > split ? cmdline.substr(split) : std::string(), kBootExtraArgsSize);
+        w.asciiz(cmdline.size() > split ? cmdline.substr(split) : std::string(), kBootExtraArgsSize,
+                 extra_cmdline_tail);
         if (!header_padding.empty()) w.bytes(header_padding);
         data_end = w.size();
         w.align(page_sz);
@@ -396,13 +397,13 @@ Bytes BootImage::build() const {
         w.le32((header_version == 0 && !dt.empty()) ? static_cast<uint32_t>(dt.size())
                                                    : header_version);
         w.le32(os_version.pack());
-        w.asciiz(board_name, kBootNameSize);
+        w.asciiz(board_name, kBootNameSize, board_name_tail);
         const size_t split = cmdline_split ? cmdline_split : kBootArgsSize;
         std::string part1 = cmdline.substr(0, std::min(cmdline.size(), split));
         std::string part2 = cmdline.size() > split ? cmdline.substr(split) : std::string();
-        w.asciiz(part1, kBootArgsSize);
+        w.asciiz(part1, kBootArgsSize, cmdline_tail);
         for (auto v : id) w.le32(v);
-        w.asciiz(part2, kBootExtraArgsSize);
+        w.asciiz(part2, kBootExtraArgsSize, extra_cmdline_tail);
 
         if (header_version >= 1) {
             w.le32(static_cast<uint32_t>(recovery_dtbo.size()));
@@ -446,7 +447,7 @@ Bytes BootImage::build() const {
         w.le32(header_size_field.value_or(standard_header_size(header_version)));
         for (auto v : reserved) w.le32(v);
         w.le32(header_version);
-        w.asciiz(cmdline, kBootArgsSize + kBootExtraArgsSize);
+        w.asciiz(cmdline, kBootArgsSize + kBootExtraArgsSize, cmdline_tail);
         if (header_version == 4) w.le32(static_cast<uint32_t>(boot_signature.size()));
         if (!header_padding.empty()) w.bytes(header_padding);
         data_end = w.size();

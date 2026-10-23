@@ -82,6 +82,12 @@ struct BootImage {
     // a NUL at the end of it and so splits after 511 bytes. Recorded from the image.
     uint32_t cmdline_split = 0;
 
+    // What the text fields hold behind the NUL that ends their text (see BinaryReader::asciiz): empty in an image from
+    // a tool that writes text and zeros, the rest of an older text in one that was cut short in place. Kept so that such
+    // an image rebuilds as it was. `cmdline_tail` follows the first command line field (the only one of v3/v4),
+    // `extra_cmdline_tail` the second (v0-v2).
+    Bytes board_name_tail, cmdline_tail, extra_cmdline_tail;
+
     // --- v4 only ---
     // signature_size is derived from boot_signature.size() at build() time.
 

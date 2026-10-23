@@ -5049,6 +5049,201 @@ done
     pass "output filter: an escape sequence, a bell and a C1 control in a name from the command line come out as \\xNN in the messages of info, identify, unpack and repack ($of_n runs), and without the filter (ABR_UNFILTERED_OUTPUT=1) the same messages have the raw bytes" ||
     fail "output filter:$of_bad"
 
+# ---- bytes behind the NUL that ends the text of a field: kept, said, written back ----------------------------------------------
+# A command line cut short in place ("console=ttyS0" over "console=ttyS0,115200 androidboot.selinux=permissive") leaves the rest of
+# the old one behind its NUL, and a tool that never clears a field leaves whatever was there. It is no part of the text and it is part
+# of the image: the image comes back as it was, the manifest has the bytes (as text when they are printable ASCII, else as hex) under
+# <field>_tail or <field>_tail_hex -- and under no key at all for an image whose fields are text and zeros. fx/*_tails.img (made from
+# the formats by tests/tools/fixtures.py) have such bytes in every text field of their headers.
+roundtrip_check fx/boot_v2_tails.img "boot v2 (bytes behind the NUL of the board name and of both command line fields)" tl_v2
+expect_line rt_tl_v2 "board_name_tail=OLDNAME" "boot v2: what is behind the board name is in the manifest, as text"
+expect_line rt_tl_v2 "cmdline_tail=115200 androidboot.selinux=permissive" "boot v2: the rest of the old command line is in the manifest, readable"
+expect_line rt_tl_v2 "extra_cmdline_tail_hex=$(printf 'ff%.0s' $(seq 30))" "boot v2: bytes that are no text are in the manifest as hex"
+if said "field tails:    board_name 7, cmdline 37, extra_cmdline 30" "$ABR" info fx/boot_v2_tails.img; then
+    pass "info says how many bytes sit behind the end of the text of each field"
+else
+    fail "info does not say what sits behind the end of the text of the fields"
+fi
+if said "bytes behind the NUL that ends the text of a header field (board_name 7, cmdline 37, extra_cmdline 30) are kept" "$ABR" unpack fx/boot_v2_tails.img -o tl_say; then
+    pass "unpack says that it keeps them"
+else
+    fail "unpack does not say that it keeps the bytes behind the end of the text of a field"
+fi
+roundtrip_check fx/boot_v0_longcmd_tails.img "boot v0 (a command line cut at 511 that goes on in the second field, bytes behind both texts)" tl_long
+expect_line rt_tl_long "cmdline_split=511" "boot v0: the cut of the long command line is still recorded"
+expect_line rt_tl_long "extra_cmdline_tail=LEFTOVER" "boot v0: the bytes behind the second field's text are kept next to the cut"
+expect_line rt_tl_long "board_name_tail_hex=0102" "boot v0: bytes with a value below 0x20 are hex"
+if said "field tails:    board_name 2, extra_cmdline 8 (" "$ABR" info fx/boot_v0_longcmd_tails.img; then
+    pass "info lists the fields that have such bytes, and only those"
+else
+    fail "info does not list just the fields that have bytes behind the end of their text"
+fi
+roundtrip_check fx/boot_v3_tails.img "boot v3 (the rest of an old command line behind the NUL of the 1536-byte field)" tl_v3
+expect_line rt_tl_v3 "cmdline_tail=115200 androidboot.selinux=permissive" "boot v3: the bytes behind the command line's text"
+roundtrip_check fx/boot_v4_tails.img "boot v4 (a tail that starts with zero bytes and has one inside)" tl_v4
+expect_line rt_tl_v4 "cmdline_tail_hex=00006f6c640074657874" "boot v4: the zero bytes of the tail are kept where they are"
+roundtrip_check fx/boot_pxa_tails.img "Marvell PXA header (bytes behind the NUL of the 24-byte board name and of both command line fields)" tl_pxa
+expect_line rt_tl_pxa "board_name_tail_hex=$(printf 'aa%.0s' $(seq 10))" "PXA: the bytes behind the 24-byte board name"
+expect_line rt_tl_pxa "extra_cmdline_tail=EXTRA" "PXA: the bytes behind the second command line field"
+roundtrip_check fx/vendor_boot_v3_tails.img "vendor_boot v3 (bytes behind the NUL of the command line and of the board name)" tl_vb3
+expect_line rt_tl_vb3 "cmdline_tail=115200 androidboot.selinux=permissive" "vendor_boot v3: the bytes behind the command line's text"
+roundtrip_check fx/vendor_boot_v4_tails.img "vendor_boot v4 (the same, and behind the names of two vendor ramdisks)" tl_vb4
+expect_line rt_tl_vb4 "board_name_tail=zz" "vendor_boot v4: the bytes behind the board name"
+expect_line rt_tl_vb4 "ramdisk0_name_tail=old" "vendor_boot v4: the bytes behind the name of the first vendor ramdisk"
+expect_line rt_tl_vb4 "ramdisk1_name_tail_hex=deadbeef" "vendor_boot v4: the bytes behind the name of the second one"
+if said "field tails:    board_name 2, cmdline 37" "$ABR" info fx/vendor_boot_v4_tails.img; then
+    pass "info says what sits behind the end of the text of the fields of a vendor_boot header"
+else
+    fail "info does not say what sits behind the end of the text of the fields of a vendor_boot header"
+fi
+if said "(board_name 2, cmdline 37, ramdisk0_name 3, ramdisk1_name 4) are kept in manifest.txt" "$ABR" unpack fx/vendor_boot_v4_tails.img -o tl_say_vb; then
+    pass "unpack of a vendor_boot says which fields have such bytes, the names of the vendor ramdisks among them"
+else
+    fail "unpack of a vendor_boot does not say which fields have bytes behind the end of their text"
+fi
+roundtrip_check fx/uimage_tails.img "U-Boot legacy image (bytes behind the NUL of the name; the header CRC covers them)" tl_ui
+expect_line rt_tl_ui "name_tail=old-name" "uImage: the bytes behind the name"
+if said "name tail:   name 8" "$ABR" info fx/uimage_tails.img; then
+    pass "info says what sits behind the end of the name of a uImage"
+else
+    fail "info does not say what sits behind the end of the name of a uImage"
+fi
+if said "(name 8) are kept in manifest.txt" "$ABR" unpack fx/uimage_tails.img -o tl_say_ui; then
+    pass "unpack of a uImage says that it keeps them"
+else
+    fail "unpack of a uImage does not say that it keeps the bytes behind the end of the name"
+fi
+
+# An image whose text fields are text and zeros has no such key: every directory that the suite unpacked above is looked at.
+tl_stray=""
+tl_n=0
+for tl_d in rt_*/; do
+    case "$tl_d" in rt_tl_*) continue ;; esac
+    [ -f "$tl_d/manifest.txt" ] || continue
+    tl_n=$((tl_n + 1))
+    grep -qE '^[a-z0-9_]*_tail(_hex)?=' "$tl_d/manifest.txt" && tl_stray="$tl_stray ${tl_d%/}"
+    # (the reserved bytes of a vbmeta header are only in the manifest when they are not all zero; the `reserved` of a boot v3/v4 header is another thing)
+    grep -qE '^avb_reserved=' "$tl_d/manifest.txt" && tl_stray="$tl_stray ${tl_d%/}"
+    grep -qx 'type=vbmeta' "$tl_d/manifest.txt" && grep -qE '^reserved=' "$tl_d/manifest.txt" && tl_stray="$tl_stray ${tl_d%/}"
+done
+if [ -z "$tl_stray" ] && [ "$tl_n" -ge 30 ]; then
+    pass "an image whose text fields are text and zeros gets no *_tail key ($tl_n unpacked directories of this suite looked at)"
+else
+    fail "*_tail keys in the manifests of images that have no such bytes (or too few directories looked at: $tl_n):$tl_stray"
+fi
+
+# Edited: the bytes follow the text -- they are written behind the NUL of the text that is there now, as far as the field holds them --
+# and without the keys the fields are text and zeros. The expected images are made by the fixture generator, not by abr.
+tl_edit() {  # <fixture> <sed script for manifest.txt> <the image that is expected> <label>
+    local d="tl_ed_$3"
+    rm -rf "$d" "$d.img"
+    "$ABR" unpack "fx/$1.img" -o "$d" >/dev/null 2>&1 || { fail "$4 (unpack)"; return; }
+    sed -i "$2" "$d/manifest.txt"
+    "$ABR" repack "$d" -o "$d.img" >/dev/null 2>&1 || { fail "$4 (repack)"; return; }
+    check "fx/$3.img" "$d.img" "$4"
+}
+tl_edit boot_v2_tails 's/^cmdline=.*/cmdline=con/' boot_v2_tails_short "boot v2: a shorter command line; what was behind the old one is behind the new one"
+tl_edit boot_v2_tails "s/^cmdline=.*/cmdline=$(printf 'x%.0s' $(seq 500))/" boot_v2_tails_long "boot v2: a command line of 500 bytes leaves room for 11 bytes of them"
+tl_edit boot_v2_tails "s/^cmdline=.*/cmdline=$(printf 'y%.0s' $(seq 511))/" boot_v2_tails_full "boot v2: a command line of 511 bytes leaves none (its NUL is the last byte of the field)"
+tl_edit boot_v2_tails '/_tail/d' boot_v2_tails_plain "boot v2: the *_tail keys taken out of the manifest, the fields are text and zeros again"
+tl_edit vendor_boot_v4_tails '/_tail/d' vendor_boot_v4_tails_plain "vendor_boot v4: the *_tail keys taken out, the fields of the header and of the table are text and zeros again"
+
+# vbmeta: the 80 reserved bytes of the header are zero by the specification, and the hash and the signature cover whatever is there; the
+# release string has a field of 48 bytes. An image that has other bytes there can only be rebuilt -- and still verify -- if they are kept.
+rm -rf vbmeta_tails
+mkdir vbmeta_tails
+cp vbmeta_signed/descriptor0.bin vbmeta_tails/
+{
+    cat vbmeta_signed/manifest.txt
+    echo "release_string_tail=OLD RELEASE"
+    echo "reserved=$(python3 -c 'print(bytes(range(1, 81)).hex())')"
+} >vbmeta_tails/manifest.txt
+"$ABR" repack vbmeta_tails -o vbmeta_tails.img --avb-key avb_test_key.pem >/dev/null 2>&1
+if python3 - <<'PYEOF'
+import hashlib, struct, sys
+d = open("vbmeta_tails.img", "rb").read()
+auth, aux = struct.unpack(">QQ", d[12:28])
+hash_off, hash_size, sig_off, sig_size = struct.unpack(">QQQQ", d[32:64])
+h = d[:256]
+ok = h[128:176] == b"abr test 1.0\0OLD RELEASE".ljust(48, b"\0") and h[176:256] == bytes(range(1, 81))
+body = d[256 + auth:256 + auth + aux]
+emb_hash = d[256 + hash_off:256 + hash_off + hash_size]
+ok = ok and hashlib.sha256(h + body).digest() == emb_hash
+open("vt_sig.bin", "wb").write(d[256 + sig_off:256 + sig_off + sig_size])
+open("vt_digest.bin", "wb").write(emb_hash)
+sys.exit(0 if ok else 1)
+PYEOF
+then
+    pass "vbmeta: the header of a signed image has the bytes behind the release string and in the reserved area, and its hash covers them"
+else
+    fail "vbmeta: a signed image made with bytes behind the release string and in the reserved area has other bytes in its header, or a wrong hash"
+fi
+if openssl pkeyutl -verify -pubin -inkey avb_test_key_pub.pem -sigfile vt_sig.bin -in vt_digest.bin \
+    -pkeyopt digest:sha256 -pkeyopt rsa_padding_mode:pkcs1 >/dev/null 2>&1; then
+    pass "vbmeta: the RSA signature over a header with bytes in its reserved area verifies with openssl"
+else
+    fail "vbmeta: the RSA signature over a header with bytes in its reserved area does not verify"
+fi
+# a header that is made without them has zeros there (and the manifest of the images above has no key for them); a manifest that someone edited
+# to hold fewer reserved bytes than the header has room for is filled with zeros, and one that holds more is cut
+for tl_n in 2 100; do
+    rm -rf "vbmeta_res$tl_n"
+    mkdir "vbmeta_res$tl_n"
+    cp vbmeta_unsigned/descriptor0.bin "vbmeta_res$tl_n/"
+    { cat vbmeta_unsigned/manifest.txt; echo "reserved=$(python3 -c "print(bytes(range(1, $tl_n + 1)).hex())")"; } >"vbmeta_res$tl_n/manifest.txt"
+    "$ABR" repack "vbmeta_res$tl_n" -o "vbmeta_res$tl_n.img" >/dev/null 2>&1
+done
+if python3 - <<'PYEOF'
+import sys
+clean = [open(f, "rb").read()[176:256] for f in ("vbmeta_unsigned.img", "vbmeta_signed.img")]
+short = open("vbmeta_res2.img", "rb").read()[176:256]
+long_ = open("vbmeta_res100.img", "rb").read()[176:256]
+sys.exit(0 if clean == [bytes(80)] * 2 and short == b"\x01\x02" + bytes(78) and long_ == bytes(range(1, 81)) else 1)
+PYEOF
+then
+    pass "vbmeta: the reserved bytes of a header are zeros when the manifest has none, filled up with zeros when it has fewer than 80, cut at 80 when it has more"
+else
+    fail "vbmeta: the reserved bytes of a header made from a manifest without them, with 2 of them, with 100 of them"
+fi
+roundtrip_check vbmeta_tails.img "vbmeta (RSA-signed, bytes behind the release string and in the reserved area: a passthrough repack keeps the signature valid)" tl_vbm
+expect_line rt_tl_vbm "release_string_tail=OLD RELEASE" "vbmeta: the bytes behind the release string"
+expect_line rt_tl_vbm "reserved=$(python3 -c 'print(bytes(range(1, 81)).hex())')" "vbmeta: the reserved bytes"
+if said "unmodeled:  release_string 11, reserved 80" "$ABR" info vbmeta_tails.img; then
+    pass "info says that the header has bytes beyond what it models"
+else
+    fail "info does not say that the vbmeta header has bytes beyond what it models"
+fi
+if said "the header holds bytes that nothing models (release_string 11, reserved 80): kept in manifest.txt" "$ABR" unpack vbmeta_tails.img -o tl_say_vm; then
+    pass "unpack of a vbmeta says that it keeps them, and that the hash and the signature cover them"
+else
+    fail "unpack of a vbmeta does not say that it keeps the bytes of the header that nothing models"
+fi
+python3 - <<'PYEOF'
+import struct
+d = bytearray(open("host_with_footer.img", "rb").read())
+_magic, _maj, _min, _orig, voff, _vsize = struct.unpack(">4sIIQQQ", bytes(d[-64:-64 + 36]))
+d[voff + 141:voff + 152] = b"OLD RELEASE"            # behind "abr test 1.0" and its NUL (the field starts at 128)
+d[voff + 176:voff + 256] = bytes(range(1, 81))
+open("host_with_footer_tails.img", "wb").write(d)
+PYEOF
+roundtrip_check host_with_footer_tails.img "AVB footer on a host image, its vbmeta header with bytes behind the release string and in the reserved area" tl_vbf
+expect_line rt_tl_vbf "release_string_tail=OLD RELEASE" "AVB footer on a host image: the bytes behind the release string"
+expect_line rt_tl_vbf "reserved=$(python3 -c 'print(bytes(range(1, 81)).hex())')" "AVB footer on a host image: the reserved bytes"
+# the footer of a boot image: its vbmeta is kept under the avb_* keys of the boot manifest
+python3 - <<'PYEOF'
+import struct
+d = bytearray(open("fx/boot_v2_avbfooter_unaligned.img", "rb").read())
+_magic, _maj, _min, _orig, voff, _vsize = struct.unpack(">4sIIQQQ", bytes(d[-64:-64 + 36]))
+assert d[voff:voff + 4] == b"AVB0"
+n = d[voff + 128:voff + 176].index(0)                  # the release string ends here: the tail goes right behind its NUL
+d[voff + 128 + n + 1:voff + 128 + n + 12] = b"OLD RELEASE"
+d[voff + 176:voff + 256] = bytes(range(1, 81))
+open("boot_v2_avbfooter_tails.img", "wb").write(d)
+PYEOF
+roundtrip_check boot_v2_avbfooter_tails.img "boot v2 with an AVB hash footer whose vbmeta header has bytes behind the release string and in the reserved area" tl_bf
+expect_line rt_tl_bf "avb_release_string_tail=OLD RELEASE" "boot with an AVB footer: the bytes behind the release string"
+expect_line rt_tl_bf "avb_reserved=$(python3 -c 'print(bytes(range(1, 81)).hex())')" "boot with an AVB footer: the reserved bytes"
+
 # ---- paths that are not ASCII --------------------------------------------------------------------------------
 # Cyrillic, an accent, Chinese and an emoji (four bytes in UTF-8, a surrogate pair on Windows) in the names of the
 # image, of the directory it is unpacked to and of the file it is packed to, and in a file name the manifest holds.

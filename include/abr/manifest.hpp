@@ -55,6 +55,13 @@ public:
     void set_hex(const std::string& key, const Bytes& data);
     Bytes get_hex(const std::string& key) const;
 
+    // What a text field of a header holds behind the NUL that ends its text (BinaryReader::asciiz), only when there is
+    // any, so that the manifest of an ordinary image does not change: as text under `key` when it is printable ASCII
+    // (the rest of an older command line), else as hex under `key`_hex (the one that is there is the one read; the hex
+    // one wins when both are).
+    void set_tail(const std::string& key, const Bytes& tail);
+    Bytes get_tail(const std::string& key) const;
+
 private:
     std::vector<std::pair<std::string, std::string>> entries_;
 };

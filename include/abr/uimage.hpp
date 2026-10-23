@@ -36,6 +36,7 @@ struct UImage {
     uint8_t type = 2;    // IH_TYPE_KERNEL
     uint8_t comp = 0;    // IH_COMP_NONE (0=none,1=gzip,2=bzip2,3=lzma,4=lzo,5=lz4,6=zstd)
     std::string name;    // <=32 bytes
+    Bytes name_tail;     // what the name field holds behind its NUL (see BootImage::cmdline_tail)
     Bytes data;          // payload, exactly as stored (still compressed per `comp`)
 
     static UImage parse(const Bytes& image);

@@ -288,8 +288,12 @@ VbmetaImage parse_header_at(const Bytes& image, size_t header_start) {
     v.rollback_index = r.be64();
     v.flags = r.be32();
     v.rollback_index_location = r.be32();
-    v.release_string = r.asciiz(48);
-    r.skip(80);  // reserved
+    v.release_string = r.asciiz(48, v.release_string_tail);
+    {
+        Bytes reserved = r.bytes(80);
+        if (std::any_of(reserved.begin(), reserved.end(), [](uint8_t b) { return b != 0; }))
+            v.reserved = std::move(reserved);
+    }
 
     size_t auth_start = header_start + kVbmetaHeaderSize;
     size_t aux_start = auth_start + static_cast<size_t>(auth_size);
@@ -397,8 +401,12 @@ Bytes build_blob(const VbmetaImage& v, const std::string& private_key_file,
     hdr.be64(v.rollback_index);
     hdr.be32(v.flags);
     hdr.be32(v.rollback_index_location);
-    hdr.asciiz(v.release_string, 48);
-    hdr.zeros(80);
+    hdr.asciiz(v.release_string, 48, v.release_string_tail);
+    {
+        Bytes reserved = v.reserved;
+        reserved.resize(80, 0);  // (a manifest that was edited by hand may hold more or fewer)
+        hdr.bytes(reserved);
+    }
     Bytes header_bytes = hdr.take();
 
     Bytes result = header_bytes;

@@ -64,6 +64,11 @@ struct VbmetaImage {
     uint32_t flags = 0;
     uint32_t rollback_index_location = 0;
     std::string release_string;
+    // What the header holds that nothing here models: the field of the release string behind its NUL, and the 80
+    // reserved bytes (zero by the specification, but the hash and the signature cover whatever is there, so an image
+    // that has other bytes there can only be rebuilt -- and still verify -- if they are kept).
+    Bytes release_string_tail;
+    Bytes reserved;  // the 80 reserved bytes as found; empty when they are all zero
 
     Bytes public_key;           // opaque AVB public-key blob
     Bytes public_key_metadata;  // opaque

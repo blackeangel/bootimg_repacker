@@ -491,6 +491,18 @@ this in the manifest / as side files and writes it back:
 - where a **long command line** was cut between the header's two fields:
   AOSP's `mkbootimg.py` fills all 512 bytes of the first one, the old C
   `mkbootimg` keeps a NUL at its end and continues after 511 (`cmdline_split`);
+- the **bytes behind the NUL** that ends the text of a fixed-size header field: the board name (16 bytes), command line
+  (512) and extra command line (1024) of a boot header, the board name, command line and the name of each ramdisk
+  fragment of a vendor_boot, the release string of a vbmeta (also in an AVB footer), the name in a uImage header. A text
+  that was cut short in place, or a tool that never clears the field, leaves what stood there before: `console=ttyS0`, a
+  NUL, then the rest of an older command line. Such a tail goes to `manifest.txt` as `cmdline_tail=`, `board_name_tail=`,
+  `extra_cmdline_tail=`, `ramdisk<i>_name_tail=`, `release_string_tail=`, `avb_release_string_tail=`, `name_tail=` --
+  as text when every byte is printable ASCII, otherwise as `..._tail_hex=` (hex; it wins if both are there) -- and is
+  written back behind the NUL of the text. A clean image has no tail and no such key, so its manifest is what it was.
+  If you edit the text, the tail stays where it was relative to the NUL and is cut to what the field has room for. A
+  vbmeta header's `reserved` area (80 bytes, `reserved=` in hex, written only when not all zero; `avb_reserved=` for a
+  footer) is kept the same way -- a signed vbmeta covers it, so dropping it would make the signature fail. `unpack`
+  says so when an image has such bytes, and `info` lists them (`field tails:`, `unmodeled:`, `name tail:`);
 - a **Marvell PXA** header (`pxa=true`, and its `unknown` word);
 - the text of `manifest.txt` itself. It is plain text, one `key=value` per line, and a value that would not read
   back as it was -- white space at either end (a command line that ends in a space: there are such images), a line

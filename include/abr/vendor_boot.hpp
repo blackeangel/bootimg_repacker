@@ -33,6 +33,7 @@ uint32_t vendor_ramdisk_type_from_name(std::string_view name);
 struct VendorRamdiskEntry {
     uint32_t type = 1;  // VENDOR_RAMDISK_TYPE_PLATFORM
     std::string name;   // <=32 bytes; unused/empty for header v3
+    Bytes name_tail;    // what the name field holds behind its NUL (see BootImage::cmdline_tail)
     std::array<uint32_t, 16> board_id{};
     Bytes data;  // fragment payload, exactly as stored on disk (still compressed)
 };
@@ -45,6 +46,7 @@ struct VendorBootImage {
     uint32_t tags_addr = 0x00000100;
     std::string board_name;
     std::string cmdline;  // <=2048 bytes
+    Bytes board_name_tail, cmdline_tail;  // what the two fields hold behind their NUL (see BootImage::cmdline_tail)
     uint64_t dtb_addr = 0x01f00000;
 
     Bytes dtb;
