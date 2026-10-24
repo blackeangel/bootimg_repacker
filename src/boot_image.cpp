@@ -191,6 +191,12 @@ BootImage BootImage::parse(const Bytes& image) {
         if (n) data_end = r.pos();
         return b;
     };
+    // Same idea as the header's: what the padding behind a component holds, if it is not zeros (r is just behind the
+    // component, `to_page` has not moved it yet).
+    auto keep_padding = [&](const char* component) {
+        Bytes p = nonzero_padding(image, r.pos(), img.page_size);
+        if (!p.empty()) img.section_padding[component] = std::move(p);
+    };
 
     if (pxa) {
         img.pxa = true;
@@ -219,13 +225,17 @@ BootImage BootImage::parse(const Bytes& image) {
         data_end = r.pos() + img.header_padding.size();
         to_page(img.page_size);
         img.kernel = grab(kernel_size);
+        keep_padding("kernel");
         to_page(img.page_size);
         img.ramdisk = grab(ramdisk_size);
+        keep_padding("ramdisk");
         to_page(img.page_size);
         img.second = grab(second_size);
+        keep_padding("second");
         to_page(img.page_size);
         if (dt_size) {
             img.dt = grab(dt_size);
+            keep_padding("dt");
             to_page(img.page_size);
         }
         img.consumed = r.pos();
@@ -272,17 +282,22 @@ BootImage BootImage::parse(const Bytes& image) {
         data_end = r.pos() + img.header_padding.size();
         to_page(img.page_size);
         img.kernel = grab(kernel_size);
+        keep_padding("kernel");
         to_page(img.page_size);
         img.ramdisk = grab(ramdisk_size);
+        keep_padding("ramdisk");
         to_page(img.page_size);
         img.second = grab(second_size);
+        keep_padding("second");
         to_page(img.page_size);
         if (header_version == 0 && dt_size) {
             img.dt = grab(dt_size);
+            keep_padding("dt");
             to_page(img.page_size);
         }
         if (header_version >= 1) {
             img.recovery_dtbo = grab(recovery_dtbo_size);
+            keep_padding("recovery_dtbo");
             to_page(img.page_size);
             uint64_t expected =
                 recovery_dtbo_size
@@ -293,6 +308,7 @@ BootImage BootImage::parse(const Bytes& image) {
         }
         if (header_version >= 2) {
             img.dtb = grab(dtb_size);
+            keep_padding("dtb");
             to_page(img.page_size);
         }
         img.consumed = r.pos();
@@ -314,11 +330,14 @@ BootImage BootImage::parse(const Bytes& image) {
         data_end = r.pos() + img.header_padding.size();
         to_page(4096);
         img.kernel = grab(kernel_size);
+        keep_padding("kernel");
         to_page(4096);
         img.ramdisk = grab(ramdisk_size);
+        keep_padding("ramdisk");
         to_page(4096);
         if (signature_size > 0) {
             img.boot_signature = grab(signature_size);
+            keep_padding("boot_signature");
             to_page(4096);
         }
         img.consumed = r.pos();
@@ -343,6 +362,12 @@ BootImage BootImage::parse(const Bytes& image) {
 
 Bytes BootImage::build() const {
     BinaryWriter w;
+    // What the padding behind a component held in the source (see section_padding).
+    auto padding_of = [&](const char* component) -> const Bytes& {
+        static const Bytes none;
+        const auto it = section_padding.find(component);
+        return it == section_padding.end() ? none : it->second;
+    };
     // Where the content ends (the last byte of a component, or of the header): what the page padding after
     // it is measured from, if a dump that lacked that padding is to be cut the same way (see below).
     size_t data_end = 0;
@@ -374,14 +399,14 @@ Bytes BootImage::build() const {
         data_end = w.size();
         w.align(page_sz);
         put(kernel);
-        w.align(page_sz);
+        w.align(page_sz, padding_of("kernel"));
         put(ramdisk);
-        w.align(page_sz);
+        w.align(page_sz, padding_of("ramdisk"));
         put(second);
-        w.align(page_sz);
+        w.align(page_sz, padding_of("second"));
         if (!dt.empty()) {
             put(dt);
-            w.align(page_sz);
+            w.align(page_sz, padding_of("dt"));
         }
     } else if (header_version <= 2) {
         uint32_t page_sz = page_size ? page_size : 2048;
@@ -423,22 +448,22 @@ Bytes BootImage::build() const {
         data_end = w.size();
         w.align(page_sz);
         put(kernel);
-        w.align(page_sz);
+        w.align(page_sz, padding_of("kernel"));
         put(ramdisk);
-        w.align(page_sz);
+        w.align(page_sz, padding_of("ramdisk"));
         put(second);
-        w.align(page_sz);
+        w.align(page_sz, padding_of("second"));
         if (header_version == 0 && !dt.empty()) {
             put(dt);
-            w.align(page_sz);
+            w.align(page_sz, padding_of("dt"));
         }
         if (header_version >= 1) {
             put(recovery_dtbo);
-            w.align(page_sz);
+            w.align(page_sz, padding_of("recovery_dtbo"));
         }
         if (header_version >= 2) {
             put(dtb);
-            w.align(page_sz);
+            w.align(page_sz, padding_of("dtb"));
         }
     } else if (header_version == 3 || header_version == 4) {
         w.le32(static_cast<uint32_t>(kernel.size()));
@@ -453,12 +478,12 @@ Bytes BootImage::build() const {
         data_end = w.size();
         w.align(4096);
         put(kernel);
-        w.align(4096);
+        w.align(4096, padding_of("kernel"));
         put(ramdisk);
-        w.align(4096);
+        w.align(4096, padding_of("ramdisk"));
         if (!boot_signature.empty()) {
             put(boot_signature);
-            w.align(4096);
+            w.align(4096, padding_of("boot_signature"));
         }
     } else {
         throw FormatError("unsupported boot header version: " + std::to_string(header_version));

@@ -120,6 +120,21 @@ inline void trim_missing_padding(Bytes& out, uint64_t missing, std::optional<uin
     out.resize(out.size() - static_cast<size_t>(cut));
 }
 
+// The padding that follows a component: from `end` (where its data ends) to the next multiple of `page`, but not past
+// the end of `image` (a dump may lack its last bytes). Zeros are what a padding is meant to hold; when it holds
+// something else -- a buffer that nobody cleared, the rest of an older image -- this returns the bytes from `end` up to
+// the last one that is not zero, and an empty vector when all of it is zero. BinaryWriter::align(page, kept) puts them
+// back.
+inline Bytes nonzero_padding(const Bytes& image, size_t end, uint64_t page) {
+    const size_t stop = static_cast<size_t>(std::min<uint64_t>(align_up(end, page), image.size()));
+    size_t last = end;  // one past the last byte that is not zero
+    for (size_t i = end; i < stop; ++i)
+        if (image[i] != 0) last = i + 1;
+    return last > end ? Bytes(image.begin() + static_cast<std::ptrdiff_t>(end),
+                              image.begin() + static_cast<std::ptrdiff_t>(last))
+                      : Bytes{};
+}
+
 // ---------------------------------------------------------------------
 // BinaryReader -- bounds-checked cursor over an in-memory buffer.
 // ---------------------------------------------------------------------
@@ -277,6 +292,15 @@ public:
     void align(uint64_t alignment) {
         uint64_t pad = padding_for(buf_.size(), alignment);
         if (pad) zeros(static_cast<size_t>(pad));
+    }
+
+    // The same, with `kept` (nonzero_padding() of the source) at the start of the padding: as much of it as the padding
+    // has room for -- a component that grew pushes it out, one that shrank leaves it where it was in the source.
+    void align(uint64_t alignment, const Bytes& kept) {
+        const size_t pad = static_cast<size_t>(padding_for(buf_.size(), alignment));
+        const size_t n = std::min(pad, kept.size());
+        buf_.insert(buf_.end(), kept.begin(), kept.begin() + static_cast<std::ptrdiff_t>(n));
+        zeros(pad - n);
     }
 
     size_t size() const { return buf_.size(); }

@@ -673,6 +673,34 @@ Bytes load_raw(const Manifest& m, const fs::path& dir, const std::string& prefix
     return read_file(dir / m.get_path(key));
 }
 
+// The bytes that are not zero in the padding behind a component (BootImage::section_padding, VendorBootImage::
+// section_padding): one file for each component that has some, `<component>_padding.bin`, named by
+// `<component>_padding_file` -- and nothing for a component whose padding is zeros, so an ordinary image has none.
+template <typename Names>
+void save_section_padding(Manifest& m, const fs::path& dir, const std::map<std::string, Bytes>& padding,
+                          const Names& components) {
+    for (const char* c : components)
+        if (const auto it = padding.find(c); it != padding.end())
+            save_raw(m, dir, std::string(c) + "_padding", it->second, std::string(c) + "_padding.bin");
+}
+template <typename Names>
+std::map<std::string, Bytes> load_section_padding(const Manifest& m, const fs::path& dir, const Names& components) {
+    std::map<std::string, Bytes> out;
+    for (const char* c : components)
+        if (Bytes b = load_raw(m, dir, std::string(c) + "_padding"); !b.empty()) out[c] = std::move(b);
+    return out;
+}
+// "kernel 211, ramdisk 3" (the bytes from the end of the component to the last one that is not zero), what `unpack` and
+// `info` say of such padding; empty when there is none.
+template <typename Names>
+std::string padding_text(const std::map<std::string, Bytes>& padding, const Names& components) {
+    std::string out;
+    for (const char* c : components)
+        if (const auto it = padding.find(c); it != padding.end() && !it->second.empty())
+            out += (out.empty() ? "" : ", ") + std::string(c) + " " + std::to_string(it->second.size());
+    return out;
+}
+
 // ------------------------------------------------- envelope (prefix/tail) --
 //
 // See abr/envelope.hpp. The manifest records the bytes around the container
@@ -1057,6 +1085,9 @@ void unpack_boot(const Bytes& whole, const fs::path& dir, const UnpackOptions& u
     save_raw(m, dir, "dtb", img.dtb, "dtb");
     save_raw(m, dir, "boot_signature", img.boot_signature, "boot_signature.bin");
     save_raw(m, dir, "header_padding", img.header_padding, "header_padding.bin");
+    save_section_padding(m, dir, img.section_padding, BootImage::kSectionNames);
+    if (const std::string t = padding_text(img.section_padding, BootImage::kSectionNames); !t.empty())
+        note("bytes that are not zero in the padding behind a component (" + t + ") are kept in *_padding.bin");
 
     Envelope env = Envelope::capture(host, off, img.consumed);
     save_envelope(m, dir, env, host, off, img.consumed);
@@ -1136,6 +1167,7 @@ Bytes repack_boot(const Manifest& m, const fs::path& dir, const RepackOptions& o
     img.dtb = load_raw(m, dir, "dtb");
     img.boot_signature = load_raw(m, dir, "boot_signature");
     img.header_padding = load_raw(m, dir, "header_padding");
+    img.section_padding = load_section_padding(m, dir, BootImage::kSectionNames);
     img.recompute_id();  // follows id_scheme; `raw` keeps the id found in the source
 
     Bytes core = img.build();
@@ -1188,6 +1220,9 @@ void unpack_vendor_boot(const Bytes& whole, const fs::path& dir, const UnpackOpt
     save_raw(m, dir, "dtb", img.dtb, "dtb");
     save_raw(m, dir, "bootconfig", img.bootconfig, "bootconfig");
     save_raw(m, dir, "header_padding", img.header_padding, "header_padding.bin");
+    save_section_padding(m, dir, img.section_padding, VendorBootImage::kSectionNames);
+    if (const std::string t = padding_text(img.section_padding, VendorBootImage::kSectionNames); !t.empty())
+        note("bytes that are not zero in the padding behind a section (" + t + ") are kept in *_padding.bin");
 
     m.set_u32("ramdisk_count", static_cast<uint32_t>(img.ramdisk_fragments.size()));
     std::vector<ComponentSource> fragment_sources;
@@ -1249,6 +1284,7 @@ Bytes repack_vendor_boot(const Manifest& m, const fs::path& dir, const RepackOpt
     img.dtb = load_raw(m, dir, "dtb");
     img.bootconfig = load_raw(m, dir, "bootconfig");
     img.header_padding = load_raw(m, dir, "header_padding");
+    img.section_padding = load_section_padding(m, dir, VendorBootImage::kSectionNames);
 
     uint32_t count = m.get_u32("ramdisk_count", 0);
     std::vector<std::string> fragment_prefixes;
@@ -2402,6 +2438,8 @@ void print_info(const fs::path& path) {
                 std::cout << "boot_signature: " << img.boot_signature.size() << " bytes\n";
             if (img.header_version <= 2)
                 std::cout << "id scheme:      " << id_scheme_name(img.id_scheme) << "\n";
+            if (const std::string t = padding_text(img.section_padding, BootImage::kSectionNames); !t.empty())
+                std::cout << "section padding: " << t << " (bytes that are not zero behind the end of a component, kept)\n";
             Envelope env = Envelope::capture(host, off, img.consumed);
             print_envelope_info(env);
             print_avb1_info(env, host, off, img.consumed);
@@ -2429,6 +2467,8 @@ void print_info(const fs::path& path) {
                           << " name=" << (e.name.empty() ? "-" : shown(e.name)) << " size=" << e.data.size()
                           << " (" << codec_name(detect_codec(e.data)) << ")\n";
             }
+            if (const std::string t = padding_text(img.section_padding, VendorBootImage::kSectionNames); !t.empty())
+                std::cout << "section padding: " << t << " (bytes that are not zero behind the end of a section, kept)\n";
             print_envelope_info(Envelope::capture(host, off, img.consumed));
             print_avb_footer_info(footer, host);
             break;

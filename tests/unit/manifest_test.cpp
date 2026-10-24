@@ -11,20 +11,24 @@
 //     and the value, CRLF line ends, comments, lines without '=');
 //   * a quoted value that is wrong is an error that says which line;
 //   * the name of a file a manifest asks repack to open has to lie in the directory of the manifest.
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <random>
 #include <sstream>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include "abr/boot_image.hpp"
 #include "abr/byte_io.hpp"
 #include "abr/manifest.hpp"
 #include "abr/textquote.hpp"
+#include "abr/vendor_boot.hpp"
 
 using namespace abr;
 namespace fs = std::filesystem;
@@ -775,6 +779,354 @@ void test_text_field_tails() {
     }
 }
 
+// ---- the padding behind a component -------------------------------------------------------------------------------------
+
+Bytes drop_trailing_zeros(Bytes b) {
+    while (!b.empty() && b.back() == 0) b.pop_back();
+    return b;
+}
+
+void test_padding_helpers() {
+    std::puts("padding behind a component: nonzero_padding() and BinaryWriter::align(page, kept)");
+    {
+        Bytes img(100, 0);
+        EXPECT(nonzero_padding(img, 10, 16).empty());  // zeros are what a padding is meant to hold
+        img[12] = 7;
+        EXPECT(nonzero_padding(img, 10, 16) == (Bytes{0, 0, 7}));  // zeros in front stay, the zeros behind the last byte go
+        img[15] = 1;
+        EXPECT(nonzero_padding(img, 10, 16) == (Bytes{0, 0, 7, 0, 0, 1}));  // the last byte of the padding is its part
+        EXPECT(nonzero_padding(img, 16, 16).empty());                        // a component that ends on a boundary has none
+        EXPECT(nonzero_padding(img, 0, 16).empty());
+        img[16] = 5;  // the first byte of the next page belongs to whatever comes next
+        EXPECT(nonzero_padding(img, 10, 16) == (Bytes{0, 0, 7, 0, 0, 1}));
+        EXPECT(nonzero_padding(img, 16, 16).empty());
+        EXPECT(nonzero_padding(img, 17, 16).empty());  // (the byte at 16 is not in the padding that starts at 17)
+    }
+    {  // a file that is cut off inside the padding
+        Bytes img(13, 0);
+        img[12] = 9;
+        EXPECT(nonzero_padding(img, 10, 16) == (Bytes{0, 0, 9}));
+        img[12] = 0;
+        EXPECT(nonzero_padding(img, 10, 16).empty());
+        EXPECT(nonzero_padding(img, 13, 16).empty());  // the end of the file is the end of the component
+        EXPECT(nonzero_padding(img, 14, 16).empty());  // and past it there is nothing to look at
+        EXPECT(nonzero_padding(img, 5000, 16).empty());
+        EXPECT(nonzero_padding(Bytes{}, 0, 16).empty());
+    }
+    EXPECT(nonzero_padding(Bytes(10, 0xFF), 4, 0).empty());  // no page size, no padding
+    EXPECT(nonzero_padding(Bytes(100, 0xFF), 40, uint64_t{16} << 20).size() == 60);  // the biggest page size, a short file
+
+    // writing it back
+    auto aligned = [](size_t before, uint64_t page, const Bytes& kept) {
+        BinaryWriter w;
+        w.zeros(before);
+        w.align(page, kept);
+        return w.take();
+    };
+    {
+        const Bytes got = aligned(10, 16, bytes_of("ABC"));
+        EXPECT(got.size() == 16);
+        EXPECT(Bytes(got.begin() + 10, got.begin() + 13) == bytes_of("ABC"));
+        EXPECT(std::all_of(got.begin() + 13, got.end(), [](uint8_t b) { return b == 0; }));
+        EXPECT(std::all_of(got.begin(), got.begin() + 10, [](uint8_t b) { return b == 0; }));
+    }
+    {
+        const Bytes got = aligned(14, 16, bytes_of("ABCDEF"));  // more than there is room for: the first two
+        EXPECT(got.size() == 16);
+        EXPECT(Bytes(got.begin() + 14, got.end()) == bytes_of("AB"));
+    }
+    EXPECT(aligned(16, 16, bytes_of("ABC")).size() == 16);  // already on a boundary: nothing is written
+    EXPECT(aligned(0, 4096, bytes_of("ABC")).empty());
+    EXPECT(aligned(10, 16, Bytes{}) == Bytes(16, 0));
+    {
+        BinaryWriter a, b;
+        a.zeros(5);
+        b.zeros(5);
+        a.align(64);
+        b.align(64, Bytes{});
+        EXPECT(a.data() == b.data());
+    }
+    EXPECT(aligned(1, 2, bytes_of("XY")) == (Bytes{0, 'X'}));  // a room of one byte
+
+    // for any file, the padding that was found and put back is what the file held (as far as the file went)
+    std::mt19937_64 rng(20261024);
+    for (int i = 0; i < 20000; ++i) {
+        const uint64_t page = uint64_t{1} << (4 + rng() % 8);  // 16 ... 2048
+        const size_t body = rng() % (3 * page);
+        const size_t gap = static_cast<size_t>(padding_for(body, page));
+        Bytes img(body + gap + rng() % 40);
+        for (auto& b : img) b = rng() % 3 == 0 ? static_cast<uint8_t>(rng()) : 0;  // sparse bytes, some of them zero
+        img.resize(body + rng() % (img.size() - body + 1));                           // a dump that may end anywhere behind the body
+        const Bytes kept = nonzero_padding(img, body, page);
+        EXPECT(kept.empty() || kept.back() != 0);
+        EXPECT(kept.size() <= gap);
+        BinaryWriter w;
+        w.zeros(body);
+        w.align(page, kept);
+        const Bytes out = w.take();
+        EXPECT(out.size() == body + gap);
+        const size_t have = std::min(gap, img.size() - body);  // the part of the padding the file has
+        EXPECT(std::equal(out.begin() + static_cast<std::ptrdiff_t>(body),
+                          out.begin() + static_cast<std::ptrdiff_t>(body + have),
+                          img.begin() + static_cast<std::ptrdiff_t>(body)));
+        EXPECT(std::all_of(out.begin() + static_cast<std::ptrdiff_t>(body + kept.size()), out.end(),
+                           [](uint8_t b) { return b == 0; }));
+    }
+}
+
+// What the padding of the images below holds: garbage that starts at the end of a component and ends with a byte that is not
+// zero, in some of the components -- the way a vendor tool that does not clear its buffer, or pads with 0xFF, leaves it.
+Bytes some_garbage(std::mt19937_64& rng, size_t room) {
+    const size_t len = 1 + rng() % room;
+    Bytes g(len);
+    switch (rng() % 4) {
+        case 0: std::fill(g.begin(), g.end(), uint8_t{0xFF}); break;
+        case 1: std::fill(g.begin(), g.end(), uint8_t{0xA5}); break;
+        default:
+            for (auto& b : g) b = rng() % 4 == 0 ? uint8_t{0} : static_cast<uint8_t>(rng());  // some zeros in the middle
+    }
+    g.back() = static_cast<uint8_t>(1 + rng() % 255);
+    return g;
+}
+
+size_t some_size(std::mt19937_64& rng, size_t page, size_t at_least) {
+    size_t n;
+    switch (rng() % 7) {
+        case 0: n = 0; break;
+        case 1: n = page * (1 + rng() % 3); break;                    // ends on a page boundary: no padding
+        case 2: n = page * (1 + rng() % 3) - 1 - rng() % 3; break;    // one to three bytes short of one
+        default: n = rng() % (3 * page + 17);
+    }
+    return std::max(n, at_least);
+}
+
+Bytes some_bytes(std::mt19937_64& rng, size_t n) {
+    Bytes b(n);
+    for (auto& x : b) x = static_cast<uint8_t>(rng());
+    return b;
+}
+
+struct Garbled {
+    Bytes image;                             // the clean image with garbage in some of the paddings
+    std::map<std::string, Bytes> expected;   // what is behind which component
+    size_t last_end = 0;                     // where the last component that is not empty ends
+    bool header_page = false;                // garbage in the header page as well
+};
+
+// The components of an image and where they lie: `parts` in order (name, size), the first one starts at `start`, every one
+// at a page boundary.
+Garbled garble(const Bytes& clean, const std::vector<std::pair<std::string, size_t>>& parts, size_t start,
+               size_t header_struct, uint64_t page, std::mt19937_64& rng) {
+    Garbled g;
+    g.image = clean;
+    if (rng() % 4 == 0 && start > header_struct) {  // the header page too: a byte that is not zero behind the header struct
+        g.image[header_struct + rng() % (start - header_struct)] = 0x5A;
+        g.header_page = true;
+    }
+    size_t pos = start;
+    for (const auto& [name, size] : parts) {
+        const size_t end = pos + size;
+        const size_t room = static_cast<size_t>(padding_for(end, page));
+        if (size > 0) g.last_end = end;
+        if (room > 0 && rng() % 2 == 0) {
+            const Bytes junk = some_garbage(rng, room);
+            std::copy(junk.begin(), junk.end(), g.image.begin() + static_cast<std::ptrdiff_t>(end));
+            g.expected[name] = junk;
+        }
+        pos = end + room;
+    }
+    EXPECT(pos == clean.size());
+    return g;
+}
+
+size_t boot_struct_size(const BootImage& img) {
+    if (img.pxa) return 1640;
+    switch (img.header_version) {
+        case 0: return 1632;
+        case 1: return 1648;
+        case 2: return 1660;
+        case 3: return 1580;
+        default: return 1584;
+    }
+}
+
+uint32_t boot_page(const BootImage& img) { return img.header_version >= 3 ? 4096 : img.page_size; }
+
+std::vector<std::pair<std::string, size_t>> boot_parts(const BootImage& img) {
+    std::vector<std::pair<std::string, size_t>> v = {{"kernel", img.kernel.size()}, {"ramdisk", img.ramdisk.size()}};
+    if (img.header_version <= 2) {
+        v.push_back({"second", img.second.size()});
+        if (img.header_version == 0 && !img.dt.empty()) v.push_back({"dt", img.dt.size()});
+        if (img.header_version >= 1) v.push_back({"recovery_dtbo", img.recovery_dtbo.size()});
+        if (img.header_version >= 2) v.push_back({"dtb", img.dtb.size()});
+    } else if (img.header_version == 4 && !img.boot_signature.empty()) {
+        v.push_back({"boot_signature", img.boot_signature.size()});
+    }
+    return v;
+}
+
+// kind: 0 v0, 1 v0 with a device tree (QCDT), 2 Marvell PXA, 3 v1, 4 v2, 5 v3, 6 v4
+BootImage some_boot_image(std::mt19937_64& rng, int kind) {
+    static const uint32_t pages[] = {512, 1024, 2048, 4096, 16384};
+    BootImage img;
+    img.header_version = kind <= 2 ? 0 : static_cast<uint32_t>(kind - 2);
+    img.pxa = kind == 2;
+    img.page_size = pages[rng() % 5];
+    if (img.pxa && img.page_size < 2048) img.page_size = 2048;  // (a PXA header is told by its page size, which has to look like one)
+    img.id_scheme = IdScheme::RAW;
+    img.cmdline = "console=ttyS0";
+    img.board_name = "padtest";
+    const size_t page = boot_page(img);
+    img.kernel = some_bytes(rng, some_size(rng, page, 1));
+    img.ramdisk = some_bytes(rng, some_size(rng, page, 0));
+    if (img.header_version <= 2) {
+        img.second = some_bytes(rng, some_size(rng, page, 0));
+        if (kind == 1 || (kind == 2 && rng() % 2)) img.dt = some_bytes(rng, some_size(rng, page, 16));  // (above 8: it is read as a size)
+        if (img.header_version >= 1) img.recovery_dtbo = some_bytes(rng, some_size(rng, page, 0));
+        if (img.header_version >= 2) img.dtb = some_bytes(rng, some_size(rng, page, 0));
+    } else if (img.header_version == 4 && rng() % 2) {
+        img.boot_signature = some_bytes(rng, 1 + rng() % 300);
+    }
+    return img;
+}
+
+void test_boot_padding() {
+    std::puts("boot image: bytes in the padding behind a component are kept, and written where they were");
+    std::mt19937_64 rng(0xB0071);
+    int with_padding = 0, with_header = 0, trimmed = 0, edited = 0;
+    for (int i = 0; i < 4200; ++i) {
+        const BootImage img = some_boot_image(rng, i % 7);
+        const Bytes clean = img.build();
+        const size_t page = boot_page(img);
+        const size_t start = static_cast<size_t>(align_up(boot_struct_size(img), page));
+        const Garbled g = garble(clean, boot_parts(img), start, boot_struct_size(img), page, rng);
+        const BootImage p = BootImage::parse(g.image);
+        EXPECT(p.build() == g.image);
+        EXPECT(p.section_padding == g.expected);
+        EXPECT(p.header_padding.empty() == !g.header_page);
+        EXPECT(p.consumed == g.image.size());
+        with_padding += !g.expected.empty();
+        with_header += g.header_page;
+        // an image without garbage has no entry
+        const BootImage c = BootImage::parse(clean);
+        EXPECT(c.section_padding.empty());
+        EXPECT(c.build() == clean);
+
+        // a dump whose last page was cut off, anywhere behind the last component
+        if (g.last_end < g.image.size()) {
+            const size_t cut = g.last_end + rng() % (g.image.size() - g.last_end + 1);
+            const Bytes cutimg(g.image.begin(), g.image.begin() + static_cast<std::ptrdiff_t>(cut));
+            const BootImage t = BootImage::parse(cutimg);
+            EXPECT(t.build() == cutimg);
+            ++trimmed;
+        }
+
+        // the kernel replaced by one of another size: the bytes found behind the old one go behind the new one, as far as they
+        // fit; every other component keeps its padding, and the ramdisk is the ramdisk
+        BootImage e = p;
+        e.kernel = some_bytes(rng, some_size(rng, page, 1));
+        const BootImage q = BootImage::parse(e.build());
+        const auto old = p.section_padding.find("kernel");
+        const size_t room = static_cast<size_t>(padding_for(e.kernel.size(), page));
+        const Bytes want = old == p.section_padding.end()
+                               ? Bytes{}
+                               : drop_trailing_zeros(Bytes(old->second.begin(),
+                                                           old->second.begin() + static_cast<std::ptrdiff_t>(std::min(room, old->second.size()))));
+        const auto now = q.section_padding.find("kernel");
+        EXPECT((now == q.section_padding.end() ? Bytes{} : now->second) == want);
+        std::map<std::string, Bytes> others = p.section_padding, others_now = q.section_padding;
+        others.erase("kernel");
+        others_now.erase("kernel");
+        EXPECT(others == others_now);
+        EXPECT(q.ramdisk == p.ramdisk && q.kernel == e.kernel && q.dt == p.dt && q.dtb == p.dtb);
+        ++edited;
+    }
+    EXPECT(with_padding > 1500 && with_header > 600 && trimmed > 2500 && edited == 4200);  // the loop looked at what it should
+}
+
+// kind: 0 v3, 1 v4 with a ramdisk table, 2 v4 without one
+VendorBootImage some_vendor_image(std::mt19937_64& rng, int kind) {
+    static const uint32_t pages[] = {2048, 4096, 8192, 16384};
+    VendorBootImage img;
+    img.header_version = kind == 0 ? 3 : 4;
+    img.page_size = pages[rng() % 4];
+    img.cmdline = "console=ttyMSM0";
+    img.board_name = "vendpad";
+    img.has_ramdisk_table = kind != 2;
+    const size_t n = kind == 1 ? 1 + rng() % 3 : 1;
+    for (size_t i = 0; i < n; ++i) {
+        VendorRamdiskEntry e;
+        if (kind == 1) {
+            e.type = static_cast<uint32_t>(1 + rng() % 3);
+            e.name = "frag" + std::to_string(i);
+        } else {
+            e.type = 0;
+        }
+        e.data = some_bytes(rng, some_size(rng, img.page_size, 1));
+        img.ramdisk_fragments.push_back(std::move(e));
+    }
+    img.dtb = some_bytes(rng, some_size(rng, img.page_size, 0));
+    if (img.header_version == 4) img.bootconfig = some_bytes(rng, some_size(rng, img.page_size, 0));
+    return img;
+}
+
+std::vector<std::pair<std::string, size_t>> vendor_parts(const VendorBootImage& img) {
+    std::vector<std::pair<std::string, size_t>> v = {{"ramdisk", img.concatenated_ramdisk().size()}, {"dtb", img.dtb.size()}};
+    if (img.header_version == 4 && img.has_ramdisk_table)
+        v.push_back({"table", img.ramdisk_fragments.size() * kVendorRamdiskTableEntrySize});
+    if (img.header_version == 4) v.push_back({"bootconfig", img.bootconfig.size()});
+    return v;
+}
+
+void test_vendor_boot_padding() {
+    std::puts("vendor_boot image: bytes in the padding behind a section are kept, and written where they were");
+    std::mt19937_64 rng(0xB0072);
+    int with_padding = 0, trimmed = 0;
+    for (int i = 0; i < 3000; ++i) {
+        const VendorBootImage img = some_vendor_image(rng, i % 3);
+        const Bytes clean = img.build();
+        const size_t page = img.page_size;
+        const size_t hdr = img.header_version == 3 ? 2112 : 2128;
+        const Garbled g = garble(clean, vendor_parts(img), static_cast<size_t>(align_up(hdr, page)), hdr, page, rng);
+        const VendorBootImage p = VendorBootImage::parse(g.image);
+        EXPECT(p.build() == g.image);
+        EXPECT(p.section_padding == g.expected);
+        EXPECT(p.header_padding.empty() == !g.header_page);
+        EXPECT(p.consumed == g.image.size());
+        with_padding += !g.expected.empty();
+        const VendorBootImage c = VendorBootImage::parse(clean);
+        EXPECT(c.section_padding.empty());
+        EXPECT(c.build() == clean);
+
+        if (g.last_end < g.image.size()) {
+            const size_t cut = g.last_end + rng() % (g.image.size() - g.last_end + 1);
+            const Bytes cutimg(g.image.begin(), g.image.begin() + static_cast<std::ptrdiff_t>(cut));
+            const VendorBootImage t = VendorBootImage::parse(cutimg);
+            EXPECT(t.build() == cutimg);
+            ++trimmed;
+        }
+
+        // the dtb replaced by one of another size
+        VendorBootImage e = p;
+        e.dtb = some_bytes(rng, some_size(rng, page, 1));
+        const VendorBootImage q = VendorBootImage::parse(e.build());
+        const auto old = p.section_padding.find("dtb");
+        const size_t room = static_cast<size_t>(padding_for(e.dtb.size(), page));
+        const Bytes want = old == p.section_padding.end()
+                               ? Bytes{}
+                               : drop_trailing_zeros(Bytes(old->second.begin(),
+                                                           old->second.begin() + static_cast<std::ptrdiff_t>(std::min(room, old->second.size()))));
+        const auto now = q.section_padding.find("dtb");
+        EXPECT((now == q.section_padding.end() ? Bytes{} : now->second) == want);
+        std::map<std::string, Bytes> others = p.section_padding, others_now = q.section_padding;
+        others.erase("dtb");
+        others_now.erase("dtb");
+        EXPECT(others == others_now);
+        EXPECT(q.dtb == e.dtb && q.concatenated_ramdisk() == p.concatenated_ramdisk() && q.bootconfig == p.bootconfig);
+    }
+    EXPECT(with_padding > 1000 && trimmed > 1800);
+}
+
 }  // namespace
 
 int run_manifest_tests() {
@@ -787,6 +1139,9 @@ int run_manifest_tests() {
     test_manifest_reading();
     test_manifest_paths();
     test_text_field_tails();
+    test_padding_helpers();
+    test_boot_padding();
+    test_vendor_boot_padding();
     if (g_failures == 0) std::printf("manifest: ok (%d checks)\n", g_checks);
     else std::printf("manifest: %d failure(s)\n", g_failures);
     return g_failures == 0 ? 0 : 1;

@@ -35,6 +35,35 @@ def page_pad(b, page):
     return b + b"\0" * ((-len(b)) % page)
 
 
+class Gaps:
+    """What a tool left in the padding behind each component of an image (component name -> the bytes at the start of
+    its padding, cut to the room it has, zeros after them; or a function of the room that makes them). `found` is what
+    an unpacker has to find afterwards: those bytes up to the last one that is not zero, for every component that has
+    some -- the manifest of the test names them as `<component>_padding.bin`."""
+
+    def __init__(self, **fills):
+        self.fills = dict(fills)
+        self.found = {}
+
+    def pad(self, name, data, page):
+        room = -len(data) % page
+        fill = self.fills.get(name, b"")
+        if callable(fill):
+            fill = fill(room)
+        fill = fill[:room]
+        if fill.rstrip(b"\0"):
+            self.found[name] = fill.rstrip(b"\0")
+        return data + fill + b"\0" * (room - len(fill))
+
+    def same_bytes(self):
+        """The fills an edited image has to carry: what was found, not what the function would make for another room."""
+        return Gaps(**self.found)
+
+
+def padded(gaps, name, data, page):
+    return gaps.pad(name, data, page) if gaps else page_pad(data, page)
+
+
 def with_tail(field, tail):
     """A text field (text, zero filled) with `tail` behind the NUL that ends its text, as far as the field has room
     for it: what a command line that was cut short in place leaves in an image (the rest of the old one), and what a
@@ -73,7 +102,7 @@ def boot_id(hash_ctor, version, kernel, ramdisk, second, dt=None, dtbo=b"", dtb=
 def boot_v012(version, kernel, ramdisk, second=b"", dt=b"", dtbo=b"", dtb=b"", *, page=2048,
               cmdline="", name="", os_version=0, id_bytes=b"", dtbo_offset=None,
               hdr_size=None, dtb_addr=0, dirty_padding=False, hdr_garbage=b"", split=512,
-              name_tail=b"", cmd_tail=b"", extra_tail=b""):
+              name_tail=b"", cmd_tail=b"", extra_tail=b"", gaps=None):
     """boot.img header v0/v1/v2. A non-empty `dt` on a v0 header is the
     Qualcomm/CAF layout: word 10 holds the dt size instead of the version."""
     word10 = len(dt) if (version == 0 and dt) else version
@@ -96,18 +125,18 @@ def boot_v012(version, kernel, ramdisk, second=b"", dt=b"", dtbo=b"", dtb=b"", *
         hdr += struct.pack("<IQ", len(dtb), dtb_addr)
     hdr += hdr_garbage  # something a vendor stashed after the header struct
     out = page_pad(hdr, page)
-    parts = [kernel, ramdisk, second]
+    parts = [("kernel", kernel), ("ramdisk", ramdisk), ("second", second)]
     if version == 0 and dt:
-        parts.append(dt)
+        parts.append(("dt", dt))
     if version >= 1:
-        parts.append(dtbo)
+        parts.append(("recovery_dtbo", dtbo))
     if version >= 2:
-        parts.append(dtb)
-    for p in parts:
-        padded = page_pad(p, page)
-        if dirty_padding and len(padded) > len(p):
-            padded = p + b"\xa5" * (len(padded) - len(p))  # vendor garbage in the page padding
-        out += padded
+        parts.append(("dtb", dtb))
+    for name_, p in parts:
+        pp = padded(gaps, name_, p, page)
+        if dirty_padding and len(pp) > len(p):
+            pp = p + b"\xa5" * (len(pp) - len(p))  # vendor garbage in the page padding
+        out += pp
     return out
 
 
@@ -121,7 +150,7 @@ def split_cmdline(cmdline, split):
 
 def boot_pxa(kernel, ramdisk, second=b"", dt=b"", *, page=2048, unknown=0x03000000, cmdline="",
              name="", id_bytes=b"", split=511, hdr_garbage=b"", signature=b"",
-             name_tail=b"", cmd_tail=b"", extra_tail=b""):
+             name_tail=b"", cmd_tail=b"", extra_tail=b"", gaps=None):
     """Marvell PXA1088/PXA1908 boot image (osm0sis/pxa-mkbootimg's bootimg.h): a v0 header
     with `unknown` after dt_size, so tags_addr/page_size sit at 40/44, the board name has
     24 bytes and the id is at 584. Pages: kernel, ramdisk, second, dt, then an optional
@@ -137,15 +166,15 @@ def boot_pxa(kernel, ramdisk, second=b"", dt=b"", *, page=2048, unknown=0x030000
     assert len(hdr) == 1640
     hdr += hdr_garbage
     out = page_pad(hdr, page)
-    for part in (kernel, ramdisk, second):
-        out += page_pad(part, page)
+    for name_, part in (("kernel", kernel), ("ramdisk", ramdisk), ("second", second)):
+        out += padded(gaps, name_, part, page)
     if dt:
-        out += page_pad(dt, page)
+        out += padded(gaps, "dt", dt, page)
     return out + signature
 
 
 def boot_v34(version, kernel, ramdisk, *, cmdline="", os_version=0, reserved=(0, 0, 0, 0),
-             hdr_size=None, signature=b"", cmd_tail=b""):
+             hdr_size=None, signature=b"", cmd_tail=b"", gaps=None):
     hdr = b"ANDROID!"
     hdr += struct.pack("<4I", len(kernel), len(ramdisk), os_version,
                        hdr_size or (1580 if version == 3 else 1584))
@@ -153,15 +182,15 @@ def boot_v34(version, kernel, ramdisk, *, cmdline="", os_version=0, reserved=(0,
     hdr += with_tail(cmdline.encode().ljust(1536, b"\0"), cmd_tail)
     if version == 4:
         hdr += le32(len(signature))
-    out = page_pad(hdr, 4096) + page_pad(kernel, 4096) + page_pad(ramdisk, 4096)
+    out = page_pad(hdr, 4096) + padded(gaps, "kernel", kernel, 4096) + padded(gaps, "ramdisk", ramdisk, 4096)
     if signature:
-        out += page_pad(signature, 4096)
+        out += padded(gaps, "boot_signature", signature, 4096)
     return out
 
 
 # -------------------------------------------------------- vendor_boot ----
 
-def vendor_boot_v4_empty_table(ramdisk, dtb, *, page=2048, hdr_size=2112, dtb_addr=0x102077FFF):
+def vendor_boot_v4_empty_table(ramdisk, dtb, *, page=2048, hdr_size=2112, dtb_addr=0x102077FFF, gaps=None):
     """A v4 header that declares no ramdisk table (Magisk/Amlogic-style
     images): one anonymous ramdisk blob, a v3-sized header_size, page 2048."""
     hdr = b"VNDRBOOT" + struct.pack("<5I", 4, page, 0x8000, 0x1000000, len(ramdisk))
@@ -169,12 +198,12 @@ def vendor_boot_v4_empty_table(ramdisk, dtb, *, page=2048, hdr_size=2112, dtb_ad
     hdr += le32(0x100) + b"vendtest".ljust(16, b"\0")
     hdr += struct.pack("<IIQ", hdr_size, len(dtb), dtb_addr)
     hdr += struct.pack("<4I", 0, 0, 0, 0)  # table size, entries, entry size, bootconfig
-    return page_pad(hdr, page) + page_pad(ramdisk, page) + page_pad(dtb, page)
+    return page_pad(hdr, page) + padded(gaps, "ramdisk", ramdisk, page) + padded(gaps, "dtb", dtb, page)
 
 
 def vendor_boot(version, fragments, *, dtb=b"", bootconfig=b"", page=4096, cmdline="", name="",
                 cmd_tail=b"", name_tail=b"", kernel_addr=0x8000, ramdisk_addr=0x1000000,
-                tags_addr=0x100, dtb_addr=0x1F00000):
+                tags_addr=0x100, dtb_addr=0x1F00000, gaps=None):
     """vendor_boot v3 (the ramdisk is `fragments[0][3]`) or v4 (`fragments` is the vendor ramdisk table:
     (type, name, name_tail, data) each). Header, ramdisk section, dtb, table, bootconfig, each from a page boundary
     (AOSP vendor_boot.h)."""
@@ -191,9 +220,9 @@ def vendor_boot(version, fragments, *, dtb=b"", bootconfig=b"", page=4096, cmdli
             table += with_tail(nm.encode().ljust(32, b"\0"), nt) + b"\0" * 64  # (board_id: 16 words)
             off += len(data)
         hdr += struct.pack("<4I", len(table), len(fragments), 108, len(bootconfig))
-    out = page_pad(hdr, page) + page_pad(section, page) + page_pad(dtb, page)
+    out = page_pad(hdr, page) + padded(gaps, "ramdisk", section, page) + padded(gaps, "dtb", dtb, page)
     if version == 4:
-        out += page_pad(table, page) + page_pad(bootconfig, page)
+        out += padded(gaps, "table", table, page) + padded(gaps, "bootconfig", bootconfig, page)
     return out
 
 
@@ -260,6 +289,13 @@ def build_all(out):
     def put(name, data):
         (out / name).write_bytes(data)
 
+    def put_gaps(name, found):
+        """name.gaps.json: what an unpacker has to find of the padding behind the components of image `name` (see Gaps).
+        `found`: a Gaps (what it has found) or a dict component -> bytes."""
+        import json
+        found = getattr(found, "found", found)
+        (out / (name + ".gaps.json")).write_text(json.dumps({k: v.hex() for k, v in found.items()}, sort_keys=True) + "\n")
+
     kernel = blob(30000)
     ramdisk = gz(blob(60000))
     second = b""
@@ -320,9 +356,11 @@ def build_all(out):
     # the last component (dtb) ends mid-page; drop the padding a dumper trimmed
     put("boot_v2_trimmed_tail.img", full[:len(full) - ((-len(dtb)) % 2048)])
 
-    # Non-zero bytes in the page padding between components: abr zero-fills
-    # padding, so this one must be *reported* by the unpack self-check.
+    # Non-zero bytes in the page padding between components (0xA5 in all of it): abr keeps them, see the "padding" fixtures below.
     put("boot_v2_dirty_padding.img", boot_v012(2, kernel, ramdisk, dtb=dtb, dirty_padding=True))
+    g_dirty = Gaps(kernel=b"\xa5" * 2048, ramdisk=b"\xa5" * 2048, dtb=b"\xa5" * 2048)
+    assert boot_v012(2, kernel, ramdisk, dtb=dtb, gaps=g_dirty) == boot_v012(2, kernel, ramdisk, dtb=dtb, dirty_padding=True)
+    put_gaps("boot_v2_dirty_padding.img", g_dirty)
 
     # --- vendor_boot -----------------------------------------------------
     put("vendor_boot_v4_emptytable_p2048.img",
@@ -435,6 +473,105 @@ def build_all(out):
         4, [(1, "platform_rd", b"", vr0), (3, "dlkm_rd", b"", vr1)], dtb=td,
         cmdline="console=ttyMSM0", name="vendtail", bootconfig=b"androidboot.x=1\n"))
     put("uimage_tails.img", uimage(tk, "kernel-tail", name_tail=b"old-name"))
+
+    # --- non-zero bytes in the padding behind a component ----------------------------------------------
+    # A tool that does not clear its buffer, or pads with 0xFF, leaves bytes there; abr keeps them (`<component>_padding.bin`)
+    # and writes them back. Each fixture has a name.gaps.json: what an unpacker has to find, per component (hex, from the end
+    # of the component to the last byte that is not zero). The fills differ in kind: a few bytes, the whole padding, a byte at
+    # the very end of it, zeros first, a fill longer than the room (cut), and a component with none.
+
+    def last_byte(room):
+        return b"\0" * (room - 1) + b"\x7f" if room else b""
+
+    pk, pr, ps = blob(30000), gz(blob(60000)), blob(4100)
+    pdt0, pdtb, pdtbo, psig = blob(5000), blob(1200), blob(3000), blob(300)
+    g_v0 = Gaps(kernel=b"KERNEL-GAP", ramdisk=b"\xa5" * 5000, second=b"\0\0SECOND", dt=last_byte)
+    put("boot_v0_padding.img", boot_v012(
+        0, pk, pr, second=ps, dt=pdt0, cmdline="console=ttyHSL0", gaps=g_v0,
+        id_bytes=boot_id(hashlib.sha1, 0, pk, pr, ps, dt=pdt0)))
+    put_gaps("boot_v0_padding.img", g_v0)
+
+    g_v2 = Gaps(kernel=b"\xff" * 4096, recovery_dtbo=b"\x01", dtb=b"DTB-GAP-DTB-GAP")
+    put("boot_v2_padding.img", boot_v012(2, pk, pr, dtbo=pdtbo, dtb=pdtb, cmdline="console=ttyS0", gaps=g_v2))
+    put_gaps("boot_v2_padding.img", g_v2)
+    # the same components, all padding zeros: what the manifest gives when the *_padding_file lines are taken out
+    put("boot_v2_padding_clean.img", boot_v012(2, pk, pr, dtbo=pdtbo, dtb=pdtb, cmdline="console=ttyS0"))
+    # one padding file taken out: the other components keep theirs
+    put("boot_v2_padding_nokernel.img", boot_v012(
+        2, pk, pr, dtbo=pdtbo, dtb=pdtb, cmdline="console=ttyS0",
+        gaps=Gaps(recovery_dtbo=b"\x01", dtb=b"DTB-GAP-DTB-GAP")))
+    # the kernel replaced: the bytes that were found go behind the new kernel, as far as the padding there has room
+    # (smaller: it all fits; 4 bytes of room: the first 4 of them; a kernel that ends on a page boundary: none)
+    for tag, size in (("smaller", 12000), ("edge4", 32764), ("aligned", 32768)):
+        newk = blob(size)
+        (out / f"pad_kernel_{tag}.bin").write_bytes(newk)
+        put(f"boot_v2_padding_k{tag}.img", boot_v012(
+            2, newk, pr, dtbo=pdtbo, dtb=pdtb, cmdline="console=ttyS0", gaps=g_v2.same_bytes()))
+
+    # the header page holds data too, and so does a gap
+    g_h = Gaps(ramdisk=b"HDR-AND-GAP")
+    put("boot_v2_padding_header.img", boot_v012(
+        2, pk, pr, dtb=pdtb, cmdline="x", hdr_garbage=b"VENDOR-DATA-IN-HEADER-PAGE", gaps=g_h))
+    put_gaps("boot_v2_padding_header.img", g_h)
+
+    # a dump whose last page was cut off: inside the padding that holds bytes, and behind them (in zeros)
+    g_t = Gaps(dtb=b"TRIM-GAP-TAIL")
+    full_t = boot_v012(2, pk, pr, dtb=pdtb, cmdline="x", gaps=g_t)
+    end_t = len(full_t) - (-len(pdtb)) % 2048  # where the dtb ends
+    put("boot_v2_padding_trimmed_in.img", full_t[:end_t + 5])
+    put_gaps("boot_v2_padding_trimmed_in.img", {"dtb": b"TRIM-"})
+    put("boot_v2_padding_trimmed_zeros.img", full_t[:end_t + 40])
+    put_gaps("boot_v2_padding_trimmed_zeros.img", g_t)
+
+    g_v3 = Gaps(kernel=b"V3-KERNEL-GAP", ramdisk=b"\xff" * 5000)
+    put("boot_v3_padding.img", boot_v34(3, pk, pr, cmdline="bootconfig", gaps=g_v3))
+    put_gaps("boot_v3_padding.img", g_v3)
+    g_v4 = Gaps(kernel=b"V4-KERNEL-GAP", ramdisk=last_byte, boot_signature=b"\0\0SIG-GAP")
+    put("boot_v4_padding.img", boot_v34(4, pk, pr, cmdline="bootconfig", signature=psig, gaps=g_v4))
+    put_gaps("boot_v4_padding.img", g_v4)
+
+    g_px = Gaps(kernel=b"PXA-KERNEL-GAP", ramdisk=b"\x01", second=b"\xee" * 9000, dt=last_byte)
+    put("boot_pxa_padding.img", boot_pxa(
+        pk, pr, second=ps, dt=pdt0, cmdline="console=ttyS0", name="SM-G531F",
+        id_bytes=boot_id(hashlib.sha1, 0, pk, pr, ps, dt=pdt0), gaps=g_px))
+    put_gaps("boot_pxa_padding.img", g_px)
+
+    # an AVB footer around an image with such padding: the digest covers the padding, so it must be as it was
+    g_f = Gaps(kernel=b"AVB-GAP", dtb=b"\xff" * 100)
+    host_f = boot_v012(2, pk, pr, dtb=pdtb, cmdline="avb", gaps=g_f)
+    put("boot_v2_padding_avbfooter.img", avb_footer_image(host_f, b"boot", 1 << 20))
+    put_gaps("boot_v2_padding_avbfooter.img", g_f)
+
+    # vendor_boot: the ramdisk section (all fragments), the dtb, the ramdisk table and the bootconfig each have padding
+    pv0, pv1, pvd = gz(blob(9000)), gz(blob(7000)), blob(800)
+    g_vb3 = Gaps(ramdisk=b"V3-RAMDISK-GAP", dtb=b"\xff" * 4096)
+    put("vendor_boot_v3_padding.img", vendor_boot(
+        3, [(0, "", b"", pv0)], dtb=pvd, cmdline="console=ttyMSM0", name="vendpad", gaps=g_vb3))
+    put_gaps("vendor_boot_v3_padding.img", g_vb3)
+    g_vb4 = Gaps(ramdisk=b"V4-RAMDISK-GAP", dtb=last_byte, table=b"\x01", bootconfig=b"\0\0\0BOOTCONFIG-GAP")
+    frags4 = [(1, "platform_rd", b"", pv0), (3, "dlkm_rd", b"", pv1)]
+    put("vendor_boot_v4_padding.img", vendor_boot(
+        4, frags4, dtb=pvd, cmdline="console=ttyMSM0", name="vendpad", bootconfig=b"androidboot.x=1\n", gaps=g_vb4))
+    put_gaps("vendor_boot_v4_padding.img", g_vb4)
+    # the dtb replaced by one with 4 bytes of room behind it (the byte at the very end of the old padding is cut off), and
+    # the same image with every *_padding_file line taken out
+    newd = blob(4096 - 4)
+    (out / "pad_vendor_dtb_edge4.bin").write_bytes(newd)
+    put("vendor_boot_v4_padding_dtbedge4.img", vendor_boot(
+        4, frags4, dtb=newd, cmdline="console=ttyMSM0", name="vendpad", bootconfig=b"androidboot.x=1\n",
+        gaps=g_vb4.same_bytes()))
+    put("vendor_boot_v4_padding_clean.img", vendor_boot(
+        4, frags4, dtb=pvd, cmdline="console=ttyMSM0", name="vendpad", bootconfig=b"androidboot.x=1\n"))
+    g_vbe = Gaps(ramdisk=b"EMPTY-TABLE-GAP", dtb=b"\xff" * 300)
+    put("vendor_boot_v4_padding_notable.img", vendor_boot_v4_empty_table(gz(blob(40000)), blob(900), gaps=g_vbe))
+    put_gaps("vendor_boot_v4_padding_notable.img", g_vbe)
+
+    # an image abr cannot write back exactly, so that the self-check has something to say (see the unpack tests): the
+    # header says how big the vendor ramdisk table is, abr works that out and writes its own number
+    odd = bytearray(vendor_boot(4, frags4, dtb=pvd, cmdline="console=ttyMSM0", name="vendpad"))
+    ts_off = 8 + 4 * 5 + 2048 + 4 + 16 + 4 + 4 + 8  # magic, 5 words, cmdline, tags_addr, name, header_size, dtb_size, dtb_addr
+    odd[ts_off:ts_off + 4] = le32(struct.unpack_from("<I", odd, ts_off)[0] + 4)
+    put("vendor_boot_v4_table_size_lies.img", bytes(odd))
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@
 
 #include <array>
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -120,6 +121,13 @@ struct BootImage {
     std::optional<uint64_t> recovery_dtbo_offset_field; // v1-v2: ditto
     std::array<uint32_t, 4> reserved{};                 // v3-v4 reserved[4]
     Bytes header_padding;                               // non-zero bytes between header struct and page end
+    // Non-zero bytes in the padding that follows a component (up to the next page boundary), by the component's
+    // name: "kernel", "ramdisk", "second", "dt", "recovery_dtbo", "dtb", "boot_signature" -- from the end of the
+    // component to the last byte that is not zero; a component whose padding is all zero has no entry. build() writes
+    // them back, as far as the padding after the component (which an edit can change) has room for them.
+    std::map<std::string, Bytes> section_padding;
+    static constexpr std::array<const char*, 7> kSectionNames = {"kernel", "ramdisk", "second", "dt",
+                                                                 "recovery_dtbo", "dtb", "boot_signature"};
     uint64_t missing_tail_padding = 0;                  // final page padding absent from the source file
     // With missing_tail_padding: how much of that final padding the source file does hold (usually none). An edit
     // of the last component changes the size of its padding; the rebuilt image keeps this much of it.

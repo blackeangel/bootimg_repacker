@@ -11,6 +11,7 @@
 
 #include <array>
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -67,6 +68,10 @@ struct VendorBootImage {
     // BootImage for the same idea.
     std::optional<uint32_t> header_size_field;  // only if not the standard 2112/2128
     Bytes header_padding;                       // non-zero bytes between header struct and page end
+    // Non-zero bytes in the padding that follows a section, by the section's name: "ramdisk" (all the fragments
+    // together), "dtb", "table" (the vendor ramdisk table), "bootconfig" -- see BootImage::section_padding.
+    std::map<std::string, Bytes> section_padding;
+    static constexpr std::array<const char*, 4> kSectionNames = {"ramdisk", "dtb", "table", "bootconfig"};
     uint64_t missing_tail_padding = 0;          // final page padding absent from the source
     std::optional<uint64_t> kept_tail_padding;  // with it: the part of that padding the source does hold
     size_t consumed = 0;                        // bytes of the source that belong to the image proper

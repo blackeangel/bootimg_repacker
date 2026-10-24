@@ -808,11 +808,20 @@ if grep -q "reproduces this image byte-for-byte" sc_ok.out; then
 else
     fail "unpack self-check did not confirm an exact round trip"
 fi
-"$ABR" unpack fx/boot_v2_dirty_padding.img -o sc_bad >sc_bad.out 2>&1
-if grep -q "does NOT reproduce" sc_bad.out; then
-    pass "unpack self-check flags an image abr cannot reproduce exactly (non-zero page padding)"
+# An image abr cannot write back exactly -- the header of this vendor_boot gives a size of the ramdisk table that is not the one
+# abr works out from the table (a field that is derived, not kept) -- is said to be one, with the place of the first difference.
+"$ABR" unpack fx/vendor_boot_v4_table_size_lies.img -o sc_bad >sc_bad.out 2>&1
+if grep -q "does NOT reproduce" sc_bad.out && grep -q "first difference at offset 0x840" sc_bad.out; then
+    pass "unpack self-check flags an image abr cannot reproduce exactly (a derived size field that lies), and where"
 else
     fail "unpack self-check missed an image abr cannot reproduce exactly"
+fi
+# (bytes in the padding between components used to be that case: they are kept now, see the section on padding below)
+"$ABR" unpack fx/boot_v2_dirty_padding.img -o sc_dirty >sc_dirty.out 2>&1
+if grep -q "reproduces this image byte-for-byte" sc_dirty.out; then
+    pass "unpack self-check confirms the round trip of an image with bytes in its padding"
+else
+    fail "unpack self-check does not confirm the round trip of an image with bytes in its padding"
 fi
 if "$ABR" unpack fx/ext4_like.img -o rt_ext4 >/dev/null 2>ext4.err; then
     fail "an ext4 image was accepted as a boot-family container"
@@ -1180,7 +1189,7 @@ if [ -x "$UNIT" ] && python3 "$AVBTOOL" version >/dev/null 2>&1; then
     fi
     "$ABR" repack av_vu -o av_vu_flags.img --avb-key av_k4096.pem >/dev/null 2>&1
     if avb_verify av_vu_flags.img vbmeta av_k4096_pub.pem av_boot.img boot &&
-        python3 "$AVBTOOL" info_image --image av_vu_flags.img | grep -q "^Flags:  *2"; then
+        said "^Flags:  *2" python3 "$AVBTOOL" info_image --image av_vu_flags.img; then
         pass "vbmeta with edited flags, re-signed by abr, passes avbtool verify_image and shows the new flags"
     else
         fail "avbtool rejects the vbmeta abr re-signed"
@@ -4854,7 +4863,8 @@ python3 "$MKBOOTIMG" >/dev/null 2>&1 --header_version 0 --kernel mf_kernel.bin -
     --cmdline "$(cat mf_plain.txt)" --output mf_in.img
 rm -rf mf_dir
 "$ABR" unpack mf_in.img -o mf_dir >/dev/null 2>&1
-"$ABR" info mf_in.img 2>&1 | grep -q -x "cmdline:        $(cat mf_plain.txt)" || mf_bad="$mf_bad [a plain command line is shown as it is]"
+mf_info=$("$ABR" info mf_in.img 2>&1)  # not `info | grep -q`: grep quitting at its match could SIGPIPE abr (see `said`)
+grep -q -x -F "cmdline:        $(cat mf_plain.txt)" <<<"$mf_info" || mf_bad="$mf_bad [a plain command line is shown as it is]"
 grep -q -x "cmdline=$(cat mf_plain.txt)" mf_dir/manifest.txt || mf_bad="$mf_bad [a plain command line is written as it is]"
 # the manifest of an earlier version, and what a person writes: white space around, CRLF, comments, no quotes
 {
@@ -4863,7 +4873,8 @@ grep -q -x "cmdline=$(cat mf_plain.txt)" mf_dir/manifest.txt || mf_bad="$mf_bad 
 } >mf_hand.txt
 cp mf_hand.txt mf_dir/manifest.txt
 "$ABR" repack mf_dir -o mf_hand.img >mf_hand.log 2>&1 || mf_bad="$mf_bad [a manifest written by hand: repack]"
-"$ABR" info mf_hand.img 2>&1 | grep -q -x "cmdline:        console=ttyS0 hand-written" || mf_bad="$mf_bad [a manifest written by hand: the command line]"
+mf_info=$("$ABR" info mf_hand.img 2>&1)
+grep -q -x -F "cmdline:        console=ttyS0 hand-written" <<<"$mf_info" || mf_bad="$mf_bad [a manifest written by hand: the command line]"
 # a quoted value that is wrong: an error that says where
 rm -rf mf_dir
 "$ABR" unpack mf_in.img -o mf_dir >/dev/null 2>&1
@@ -5243,6 +5254,122 @@ PYEOF
 roundtrip_check boot_v2_avbfooter_tails.img "boot v2 with an AVB hash footer whose vbmeta header has bytes behind the release string and in the reserved area" tl_bf
 expect_line rt_tl_bf "avb_release_string_tail=OLD RELEASE" "boot with an AVB footer: the bytes behind the release string"
 expect_line rt_tl_bf "avb_reserved=$(python3 -c 'print(bytes(range(1, 81)).hex())')" "boot with an AVB footer: the reserved bytes"
+
+# ---- non-zero bytes in the padding behind a component: kept, said, written back ----------------------------------------------
+# A tool that does not clear its buffer, or pads with 0xFF, leaves bytes between the end of a component and the next page boundary. They
+# belong to no component and they are part of the image: abr keeps them in <component>_padding.bin (nothing for a component whose padding
+# is zeros), says so, and writes them back -- after an edit as far as the padding behind the component has room for them. Every
+# fx/*padding*.img comes with a .gaps.json made by the fixture generator: what the image holds behind each component, which
+# tests/tools/padding_check.py compares with what unpack kept (the judge does not read abr's files for that, it reads the image's layout
+# from the generator).
+padding_case() {  # <fixture name> <label> <tag>
+    roundtrip_check "fx/$1.img" "$2" "pd_$3"
+    local r
+    if r=$(python3 "$TOOLS/padding_check.py" "rt_pd_$3" "fx/$1.img.gaps.json" 2>&1); then
+        pass "$2: unpack keeps what the padding holds, component by component (judge: $r)"
+    else
+        fail "$2: what unpack kept of the padding is not what the image holds: $r"
+    fi
+}
+padding_case boot_v0_padding "boot v0 + QCDT dt + second (a few bytes, the whole padding, zeros first, the very last byte)" v0
+padding_case boot_v2_padding "boot v2 (0xFF all over the padding of the kernel, a byte behind the recovery dtbo, text behind the dtb)" v2
+padding_case boot_v2_padding_header "boot v2 with bytes in the header page and in the padding of the ramdisk" hdr
+padding_case boot_v3_padding "boot v3" v3
+padding_case boot_v4_padding "boot v4 with a signature (kernel, ramdisk, signature)" v4
+padding_case boot_pxa_padding "Marvell PXA header (kernel, ramdisk, second, dt)" pxa
+padding_case boot_v2_padding_trimmed_in "boot v2 dump that ends inside the bytes of the last padding" tin
+padding_case boot_v2_padding_trimmed_zeros "boot v2 dump that ends behind them, in zeros" tzero
+padding_case boot_v2_dirty_padding "boot v2 with 0xA5 in every padding" dirty
+padding_case boot_v2_padding_avbfooter "boot v2 with such padding, inside an AVB hash footer" avb
+padding_case vendor_boot_v3_padding "vendor_boot v3 (ramdisk, dtb)" vb3
+padding_case vendor_boot_v4_padding "vendor_boot v4 (ramdisk section, dtb, ramdisk table, bootconfig)" vb4
+padding_case vendor_boot_v4_padding_notable "vendor_boot v4 without a ramdisk table (ramdisk, dtb)" vbnt
+expect_key rt_pd_hdr header_padding_file "boot v2: the header page's bytes are kept as before, next to those of the components"
+expect_line rt_pd_v2 "kernel_padding_file=kernel_padding.bin" "boot v2: the manifest names the file of the kernel's padding"
+if said "hash check:   OK" "$ABR" info fx/boot_v2_padding_avbfooter.img; then
+    pass "AVB footer: the digest covers the padding, so the hash check of the image with such padding is OK"
+else
+    fail "AVB footer: the hash check of an image whose padding holds bytes is not OK"
+fi
+if said "bytes that are not zero in the padding behind a component (kernel 720, ramdisk 1402, dtb 848) are kept in" "$ABR" unpack fx/boot_v2_dirty_padding.img -o pd_say; then
+    pass "unpack says which components have bytes in their padding, and how many"
+else
+    fail "unpack does not say that it keeps the bytes in the padding"
+fi
+if said "section padding: kernel 720, ramdisk 1402, dtb 848 (" "$ABR" info fx/boot_v2_dirty_padding.img; then
+    pass "info lists the components that have bytes in their padding"
+else
+    fail "info does not list the bytes in the padding of the components"
+fi
+if said "bytes that are not zero in the padding behind a section (ramdisk 14, dtb 3296, table 1, bootconfig 17) are kept in" "$ABR" unpack fx/vendor_boot_v4_padding.img -o pd_say_vb; then
+    pass "unpack of a vendor_boot says which of its sections have bytes in their padding"
+else
+    fail "unpack of a vendor_boot does not say that it keeps the bytes in the padding"
+fi
+if said "section padding: ramdisk 14, dtb 3296, table 1, bootconfig 17 (" "$ABR" info fx/vendor_boot_v4_padding.img; then
+    pass "info of a vendor_boot lists the sections that have bytes in their padding"
+else
+    fail "info of a vendor_boot does not list the bytes in the padding of its sections"
+fi
+
+# An image whose paddings are zeros has no such file and no such key: every directory that the suite unpacked above is looked at.
+pd_stray=""
+pd_n=0
+for pd_d in rt_*/; do
+    case "$pd_d" in rt_pd_*) continue ;; esac
+    [ -f "$pd_d/manifest.txt" ] || continue
+    pd_n=$((pd_n + 1))
+    grep -qE '^(kernel|ramdisk|second|dt|recovery_dtbo|dtb|boot_signature|table|bootconfig)_padding_file=' "$pd_d/manifest.txt" && pd_stray="$pd_stray ${pd_d%/}"
+done
+if [ -z "$pd_stray" ] && [ "$pd_n" -ge 30 ]; then
+    pass "an image whose paddings are zeros gets no *_padding_file key ($pd_n unpacked directories of this suite looked at)"
+else
+    fail "*_padding_file keys in the manifests of images whose padding is zeros (or too few directories looked at: $pd_n):$pd_stray"
+fi
+
+# Edited: the bytes found are written behind the component as it is now, as far as the padding there has room for them; without the
+# line of the manifest that names a file, that component's padding is zeros again. The expected images are made by the fixture
+# generator, which pads with the bytes that were found, not by abr.
+pd_edit() {  # <fixture> <the image that is expected> <label> <sed script for manifest.txt or ""> [<file of fx/ to copy into the directory> <its name there>]
+    local d="pd_ed_$2"
+    rm -rf "$d" "$d.img"
+    "$ABR" unpack "fx/$1.img" -o "$d" >/dev/null 2>&1 || { fail "$3 (unpack)"; return; }
+    [ -n "$4" ] && sed -i "$4" "$d/manifest.txt"
+    [ -n "${5:-}" ] && cp "fx/$5" "$d/$6"
+    "$ABR" repack "$d" -o "$d.img" >/dev/null 2>&1 || { fail "$3 (repack)"; return; }
+    check "fx/$2.img" "$d.img" "$3"
+}
+pd_edit boot_v2_padding boot_v2_padding_ksmaller "boot v2: a smaller kernel -- the bytes that were behind the old one all fit behind the new one" "" pad_kernel_smaller.bin kernel
+pd_edit boot_v2_padding boot_v2_padding_kedge4 "boot v2: a kernel that leaves 4 bytes of padding -- the first 4 of the bytes that were behind the old kernel" "" pad_kernel_edge4.bin kernel
+pd_edit boot_v2_padding boot_v2_padding_kaligned "boot v2: a kernel that ends on a page boundary has no padding, so none of the bytes (and the ramdisk follows at once)" "" pad_kernel_aligned.bin kernel
+pd_edit boot_v2_padding boot_v2_padding_nokernel "boot v2: the line of the kernel's padding taken out of the manifest -- zeros there, the other components keep theirs" '/^kernel_padding_file=/d'
+pd_edit boot_v2_padding boot_v2_padding_clean "boot v2: every *_padding_file line taken out -- all the padding is zeros" '/_padding_file=/d'
+pd_edit vendor_boot_v4_padding vendor_boot_v4_padding_dtbedge4 "vendor_boot v4: a dtb that leaves 4 bytes of padding keeps the first 4 of what was behind the old one, the other sections keep theirs" "" pad_vendor_dtb_edge4.bin dtb
+pd_edit vendor_boot_v4_padding vendor_boot_v4_padding_clean "vendor_boot v4: every *_padding_file line taken out -- all the padding is zeros" '/_padding_file=/d'
+
+# An edit of the image inside an AVB footer: the digest is made over the rebuilt image, padding included, so the check is still OK and
+# the bytes of the padding are still there.
+rm -rf pd_avb_ed pd_avb_ed.img
+"$ABR" unpack fx/boot_v2_padding_avbfooter.img -o pd_avb_ed >/dev/null 2>&1
+head -c 3000 /dev/urandom >pd_avb_ed/ramdisk.cpio
+if "$ABR" repack pd_avb_ed -o pd_avb_ed.img >/dev/null 2>&1 && said "hash check:   OK" "$ABR" info pd_avb_ed.img &&
+    said "section padding: kernel 7," "$ABR" info pd_avb_ed.img; then
+    pass "AVB footer: after an edit the digest is made over the image with its padding, and the padding is still there"
+else
+    fail "AVB footer: an edit of an image with bytes in its padding does not leave a footer that checks out, or loses them"
+fi
+
+# The file of a padding is named by the manifest like any other: a name outside the directory is refused, and nothing is written.
+rm -rf pd_bad pd_bad.img
+"$ABR" unpack fx/boot_v2_padding.img -o pd_bad >/dev/null 2>&1
+sed -i 's/^kernel_padding_file=.*/kernel_padding_file=..\/escape.bin/' pd_bad/manifest.txt
+if "$ABR" repack pd_bad -o pd_bad.img >pd_bad.out 2>&1; then
+    fail "repack took a kernel_padding_file that lies outside the directory of the manifest"
+elif grep -q "kernel_padding_file" pd_bad.out && [ ! -e pd_bad.img ]; then
+    pass "a kernel_padding_file outside the directory of the manifest is refused with its key, and nothing is written"
+else
+    fail "repack refused a kernel_padding_file outside the directory, but not with its key, or left a file behind"
+fi
 
 # ---- paths that are not ASCII --------------------------------------------------------------------------------
 # Cyrillic, an accent, Chinese and an emoji (four bytes in UTF-8, a surrogate pair on Windows) in the names of the

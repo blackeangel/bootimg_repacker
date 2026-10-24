@@ -43,7 +43,7 @@ tools" below.
 | self-contained RSA: BigInt (Knuth D, Montgomery), DER/PEM/X.509, PKCS#1 v1.5 sign/verify, PKCS#8/PKCS#1 key parsing, AVB public-key blob -- **no OpenSSL anywhere in the build** | **done + verified** (Python integers, `openssl dgst -sign`, `avbtool extract_public_key`; see "Self-contained crypto" below) |
 | manifest + CLI (`abr info/unpack/repack`) | **done** |
 | CMake: FetchContent-vendored static zlib/lz4/zstd/xz/bzip2 | **done + build-verified natively on Linux**, both the dynamic and the `-DABR_STATIC_BINARY=ON` fully-static configurations |
-| Test suite (`tests/run_tests.sh`) | **done, 403/403 passing** on g++-14 (all judges required, as in the CI) and under AddressSanitizer + UndefinedBehaviorSanitizer (no report), 394/394 on clang-20 (the nine "the judge is there" checks belong to `ABR_REQUIRE_ORACLES`, which that run did not set), 402/402 for `abr.exe` under wine (the platform's own tests differ); CI runs the matrix (g++-14, clang-20, ASan+UBSan with a fuzz run, Windows under wine, arm64 under qemu-user, android-arm64) -- see Verification |
+| Test suite (`tests/run_tests.sh`) | **done, 447/447 passing** on g++-14 (all judges required, as in the CI) and under AddressSanitizer + UndefinedBehaviorSanitizer (no report), 438/438 on clang-20 (the nine "the judge is there" checks belong to `ABR_REQUIRE_ORACLES`, which that run did not set), 446/446 for `abr.exe` under wine (the platform's own tests differ); CI runs the matrix (g++-14, clang-20, ASan+UBSan with a fuzz run, Windows under wine, arm64 under qemu-user, android-arm64) -- see Verification |
 | CMake cross toolchains (mingw-w64, Android NDK) | **done + verified** (mingw reproduced locally; NDK only provable via CI, see below) |
 | GitHub Actions static build matrix (linux-x86_64, windows-x86_64, android-arm64) | **done + verified**: run 35313499827, all 3 jobs green, all 3 static binaries produced as artifacts (abr-linux-x86_64, abr-windows-x86_64, abr-android-arm64) |
 
@@ -1485,7 +1485,7 @@ hostile ones, and text that goes into a file or onto a terminal. It found real b
 - `-DABR_SANITIZE=address,undefined` (CMake option, an interface target `abr_sanitize` that `abr_core` links; abr's own
   code is instrumented, the vendored libraries are not; refused with MSVC, Windows and `ABR_STATIC_BINARY`).
 - The whole suite runs on that build with the sanitizers' reports written to files (a test that expects an error would
-  take a sanitizer's exit status for the error it wanted): **403 of 403 now, no report** (353 when the build was added). The CI has a job for it
+  take a sanitizer's exit status for the error it wanted): **447 of 447 now, no report** (353 when the build was added). The CI has a job for it
   (`linux-x86_64 (g++-14, ASan+UBSan)`): the suite, the reports of the suite, and a short fuzz run on the images the suite made.
 - `ABR_KEEP_WORK=1 tests/run_tests.sh` keeps the directory the suite worked in: every image it made is a seed for the fuzzer.
 
@@ -1561,12 +1561,14 @@ hostile ones, and text that goes into a file or onto a terminal. It found real b
 
 ### Ideas not done
 
-- **Header fidelity:** the bytes behind the NUL of a text field are kept now (next section). What is still not kept, and
-  why, is listed there.
+- **Header fidelity:** the bytes behind the NUL of a text field and the non-zero bytes in the padding behind a component are
+  kept now (the next two sections). What is still not kept, and why, is listed at the end of the second.
 - In-process libFuzzer targets for the parsers (the fuzzer above is a command-line fuzzer: slow, but it sees `main`).
 - A fuzz mode that damages `manifest.txt` and the component files of an unpacked directory (`repack` side).
 
 ## Header fidelity: the bytes behind the NUL of a text field (done, 22-23 Oct 2026)
+
+(The list of what is still not kept, which used to end this section, is at the end of the next one, brought up to date.)
 
 The fuzzer's `--report-roundtrip` table (4482 runs, `--rng-seed 31`, 553 images that did not come back as they were) showed
 what a round trip still lost. About 250 of those were one thing: a fixed-size text field (a command line, a board name, a
@@ -1620,19 +1622,101 @@ abr read the text up to the NUL, and wrote it back with zeros behind it -- so th
   copy of the tail (16 MiB case), the edges of the printable range, `reserved` stored when all zero, `reserved` not padded
   to 80 bytes, `info` printing for an empty tail, and the four notes of `unpack`.
 
+## Header fidelity: non-zero bytes in the padding behind a component (done, 24 Oct 2026)
+
+The biggest group the list above had left out: about 100 of the 553 images of the fuzz table (and a good part of the 330 that
+were left after the tails) had **non-zero bytes in the padding** between the end of a component and the next page boundary
+-- a tool that does not clear its buffer, a 0xFF fill. abr wrote zeros there, so the repack was another image, and `unpack`
+said so ("does NOT reproduce"). It had been left because "each edit that moves a section decides which gap's bytes go where".
+That has a small answer: the bytes belong to the component in front of them, and go back behind it.
+
+### Design
+
+- **Padding** is what lies from the end of a component to the next page boundary (or to the end of the image, if that comes
+  first: a dump whose last page was cut). `nonzero_padding(image, end, page)` returns the bytes from `end` up to the last one
+  that is not zero (zeros in front of them are part of it, the zeros behind the last one are not), and nothing when all of the
+  padding is zero.
+- The components: boot v0-v2 and the PXA header: kernel, ramdisk, second, dt (v0 and PXA), recovery_dtbo, dtb; v3/v4: kernel,
+  ramdisk, boot_signature; vendor_boot v3/v4: the ramdisk section (all fragments), dtb, the ramdisk table (`table`),
+  bootconfig. The padding of the header page was kept before (`header_padding.bin`) and is the same idea, kept as it was.
+- A side file `<component>_padding.bin`, named in `manifest.txt` by `<component>_padding_file=` (like `header_padding_file`).
+  A component whose padding is zeros has neither: the directory of an ordinary image is what it was (the 13 real device
+  dumps that unpack get no new key and no note and come back byte for byte; the suite looks at every directory it unpacks and
+  fails on a `*_padding_file` key where no such bytes exist).
+- **Edit semantics:** `BinaryWriter::align(page, kept)` writes the kept bytes right behind the component as it is now, as far as
+  the padding up to the next page boundary has room for them, and zeros for the rest. A bigger component leaves less room and
+  cuts them, a smaller one leaves more, one that ends on a page boundary has no padding; the line of the manifest taken out
+  gives zeros there. (That is "as far as it fits", chosen because it needs no decision about which gap a moved section's bytes
+  belong to.)
+- Dumps whose final padding was cut (`missing_tail_padding`, `tail_padding_kept`) work as they did: the bytes the dump holds
+  are kept and the rebuilt image ends where the dump did. An AVB footer's digest covers the padding, so an image with such bytes
+  verifies (`hash check: OK`), and so does one that was edited and signed again.
+- `unpack` says so (`bytes that are not zero in the padding behind a component (kernel 720, ramdisk 1402, dtb 848) are kept
+  in *_padding.bin`; "section" for a vendor_boot) and `info` has a line (`section padding: kernel 720, ramdisk 1402 (...)`).
+  No such bytes, no word.
+- A consequence for the self-check: `boot_v2_dirty_padding.img` was the image `unpack` said it could not reproduce, on
+  purpose, and now it comes back. The honest example of "does NOT reproduce" in the suite is now
+  `vendor_boot_v4_table_size_lies.img`: a `vendor_ramdisk_table_size` word that disagrees with the entries it describes, a field
+  abr derives and does not keep.
+
+### Verified by
+
+- 37 new files of fixtures (`tests/tools/fixtures.py`; the 45 earlier ones are byte for byte what they were): 12 images with
+  bytes in the padding (a few bytes, a whole padding, zeros first and bytes after, the very last byte of the page, 0xFF all
+  over, text; boot v0 with a QCDT dt and a second stage, v2, v3, v4 with a signature, PXA, vendor_boot v3 and v4 with and
+  without a table, a v2 with bytes in the header page too, a v2 inside an AVB footer, two v2 dumps cut inside the padding and
+  behind it), 7 images that an edit is expected to give (a smaller kernel, a kernel that leaves 4 bytes of padding, one that
+  ends on a page boundary, a line of the manifest taken out, ...), `.gaps.json` files that say what each image holds behind
+  each component, and `vendor_boot_v4_table_size_lies.img`. **Synthetic**: made from the format descriptions; no real device
+  image that abr has seen has such bytes (the 13 real dumps are a control that nothing changed for clean images).
+- `tests/tools/padding_check.py`, a judge that does not read abr's code or abr's idea of the layout: it takes the generator's
+  `.gaps.json` and compares it with the `*_padding.bin` files that `unpack` wrote and the keys of the manifest (no file for a
+  component that has none, no key without a file).
+- A section of the CLI suite ("non-zero bytes in the padding behind a component"): every fixture round-trips byte for byte and
+  the judge agrees with what was kept; the edits above give the images the generator made; a name that leaves the directory is
+  refused with its key; `info` and `unpack` say the right numbers for boot and vendor_boot; the digest of an AVB footer holds
+  before and after an edit. 44 checks more than before (403 -> 447).
+- Unit tests (`abr_unit_tests manifest`, **450 454 checks** now): the helpers (`nonzero_padding` on hand-made cases, `BinaryWriter::align`
+  for every relation of room and bytes, and 20 000 random buffers with page sizes of 16 to 2048 for which the padding that was
+  found and put back is what the file held, a dump that ends anywhere included) and a random generator of boot images (seven
+  kinds: v0, v0 with a QCDT dt, PXA, v1, v2, v3, v4; page sizes from 512 to 16 KiB; components that end on a page boundary or a
+  byte or two short of one; garbage behind some of them; the header page too; dumps cut inside the padding) and of vendor_boot
+  images (three kinds), whose parse and build must return the image, keep the bytes under the right component, and write
+  them where the rules above say after a change of a component.
+- **Mutation tests** (the harness is not in the repository: a script that applies one change of the source at a time, builds it
+  alone and runs only the tests that concern it): 117 mutants of `nonzero_padding`, `BinaryWriter::align`, and each
+  `keep_padding` / `padding_of` call site of boot and vendor_boot (removed, or given the name of another component), run
+  against the unit tests; 116 killed, the survivor is equivalent (`last >= end` for `last > end`: an empty range is an empty
+  vector either way). 35 mutants of the wiring in `main.cpp` (the side files and keys, the loader, the text of the notes
+  and of `info`, the lists of names of boot and vendor_boot swapped), run against the CLI section: 33 killed, two equivalent (an empty entry in the
+  map of padding changes nothing). Unlike the round for the tails, no mutant pointed at a missing test.
+- The suites: g++-14 447/447 (all judges required), ASan+UBSan 447/447 with no report, clang-20 438/438, `abr.exe` under wine
+  446/446. One failure turned up on the way and was not about padding: `python3 avbtool.py info_image ... | grep -q` under
+  `pipefail` lets `grep` close the pipe at its first match while avbtool is still writing (`BrokenPipeError`); it failed once, in a
+  run with two suites at a time. That check and two like it (`abr info | grep -q`) read the whole output first now,
+  as `said` does.
+- The fuzzer (`--rng-seed 31`, the same 747 seeds, 4482 images): the images that unpack and come back from `repack` as another
+  image went from 553 (before the tails) to 330 (tails) to **164** (padding), 525 -> 301 -> **140** distinct findings, and
+  **none of the 164 is silent** (`unpack` said so for every one): boot 45, elf_boot 110, vendor_boot 5, uimage 2, vbmeta 2.
+
 ### What is still not kept (the fuzz table with `--rng-seed 31` told these apart)
 
-- **Non-zero bytes in the padding between the sections** (after the header page, between kernel and ramdisk, ...): about 100
-  of the 553. abr writes zeros there; `unpack` says the repack is not identical (the existing test
-  `boot_v2_dirty_padding.img` pins that on purpose). Keeping them is possible -- a stored blob per gap, "as far as it
-  fits" -- but each edit that moves a section decides which gap's bytes go where, so it was left; no image seen so far
-  has any.
-- **Sony ELF boot images** (110 of them in that table): abr writes the layout it understands; what does not fit its model is
-  said, by design (see "Sony ELF boot images").
-- **Wrappers abr cannot take apart** (a SIN container's data, a blob, a ChromeOS preamble of a layout futility does
-  not write) and **truncated or self-contradicting images**: refused or said, never written as if whole.
-- The MTK header's raw 512 bytes (only the fields abr models are kept; unchanged images are replayed byte for byte, edited ones
-  get a header made from the fields).
+The 164 images of the table, by format: elf_boot 110, boot 45, vendor_boot 5, uimage 2, vbmeta 2. `unpack` said so for every one.
+
+- **Sony ELF boot images** (110): abr writes the layout it understands; what does not fit its model is said, by design (see
+  "Sony ELF boot images").
+- **Images inside a SIN** (most of the 45 boot images come from SIN seeds): the container is not kept and a repack writes the
+  plain image, as Android Image Kitchen does -- `unpack` says so ("the container is not kept ... the SIN is signed by Sony and
+  cannot be made again") and says that the image inside comes back byte for byte.
+- **A derived field that disagrees with what it describes**: the five vendor_boot images differ in `vendor_ramdisk_size` (offset
+  24), which abr writes from the fragments it holds; the fixture `vendor_boot_v4_table_size_lies.img` does the same with
+  `vendor_ramdisk_table_size`.
+- **A wrapper or a footer that was damaged**: the size or checksum words of a DHTB or loki header, a ChromeOS or blob
+  container, an AVB footer whose descriptor did not match its image (`unpack` says "already modified without re-signing?"), a
+  vbmeta with a changed byte. Said, never written as if whole.
+- **Bytes appended behind a uImage** (2 images): the repack ends where the image does.
+- The MTK header's raw 512 bytes (only the fields abr models are kept; unchanged images are replayed byte for byte, edited
+  ones get a header made from the fields).
 
 ## Next steps (in order)
 

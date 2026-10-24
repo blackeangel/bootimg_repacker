@@ -503,6 +503,19 @@ this in the manifest / as side files and writes it back:
   vbmeta header's `reserved` area (80 bytes, `reserved=` in hex, written only when not all zero; `avb_reserved=` for a
   footer) is kept the same way -- a signed vbmeta covers it, so dropping it would make the signature fail. `unpack`
   says so when an image has such bytes, and `info` lists them (`field tails:`, `unmodeled:`, `name tail:`);
+- the **bytes in the padding behind a component**. Every component of an image (kernel, ramdisk, second stage, dt,
+  recovery dtbo, dtb, boot signature; in a vendor_boot the ramdisk section, the dtb, the ramdisk table and the bootconfig)
+  is followed by padding up to the next page boundary, and the format says it is zeros. A tool that does not clear its
+  buffer, or that pads with 0xFF, leaves other bytes there. They belong to no component and they are part of the image
+  (and of what an AVB footer's digest covers): `abr` keeps them, from the end of the component to the last byte that is
+  not zero, in `<component>_padding.bin`, which the manifest names with `<component>_padding_file=`. A component whose
+  padding is zeros has neither the file nor the key, so a clean image's directory is what it was. They are written back
+  right behind the end of the component, as far as the padding up to the page boundary has room for them: if you edit
+  the component, a bigger one leaves less room and cuts them, a smaller one leaves more, and one that ends on a page
+  boundary has no padding at all. Take the `*_padding_file` line out of the manifest and that padding is zeros again.
+  `unpack` says which components have such bytes and how many (`kernel 720, ramdisk 1402`), and `info` lists them
+  (`section padding:`). Dumps whose last padding was trimmed keep working: the bytes the dump holds are kept, and the
+  rebuilt image ends where the dump did;
 - a **Marvell PXA** header (`pxa=true`, and its `unknown` word);
 - the text of `manifest.txt` itself. It is plain text, one `key=value` per line, and a value that would not read
   back as it was -- white space at either end (a command line that ends in a space: there are such images), a line

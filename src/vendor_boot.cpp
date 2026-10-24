@@ -91,12 +91,19 @@ VendorBootImage VendorBootImage::parse(const Bytes& image) {
     // Where the content ends (the last byte of a section, or of the header): what the final page padding is
     // measured from.
     size_t data_end = r.pos() + img.header_padding.size();
+    // What the padding behind a section holds, if it is not zeros (r is just behind the section).
+    auto keep_padding = [&](const char* section) {
+        Bytes p = nonzero_padding(image, r.pos(), img.page_size);
+        if (!p.empty()) img.section_padding[section] = std::move(p);
+    };
     to_page();
     Bytes ramdisk_section = r.bytes(vendor_ramdisk_size);
     if (vendor_ramdisk_size) data_end = r.pos();
+    keep_padding("ramdisk");
     to_page();
     img.dtb = r.bytes(dtb_size);
     if (dtb_size) data_end = r.pos();
+    keep_padding("dtb");
     to_page();
 
     if (img.header_version >= 4 && table_entry_num > 0) {
@@ -119,10 +126,12 @@ VendorBootImage VendorBootImage::parse(const Bytes& image) {
         }
         r.seek(table_start + static_cast<size_t>(table_entry_num) * table_entry_size);
         data_end = r.pos();
+        keep_padding("table");
         to_page();
         if (bootconfig_size > 0) {
             img.bootconfig = r.bytes(bootconfig_size);
             data_end = r.pos();
+            keep_padding("bootconfig");
             to_page();
         }
     } else {
@@ -135,6 +144,7 @@ VendorBootImage VendorBootImage::parse(const Bytes& image) {
         if (img.header_version >= 4 && bootconfig_size > 0) {
             img.bootconfig = r.bytes(bootconfig_size);
             data_end = r.pos();
+            keep_padding("bootconfig");
             to_page();
         }
     }
@@ -190,13 +200,19 @@ Bytes VendorBootImage::build() const {
     if (!header_padding.empty()) w.bytes(header_padding);
     // Where the content ends (the last byte of a section, or of the header): what a cut-off tail is measured from.
     size_t data_end = w.size();
+    // What the padding behind a section held in the source (see section_padding).
+    auto padding_of = [&](const char* section) -> const Bytes& {
+        static const Bytes none;
+        const auto it = section_padding.find(section);
+        return it == section_padding.end() ? none : it->second;
+    };
     w.align(page_sz);
     w.bytes(ramdisk_section);
     if (!ramdisk_section.empty()) data_end = w.size();
-    w.align(page_sz);
+    w.align(page_sz, padding_of("ramdisk"));
     w.bytes(dtb);
     if (!dtb.empty()) data_end = w.size();
-    w.align(page_sz);
+    w.align(page_sz, padding_of("dtb"));
 
     if (header_version >= 4) {
         if (with_table) {
@@ -210,12 +226,12 @@ Bytes VendorBootImage::build() const {
                 running_offset += static_cast<uint32_t>(e.data.size());
             }
             if (!ramdisk_fragments.empty()) data_end = w.size();
-            w.align(page_sz);
+            w.align(page_sz, padding_of("table"));
         }
         if (!bootconfig.empty()) {
             w.bytes(bootconfig);
             data_end = w.size();
-            w.align(page_sz);
+            w.align(page_sz, padding_of("bootconfig"));
         }
     }
     Bytes out = w.take();
