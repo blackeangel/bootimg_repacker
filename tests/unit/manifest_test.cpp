@@ -12,12 +12,14 @@
 //   * a quoted value that is wrong is an error that says which line;
 //   * the name of a file a manifest asks repack to open has to lie in the directory of the manifest.
 #include <algorithm>
+#include <charconv>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <optional>
 #include <random>
 #include <sstream>
 #include <string>
@@ -1151,6 +1153,257 @@ void test_uimage_consumed() {
     }
 }
 
+
+// ---- the numbers, flags and lists of a manifest
+
+// The number in `text` as Manifest::get_bounded reads it, or nothing when it is refused.
+std::optional<uint64_t> number_of(const std::string& text, unsigned bits) {
+    Manifest m;
+    m.set("k", text);
+    try {
+        return m.get_bounded("k", 0, bits);
+    } catch (const FormatError&) {
+        return std::nullopt;
+    }
+}
+
+// The same rule read again with the standard library: digits only (std::from_chars takes no sign for an unsigned type,
+// no white space and no prefix), decimal or, behind 0x, hexadecimal, and a value that has to fit the field.
+std::optional<uint64_t> number_by_from_chars(const std::string& text, unsigned bits) {
+    int base = 10;
+    const char* first = text.data();
+    const char* last = text.data() + text.size();
+    if (text.size() > 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) {
+        base = 16;
+        first += 2;
+    }
+    if (first == last) return std::nullopt;
+    uint64_t v = 0;
+    const auto r = std::from_chars(first, last, v, base);
+    if (r.ec != std::errc() || r.ptr != last) return std::nullopt;
+    if (bits < 64 && (v >> bits) != 0) return std::nullopt;
+    return v;
+}
+
+template <class F>
+std::string refusal_of(F&& f) {
+    try {
+        f();
+    } catch (const FormatError& e) {
+        return e.what();
+    } catch (const std::exception& e) {
+        return std::string("NOT A FormatError: ") + e.what();
+    }
+    return "";
+}
+
+void test_manifest_numbers() {
+    std::puts("manifest.txt: a number is a number that fits its field");
+    struct Case {
+        const char* text;
+        unsigned bits;
+        bool ok;
+        uint64_t value;
+    };
+    const Case cases[] = {
+        {"0", 32, true, 0},
+        {"1234", 32, true, 1234},
+        {"0x10", 32, true, 16},
+        {"0X1f", 32, true, 31},
+        {"0xFfFf", 16, true, 65535},
+        {"010", 32, true, 10},  // (not octal)
+        {"00", 8, true, 0},
+        {"255", 8, true, 255},
+        {"256", 8, false, 0},
+        {"65535", 16, true, 65535},
+        {"65536", 16, false, 0},
+        {"4294967295", 32, true, 4294967295ull},
+        {"4294967296", 32, false, 0},
+        {"0xffffffff", 32, true, 0xFFFFFFFFull},
+        {"0x100000000", 32, false, 0},
+        {"18446744073709551615", 64, true, UINT64_MAX},
+        {"18446744073709551616", 64, false, 0},
+        {"0xffffffffffffffff", 64, true, UINT64_MAX},
+        {"0x10000000000000000", 64, false, 0},
+        {"", 32, false, 0},
+        {" 1", 32, false, 0},
+        {"1 ", 32, false, 0},
+        {"+1", 32, false, 0},
+        {"-1", 32, false, 0},
+        {"1a", 32, false, 0},
+        {"abc", 32, false, 0},
+        {"0x", 32, false, 0},
+        {"0xg", 32, false, 0},
+        {"0x1_0", 32, false, 0},
+        {"1_000", 32, false, 0},
+        {"1e3", 32, false, 0},
+        {"1.0", 32, false, 0},
+        {"0b11", 32, false, 0},
+        {"\xd9\xa3", 32, false, 0},  // an Arabic-Indic digit
+        {"9999999999999999999999999999", 64, false, 0},
+    };
+    for (const Case& c : cases) {
+        const auto got = number_of(c.text, c.bits);
+        ++g_checks;
+        if (got.has_value() != c.ok || (c.ok && *got != c.value)) {
+            ++g_failures;
+            std::printf("  FAIL: \"%s\" (%u bits): %s\n", printable(c.text).c_str(), c.bits,
+                        got ? std::to_string(*got).c_str() : "refused");
+        }
+    }
+    // a key that is not there gives the default, one that is there and empty is an error
+    Manifest m;
+    EXPECT(m.get_u32("absent", 7) == 7);
+    EXPECT(m.get_u64("absent", 9) == 9);
+    EXPECT(m.get_addr32("absent", 5) == 5);
+    m.set("empty", "");
+    EXPECT_HAS(refusal_of([&] { m.get_u32("empty", 7); }), "empty");
+
+    // what is said names the key and the value, and is not what the standard library says
+    m.set("page_size", "4096k");
+    const std::string said = refusal_of([&] { m.get_u32("page_size"); });
+    EXPECT_HAS(said, "page_size=4096k");
+    EXPECT_HAS(said, "not a number");
+    EXPECT(!contains(said, "stoul") && !contains(said, "NOT A FormatError"));
+    m.set("page_size", "4294967296");
+    EXPECT_HAS(refusal_of([&] { m.get_u32("page_size"); }), "does not fit in 32 bits");
+    m.set("kernel_addr", "0x100000000");
+    EXPECT_HAS(refusal_of([&] { m.get_addr32("kernel_addr"); }), "does not fit in 32 bits");
+    EXPECT(m.get_addr("kernel_addr") == 0x100000000ull);
+    m.set("escape", "\x1b[2J");
+    const std::string esc = refusal_of([&] { m.get_u32("escape"); });
+    EXPECT(esc.find('\x1b') == std::string::npos);  // (what a value holds is not put into a message as it is)
+    EXPECT_HAS(esc, "\\x1b");
+
+    // 40 000 values made of the characters that numbers are made of, and of those that they are not: the same answer as
+    // the standard library's
+    std::mt19937_64 rng(0x4e554d42ull);
+    const std::string alphabet = "0123456789012345678901234567890xXabcdefABCDEFgG +-_.,e";
+    int disagreements = 0;
+    for (int i = 0; i < 40000; ++i) {
+        std::string text;
+        const size_t len = rng() % 26;
+        if (rng() % 3 == 0) text = rng() % 2 ? "0x" : "0X";
+        for (size_t k = 0; k < len; ++k) text += alphabet[rng() % alphabet.size()];
+        static constexpr unsigned kWidths[] = {8, 16, 32, 64};
+        const unsigned bits = kWidths[rng() % 4];
+        const auto mine = number_of(text, bits);
+        const auto theirs = number_by_from_chars(text, bits);
+        ++g_checks;
+        if (mine != theirs && ++disagreements <= 5) {
+            ++g_failures;
+            std::printf("  FAIL: \"%s\" (%u bits): %s, the standard library says %s\n", printable(text).c_str(), bits,
+                        mine ? std::to_string(*mine).c_str() : "refused", theirs ? std::to_string(*theirs).c_str() : "refused");
+        }
+    }
+}
+
+void test_manifest_flags_and_lists() {
+    std::puts("manifest.txt: flags, counts, sizes, levels and hex strings");
+    Manifest m;
+    for (const char* v : {"true", "TRUE", "True", "1", "yes", "YES", "Yes"}) {
+        m.set("flag", v);
+        EXPECT(m.get_bool("flag", false) == true);
+    }
+    for (const char* v : {"false", "FALSE", "False", "0", "no", "NO", "No"}) {
+        m.set("flag", v);
+        EXPECT(m.get_bool("flag", true) == false);
+    }
+    EXPECT(m.get_bool("absent", true) == true && m.get_bool("absent", false) == false);
+    for (const char* v : {"", "ture", "2", "on", " true", "true ", "t", "-1", "truee"}) {
+        m.set("flag", v);
+        const std::string said = refusal_of([&] { m.get_bool("flag", false); });
+        ++g_checks;
+        if (!contains(said, "flag=") || contains(said, "NOT A FormatError")) {
+            ++g_failures;
+            std::printf("  FAIL: flag=\"%s\" gave: \"%s\"\n", v, said.c_str());
+        }
+    }
+
+    // counts
+    m.set("n", "65536");
+    EXPECT(m.get_count("n") == 65536);
+    m.set("n", "65537");
+    EXPECT_HAS(refusal_of([&] { m.get_count("n"); }), "outside 0 .. 65536");
+    m.set("n", "4294967295");
+    EXPECT_HAS(refusal_of([&] { m.get_count("n"); }), "outside");
+    m.set("n", "-1");
+    EXPECT_HAS(refusal_of([&] { m.get_count("n"); }), "outside");
+    EXPECT(m.get_count("absent", 3) == 3);
+
+    // sizes
+    m.set("size", "1073741824");
+    EXPECT(m.get_size("size") == 0x40000000ull);
+    m.set("size", "0x40000000");
+    EXPECT(m.get_size("size") == 0x40000000ull);
+    m.set("size", "1073741825");
+    EXPECT_HAS(refusal_of([&] { m.get_size("size"); }), "more than 1024 MiB");
+    m.set("size", "18446744073709551615");
+    EXPECT_HAS(refusal_of([&] { m.get_size("size"); }), "more than 1024 MiB");
+    m.set("size", "-155648");
+    EXPECT_HAS(refusal_of([&] { m.get_size("size"); }), "not a number");
+
+    // levels
+    for (const char* v : {"-1", "0", "9", "22"}) {
+        m.set("level", v);
+        EXPECT(m.get_int("level", -1, -1, 22) == std::atoll(v));
+    }
+    for (const char* v : {"-2", "23", "+3", "abc", "", "--1", "9999999999999999999"}) {
+        m.set("level", v);
+        const std::string said = refusal_of([&] { m.get_int("level", -1, -1, 22); });
+        ++g_checks;
+        if (!contains(said, "level=") || contains(said, "NOT A FormatError")) {
+            ++g_failures;
+            std::printf("  FAIL: level=\"%s\" gave: \"%s\"\n", v, said.c_str());
+        }
+    }
+
+    // hex
+    m.set("h", "00ffA0");
+    EXPECT((m.get_hex("h") == Bytes{0x00, 0xFF, 0xA0}));
+    m.set("h", "");
+    EXPECT(m.get_hex("h").empty());
+    m.set("h", "abc");
+    EXPECT_HAS(refusal_of([&] { m.get_hex("h"); }), "odd number");
+    m.set("h", "zz");
+    EXPECT_HAS(refusal_of([&] { m.get_hex("h"); }), "invalid hex");
+
+    // a manifest of many lines (the lookups are not a walk through the lines)
+    Manifest big;
+    for (int i = 0; i < 200000; ++i) big.set("key" + std::to_string(i), std::to_string(i));
+    big.set("key7", "seven");
+    EXPECT(big.has("key199999") && !big.has("key200000") && big.get("key7") == "seven" && big.get("key0") == "0");
+}
+
+// A file that is a directory, a name that is none: said, and nothing is made.
+void test_file_helpers() {
+    std::puts("read_file and write_file: only files, and only names of files");
+    TempDir dir;
+    EXPECT_HAS(refusal_of([&] { read_file(dir.path); }), "is a directory");
+    EXPECT_HAS(refusal_of([&] { read_file(dir.path / "missing"); }), "cannot open file for reading");
+    write_text(dir.path / "f", "abc");
+    EXPECT(read_file(dir.path / "f").size() == 3);
+    EXPECT_HAS(refusal_of([&] { Manifest::load(dir.path); }), "is a directory");
+    EXPECT_HAS(refusal_of([&] { Manifest::load(dir.path / "missing"); }), "cannot open manifest");
+
+    const Bytes data{1, 2, 3};
+    EXPECT_HAS(refusal_of([&] { write_file(dir.path / "sub" / "", data); }), "not the name of a file");
+    EXPECT(!fs::exists(dir.path / "sub"));  // (the directory that the name would have asked for is not made)
+    EXPECT_HAS(refusal_of([&] { write_file(fs::path(), data); }), "not the name of a file");
+    write_file(dir.path / "a" / "b" / "c.bin", data);
+    EXPECT(read_file(dir.path / "a" / "b" / "c.bin") == data);
+#ifndef _WIN32
+    // a fifo is not opened (it would be waited for); a symbolic link to a file is a file
+    std::error_code ec;
+    fs::create_symlink(dir.path / "f", dir.path / "link", ec);
+    if (!ec) EXPECT(read_file(dir.path / "link").size() == 3);
+    fs::create_symlink(dir.path, dir.path / "dirlink", ec);
+    if (!ec) EXPECT_HAS(refusal_of([&] { read_file(dir.path / "dirlink"); }), "is a directory");
+    fs::create_symlink("/dev/null", dir.path / "devnull", ec);
+    if (!ec) EXPECT_HAS(refusal_of([&] { read_file(dir.path / "devnull"); }), "not a regular file");
+#endif
+}
+
 }  // namespace
 
 int run_manifest_tests() {
@@ -1167,6 +1420,9 @@ int run_manifest_tests() {
     test_boot_padding();
     test_vendor_boot_padding();
     test_uimage_consumed();
+    test_manifest_numbers();
+    test_manifest_flags_and_lists();
+    test_file_helpers();
     if (g_failures == 0) std::printf("manifest: ok (%d checks)\n", g_checks);
     else std::printf("manifest: %d failure(s)\n", g_failures);
     return g_failures == 0 ? 0 : 1;

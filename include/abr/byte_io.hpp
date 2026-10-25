@@ -55,6 +55,17 @@ public:
 // File helpers
 // ---------------------------------------------------------------------
 
+// The whole file. Only a regular file (a symbolic link to one is fine): a directory, a device that has no end, a fifo
+// that nobody writes, a socket are refused with a message -- opening them "works", and what a read of them gives (or
+// the size that is asked of them) is not a file's -- and so is one above kMaxReadFile, which nothing of the family
+// has the size of (the fields of the headers are 32 bits).
+inline constexpr uint64_t kMaxReadFile = 0x80000000ull;
+// The first part of that rule, for a file that is opened some other way: FormatError for a path that exists and is a directory, a
+// device, a fifo or a socket (a symbolic link is followed). A path that is not there passes: opening it says so.
+void require_regular_file(const std::filesystem::path& path);
+// The size of an image that abr builds or pads to (and of a partition that an AVB footer is placed at the end of): no image
+// of the boot family is near it, and a manifest that asks for more is taken for damaged.
+inline constexpr uint64_t kMaxImageSize = 0x40000000ull;
 Bytes read_file(const std::filesystem::path& path);
 void write_file(const std::filesystem::path& path, const Bytes& data);
 void write_file(const std::filesystem::path& path, const uint8_t* data, size_t size);

@@ -189,6 +189,7 @@ jobs:
       # Damaged copies of every image the suite made (it keeps its work directory under ABR_KEEP_WORK): abr must refuse or
       # take each one, not crash, hang, run out of memory or make a sanitizer say anything.
       - name: Fuzz the images the suite made
+        id: fuzz_images
         run: |
           work=$(sed -n 's/^note: the work directory is kept: //p' test.log | head -n 1)
           test -d "$work"
@@ -196,17 +197,44 @@ jobs:
             --time-limit 1200 --timeout 120 --findings fuzz-findings 2>&1 | tee fuzz.log
 
       - name: Post fuzz findings on failure
-        if: failure()
+        if: ${{ failure() && steps.fuzz_images.outcome == 'failure' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           [ -f fuzz.log ] && python3 .github/scripts/post_failure_log.py "linux-x86_64 (g++-14, ASan+UBSan) fuzz" fuzz.log || true
 
       - uses: actions/upload-artifact@v4
-        if: failure()
+        if: ${{ failure() && steps.fuzz_images.outcome == 'failure' }}
         with:
           name: fuzz-findings
           path: fuzz-findings
+          if-no-files-found: ignore
+
+      # The same for `repack`: the directory of an unpack of each of those images, damaged the way a hand edit or a bad download
+      # would (a value of manifest.txt, a file, the ramdisk directory and its ramdisk.meta, a key), must be refused with a
+      # message or taken. Not a crash, a hang, a library's exception, a message that prints what it was given as it was, an
+      # image that cannot be unpacked again, or one that is not what the directory says.
+      - name: Fuzz repack with damaged directories of the images the suite made
+        id: fuzz_repack
+        if: ${{ !cancelled() && hashFiles('test.log') != '' }}
+        run: |
+          work=$(sed -n 's/^note: the work directory is kept: //p' test.log | head -n 1)
+          test -d "$work"
+          python3 tests/tools/fuzz_repack.py --abr build-asan/abr --seeds "$work" --iterations 2 \
+            --time-limit 900 --timeout 120 --jobs 2 --findings fuzz-repack-findings 2>&1 | tee fuzz-repack.log
+
+      - name: Post repack fuzz findings on failure
+        if: ${{ failure() && steps.fuzz_repack.outcome == 'failure' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          [ -f fuzz-repack.log ] && python3 .github/scripts/post_failure_log.py "linux-x86_64 (g++-14, ASan+UBSan) fuzz repack" fuzz-repack.log || true
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ failure() && steps.fuzz_repack.outcome == 'failure' }}
+        with:
+          name: fuzz-repack-findings
+          path: fuzz-repack-findings
           if-no-files-found: ignore
 
   windows-x86_64:

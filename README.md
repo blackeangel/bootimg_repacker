@@ -66,6 +66,15 @@ abr identify [-b] <file>...   # what is it? worded like Android Image Kitchen's 
 one file per component (kernel, ramdisk, dtb, ...) into the output
 directory. Edit whatever you need to, then `repack`.
 
+`repack` reads what you edited strictly, and says which key and which value it will not take (it writes nothing then).
+A number is decimal digits, or `0x` and hexadecimal digits (`010` is ten, not eight): no sign, no unit, no text behind it,
+and no more than the field it is for holds (a 32-bit field of a header takes up to 4294967295, not "the first 32 bits of
+something bigger"). A flag is `true` or `false` (`yes`, `no`, `1`, `0` in any case do too), hexadecimal digits come
+in pairs, a count (ramdisks, descriptors, blobs) is at most 65536 and the size of a partition (`pad_to`) at most 1 GiB. The
+files it reads are regular files: a directory, a fifo or a device (`/dev/zero`) in their place is refused at once, and
+so is `-o dir/`, which is not the name of a file. A `.abr_raw/` copy that is not the component it is for is refused too (take
+it out to have the component compressed again).
+
 Paths may hold any characters. On Windows `abr.exe` reads the wide command line (the C runtime's `argv` holds a `?` for
 every character outside the ANSI code page: Cyrillic on a Western system, Chinese, an emoji) and works in UTF-8 from
 there, and a console is switched to UTF-8 while it runs, so a path like `C:\Users\Павел\загрузка.img` comes through
@@ -678,6 +687,24 @@ tests/tools/fuzz_images.py --abr build-asan/abr --seeds <that directory> --itera
 
 A run is determined by `--rng-seed`, the seed and the iteration, so a finding is rebuilt by the same command; the
 damaged file is kept with the command and abr's output, and `--repro FILE` runs the commands on a file again.
+
+`tests/tools/fuzz_repack.py` does the same for `repack`, which reads something else: the directory `unpack` wrote, and
+that can come from someone else (a downloaded directory, a script, an archive). It unpacks every seed once and damages
+the directory the ways a hand edit or a hostile archive would: a value of `manifest.txt` (not a number, a number that does
+not fit its field, a count of four billion, a flag that is neither `true` nor `false`, a key twice, a name that leaves the
+directory), a component file (cut, grown, a directory, a fifo or a link to `/dev/zero` in its place), the ramdisk
+directory and `ramdisk.meta`, the raw copies in `.abr_raw`, the key that signs, the `-o` argument. A directory may be
+refused or taken, but `repack` must not crash, hang, run out of memory, stop with an exception of the standard library,
+print a control character or a byte that is not UTF-8 (the filter that makes output safe is turned off for the run, to see
+the messages that forget to escape), say nothing when it refuses, leave something behind, change the directory it reads or
+write an image that depends on `-j` or `-o`, that `unpack` cannot read again, or that does not come back byte for byte:
+
+```sh
+tests/tools/fuzz_repack.py --abr build-asan/abr --seeds <that directory> --iterations 10 --rng-seed 1 --jobs 2
+```
+
+(`--families`, `--mutators` and `--deep` narrow it down; a finding is kept as a tar file with its command, `--repro FILE.tar`
+runs it again.)
 
 Beyond those, the suite compares `abr` with the programs Android Image Kitchen runs for the formats `abr` opens by
 itself -- `rkcrc`, `blobpack` / `blobunpack`, `mboot`, `loki_tool`, `pxa-mkbootimg` / `pxa-unpackbootimg`, `sony_dump`,

@@ -86,6 +86,9 @@ struct Meta {
     }
 };
 
+// Text that came out of a file somebody else may have written, for a message: escaped if a terminal would act on it.
+std::string shown_text(std::string_view s) { return textquote::quote_shown(s); }
+
 [[noreturn]] void meta_error(size_t line, const std::string& what) {
     throw FormatError("line " + std::to_string(line) + ": " + what);
 }
@@ -99,22 +102,22 @@ uint32_t parse_u32(std::string_view s, int base, size_t line, const char* what) 
         else if (base == 16 && c >= 'a' && c <= 'f') d = c - 'a' + 10;
         else if (base == 16 && c >= 'A' && c <= 'F') d = c - 'A' + 10;
         else d = 99;
-        if (d >= base) meta_error(line, std::string("'") + std::string(s) + "' is not a valid " + what);
+        if (d >= base) meta_error(line, std::string("'") + shown_text(s) + "' is not a valid " + what);
         v = v * static_cast<uint64_t>(base) + static_cast<uint64_t>(d);
-        if (v > 0xFFFFFFFFull) meta_error(line, std::string("the ") + what + " '" + std::string(s) + "' is too large");
+        if (v > 0xFFFFFFFFull) meta_error(line, std::string("the ") + what + " '" + shown_text(s) + "' is too large");
     }
     return static_cast<uint32_t>(v);
 }
 
 uint32_t parse_permissions(std::string_view s, size_t line, const char* what) {
     const uint32_t v = parse_u32(s, 8, line, what);
-    if (v & ~07777u) meta_error(line, std::string("the ") + what + " '" + std::string(s) + "' has bits beyond the permissions");
+    if (v & ~07777u) meta_error(line, std::string("the ") + what + " '" + shown_text(s) + "' has bits beyond the permissions");
     return v;
 }
 
 std::pair<uint32_t, uint32_t> parse_pair(std::string_view s, size_t line, const char* what) {
     const size_t colon = s.find(':');
-    if (colon == std::string_view::npos) meta_error(line, std::string("'") + std::string(s) + "' should be MAJOR:MINOR");
+    if (colon == std::string_view::npos) meta_error(line, std::string("'") + shown_text(s) + "' should be MAJOR:MINOR");
     return {parse_u32(s.substr(0, colon), 10, line, what), parse_u32(s.substr(colon + 1), 10, line, what)};
 }
 
@@ -145,14 +148,14 @@ Extras parse_extras(std::string_view s, size_t line) {
         const std::string_view item = s.substr(0, comma);
         s = comma == std::string_view::npos ? std::string_view() : s.substr(comma + 1);
         const size_t eq = item.find('=');
-        if (eq == std::string_view::npos) meta_error(line, "'" + std::string(item) + "' should be key=value");
+        if (eq == std::string_view::npos) meta_error(line, "'" + shown_text(item) + "' should be key=value");
         const std::string_view key = item.substr(0, eq);
         const std::string_view value = item.substr(eq + 1);
         if (key == "ino") x.ino = parse_u32(value, 10, line, "inode number");
         else if (key == "nlink") x.nlink = parse_u32(value, 10, line, "link count");
         else if (key == "dev") x.dev = parse_pair(value, line, "device number");
         else if (key == "rdev") x.rdev = parse_pair(value, line, "device number");
-        else meta_error(line, "unknown extra '" + std::string(key) + "'");
+        else meta_error(line, "unknown extra '" + shown_text(key) + "'");
     }
     return x;
 }
@@ -222,7 +225,7 @@ template <class F>
 void each_setting(const std::vector<std::string_view>& args, size_t line, F&& handle) {
     for (std::string_view item : args) {
         const size_t eq = item.find('=');
-        if (eq == std::string_view::npos) meta_error(line, "'" + std::string(item) + "' should be key=value");
+        if (eq == std::string_view::npos) meta_error(line, "'" + shown_text(item) + "' should be key=value");
         handle(item.substr(0, eq), item.substr(eq + 1));
     }
 }
@@ -293,7 +296,7 @@ Meta parse_meta(std::string_view text) {
                     else if (k == "gid") m.default_gid = parse_u32(v, 10, line_no, "gid");
                     else if (k == "mtime") m.default_mtime = parse_u32(v, 10, line_no, "mtime");
                     else if (k == "dev") std::tie(m.default_devmajor, m.default_devminor) = parse_pair(v, line_no, "device number");
-                    else meta_error(line_no, "unknown default '" + std::string(k) + "'");
+                    else meta_error(line_no, "unknown default '" + shown_text(k) + "'");
                 });
             } else if (key == "newmode") {
                 each_setting(args, line_no, [&](std::string_view k, std::string_view v) {
@@ -301,10 +304,10 @@ Meta parse_meta(std::string_view text) {
                     else if (k == "exec") m.new_exec = parse_permissions(v, line_no, "mode");
                     else if (k == "dir") m.new_dir = parse_permissions(v, line_no, "mode");
                     else if (k == "link") m.new_link = parse_permissions(v, line_no, "mode");
-                    else meta_error(line_no, "unknown newmode '" + std::string(k) + "' (file, exec, dir or link)");
+                    else meta_error(line_no, "unknown newmode '" + shown_text(k) + "' (file, exec, dir or link)");
                 });
             } else {
-                meta_error(line_no, "unknown setting '" + std::string(key) + "'");
+                meta_error(line_no, "unknown setting '" + shown_text(key) + "'");
             }
             continue;
         }
@@ -1001,10 +1004,10 @@ VolumeBuild build_volume(const fs::path& tree_dir, const fs::path& meta_file, co
         std::unordered_set<std::string> present;
         for (const Built& b : built) {
             present.insert(b.path);
-            if (!b.meta) fresh.push_back(b.path + " " + b.type + " " + octal(b.entry.mode & 07777u));
+            if (!b.meta) fresh.push_back(shown_text(b.path) + " " + b.type + " " + octal(b.entry.mode & 07777u));
         }
         for (const MetaEntry& me : meta.entries)
-            if (!present.count(me.path)) gone.push_back(me.path);
+            if (!present.count(me.path)) gone.push_back(shown_text(me.path));
         if (!fresh.empty())
             note(plural(fresh.size(), "new entry", "new entries") + " not in " + meta_name + ", with its default owner " +
                  std::to_string(meta.default_uid) + ":" + std::to_string(meta.default_gid) + " and these modes: " +

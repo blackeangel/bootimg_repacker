@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "abr/byte_io.hpp"
 
+#include "abr/textquote.hpp"
+
 #ifdef _WIN32
 #include <fcntl.h>
 #include <io.h>
@@ -17,11 +19,24 @@
 
 namespace abr {
 
+void require_regular_file(const std::filesystem::path& path) {
+    std::error_code ec;
+    const std::filesystem::file_status st = std::filesystem::status(path, ec);  // (through a symbolic link)
+    if (ec) return;  // not there (or not to be looked at): opening it says what is wrong
+    if (st.type() == std::filesystem::file_type::directory)
+        throw FormatError(textquote::quote_shown(path.string()) + " is a directory, not a file");
+    if (st.type() != std::filesystem::file_type::regular && st.type() != std::filesystem::file_type::not_found)
+        throw FormatError(textquote::quote_shown(path.string()) + " is not a regular file (a device, a fifo or a socket)");
+}
+
 Bytes read_file(const std::filesystem::path& path) {
+    require_regular_file(path);
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) throw FormatError("cannot open file for reading: " + path.string());
     std::streamsize n = f.tellg();
     if (n < 0) throw FormatError("cannot stat file: " + path.string());
+    if (static_cast<uint64_t>(n) > kMaxReadFile)
+        throw FormatError(textquote::quote_shown(path.string()) + " is too big (" + std::to_string(n) + " bytes; abr reads at most 2 GiB of a file)");
     f.seekg(0);
     Bytes out(static_cast<size_t>(n));
     if (n > 0 && !f.read(reinterpret_cast<char*>(out.data()), n))
@@ -30,6 +45,9 @@ Bytes read_file(const std::filesystem::path& path) {
 }
 
 void write_file(const std::filesystem::path& path, const uint8_t* data, size_t size) {
+    // (a name that ends in a slash, or none: the parent below would be made a directory of that name, and the file never opens)
+    if (!path.has_filename())
+        throw FormatError(textquote::quote_shown(path.string()) + " is not the name of a file (it is empty or ends in a slash)");
     if (path.has_parent_path()) std::filesystem::create_directories(path.parent_path());
     std::ofstream f(path, std::ios::binary | std::ios::trunc);
     if (!f) throw FormatError("cannot open file for writing: " + path.string());

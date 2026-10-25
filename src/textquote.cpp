@@ -206,9 +206,17 @@ bool unquote(std::string_view s, std::string& out, std::string& why) {
                 i += 2;
                 break;
             }
-            default:
-                why = std::string("unknown escape \\") + s[i] + " in a quoted string";
+            default: {
+                const unsigned char c = static_cast<unsigned char>(s[i]);
+                if (c >= 0x20 && c < 0x7F) {
+                    why = std::string("unknown escape \\") + static_cast<char>(c) + " in a quoted string";
+                } else {  // (what follows the backslash may be anything: it is not put into the message as it is)
+                    std::string byte;
+                    escape_byte(byte, c);
+                    why = "unknown escape (a backslash and the byte " + byte + ") in a quoted string";
+                }
                 return false;
+            }
         }
     }
     if (i >= s.size()) {

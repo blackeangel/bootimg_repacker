@@ -17,12 +17,15 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "abr/byte_io.hpp"
 
 namespace abr {
+
+inline constexpr uint32_t kMaxEntries = 65536;
 
 class Manifest {
 public:
@@ -38,21 +41,40 @@ public:
     // ../../.ssh/id_rsa must not get that file built into an image.)
     std::string get_path(const std::string& key, const std::string& def = "") const;
 
+    // Numbers: decimal digits, or 0x and hexadecimal digits, and nothing else -- no sign, no octal ("010" is ten), no
+    // trailing text, no white space inside. What is not a number, or does not fit in the field it is read for (a value
+    // above 32 bits for a 32-bit field is refused, not cut to it), is a FormatError that names the key and the value.
+    // A key that is not there gives `def`; one that is there and empty is an error.
     void set_u32(const std::string& key, uint32_t v);
     void set_u64(const std::string& key, uint64_t v);
     uint32_t get_u32(const std::string& key, uint32_t def = 0) const;
     uint64_t get_u64(const std::string& key, uint64_t def = 0) const;
+    // A number of at most `bits` bits (8, 16, 32 or 64).
+    uint64_t get_bounded(const std::string& key, uint64_t def, unsigned bits) const;
+    // A number that is at least `lo` and at most `hi` (a level of compression, a count).
+    int64_t get_int(const std::string& key, int64_t def, int64_t lo, int64_t hi) const;
+    // The size of an image or of a partition (`pad_to`, `avb_partition_size`, ...): at most kMaxImageSize, because no
+    // image of the family is bigger and a value beyond it only makes abr ask for memory it cannot have.
+    uint64_t get_size(const std::string& key, uint64_t def = 0) const;
+    // How many entries there are (descriptors, ramdisks, blobs, segments): at most kMaxEntries. A count that is not
+    // checked is a loop that runs to four billion.
+    uint32_t get_count(const std::string& key, uint32_t def = 0) const;
 
     // Addresses are written/read as 0x-prefixed hex for readability.
     void set_addr(const std::string& key, uint64_t v);
     uint64_t get_addr(const std::string& key, uint64_t def = 0) const;
+    // An address that is 32 bits in the header it goes into.
+    uint32_t get_addr32(const std::string& key, uint32_t def = 0) const;
 
+    // true / false / yes / no / 1 / 0 (in any case). Anything else, and an empty value, is a FormatError: a typo that
+    // reads as `false` would silently turn a feature off.
     void set_bool(const std::string& key, bool v);
     bool get_bool(const std::string& key, bool def = false) const;
 
     // Binary blobs too short/structural to deserve their own component
     // file (ids, salts, small keys) are stored inline as hex text.
     void set_hex(const std::string& key, const Bytes& data);
+    // An even number of hexadecimal digits (any case); an odd one or another character is a FormatError.
     Bytes get_hex(const std::string& key) const;
 
     // What a text field of a header holds behind the NUL that ends its text (BinaryReader::asciiz), only when there is
@@ -63,7 +85,8 @@ public:
     Bytes get_tail(const std::string& key) const;
 
 private:
-    std::vector<std::pair<std::string, std::string>> entries_;
+    std::vector<std::pair<std::string, std::string>> entries_;  // in the order they were set (and are written)
+    std::unordered_map<std::string, size_t> index_;              // key -> its place in entries_ (a manifest can have many lines)
 };
 
 }  // namespace abr

@@ -469,8 +469,7 @@ struct TreeJob {
 
 // How many cpio archives one after the other (see ramdisk_tree.hpp) the unpack recorded for `prefix`.
 size_t recorded_volumes(const Manifest& m, const std::string& prefix) {
-    const long n = std::strtol(m.get(prefix + "_tree_volumes", "1").c_str(), nullptr, 10);
-    return static_cast<size_t>(std::clamp<long>(n, 1, 256));
+    return static_cast<size_t>(m.get_int(prefix + "_tree_volumes", 1, 1, 256));
 }
 
 void save_ramdisk_trees(Manifest& m, const fs::path& dir, const std::vector<TreeJob>& jobs,
@@ -551,6 +550,22 @@ void save_ramdisk_trees(Manifest& m, const fs::path& dir, const std::vector<Tree
     }
 }
 
+// The raw copy of a component (.abr_raw/<file>.raw) goes into the image in place of the component when that is unchanged -- it
+// is what keeps the very bytes of an image that cannot be made again. It is believed only when it gives the component back:
+// a directory can come from anyone, and bytes there that read as one kernel in `kernel` and are another in .abr_raw would be
+// built into the image where nobody looks, or a copy that was cut short would make an image that does not start.
+void check_raw_copy(const fs::path& raw_path, const Bytes& raw, const Bytes& stored_hash, const std::string& filename) {
+    std::string why;
+    try {
+        if (hash::sha256(decompress(detect_codec(raw), raw)) == stored_hash) return;
+        why = "it does not decompress to " + filename + " as it was unpacked";
+    } catch (const std::exception& e) {
+        why = std::string("it does not decompress (") + e.what() + ")";
+    }
+    throw FormatError(raw_path.generic_string() + " does not belong to " + filename + ": " + why +
+                      ". Delete it to have " + filename + " compressed again, or unpack the image again");
+}
+
 // What goes into the image for one component. For a ramdisk that also exists as a directory (see
 // ramdisk_tree.hpp) there are two places it may have been edited, and which one counts is decided
 // by what changed since unpacking, not by file times: the file by the hash of its contents, the
@@ -612,6 +627,7 @@ Bytes load_component(const Manifest& m, const fs::path& dir, const std::string& 
     Bytes result;
     if (original && fs::exists(raw_path)) {
         result = read_file(raw_path);  // untouched: the very bytes the image had
+        check_raw_copy(raw_path, result, stored_hash, filename);
     } else {
         if (use_tree) {
             for (const std::string& n : report.notes) note(n);
@@ -627,7 +643,7 @@ Bytes load_component(const Manifest& m, const fs::path& dir, const std::string& 
         // Optional `<prefix>_level=N` in the manifest picks the compression level
         // (codec-specific; absent or -1: the codec's default -- or, on the second try of a build
         // that did not fit its partition, the densest the decoders allow).
-        int level = static_cast<int>(std::strtol(m.get(prefix + "_level", "-1").c_str(), nullptr, 10));
+        int level = static_cast<int>(m.get_int(prefix + "_level", -1, -1, 22));
         if (level < 0 && opt.dense) level = dense_level(codec);
         else if (level < 0 && dense_level(codec) >= 0) g_denser_would_help = true;
         result = compress(codec, plain, level);
@@ -731,8 +747,8 @@ Envelope load_envelope(const Manifest& m, const fs::path& dir) {
     Envelope e;
     e.prefix = load_raw(m, dir, "prefix");
     e.tail = load_raw(m, dir, "tail");
-    e.pad_byte = static_cast<uint8_t>(m.get_u32("pad_byte", 0));
-    e.pad_to = m.get_u64("pad_to", 0);
+    e.pad_byte = static_cast<uint8_t>(m.get_bounded("pad_byte", 0, 8));
+    e.pad_to = m.get_size("pad_to", 0);
     return e;
 }
 
@@ -885,7 +901,7 @@ Bytes reattach_avb_footer(const Manifest& m, const fs::path& dir, Bytes host,
     if (!m.get_bool("has_avb_footer", false)) return host;
     VbmetaImage v;
     v.has_footer = true;
-    v.source_total_size = m.get_u64("avb_partition_size", 0);
+    v.source_total_size = m.get_size("avb_partition_size", 0);
     v.footer_original_image_size = host.size();
     v.algorithm_type = m.get_u32("avb_algorithm_type", 0);
     v.rollback_index = m.get_u64("avb_rollback_index", 0);
@@ -898,7 +914,7 @@ Bytes reattach_avb_footer(const Manifest& m, const fs::path& dir, Bytes host,
     v.signature = m.get_hex("avb_signature");
     v.public_key = load_raw(m, dir, "avb_public_key");
     v.public_key_metadata = load_raw(m, dir, "avb_public_key_metadata");
-    uint32_t count = m.get_u32("avb_descriptor_count", 0);
+    uint32_t count = m.get_count("avb_descriptor_count", 0);
     for (uint32_t i = 0; i < count; ++i) {
         std::string p = "avb_descriptor" + std::to_string(i);
         AvbDescriptor d;
@@ -1120,13 +1136,13 @@ Bytes repack_boot(const Manifest& m, const fs::path& dir, const RepackOptions& o
     BootImage img;
     img.header_version = m.get_u32("header_version", 4);
     img.pxa = m.get_bool("pxa", false);
-    if (img.pxa) img.pxa_unknown = static_cast<uint32_t>(m.get_addr("pxa_unknown", 0x03000000));
+    if (img.pxa) img.pxa_unknown = m.get_addr32("pxa_unknown", 0x03000000);
     if (img.header_version <= 2) {
         img.page_size = m.get_u32("page_size", 2048);
-        img.kernel_addr = static_cast<uint32_t>(m.get_addr("kernel_addr", 0x00008000));
-        img.ramdisk_addr = static_cast<uint32_t>(m.get_addr("ramdisk_addr", 0x01000000));
-        img.second_addr = static_cast<uint32_t>(m.get_addr("second_addr", 0x00f00000));
-        img.tags_addr = static_cast<uint32_t>(m.get_addr("tags_addr", 0x00000100));
+        img.kernel_addr = m.get_addr32("kernel_addr", 0x00008000);
+        img.ramdisk_addr = m.get_addr32("ramdisk_addr", 0x01000000);
+        img.second_addr = m.get_addr32("second_addr", 0x00f00000);
+        img.tags_addr = m.get_addr32("tags_addr", 0x00000100);
         img.board_name = m.get("board_name");
         img.board_name_tail = m.get_tail("board_name_tail");
         if (img.header_version >= 2) img.dtb_addr = m.get_addr("dtb_addr", 0);
@@ -1153,8 +1169,8 @@ Bytes repack_boot(const Manifest& m, const fs::path& dir, const RepackOptions& o
     img.cmdline_tail = m.get_tail("cmdline_tail");
     img.extra_cmdline_tail = m.get_tail("extra_cmdline_tail");
     img.cmdline_split = m.get_u32("cmdline_split", 0);
-    img.missing_tail_padding = m.get_u64("missing_tail_padding", 0);
-    if (m.has("tail_padding_kept")) img.kept_tail_padding = m.get_u64("tail_padding_kept", 0);
+    img.missing_tail_padding = m.get_size("missing_tail_padding", 0);
+    if (m.has("tail_padding_kept")) img.kept_tail_padding = m.get_size("tail_padding_kept", 0);
 
     {
         auto parts = load_components(m, dir, {"kernel", "ramdisk", "second"}, opt);
@@ -1269,9 +1285,9 @@ Bytes repack_vendor_boot(const Manifest& m, const fs::path& dir, const RepackOpt
     VendorBootImage img;
     img.header_version = m.get_u32("header_version", 4);
     img.page_size = m.get_u32("page_size", 4096);
-    img.kernel_addr = static_cast<uint32_t>(m.get_addr("kernel_addr", 0x00008000));
-    img.ramdisk_addr = static_cast<uint32_t>(m.get_addr("ramdisk_addr", 0x01000000));
-    img.tags_addr = static_cast<uint32_t>(m.get_addr("tags_addr", 0x00000100));
+    img.kernel_addr = m.get_addr32("kernel_addr", 0x00008000);
+    img.ramdisk_addr = m.get_addr32("ramdisk_addr", 0x01000000);
+    img.tags_addr = m.get_addr32("tags_addr", 0x00000100);
     img.board_name = m.get("board_name");
     img.board_name_tail = m.get_tail("board_name_tail");
     img.cmdline = m.get("cmdline");
@@ -1279,14 +1295,14 @@ Bytes repack_vendor_boot(const Manifest& m, const fs::path& dir, const RepackOpt
     img.dtb_addr = m.get_addr("dtb_addr", 0);
     if (m.has("header_size")) img.header_size_field = m.get_u32("header_size");
     img.has_ramdisk_table = m.get_bool("ramdisk_table", true);
-    img.missing_tail_padding = m.get_u64("missing_tail_padding", 0);
-    if (m.has("tail_padding_kept")) img.kept_tail_padding = m.get_u64("tail_padding_kept", 0);
+    img.missing_tail_padding = m.get_size("missing_tail_padding", 0);
+    if (m.has("tail_padding_kept")) img.kept_tail_padding = m.get_size("tail_padding_kept", 0);
     img.dtb = load_raw(m, dir, "dtb");
     img.bootconfig = load_raw(m, dir, "bootconfig");
     img.header_padding = load_raw(m, dir, "header_padding");
     img.section_padding = load_section_padding(m, dir, VendorBootImage::kSectionNames);
 
-    uint32_t count = m.get_u32("ramdisk_count", 0);
+    uint32_t count = m.get_count("ramdisk_count", 0);
     std::vector<std::string> fragment_prefixes;
     for (uint32_t i = 0; i < count; ++i) fragment_prefixes.push_back("ramdisk" + std::to_string(i));
     std::vector<Bytes> fragment_data = load_components(m, dir, fragment_prefixes, opt);
@@ -1345,7 +1361,7 @@ Bytes repack_dtbo(const Manifest& m, const fs::path& dir, const RepackOptions& o
     img.version = m.get_u32("version", 0);
     img.page_size = m.get_u32("page_size", 2048);
     img.acpio = m.get_bool("acpio", false);
-    uint32_t count = m.get_u32("entry_count", 0);
+    uint32_t count = m.get_count("entry_count", 0);
     for (uint32_t i = 0; i < count; ++i) {
         std::string p = "entry" + std::to_string(i);
         DtboEntry e;
@@ -1379,7 +1395,8 @@ void unpack_dtb(const Bytes& data, const fs::path& dir) {
 }
 
 Bytes repack_dtb(const Manifest& m, const fs::path& dir) {
-    uint32_t count = m.get_u32("blob_count", 0);
+    uint32_t count = m.get_count("blob_count", 0);
+    if (count == 0) throw FormatError("manifest.txt: blob_count is 0; a dtb has at least one blob (blob0_file=...)");
     std::vector<Bytes> blobs;
     for (uint32_t i = 0; i < count; ++i)
         blobs.push_back(read_file(dir / m.get_path("blob" + std::to_string(i) + "_file")));
@@ -1448,11 +1465,11 @@ Bytes repack_vbmeta(const Manifest& m, const fs::path& dir, const RepackOptions&
     v.public_key_metadata = load_raw(m, dir, "public_key_metadata");
     v.has_footer = m.get_bool("has_footer", false);
     if (v.has_footer) {
-        v.footer_original_image_size = m.get_u64("footer_original_image_size", 0);
-        v.source_total_size = m.get_u64("source_total_size", 0);
+        v.footer_original_image_size = m.get_size("footer_original_image_size", 0);
+        v.source_total_size = m.get_size("source_total_size", 0);
         v.host_prefix = load_raw(m, dir, "host_prefix");
     }
-    uint32_t count = m.get_u32("descriptor_count", 0);
+    uint32_t count = m.get_count("descriptor_count", 0);
     for (uint32_t i = 0; i < count; ++i) {
         std::string p = "descriptor" + std::to_string(i);
         AvbDescriptor d;
@@ -1499,8 +1516,8 @@ void unpack_uimage(const Bytes& data, const fs::path& dir) {
 Bytes repack_uimage(const Manifest& m, const fs::path& dir, const RepackOptions& opt) {
     UImage img;
     img.timestamp = m.get_u32("timestamp", 0);
-    img.load_addr = static_cast<uint32_t>(m.get_addr("load_addr", 0));
-    img.entry_point = static_cast<uint32_t>(m.get_addr("entry_point", 0));
+    img.load_addr = m.get_addr32("load_addr", 0);
+    img.entry_point = m.get_addr32("entry_point", 0);
     auto lookup = [](std::string_view name, auto name_fn, uint8_t max) -> uint8_t {
         for (int i = 0; i <= max; ++i)
             if (name_fn(static_cast<uint8_t>(i)) == name) return static_cast<uint8_t>(i);
@@ -1552,12 +1569,16 @@ std::string join_numbers(const std::vector<uint64_t>& v) {
     return out;
 }
 
-std::vector<uint64_t> split_numbers(const std::string& s) {
+// "3,0,12": decimal numbers, comma between. Anything else (an empty part, a sign, a letter, more than 18 digits) is a
+// FormatError that names `key`.
+std::vector<uint64_t> split_numbers(const std::string& key, const std::string& s) {
     std::vector<uint64_t> out;
     size_t at = 0;
     while (at <= s.size() && !s.empty()) {
         const size_t comma = s.find(',', at);
         const std::string part = s.substr(at, comma == std::string::npos ? std::string::npos : comma - at);
+        if (part.empty() || part.size() > 18 || part.find_first_not_of("0123456789") != std::string::npos)
+            throw FormatError("manifest.txt: " + key + "=" + textquote::quote_shown(s) + " is not a list of decimal numbers separated by commas");
         out.push_back(std::strtoull(part.c_str(), nullptr, 10));
         if (comma == std::string::npos) break;
         at = comma + 1;
@@ -1621,9 +1642,9 @@ void unpack_elf_boot(const Bytes& data, const fs::path& dir, const UnpackOptions
 Bytes repack_elf_boot(const Manifest& m, const fs::path& dir, const RepackOptions& opt) {
     legacy::ElfBootImage img;
     img.is_64bit = m.get_bool("is_64bit", false);
-    img.machine = static_cast<uint16_t>(m.get_u32("machine", 40));
+    img.machine = static_cast<uint16_t>(m.get_bounded("machine", 40, 16));
     if (m.has("elf_entry")) img.entry = m.get_addr("elf_entry");
-    uint32_t count = m.get_u32("segment_count", 0);
+    uint32_t count = m.get_count("segment_count", 0);
     std::vector<std::string> segment_prefixes;
     for (uint32_t i = 0; i < count; ++i)
         segment_prefixes.push_back(m.get("segment" + std::to_string(i) + "_prefix", "segment" + std::to_string(i)));
@@ -1639,14 +1660,19 @@ Bytes repack_elf_boot(const Manifest& m, const fs::path& dir, const RepackOption
     }
     if (m.get("elf_layout", "") == "kept") {
         // The bytes around the segments, as the unpack found them: .abr_raw/elf_layout.bin, cut up by the sizes the manifest has.
-        const std::vector<uint64_t> order = split_numbers(m.get("elf_layout_order", ""));
-        const std::vector<uint64_t> sizes = split_numbers(m.get("elf_layout_sizes", ""));
         const fs::path file = dir / ".abr_raw" / "elf_layout.bin";
         try {
+            const std::vector<uint64_t> order = split_numbers("elf_layout_order", m.get("elf_layout_order", ""));
+            const std::vector<uint64_t> sizes = split_numbers("elf_layout_sizes", m.get("elf_layout_sizes", ""));
             if (!fs::exists(file)) throw FormatError(file.generic_string() + " is not there");
             const Bytes blob = read_file(file);
             uint64_t total = 0;
-            for (uint64_t n : sizes) total += n;
+            for (uint64_t n : sizes) {
+                if (n > blob.size()) throw FormatError("elf_layout_sizes does not fit " + file.generic_string());
+                total += n;
+            }
+            for (uint64_t n : order)  // (a number that is the number of no segment is for the build to say: it falls back with the reason)
+                if (n > UINT32_MAX) throw FormatError("elf_layout_order has a number that is no segment's (" + std::to_string(n) + ")");
             if (sizes.size() != order.size() + 1 || total != blob.size())
                 throw FormatError("elf_layout_sizes does not fit " + file.generic_string());
             legacy::ElfLayout L;
@@ -1712,7 +1738,7 @@ Bytes repack_krnl(const Manifest& m, const fs::path& dir, const RepackOptions& o
     img.payload = load_component(m, dir, m.has("kernel_file") ? "kernel" : "ramdisk", opt);
     std::optional<uint32_t> crc;
     if (m.has("krnl_crc") && hash::sha256(img.payload) == m.get_hex("krnl_payload_sha256"))
-        crc = static_cast<uint32_t>(m.get_addr("krnl_crc", 0));
+        crc = m.get_addr32("krnl_crc", 0);
     return assemble_envelope(m, dir, img.build(crc), opt);
 }
 
@@ -1778,9 +1804,9 @@ void save_blob_fields(Manifest& m, const fs::path& dir, const legacy::BlobImage&
 legacy::BlobImage load_blob_fields(const Manifest& m, const fs::path& dir) {
     legacy::BlobImage b;
     b.secure = m.get_bool("blob_secure", false);
-    b.secure_datalen = static_cast<uint32_t>(m.get_addr("blob_secure_datalen", 0));
-    b.secure_siglen = static_cast<uint32_t>(m.get_addr("blob_secure_siglen", 0));
-    b.version = static_cast<uint32_t>(m.get_addr("blob_version", legacy::kBlobVersion));
+    b.secure_datalen = m.get_addr32("blob_secure_datalen", 0);
+    b.secure_siglen = m.get_addr32("blob_secure_siglen", 0);
+    b.version = m.get_addr32("blob_version", legacy::kBlobVersion);
     const Bytes unknown = m.get_hex("blob_unknown");
     if (!unknown.empty()) {
         if (unknown.size() != 4 * b.unknown.size())
@@ -1789,7 +1815,7 @@ legacy::BlobImage load_blob_fields(const Manifest& m, const fs::path& dir) {
             b.unknown[i] = uint32_t(unknown[4 * i]) | (uint32_t(unknown[4 * i + 1]) << 8) |
                            (uint32_t(unknown[4 * i + 2]) << 16) | (uint32_t(unknown[4 * i + 3]) << 24);
     }
-    const uint32_t count = m.get_u32("blob_parts", 1);
+    const uint32_t count = m.get_count("blob_parts", 1);
     for (uint32_t i = 0; i < count; ++i) {
         const std::string key = "blob_part" + std::to_string(i);
         legacy::BlobPart part;
@@ -1936,14 +1962,14 @@ legacy::LokiInfo load_loki_fields(const Manifest& m, const fs::path& dir) {
         l.build.assign(text.begin(), text.end());
         l.build.resize(legacy::kLokiBuildSize, 0);
     }
-    l.patched_ramdisk_addr = static_cast<uint32_t>(m.get_addr("loki_patched_ramdisk_addr", 0));
+    l.patched_ramdisk_addr = m.get_addr32("loki_patched_ramdisk_addr", 0);
     l.patched_ramdisk_size = m.get_u32("loki_patched_ramdisk_size", 0);
-    if (m.has("loki_hdr_ramdisk_addr")) l.hdr_ramdisk_addr = static_cast<uint32_t>(m.get_addr("loki_hdr_ramdisk_addr", 0));
+    if (m.has("loki_hdr_ramdisk_addr")) l.hdr_ramdisk_addr = m.get_addr32("loki_hdr_ramdisk_addr", 0);
     l.block = load_raw(m, dir, "loki_block");
     l.patch_offset = m.get_u32("loki_shellcode_offset", 0);
     l.tail.tail = load_raw(m, dir, "loki_tail");
-    l.tail.pad_byte = static_cast<uint8_t>(m.get_u32("loki_pad_byte", 0));
-    l.tail.pad_to = m.get_u64("loki_pad_to", 0);
+    l.tail.pad_byte = static_cast<uint8_t>(m.get_bounded("loki_pad_byte", 0, 8));
+    l.tail.pad_to = m.get_size("loki_pad_to", 0);
     return l;
 }
 
@@ -2034,8 +2060,8 @@ legacy::ChromeosInfo load_chromeos_fields(const Manifest& m, const fs::path& dir
     c.signed_sha256 = m.get_hex("chromeos_signed_sha256");
     if (c.body_signature.empty() || c.preamble_signature.empty()) c.signed_sha256.clear();  // nothing to keep
     c.tail.tail = load_raw(m, dir, "chromeos_tail");
-    c.tail.pad_byte = static_cast<uint8_t>(m.get_u32("chromeos_pad_byte", 0));
-    c.tail.pad_to = m.get_u64("chromeos_pad_to", 0);
+    c.tail.pad_byte = static_cast<uint8_t>(m.get_bounded("chromeos_pad_byte", 0, 8));
+    c.tail.pad_to = m.get_size("chromeos_pad_to", 0);
     return c;
 }
 
@@ -2289,7 +2315,7 @@ Bytes repack_osip(const Manifest& m, const fs::path& dir, const RepackOptions& o
     const uint64_t body = img.body_size();
     const std::string pad_word = m.get("osip_sector_pad", "0xFF");
     const bool aligned = pad_word != "none";
-    const uint8_t pad_byte = aligned ? static_cast<uint8_t>(m.get_addr("osip_sector_pad", 0xFF)) : 0;
+    const uint8_t pad_byte = aligned ? static_cast<uint8_t>(m.get_bounded("osip_sector_pad", 0xFF, 8)) : 0;
     if (!img.header.empty()) {
         const bool size_changed = !m.has("osip_body_size") || m.get_u64("osip_body_size", 0) != body;
         if (size_changed || signed_now != signed_was) osip_refresh_header(img.header, align_up(body, kOsipSectorSize), signed_now);

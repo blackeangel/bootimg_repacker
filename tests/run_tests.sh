@@ -4920,6 +4920,299 @@ done
     pass "manifest.txt: $mf_checked names that leave the directory ('..', an absolute path, a drive, a backslash, a doubled slash) in the file and directory keys of boot, vendor_boot, vbmeta, dtbo, dtb, ASUS blob, Sony ELF and ChromeOS images are refused, with the key, and nothing is written" ||
     fail "manifest.txt: file names that leave the directory ($mf_checked tried):$mf_names_bad"
 
+# ---- repack reads what it is given with care -------------------------------------------------------------------------------
+# tests/tools/fuzz_repack.py damages the directory of an unpack (the manifest, the files, the ramdisk directory and its meta file,
+# the keys) and runs `repack` on it. What it found, and what the checks below hold:
+#   - a number of the manifest was read with stoul/stoull: "12abc" was 12, "-1" was 4294967295, 0x100000000 in a 32-bit field was cut
+#     to 0, and a word was an exception that said "stoul" and nothing of the key. A number is digits (decimal, or 0x and hexadecimal
+#     digits), it fits the field it is for, and what is not is refused with the key and the value; so are a flag that is neither
+#     true nor false, hexadecimal digits of an odd number, a count that no image has, a size that no image has;
+#   - a directory, a fifo or a device where a file should be was opened as one: a bad_alloc, or a wait for ever;
+#   - 0xFFFFFFFFFFFFFFFF as pad_to made `repack` ask for all the memory there is, and 4294967295 as a count made it loop that long;
+#   - what a directory says (a value of the manifest, a line of ramdisk.meta, the name of a file) went into a message as it was, escape
+#     sequences too (checked with the filter that makes output safe turned off: it is the last defence, not the only one);
+#   - `-o dir/` left an empty directory behind; a dtb of no blob was written as an empty file and said to be fine; a copy in .abr_raw
+#     that was not the component was built into the image as if it were.
+rp_bad=""
+rp_n=0
+rp_run=rp_run.img
+rp_report() {  # <what the checks show>: one PASS or FAIL for the checks since the last report
+    if [ -z "$rp_bad" ] && [ "$rp_n" -gt 0 ]; then pass "repack: $rp_n $1"; else fail "repack: $1 ($rp_n tried):$rp_bad"; fi
+    rp_bad=""
+    rp_n=0
+}
+rp_fresh() {  # <image> <dir>: a fresh unpack of the image
+    rm -rf "$2"
+    "$ABR" unpack "$1" -o "$2" >/dev/null 2>&1
+}
+rp_set() {  # <dir> <key> <value>: the manifest with the value of the key replaced (the key added when it is not there), the value as it is
+    K="$2" V="$3" python3 -I - "$1/manifest.txt" <<'PYEOF'
+import os, sys
+path, key, val = sys.argv[1], os.environ["K"], os.environ["V"]
+lines = open(path, "rb").read().decode("utf-8").split("\n")
+out, done = [], False
+for ln in lines:
+    if ln.split("=", 1)[0] == key:
+        out.append(key + "=" + val)
+        done = True
+    else:
+        out.append(ln)
+if not done:
+    out.insert(len(out) - 1 if out and out[-1] == "" else len(out), key + "=" + val)
+open(path, "wb").write("\n".join(out).encode("utf-8"))
+PYEOF
+}
+rp_clean() {  # <file>: no byte in it that a terminal would act on (a control character, a C1 control, what is not UTF-8)
+    python3 -I - "$1" <<'PYEOF'
+import sys
+data = open(sys.argv[1], "rb").read().replace(b"\r\n", b"\n")
+try:
+    text = data.decode("utf-8")
+except UnicodeDecodeError:
+    sys.exit(1)
+for ch in text:
+    o = ord(ch)
+    if (o < 0x20 and ch not in "\n\t") or o == 0x7F or 0x80 <= o <= 0x9F:
+        sys.exit(1)
+PYEOF
+}
+rp_refused() {  # <dir> <label> <text the message has>: repack of <dir> is refused with that text (none of a library's) and writes nothing
+    local d="$1" label="$2" want="$3"
+    rm -f "$rp_run" rp_run.log
+    rp_n=$((rp_n + 1))
+    if timeout 120 "$ABR" repack "$d" -o "$rp_run" >rp_run.log 2>&1; then
+        rp_bad="$rp_bad [$label: taken]"
+    elif [ -e "$rp_run" ]; then
+        rp_bad="$rp_bad [$label: an image was written]"
+    elif ! grep -q -F -- "$want" rp_run.log; then
+        rp_bad="$rp_bad [$label: said: $(head -c 160 rp_run.log)]"
+    elif grep -q -E 'stoul|stoull|std::|bad_alloc|vector::|terminate|Aborted|Segmentation' rp_run.log; then
+        rp_bad="$rp_bad [$label: said what a library says: $(head -c 160 rp_run.log)]"
+    fi
+}
+rp_made() {  # <dir> <label>: repack of <dir> works (the image is rp_run.img)
+    rm -f "$rp_run" rp_run.log
+    rp_n=$((rp_n + 1))
+    if ! timeout 120 "$ABR" repack "$1" -o "$rp_run" >rp_run.log 2>&1 || [ ! -s "$rp_run" ]; then
+        rp_bad="$rp_bad [$2: refused: $(head -c 160 rp_run.log)]"
+        return 1
+    fi
+}
+
+# numbers: what is not one, what does not fit
+for rp_case in "boot_v2.img page_size kernel_addr header_version" "vendor_boot_v4.img page_size" \
+    "vbmeta_signed.img flags rollback_index" "dtbo_built.img version entry0_id"; do
+    read -r rp_img rp_keys <<<"$rp_case"
+    if ! rp_fresh "$rp_img" rp_dir; then rp_bad="$rp_bad [$rp_img: unpack]"; continue; fi
+    for rp_key in $rp_keys; do
+        for rp_v in '12abc' '-1' '0x' '99999999999999999999' '' '4294967296' '18446744073709551616'; do
+            [ "$rp_key" = rollback_index ] && [ "$rp_v" = 4294967296 ] && continue  # (64 bits: that one fits)
+            rm -rf rp_try
+            cp -a rp_dir rp_try
+            rp_set rp_try "$rp_key" "$rp_v"
+            rp_refused rp_try "$rp_img $rp_key=$rp_v" "manifest.txt: $rp_key=$rp_v "
+        done
+    done
+done
+rp_report "numbers that are none or do not fit their field (letters behind digits, a sign, a bare 0x, 20 digits, nothing, 2^32, 2^64) in the fields of boot, vendor_boot, vbmeta and dtbo are refused with the key and the value, in no library's words, and nothing is written"
+
+# numbers: what is one (the edge of the field, a leading zero is not octal, 0X, an upper case digit)
+rp_fresh boot_v2.img rp_dir
+for rp_case in '0xFFFFFFFF:0xffffffff' '4294967295:0xffffffff' '010:0xa' '0X10008000:0x10008000' '0x0:0x0' '00:0x0' '0xAbCdEf01:0xabcdef01'; do
+    rm -rf rp_try rp_try_re
+    cp -a rp_dir rp_try
+    rp_set rp_try kernel_addr "${rp_case%%:*}"
+    if rp_made rp_try "kernel_addr=${rp_case%%:*}" && "$ABR" unpack "$rp_run" -o rp_try_re >/dev/null 2>&1; then
+        grep -q -x -F "kernel_addr=${rp_case#*:}" rp_try_re/manifest.txt ||
+            rp_bad="$rp_bad [kernel_addr=${rp_case%%:*} came back as: $(grep '^kernel_addr=' rp_try_re/manifest.txt)]"
+    fi
+done
+rm -rf rp_try
+cp -a rp_dir rp_try
+rp_set rp_try kernel_addr 0X10008000
+rp_made rp_try "the address of the image, in another spelling" && { cmp -s "$rp_run" boot_v2.img || rp_bad="$rp_bad [0X10008000 is not the image]"; }
+rp_report "numbers at the edge of a 32-bit field or spelled another way (0xFFFFFFFF, 4294967295, 010 is ten, 0X, an upper case digit) are taken as what they say"
+
+# counts: more than any image has, or none that is one
+for rp_case in "vendor_boot_v4.img ramdisk_count" "vbmeta_signed.img descriptor_count" "dtbo_built.img entry_count" "v2.dtb blob_count"; do
+    read -r rp_img rp_key <<<"$rp_case"
+    if ! rp_fresh "$rp_img" rp_dir; then rp_bad="$rp_bad [$rp_img: unpack]"; continue; fi
+    for rp_v in '65537' '4294967295' '-1' '12abc'; do
+        rm -rf rp_try
+        cp -a rp_dir rp_try
+        rp_set rp_try "$rp_key" "$rp_v"
+        case "$rp_v" in 12abc) rp_want="is not a number" ;; *) rp_want="is outside 0 .. 65536" ;; esac
+        rp_refused rp_try "$rp_img $rp_key=$rp_v" "manifest.txt: $rp_key=$rp_v $rp_want"
+    done
+done
+rp_fresh v2.dtb rp_dir
+rp_set rp_dir blob_count 0
+rp_refused rp_dir "a dtb of no blob" "blob_count is 0"
+rp_report "counts that no image has (65537, 4294967295, -1, letters) of ramdisks, descriptors, entries and blobs, and a dtb of no blob, are refused with the key and the value, and nothing is written"
+
+# true and false, hexadecimal digits, the size of a partition
+rp_fresh dtbo_built.img rp_dir
+for rp_v in maybe tru 2 on -1; do
+    rm -rf rp_try
+    cp -a rp_dir rp_try
+    rp_set rp_try acpio "$rp_v"
+    rp_refused rp_try "acpio=$rp_v" "manifest.txt: acpio=$rp_v is neither true nor false"
+done
+rm -rf rp_try
+cp -a rp_dir rp_try
+rp_set rp_try acpio ''
+rp_refused rp_try "acpio=" "manifest.txt: acpio= is empty; it has to be true or false"
+for rp_v in false FALSE False no No NO 0; do  # (what the image was: the very image)
+    rm -rf rp_try
+    cp -a rp_dir rp_try
+    rp_set rp_try acpio "$rp_v"
+    rp_made rp_try "acpio=$rp_v" && { cmp -s "$rp_run" dtbo_built.img || rp_bad="$rp_bad [acpio=$rp_v is not the image]"; }
+done
+for rp_v in true TRUE True yes Yes YES 1; do
+    rm -rf rp_try rp_try_re
+    cp -a rp_dir rp_try
+    rp_set rp_try acpio "$rp_v"
+    if rp_made rp_try "acpio=$rp_v" && "$ABR" unpack "$rp_run" -o rp_try_re >/dev/null 2>&1; then
+        grep -q -x 'acpio=true' rp_try_re/manifest.txt || rp_bad="$rp_bad [acpio=$rp_v did not make an ACPIO image]"
+    fi
+done
+for rp_case in "boot_v2.img id abc odd" "boot_v2.img id zz invalid" "boot_v2.img id 0g invalid" "dtbo_built.img entry0_extra abc odd" \
+    "vendor_boot_v4.img ramdisk1_board_id abc odd" "vendor_boot_v4.img ramdisk1_board_id 0x00 invalid"; do
+    read -r rp_img rp_key rp_v rp_kind <<<"$rp_case"
+    rp_fresh "$rp_img" rp_dir
+    rp_set rp_dir "$rp_key" "$rp_v"
+    case "$rp_kind" in odd) rp_want="manifest.txt: $rp_key has an odd number of hexadecimal digits" ;; *) rp_want="invalid hex value for manifest key: $rp_key" ;; esac
+    rp_refused rp_dir "$rp_img $rp_key=$rp_v" "$rp_want"
+done
+rp_fresh boot_v2.img rp_dir
+for rp_v in 0x7FFFFFFFFFFFFFFF 18446744073709551615 1073741825 2147483648; do
+    rm -rf rp_try
+    cp -a rp_dir rp_try
+    rp_set rp_try pad_to "$rp_v"
+    rp_refused rp_try "pad_to=$rp_v" "manifest.txt: pad_to=$rp_v is more than 1024 MiB"
+done
+rm -rf rp_try
+cp -a rp_dir rp_try
+rp_set rp_try pad_to 0x80000
+rp_made rp_try "pad_to=0x80000" && { [ "$(wc -c <"$rp_run" | tr -d ' ')" = 524288 ] || rp_bad="$rp_bad [pad_to=0x80000 is $(wc -c <"$rp_run" | tr -d ' ') bytes]"; }
+rp_report "flags that are neither true nor false, hexadecimal digits of an odd number or none, a size no image has (pad_to) are refused with the key, and what spells true and false in any case is taken"
+
+# what is no file is not read
+rp_fresh boot_v2.img rp_dir
+rm -rf rp_nf
+cp -a rp_dir rp_nf
+rm rp_nf/kernel
+mkdir rp_nf/kernel
+rp_refused rp_nf "a directory where the kernel is" "is a directory"
+rm -rf rp_nf
+cp -a rp_dir rp_nf
+rm rp_nf/manifest.txt
+mkdir rp_nf/manifest.txt
+rp_refused rp_nf "a directory where the manifest is" "is a directory"
+rm -f rp_run.img rp_nf_img.log
+if timeout 60 "$ABR" info rp_dir >rp_nf_img.log 2>&1 || ! grep -q -F "is a directory" rp_nf_img.log; then
+    rp_bad="$rp_bad [info of a directory: $(head -c 160 rp_nf_img.log)]"
+fi
+rp_n=$((rp_n + 1))
+if [ "$RD_WINE" = 0 ]; then
+    rm -rf rp_nf
+    cp -a rp_dir rp_nf
+    rm rp_nf/kernel
+    mkfifo rp_nf/kernel
+    rp_refused rp_nf "a fifo where the kernel is" "is not a regular file"
+    rm -rf rp_nf
+    cp -a rp_dir rp_nf
+    rm rp_nf/manifest.txt
+    mkfifo rp_nf/manifest.txt
+    rp_refused rp_nf "a fifo where the manifest is" "is not a regular file"
+    rm -rf rp_nf
+    cp -a rp_dir rp_nf
+    rm rp_nf/kernel
+    ln -s /dev/zero rp_nf/kernel
+    rp_refused rp_nf "a link to /dev/zero where the kernel is" "is not a regular file"
+    for rp_cmd in "info /dev/zero" "identify /dev/zero" "unpack /dev/zero -o rp_nf_out"; do
+        rm -rf rp_nf_out
+        rp_n=$((rp_n + 1))
+        # shellcheck disable=SC2086
+        if timeout 60 "$ABR" $rp_cmd >rp_nf_dev.log 2>&1 || ! grep -q -F "is not a regular file" rp_nf_dev.log || [ -e rp_nf_out ]; then
+            rp_bad="$rp_bad [$rp_cmd: $(head -c 160 rp_nf_dev.log)]"
+        fi
+    done
+fi
+rp_report "files that are not files (a directory or a fifo where the kernel or the manifest is, a link to /dev/zero, a directory or a device as the image) are refused at once, with that said, and nothing is written"
+
+# -o that is not the name of a file
+rp_fresh boot_v2.img rp_dir
+rm -rf rp_odir rp_odir.log
+rp_n=$((rp_n + 1))
+if timeout 60 "$ABR" repack rp_dir -o rp_odir/ >rp_odir.log 2>&1 || ! grep -q -F "is not the name of a file" rp_odir.log || [ -e rp_odir ]; then
+    rp_bad="$rp_bad [-o dir/: $(head -c 160 rp_odir.log)] [$(ls -d rp_odir 2>&1)]"
+fi
+rp_report "name of the output that ends in a slash is refused, and no directory is made for it"
+
+# a copy in .abr_raw that is not the component
+rp_fresh boot_v2.img rp_dir
+if [ -f rp_dir/.abr_raw/kernel.raw ]; then
+    rm -rf rp_try
+    cp -a rp_dir rp_try
+    head -c 100 rp_dir/.abr_raw/kernel.raw >rp_try/.abr_raw/kernel.raw
+    rp_refused rp_try "a raw copy of the kernel that is cut short" ".abr_raw/kernel.raw does not belong to kernel"
+    printf 'something else' | gzip -9n >rp_try/.abr_raw/kernel.raw
+    rp_refused rp_try "a raw copy of the kernel that is another stream" "it does not decompress to kernel as it was unpacked"
+    head -c 4000 /dev/urandom >rp_try/.abr_raw/kernel.raw
+    rp_refused rp_try "a raw copy of the kernel that is no stream" ".abr_raw/kernel.raw does not belong to kernel"
+    rm -rf rp_try rp_try_re
+    cp -a rp_dir rp_try
+    rm rp_try/.abr_raw/kernel.raw
+    if rp_made rp_try "the raw copy of the kernel is gone" && "$ABR" unpack "$rp_run" -o rp_try_re >/dev/null 2>&1; then
+        cmp -s rp_try_re/kernel rp_dir/kernel || rp_bad="$rp_bad [the raw copy is gone: the kernel is another]"
+    fi
+    rm -rf rp_try rp_try_re
+    cp -a rp_dir rp_try
+    rp_made rp_try "an untouched directory" && { cmp -s "$rp_run" boot_v2.img || rp_bad="$rp_bad [the untouched directory is not the image]"; }
+else
+    rp_bad="$rp_bad [the unpack of boot_v2.img has no .abr_raw/kernel.raw]"
+fi
+rp_report "raw copies that are not the component they are for (cut short, another stream, no stream) are refused with the file named, a copy that is gone makes the component compressed again, and an untouched directory is the image"
+
+# text of the directory in a message: no control character gets through, with the filter that makes output safe turned off
+rp_esc_ck() {  # <dir> <label>: repack of <dir> says something, and none of it is a control character
+    rp_n=$((rp_n + 1))
+    rm -f rp_esc.img rp_esc.log
+    ABR_UNFILTERED_OUTPUT=1 timeout 120 "$ABR" repack "$1" -o rp_esc.img >rp_esc.log 2>&1
+    [ -s rp_esc.log ] || { rp_bad="$rp_bad [$2: no message]"; return; }
+    rp_clean rp_esc.log || rp_bad="$rp_bad [$2: a control character in: $(head -c 160 rp_esc.log | od -c | head -3)]"
+}
+rp_esc_val='"\x1b]0;pwned\x07 \x9b2J \xc2\x85 \x1b[2J"'
+for rp_case in "boot_v2.img page_size" "boot_v2.img pad_to" "dtbo_built.img acpio" "vbmeta_signed.img flags" "v2.dtb blob_count"; do
+    read -r rp_img rp_key <<<"$rp_case"
+    rp_fresh "$rp_img" rp_dir
+    rp_set rp_dir "$rp_key" "$rp_esc_val"
+    rp_esc_ck rp_dir "$rp_img $rp_key=<escape sequences>"
+done
+rd_image mkbootfs >/dev/null 2>&1
+rp_fresh rdimg_mkbootfs.img rp_dir
+if [ -f rp_dir/ramdisk.meta ]; then
+    rm -rf rp_try
+    cp -a rp_dir rp_try
+    python3 -I - rp_try/ramdisk.meta <<'PYEOF'
+import sys
+p = sys.argv[1]
+b = open(p, "rb").read().replace(b"\nentries\n", b"\nbogus\x1b[2J\x07x value\nentries\n", 1)
+open(p, "wb").write(b)
+PYEOF
+    rp_esc_ck rp_try "ramdisk.meta: a setting that is none, with escape sequences"
+    if [ "$RD_WINE" = 0 ]; then
+        rm -rf rp_try
+        cp -a rp_dir rp_try
+        python3 -I -c 'open("rp_try/ramdisk/new\x1b[2J\x07file", "w").write("x")'
+        rp_esc_ck rp_try "ramdisk/: a new file whose name has escape sequences"
+    fi
+else
+    rp_bad="$rp_bad [rdimg_mkbootfs.img: no ramdisk.meta]"
+fi
+rp_report "values, lines and names of a directory with escape sequences in them (manifest.txt, ramdisk.meta, a file name of the tree) come into no message as they are"
+
 # ---- a page size that cannot be one: refused with a reason, not gigabytes of zeros ---------------------------------------
 # page_size is the word of a header that the padding of every part is worked out from. 0xFFFFFFFF in it made the check at the
 # end of `unpack` ask for 4 GiB of zeros (found by tests/tools/fuzz_images.py under AddressSanitizer). A flash page size is a

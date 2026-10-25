@@ -2,8 +2,11 @@
 #include "abr/manifest.hpp"
 
 #include <algorithm>
+#include <cctype>
+#include <cstdint>
 #include <cstdio>
 #include <fstream>
+#include <string_view>
 
 #include "abr/textquote.hpp"
 
@@ -19,6 +22,7 @@ std::string trim(const std::string& s) {
 }  // namespace
 
 Manifest Manifest::load(const std::filesystem::path& path) {
+    require_regular_file(path);  // (a fifo would be waited for)
     std::ifstream f(path, std::ios::binary);  // CR before LF is trimmed below; no text-mode surprises
     if (!f) throw FormatError("cannot open manifest: " + path.string());
     Manifest m;
@@ -50,26 +54,21 @@ void Manifest::save(const std::filesystem::path& path, const std::string& header
     for (auto& [k, v] : entries_) f << k << "=" << textquote::quote(v, false) << "\n";
 }
 
-bool Manifest::has(const std::string& key) const {
-    for (auto& [k, v] : entries_)
-        if (k == key) return true;
-    return false;
-}
+bool Manifest::has(const std::string& key) const { return index_.find(key) != index_.end(); }
 
 void Manifest::set(const std::string& key, const std::string& value) {
-    for (auto& [k, v] : entries_) {
-        if (k == key) {
-            v = value;
-            return;
-        }
+    const auto it = index_.find(key);
+    if (it != index_.end()) {
+        entries_[it->second].second = value;
+        return;
     }
+    index_.emplace(key, entries_.size());
     entries_.emplace_back(key, value);
 }
 
 std::string Manifest::get(const std::string& key, const std::string& def) const {
-    for (auto& [k, v] : entries_)
-        if (k == key) return v;
-    return def;
+    const auto it = index_.find(key);
+    return it == index_.end() ? def : entries_[it->second].second;
 }
 
 // What a name that is to be found in the directory of the unpack must not be, or "" when it is fine.
@@ -95,7 +94,7 @@ static const char* path_problem(const std::string& v) {
 std::string Manifest::get_path(const std::string& key, const std::string& def) const {
     std::string v = get(key, def);
     if (const char* why = path_problem(v); *why)
-        throw FormatError("manifest.txt: " + key + "=" + textquote::quote(v, true) + " " + why +
+        throw FormatError("manifest.txt: " + key + "=" + textquote::quote_shown(v) + " " + why +
                           ". A file the manifest names has to be in the directory it is in (a relative path "
                           "without '..'); copy it there");
     return v;
@@ -104,13 +103,67 @@ std::string Manifest::get_path(const std::string& key, const std::string& def) c
 void Manifest::set_u32(const std::string& key, uint32_t v) { set(key, std::to_string(v)); }
 void Manifest::set_u64(const std::string& key, uint64_t v) { set(key, std::to_string(v)); }
 
-uint32_t Manifest::get_u32(const std::string& key, uint32_t def) const {
-    if (!has(key)) return def;
-    return static_cast<uint32_t>(std::stoul(get(key), nullptr, 0));
+// The number in `text`: decimal digits, or 0x and hexadecimal digits. `key` and `shown` (the value as the manifest has it, `text`
+// may be a part of it) are for the message.
+static uint64_t parse_number(const std::string& key, const std::string& shown, std::string_view text, unsigned bits) {
+    auto fail = [&](const std::string& why) {
+        throw FormatError("manifest.txt: " + key + "=" + textquote::quote_shown(shown) + " " + why);
+    };
+    if (text.empty()) fail("is empty; a number is needed (decimal, or hexadecimal with 0x)");
+    unsigned base = 10;
+    size_t i = 0;
+    if (text.size() > 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) {
+        base = 16;
+        i = 2;
+    }
+    uint64_t v = 0;
+    for (; i < text.size(); ++i) {
+        const unsigned char c = static_cast<unsigned char>(text[i]);
+        unsigned d = 99;
+        if (c >= '0' && c <= '9') d = c - '0';
+        else if (base == 16 && c >= 'a' && c <= 'f') d = c - 'a' + 10;
+        else if (base == 16 && c >= 'A' && c <= 'F') d = c - 'A' + 10;
+        if (d >= base) fail("is not a number (decimal digits, or 0x and hexadecimal digits)");
+        if (v > (UINT64_MAX - d) / base) fail("is too large (it does not fit in 64 bits)");
+        v = v * base + d;
+    }
+    if (bits < 64 && (v >> bits) != 0) fail("does not fit in " + std::to_string(bits) + " bits");
+    return v;
 }
-uint64_t Manifest::get_u64(const std::string& key, uint64_t def) const {
+
+uint64_t Manifest::get_bounded(const std::string& key, uint64_t def, unsigned bits) const {
     if (!has(key)) return def;
-    return std::stoull(get(key), nullptr, 0);
+    const std::string text = get(key);
+    return parse_number(key, text, text, bits);
+}
+
+uint32_t Manifest::get_u32(const std::string& key, uint32_t def) const {
+    return static_cast<uint32_t>(get_bounded(key, def, 32));
+}
+uint64_t Manifest::get_u64(const std::string& key, uint64_t def) const { return get_bounded(key, def, 64); }
+
+int64_t Manifest::get_int(const std::string& key, int64_t def, int64_t lo, int64_t hi) const {
+    if (!has(key)) return def;
+    std::string text = get(key);
+    const bool negative = !text.empty() && text[0] == '-';
+    const uint64_t magnitude = parse_number(key, text, negative ? std::string_view(text).substr(1) : std::string_view(text), 63);
+    const int64_t v = negative ? -static_cast<int64_t>(magnitude) : static_cast<int64_t>(magnitude);
+    if (v < lo || v > hi)
+        throw FormatError("manifest.txt: " + key + "=" + textquote::quote_shown(text) + " is outside " + std::to_string(lo) + " .. " +
+                          std::to_string(hi));
+    return v;
+}
+
+uint32_t Manifest::get_count(const std::string& key, uint32_t def) const {
+    return static_cast<uint32_t>(get_int(key, def, 0, kMaxEntries));
+}
+
+uint64_t Manifest::get_size(const std::string& key, uint64_t def) const {
+    const uint64_t v = get_u64(key, def);
+    if (v > kMaxImageSize)
+        throw FormatError("manifest.txt: " + key + "=" + textquote::quote_shown(get(key)) + " is more than " + std::to_string(kMaxImageSize >> 20) +
+                          " MiB, and no image of the family is that big");
+    return v;
 }
 
 void Manifest::set_addr(const std::string& key, uint64_t v) {
@@ -118,16 +171,20 @@ void Manifest::set_addr(const std::string& key, uint64_t v) {
     std::snprintf(buf, sizeof(buf), "0x%llx", static_cast<unsigned long long>(v));
     set(key, buf);
 }
-uint64_t Manifest::get_addr(const std::string& key, uint64_t def) const {
-    if (!has(key)) return def;
-    return std::stoull(get(key), nullptr, 0);  // base 0 auto-detects the 0x prefix
+uint64_t Manifest::get_addr(const std::string& key, uint64_t def) const { return get_bounded(key, def, 64); }
+uint32_t Manifest::get_addr32(const std::string& key, uint32_t def) const {
+    return static_cast<uint32_t>(get_bounded(key, def, 32));
 }
 
 void Manifest::set_bool(const std::string& key, bool v) { set(key, v ? "true" : "false"); }
 bool Manifest::get_bool(const std::string& key, bool def) const {
     if (!has(key)) return def;
     std::string v = get(key);
-    return v == "true" || v == "1" || v == "yes";
+    for (char& c : v) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (v == "true" || v == "1" || v == "yes") return true;
+    if (v == "false" || v == "0" || v == "no") return false;
+    throw FormatError("manifest.txt: " + key + "=" + textquote::quote_shown(get(key)) +
+                      (v.empty() ? " is empty; it has to be true or false" : " is neither true nor false"));
 }
 
 void Manifest::set_hex(const std::string& key, const Bytes& data) {
@@ -166,6 +223,8 @@ Bytes Manifest::get_hex(const std::string& key) const {
         if (c >= 'A' && c <= 'F') return c - 'A' + 10;
         return -1;
     };
+    if (s.size() % 2 != 0)
+        throw FormatError("manifest.txt: " + key + " has an odd number of hexadecimal digits (" + std::to_string(s.size()) + ")");
     for (size_t i = 0; i + 1 < s.size(); i += 2) {
         int hi = nibble(s[i]), lo = nibble(s[i + 1]);
         if (hi < 0 || lo < 0) throw FormatError("invalid hex value for manifest key: " + key);
