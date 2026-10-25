@@ -38,6 +38,7 @@ struct UImage {
     std::string name;    // <=32 bytes
     Bytes name_tail;     // what the name field holds behind its NUL (see BootImage::cmdline_tail)
     Bytes data;          // payload, exactly as stored (still compressed per `comp`)
+    size_t consumed = 0; // set by parse(): the bytes of the source that belong to the image (the header and `data`)
 
     static UImage parse(const Bytes& image);
     Bytes build() const;

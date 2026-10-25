@@ -473,7 +473,8 @@ this in the manifest / as side files and writes it back:
 - bytes **before** the image (a vendor wrapper such as a BFBF/SSSS
   header) and **after** it (signature trailers, an AVBv1 `BootSignature`,
   a `SEANDROIDENFORCE` marker), and zero/0xFF **fill up to the original
-  partition size**;
+  partition size**; a legacy U-Boot uImage keeps what lies behind its data
+  the same way (`tail.bin`, `pad_byte`, `pad_to`);
 - the boot header `id` and **how it was computed** (AOSP SHA-1, SHA-1
   that also covers a Qualcomm dt blob, SHA-256, or an unrecognised value
   kept verbatim) -- after an edit the id is recomputed the same way;

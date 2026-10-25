@@ -573,6 +573,24 @@ def build_all(out):
     odd[ts_off:ts_off + 4] = le32(struct.unpack_from("<I", odd, ts_off)[0] + 4)
     put("vendor_boot_v4_table_size_lies.img", bytes(odd))
 
+    # --- bytes behind a uImage: fill up to the size of a partition, a trailer -----------------------------------------
+    # The image proper is the 64-byte header and the `size` bytes of data its header declares. A partition dump has fill behind it
+    # (0xFF on flash, zeros elsewhere), and some tools put a trailer there (a signature: it depends on the image).
+    uk1, uk2 = blob(5000), blob(3000)
+    part = 16384
+    trailer = b"SIGN" + blob(60)
+
+    def filled(image, tail, fill):
+        return image + tail + fill * (part - len(image) - len(tail))
+
+    put("uimage_filled.img", filled(uimage(uk1, "kernel"), b"", b"\xff"))
+    put("uimage_trailer.img", uimage(uk1, "kernel") + trailer)
+    put("uimage_trailer_filled.img", filled(uimage(uk1, "kernel"), trailer, b"\0"))
+    # what an edit that replaces the data by a smaller `uk2` is expected to give: the trailer and the fill, put back to the same size
+    put("uimage_filled_smaller.img", filled(uimage(uk2, "kernel"), b"", b"\xff"))
+    put("uimage_trailer_filled_smaller.img", filled(uimage(uk2, "kernel"), trailer, b"\0"))
+    put("uimage_kernel_smaller.bin", uk2)
+
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:

@@ -5371,6 +5371,74 @@ else
     fail "repack refused a kernel_padding_file outside the directory, but not with its key, or left a file behind"
 fi
 
+# ---- bytes behind a uImage: the fill up to the size of a partition, a trailer ------------------------------------------------
+# The image proper is the 64-byte header and the number of data bytes that the header declares. A dump of a partition has fill behind it
+# (0xFF on flash, zeros elsewhere) and some tools put a trailer there. Like the bytes around a boot image they are kept (tail.bin,
+# pad_byte / pad_to) and put back; the repack used to end where the image does, which `unpack` said ("does NOT reproduce"). The
+# fixtures come from the generator (tests/tools/fixtures.py), which knows where the image ends.
+roundtrip_check fx/uimage_filled.img "uImage + 0xFF fill up to the size of the partition (16 KiB)" ui_fill
+expect_line rt_ui_fill "pad_byte=0xff" "uImage: the byte of the fill is in the manifest"
+expect_line rt_ui_fill "pad_to=16384" "uImage: the size the fill goes up to is in the manifest"
+roundtrip_check fx/uimage_trailer.img "uImage + a trailer of 64 bytes" ui_trl
+if cmp -s <(tail -c 64 fx/uimage_trailer.img) rt_ui_trl/tail.bin && grep -q "^tail_file=tail.bin$" rt_ui_trl/manifest.txt; then
+    pass "uImage: the trailer is tail.bin, byte for byte, and the manifest names it"
+else
+    fail "uImage: the trailer is not what tail.bin holds"
+fi
+roundtrip_check fx/uimage_trailer_filled.img "uImage + a trailer + zero fill up to the size of the partition" ui_both
+if cmp -s <(head -c $((64 + 5000 + 64)) fx/uimage_trailer_filled.img | tail -c 64) rt_ui_both/tail.bin &&
+    grep -q "^pad_to=16384$" rt_ui_both/manifest.txt; then
+    pass "uImage: with fill behind it the trailer is still the 64 bytes behind the image, and the fill is pad_to"
+else
+    fail "uImage: a trailer and fill behind it are not kept as a trailer and a fill"
+fi
+"$ABR" repack rt_ui_trl -o rt_ui_trl.again >/dev/null 2>rt_ui_trl.again.err
+if cmp -s fx/uimage_trailer.img rt_ui_trl.again && ! grep -q "kept as they were" rt_ui_trl.again.err; then
+    pass "an unedited uImage with a trailer repacks without a stale-signature warning"
+else
+    fail "an unedited uImage with a trailer repacked with a warning about its trailer, or not as it was"
+fi
+"$ABR" unpack fx/uimage_tails.img -o ui_plain >ui_plain.out 2>&1
+if ! grep -qE '^(tail_file|pad_to|pad_byte|prefix_file|core_sha256)=' ui_plain/manifest.txt && ! grep -q "after the uImage" ui_plain.out; then
+    pass "a uImage with nothing behind it has no tail, no fill and no hash in its manifest, and unpack says nothing of them"
+else
+    fail "a uImage with nothing behind it got keys, or a note, for what is behind the image"
+fi
+if said "reproduces this image byte-for-byte" "$ABR" unpack fx/uimage_trailer_filled.img -o ui_say; then
+    pass "unpack of a uImage with a trailer and fill behind it: its self-check confirms the round trip"
+else
+    fail "unpack of a uImage with a trailer and fill behind it does not confirm the round trip"
+fi
+if said "64 bytes after the uImage are kept verbatim" "$ABR" unpack fx/uimage_trailer.img -o ui_say2; then
+    pass "unpack says that it keeps the trailer behind a uImage"
+else
+    fail "unpack does not say that it keeps the bytes behind a uImage"
+fi
+if said "trailing:       64 bytes after the image" "$ABR" info fx/uimage_trailer.img &&
+    said "padding:        0xff fill up to 16384 bytes" "$ABR" info fx/uimage_filled.img; then
+    pass "info of a uImage lists the trailer and the fill behind it"
+else
+    fail "info of a uImage does not list what is behind the image"
+fi
+# Edited: the data replaced by a smaller one gives the header of that data with the same trailer and the same fill up to the
+# same size (the images that are expected come from the generator); a trailer is a signature as far as abr can tell, so the repack
+# warns that it is the old one, and a fill is not
+ui_edit() {  # <fixture> <the image that is expected> <label>
+    local d="ui_ed_$2"
+    rm -rf "$d" "$d.img"
+    "$ABR" unpack "fx/$1.img" -o "$d" >/dev/null 2>&1 || { fail "$3 (unpack)"; return; }
+    cp fx/uimage_kernel_smaller.bin "$d/data.bin"
+    "$ABR" repack "$d" -o "$d.img" >"$d.log" 2>&1 || { fail "$3 (repack)"; return; }
+    check "fx/$2.img" "$d.img" "$3"
+}
+ui_edit uimage_filled uimage_filled_smaller "uImage with fill: a smaller payload, and the fill goes up to the same size again"
+ui_edit uimage_trailer_filled uimage_trailer_filled_smaller "uImage with a trailer and fill: a smaller payload, the trailer behind it and the fill up to the same size"
+if grep -q "kept as they were" ui_ed_uimage_trailer_filled_smaller.log && ! grep -q "kept as they were" ui_ed_uimage_filled_smaller.log; then
+    pass "an edited uImage warns that the trailer behind it is the old one, and does not warn about fill"
+else
+    fail "the warning about the trailer behind an edited uImage is missing, or there is one about fill"
+fi
+
 # ---- paths that are not ASCII --------------------------------------------------------------------------------
 # Cyrillic, an accent, Chinese and an emoji (four bytes in UTF-8, a surrogate pair on Windows) in the names of the
 # image, of the directory it is unpacked to and of the file it is packed to, and in a file name the manifest holds.

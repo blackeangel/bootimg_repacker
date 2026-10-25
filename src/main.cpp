@@ -1484,6 +1484,11 @@ void unpack_uimage(const Bytes& data, const fs::path& dir) {
     if (const std::string t = tails_text({{"name", &img.name_tail}}); !t.empty())
         note("bytes behind the NUL that ends the text of a header field (" + t + ") are kept in manifest.txt (*_tail)");
     save_raw(m, dir, "data", img.data, "data.bin");
+    // What lies behind the image (fill up to the size of a partition, a trailer): kept like the bytes around a boot image.
+    const Envelope env = Envelope::capture(data, 0, img.consumed);
+    save_envelope(m, dir, env, data, 0, img.consumed);
+    if (!env.tail.empty())
+        note(std::to_string(env.tail.size()) + " bytes after the uImage are kept verbatim (tail.bin)");
     m.save(dir / "manifest.txt",
            "abr uimage manifest -- edit then `abr repack " + dir.string() + " -o out.img`\n"
            "# NOTE: 'data' is stored exactly as found in the source image -- if 'compression'\n"
@@ -1491,7 +1496,7 @@ void unpack_uimage(const Bytes& data, const fs::path& dir) {
            "# transcode uImage payload compression.");
 }
 
-Bytes repack_uimage(const Manifest& m, const fs::path& dir) {
+Bytes repack_uimage(const Manifest& m, const fs::path& dir, const RepackOptions& opt) {
     UImage img;
     img.timestamp = m.get_u32("timestamp", 0);
     img.load_addr = static_cast<uint32_t>(m.get_addr("load_addr", 0));
@@ -1508,7 +1513,7 @@ Bytes repack_uimage(const Manifest& m, const fs::path& dir) {
     img.name = m.get("name");
     img.name_tail = m.get_tail("name_tail");
     img.data = load_raw(m, dir, "data");
-    return img.build();
+    return assemble_envelope(m, dir, img.build(), opt);
 }
 
 // ----------------------------------------------------------- elf_boot --
@@ -2519,6 +2524,7 @@ void print_info(const fs::path& path) {
             std::cout << "type:        " << uboot_type_name(img.type) << "\n";
             std::cout << "compression: " << uboot_comp_name(img.comp) << "\n";
             std::cout << "data:        " << img.data.size() << " bytes\n";
+            print_envelope_info(Envelope::capture(data, 0, img.consumed));
             break;
         }
         case Fmt::BLOB: {
@@ -2633,7 +2639,7 @@ Bytes build_image_once(const fs::path& dir, const RepackOptions& opt) {
         case Fmt::DTBO: result = repack_dtbo(m, dir, opt); break;
         case Fmt::DTB: result = repack_dtb(m, dir); break;
         case Fmt::VBMETA: result = repack_vbmeta(m, dir, opt); break;
-        case Fmt::UIMAGE: result = repack_uimage(m, dir); break;
+        case Fmt::UIMAGE: result = repack_uimage(m, dir, opt); break;
         case Fmt::ELF_BOOT: result = repack_elf_boot(m, dir, opt); break;
         case Fmt::KRNL: result = repack_krnl(m, dir, opt); break;
         case Fmt::BLOB: result = repack_blob(m, dir); break;

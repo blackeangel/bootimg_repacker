@@ -90,6 +90,7 @@ UImage UImage::parse(const Bytes& image) {
     if (computed_data_crc != data_crc)
         throw FormatError("u-boot image data CRC mismatch (corrupt file?)");
 
+    img.consumed = kUimageHeaderSize + img.data.size();
     return img;
 }
 

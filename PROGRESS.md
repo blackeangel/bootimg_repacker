@@ -43,7 +43,7 @@ tools" below.
 | self-contained RSA: BigInt (Knuth D, Montgomery), DER/PEM/X.509, PKCS#1 v1.5 sign/verify, PKCS#8/PKCS#1 key parsing, AVB public-key blob -- **no OpenSSL anywhere in the build** | **done + verified** (Python integers, `openssl dgst -sign`, `avbtool extract_public_key`; see "Self-contained crypto" below) |
 | manifest + CLI (`abr info/unpack/repack`) | **done** |
 | CMake: FetchContent-vendored static zlib/lz4/zstd/xz/bzip2 | **done + build-verified natively on Linux**, both the dynamic and the `-DABR_STATIC_BINARY=ON` fully-static configurations |
-| Test suite (`tests/run_tests.sh`) | **done, 447/447 passing** on g++-14 (all judges required, as in the CI) and under AddressSanitizer + UndefinedBehaviorSanitizer (no report), 438/438 on clang-20 (the nine "the judge is there" checks belong to `ABR_REQUIRE_ORACLES`, which that run did not set), 446/446 for `abr.exe` under wine (the platform's own tests differ); CI runs the matrix (g++-14, clang-20, ASan+UBSan with a fuzz run, Windows under wine, arm64 under qemu-user, android-arm64) -- see Verification |
+| Test suite (`tests/run_tests.sh`) | **done, 462/462 passing** on g++-14 (all judges required, as in the CI) and under AddressSanitizer + UndefinedBehaviorSanitizer (no report), 453/453 on clang-20 (the nine "the judge is there" checks belong to `ABR_REQUIRE_ORACLES`, which that run did not set), 461/461 for `abr.exe` under wine (the platform's own tests differ); CI runs the matrix (g++-14, clang-20, ASan+UBSan with a fuzz run, Windows under wine, arm64 under qemu-user, android-arm64) -- see Verification |
 | CMake cross toolchains (mingw-w64, Android NDK) | **done + verified** (mingw reproduced locally; NDK only provable via CI, see below) |
 | GitHub Actions static build matrix (linux-x86_64, windows-x86_64, android-arm64) | **done + verified**: run 35313499827, all 3 jobs green, all 3 static binaries produced as artifacts (abr-linux-x86_64, abr-windows-x86_64, abr-android-arm64) |
 
@@ -1485,7 +1485,7 @@ hostile ones, and text that goes into a file or onto a terminal. It found real b
 - `-DABR_SANITIZE=address,undefined` (CMake option, an interface target `abr_sanitize` that `abr_core` links; abr's own
   code is instrumented, the vendored libraries are not; refused with MSVC, Windows and `ABR_STATIC_BINARY`).
 - The whole suite runs on that build with the sanitizers' reports written to files (a test that expects an error would
-  take a sanitizer's exit status for the error it wanted): **447 of 447 now, no report** (353 when the build was added). The CI has a job for it
+  take a sanitizer's exit status for the error it wanted): **462 of 462 now, no report** (353 when the build was added). The CI has a job for it
   (`linux-x86_64 (g++-14, ASan+UBSan)`): the suite, the reports of the suite, and a short fuzz run on the images the suite made.
 - `ABR_KEEP_WORK=1 tests/run_tests.sh` keeps the directory the suite worked in: every image it made is a seed for the fuzzer.
 
@@ -1676,7 +1676,7 @@ That has a small answer: the bytes belong to the component in front of them, and
   the judge agrees with what was kept; the edits above give the images the generator made; a name that leaves the directory is
   refused with its key; `info` and `unpack` say the right numbers for boot and vendor_boot; the digest of an AVB footer holds
   before and after an edit. 44 checks more than before (403 -> 447).
-- Unit tests (`abr_unit_tests manifest`, **450 454 checks** now): the helpers (`nonzero_padding` on hand-made cases, `BinaryWriter::align`
+- Unit tests (`abr_unit_tests manifest`, **450 454 checks** after this change): the helpers (`nonzero_padding` on hand-made cases, `BinaryWriter::align`
   for every relation of room and bytes, and 20 000 random buffers with page sizes of 16 to 2048 for which the padding that was
   found and put back is what the file held, a dump that ends anywhere included) and a random generator of boot images (seven
   kinds: v0, v0 with a QCDT dt, PXA, v1, v2, v3, v4; page sizes from 512 to 16 KiB; components that end on a page boundary or a
@@ -1701,7 +1701,8 @@ That has a small answer: the bytes belong to the component in front of them, and
 
 ### What is still not kept (the fuzz table with `--rng-seed 31` told these apart)
 
-The 164 images of the table, by format: elf_boot 110, boot 45, vendor_boot 5, uimage 2, vbmeta 2. `unpack` said so for every one.
+The 162 images of the table (164 before the change of the next section), by format: elf_boot 110, boot 45, vendor_boot 5, vbmeta 2.
+`unpack` said so for every one.
 
 - **Sony ELF boot images** (110): abr writes the layout it understands; what does not fit its model is said, by design (see
   "Sony ELF boot images").
@@ -1714,9 +1715,36 @@ The 164 images of the table, by format: elf_boot 110, boot 45, vendor_boot 5, ui
 - **A wrapper or a footer that was damaged**: the size or checksum words of a DHTB or loki header, a ChromeOS or blob
   container, an AVB footer whose descriptor did not match its image (`unpack` says "already modified without re-signing?"), a
   vbmeta with a changed byte. Said, never written as if whole.
-- **Bytes appended behind a uImage** (2 images): the repack ends where the image does.
 - The MTK header's raw 512 bytes (only the fields abr models are kept; unchanged images are replayed byte for byte, edited
   ones get a header made from the fields).
+
+## Bytes behind a uImage (done, 24 Oct 2026)
+
+The last fuzz table still had two uImage images. A legacy uImage is its 64-byte header and as many bytes of data as the header
+says; whatever lies behind that -- fill up to the size of a partition (0xFF on flash, zeros elsewhere), a trailer -- was
+dropped by the repack, which `unpack` said. The boot family, dtbo and vbmeta had the `Envelope` for such bytes from the
+start; uImage did not use it.
+
+- `UImage::parse` sets `consumed` (header and data). `unpack` keeps what lies behind it the way it does for a boot image
+  (`tail.bin`; `pad_byte` / `pad_to` for a run of fill; `core_sha256` when there is a tail, so an edit can be told from an
+  untouched repack) and says `N bytes after the uImage are kept verbatim (tail.bin)`; `repack` puts it back around the
+  rebuilt image (an edit warns that a trailer is the old one -- it may be a signature -- and does not warn about fill);
+  `info` lists it (`trailing:`, `padding:`). A uImage with nothing behind it gets no key and no word.
+- Checked by: 6 new fixtures (fill, trailer, both, and the two images an edit is expected to give, from the generator), 15
+  checks in the CLI suite (a section of its own: every variant round-trips, `tail.bin` is the trailer byte for byte, the
+  keys, the note, `info`, the edit with a smaller payload gives the generator's image, the warning for a trailer and none for
+  fill, no warning for an untouched repack, no word for a plain uImage; 13 of them fail on a binary from before the change), and
+  a unit test (`consumed` for 300 random images with up to 700 bytes behind them).
+- **Mutation tests**: 7 mutants of `consumed` against the unit test and 12 of the wiring in `main.cpp` against the CLI section: all
+  killed. One (the note printed although nothing is behind the image) survived the first version of the section and has
+  its check now.
+- Every fixture image of the suite (70), each with a 64-byte trailer appended and with 5000 bytes of 0xFF appended, comes back
+  byte for byte from `unpack` and `repack` -- `vendor_boot_v4_table_size_lies.img` apart, which does not by design -- so
+  no other format drops what lies behind it.
+- The suites: g++-14 462/462 (all judges required), ASan+UBSan 462/462 with no report, clang-20 453/453, `abr.exe` under wine
+  461/461 (15 checks more than before: 447 -> 462); the unit tests, 451 954 checks (1 500 more), pass on the g++, ASan+UBSan,
+  clang and mingw-under-wine builds.
+- The fuzz table (same seeds, 4482 images): 164 -> **162** images, 140 -> **138** distinct findings.
 
 ## Next steps (in order)
 
@@ -1729,11 +1757,13 @@ The 164 images of the table, by format: elf_boot 110, boot 45, vendor_boot 5, ui
    requests and manual dispatch: dispatch it with
    `gh api -X POST repos/<repo>/actions/workflows/build.yml/dispatches -f ref=<branch>`).
 
-CI status of the branch: run 39689458222 (commit `6e3ddd9`, hardening) green on all **six** jobs -- and, with `pipefail` in
-the workflow's shell, a green that means something: the annotations of the jobs say "353 passed, 0 failed" for linux
-g++-14, clang-20, arm64 under qemu-user and the ASan+UBSan build (whose fuzz step found nothing too) and "352 passed, 0
-failed" for Windows under wine; android-arm64 only builds. The runs before it (39020243483 for `750530f`, 38652019847,
-38360970941, 37254228679) were green under the old shell, which could not have shown a failing suite.
+CI status of the branch: run 40123468084 (commit `780f063`, padding behind the components) green on all **six** jobs: the
+annotations of the jobs say "447 passed, 0 failed" for linux g++-14, clang-20, the ASan+UBSan build and arm64 under qemu-user,
+"446 passed, 0 failed" for Windows under wine; android-arm64 only builds. The run before it, 40038351307 (commit `7bccfc0`, the
+tails of text fields), was green on the same six (403 passed, 402 for Windows), and 39689458222 (commit `6e3ddd9`, hardening)
+before that -- with `pipefail` in the workflow's shell, so a green that means something: 353 passed, 352 for Windows (whose
+ASan job's fuzz step found nothing too). The runs before those (39020243483 for `750530f`, 38652019847, 38360970941,
+37254228679) were green under the old shell, which could not have shown a failing suite.
 
 ### CI status: green as of commit `ea0206d` (run 35313499827)
 

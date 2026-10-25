@@ -28,6 +28,7 @@
 #include "abr/byte_io.hpp"
 #include "abr/manifest.hpp"
 #include "abr/textquote.hpp"
+#include "abr/uimage.hpp"
 #include "abr/vendor_boot.hpp"
 
 using namespace abr;
@@ -1127,6 +1128,29 @@ void test_vendor_boot_padding() {
     EXPECT(with_padding > 1000 && trimmed > 1800);
 }
 
+// A uImage is its 64-byte header and the number of bytes of data the header declares; whatever the file holds behind that is not
+// the image, and `consumed` says where it begins (what `unpack` keeps in tail.bin / pad_to).
+void test_uimage_consumed() {
+    std::puts("uImage: where the image ends");
+    std::mt19937_64 rng(0x01D);
+    for (int i = 0; i < 300; ++i) {
+        UImage u;
+        u.timestamp = static_cast<uint32_t>(rng());
+        u.name = "unit";
+        u.data = some_bytes(rng, rng() % 3 == 0 ? 0 : rng() % 5000);
+        const Bytes built = u.build();
+        EXPECT(built.size() == kUimageHeaderSize + u.data.size());
+        EXPECT(UImage::parse(built).consumed == built.size());
+        Bytes more = built;
+        const size_t extra = rng() % 700;
+        for (size_t k = 0; k < extra; ++k) more.push_back(static_cast<uint8_t>(rng()));
+        const UImage p = UImage::parse(more);
+        EXPECT(p.consumed == built.size());  // not the size of the file
+        EXPECT(p.data == u.data);
+        EXPECT(p.build() == built);          // and what is behind it is no part of what is built
+    }
+}
+
 }  // namespace
 
 int run_manifest_tests() {
@@ -1142,6 +1166,7 @@ int run_manifest_tests() {
     test_padding_helpers();
     test_boot_padding();
     test_vendor_boot_padding();
+    test_uimage_consumed();
     if (g_failures == 0) std::printf("manifest: ok (%d checks)\n", g_checks);
     else std::printf("manifest: %d failure(s)\n", g_failures);
     return g_failures == 0 ? 0 : 1;
