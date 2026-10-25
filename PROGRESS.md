@@ -1757,10 +1757,11 @@ start; uImage did not use it.
    requests and manual dispatch: dispatch it with
    `gh api -X POST repos/<repo>/actions/workflows/build.yml/dispatches -f ref=<branch>`).
 
-CI status of the branch: run 40123468084 (commit `780f063`, padding behind the components) green on all **six** jobs: the
-annotations of the jobs say "447 passed, 0 failed" for linux g++-14, clang-20, the ASan+UBSan build and arm64 under qemu-user,
-"446 passed, 0 failed" for Windows under wine; android-arm64 only builds. The run before it, 40038351307 (commit `7bccfc0`, the
-tails of text fields), was green on the same six (403 passed, 402 for Windows), and 39689458222 (commit `6e3ddd9`, hardening)
+CI status of the branch: run 40145515015 (commit `04d347c`, the bytes behind a uImage) green on all **six** jobs: the
+annotations of the jobs say "462 passed, 0 failed" for linux g++-14, clang-20, the ASan+UBSan build and arm64 under qemu-user,
+"461 passed, 0 failed" for Windows under wine; android-arm64 only builds. The run before it, 40123468084 (commit `780f063`,
+padding behind the components), was green on the same six (447 passed, 446 for Windows); 40038351307 (commit `7bccfc0`, the
+tails of text fields) after it again (403 passed, 402 for Windows), and 39689458222 (commit `6e3ddd9`, hardening)
 before that -- with `pipefail` in the workflow's shell, so a green that means something: 353 passed, 352 for Windows (whose
 ASan job's fuzz step found nothing too). The runs before those (39020243483 for `750530f`, 38652019847, 38360970941,
 37254228679) were green under the old shell, which could not have shown a failing suite.
