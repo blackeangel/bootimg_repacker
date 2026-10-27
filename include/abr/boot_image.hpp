@@ -40,8 +40,11 @@ struct OsVersion {
     uint32_t pack() const;
     std::string to_string() const;               // "A.B.C"
     std::string patch_level_string() const;       // "YYYY-MM"
-    static std::optional<OsVersion> parse(const std::string& version,
-                                           const std::string& patch_level);
+    // The two texts of manifest.txt (`os_version`, `os_patch_level`; either may be empty). "A", "A.B" or "A.B.C": decimal numbers
+    // of at most 127 (the field has 7 bits for each); "YYYY-MM": a year from 2000 to 2127 (or 0000: the field holds none), a
+    // month of at most 15 (4 bits: what an image has in it is written as it is). Throws FormatError, naming the key, for the
+    // rest -- there is no number that is "the first digits of" what was written.
+    static OsVersion parse(const std::string& version, const std::string& patch_level);
 };
 
 // How the 32-byte `id` field of a v0-v2 header was derived. The field is a

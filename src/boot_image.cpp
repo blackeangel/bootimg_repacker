@@ -2,9 +2,11 @@
 #include "abr/boot_image.hpp"
 
 #include "abr/sha.hpp"
+#include "abr/textquote.hpp"
 
 #include <algorithm>
 #include <cstdio>
+#include <string_view>
 
 namespace abr {
 
@@ -39,19 +41,54 @@ std::string OsVersion::patch_level_string() const {
     return buf;
 }
 
-std::optional<OsVersion> OsVersion::parse(const std::string& version,
-                                           const std::string& patch_level) {
+namespace {
+// `s` is decimal digits, at most `max_digits` of them, and a number of at most `max`.
+bool decimal_up_to(std::string_view s, size_t max_digits, unsigned max, unsigned& out) {
+    if (s.empty() || s.size() > max_digits) return false;
+    unsigned v = 0;
+    for (char c : s) {
+        if (c < '0' || c > '9') return false;
+        v = v * 10 + static_cast<unsigned>(c - '0');
+    }
+    if (v > max) return false;
+    out = v;
+    return true;
+}
+}  // namespace
+
+OsVersion OsVersion::parse(const std::string& version, const std::string& patch_level) {
     OsVersion o;
     if (!version.empty()) {
-        unsigned a = 0, b = 0, c = 0;
-        if (std::sscanf(version.c_str(), "%u.%u.%u", &a, &b, &c) < 1) return std::nullopt;
-        o.major = a;
-        o.minor = b;
-        o.patch = c;
+        unsigned parts[3] = {0, 0, 0};
+        size_t count = 0, at = 0;
+        bool ok = true;
+        for (;;) {
+            const size_t dot = version.find('.', at);
+            const std::string_view part =
+                std::string_view(version).substr(at, dot == std::string::npos ? std::string::npos : dot - at);
+            if (count == 3 || !decimal_up_to(part, 3, 127, parts[count])) {
+                ok = false;
+                break;
+            }
+            ++count;
+            if (dot == std::string::npos) break;
+            at = dot + 1;
+        }
+        if (!ok)
+            throw FormatError("manifest.txt: os_version=" + textquote::quote_shown(version) +
+                              " is not a version like 14.0.0 (one to three decimal numbers of at most 127, with dots between them)");
+        o.major = parts[0];
+        o.minor = parts[1];
+        o.patch = parts[2];
     }
     if (!patch_level.empty()) {
         unsigned y = 0, m = 0;
-        if (std::sscanf(patch_level.c_str(), "%u-%u", &y, &m) != 2) return std::nullopt;
+        const bool ok = patch_level.size() >= 6 && patch_level[4] == '-' &&
+                        decimal_up_to(std::string_view(patch_level).substr(0, 4), 4, 9999, y) &&
+                        decimal_up_to(std::string_view(patch_level).substr(5), 2, 15, m) && (y == 0 || (y >= 2000 && y <= 2127));
+        if (!ok)
+            throw FormatError("manifest.txt: os_patch_level=" + textquote::quote_shown(patch_level) +
+                              " is not a patch level like 2024-05 (a year from 2000 to 2127, or 0000, a dash, and a month of at most 15)");
         o.year = y;
         o.month = m;
     }
@@ -218,9 +255,7 @@ BootImage BootImage::parse(const Bytes& image) {
         if (!part2.empty() && part1.size() != kBootArgsSize)
             img.cmdline_split = static_cast<uint32_t>(part1.size());
 
-        if (!is_flash_page_size(img.page_size))
-            throw FormatError("boot image page_size " + std::to_string(img.page_size) +
-                              " is not a flash page size (a power of two from 512 bytes to 16 MiB)");
+        require_flash_page_size("boot image", img.page_size);
         keep_header_padding(r.pos(), img.page_size);
         data_end = r.pos() + img.header_padding.size();
         to_page(img.page_size);
@@ -274,9 +309,7 @@ BootImage BootImage::parse(const Bytes& image) {
         }
 
         if (img.page_size == 0) throw FormatError("boot image page_size is zero");
-        if (!is_flash_page_size(img.page_size))
-            throw FormatError("boot image page_size " + std::to_string(img.page_size) +
-                              " is not a flash page size (a power of two from 512 bytes to 16 MiB)");
+        require_flash_page_size("boot image", img.page_size);
 
         keep_header_padding(r.pos(), img.page_size);
         data_end = r.pos() + img.header_padding.size();
@@ -379,6 +412,7 @@ Bytes BootImage::build() const {
 
     if (pxa) {
         const uint32_t page_sz = page_size ? page_size : 2048;
+        require_flash_page_size("boot image", page_sz);
         w.le32(static_cast<uint32_t>(kernel.size()));
         w.le32(kernel_addr);
         w.le32(static_cast<uint32_t>(ramdisk.size()));
@@ -410,6 +444,7 @@ Bytes BootImage::build() const {
         }
     } else if (header_version <= 2) {
         uint32_t page_sz = page_size ? page_size : 2048;
+        require_flash_page_size("boot image", page_sz);
         w.le32(static_cast<uint32_t>(kernel.size()));
         w.le32(kernel_addr);
         w.le32(static_cast<uint32_t>(ramdisk.size()));

@@ -24,6 +24,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 #include "abr/boot_image.hpp"
@@ -562,8 +563,8 @@ void check_raw_copy(const fs::path& raw_path, const Bytes& raw, const Bytes& sto
     } catch (const std::exception& e) {
         why = std::string("it does not decompress (") + e.what() + ")";
     }
-    throw FormatError(raw_path.generic_string() + " does not belong to " + filename + ": " + why +
-                      ". Delete it to have " + filename + " compressed again, or unpack the image again");
+    throw FormatError(textquote::quote_shown(raw_path.generic_string()) + " does not belong to " + textquote::quote_shown(filename) + ": " + why +
+                      ". Delete it to have " + textquote::quote_shown(filename) + " compressed again, or unpack the image again");
 }
 
 // What goes into the image for one component. For a ramdisk that also exists as a directory (see
@@ -611,7 +612,7 @@ Bytes load_component(const Manifest& m, const fs::path& dir, const std::string& 
             tree_changed = tree_hash != m.get_hex(prefix + "_tree_hash");
             if (tree_changed || opt.ramdisk_from == "tree" || !from_file) from_tree = std::move(rebuilt);
         } else if (opt.ramdisk_from == "tree") {
-            throw FormatError("--ramdisk-from tree: the directory " + (dir / tree_name).generic_string() + " is missing");
+            throw FormatError("--ramdisk-from tree: the directory " + textquote::quote_shown((dir / tree_name).generic_string()) + " is missing");
         }
     }
     if (tree_changed && file_changed && opt.ramdisk_from.empty())
@@ -743,9 +744,26 @@ void save_envelope(Manifest& m, const fs::path& dir, const Envelope& e, const By
     }
 }
 
+// `prefix_kind` says that the bytes in front of the image are a constant signing header (Nook's), one that an edit of the image
+// leaves valid, so that repack keeps it without a warning. It has to be that header still -- the whole of it, with the name that tells
+// it where the bootloader looks -- or what comes out is no Nook image for anybody, abr included.
+void check_prefix_kind(const std::string& kind, const Bytes& prefix) {
+    if (kind != "NOOK" && kind != "NOOKTAB")
+        throw FormatError("manifest.txt: prefix_kind=" + shown(kind) + " is not a kind of header that abr knows (NOOK or NOOKTAB)");
+    const Identity id = identify(prefix);
+    if (id.aik_type() != kind)
+        throw FormatError("prefix.bin is not a " + kind + " signing header any more (prefix_kind=" + kind +
+                          " in manifest.txt says it is): the name that tells it, \"Green Loader\" and the like at byte 64 (\"BauwksBoot\" "
+                          "at byte 48 on a tablet), is not there");
+    if (id.payload_offset != prefix.size())
+        throw FormatError("prefix.bin is " + std::to_string(prefix.size()) + " bytes; a " + kind + " signing header is " +
+                          std::to_string(id.payload_offset) + " bytes");
+}
+
 Envelope load_envelope(const Manifest& m, const fs::path& dir) {
     Envelope e;
     e.prefix = load_raw(m, dir, "prefix");
+    if (m.has("prefix_kind")) check_prefix_kind(m.get("prefix_kind"), e.prefix);
     e.tail = load_raw(m, dir, "tail");
     e.pad_byte = static_cast<uint8_t>(m.get_bounded("pad_byte", 0, 8));
     e.pad_to = m.get_size("pad_to", 0);
@@ -1163,8 +1181,7 @@ Bytes repack_boot(const Manifest& m, const fs::path& dir, const RepackOptions& o
                               (uint32_t(rb[i * 4 + 2]) << 16) | (uint32_t(rb[i * 4 + 3]) << 24);
     }
     if (m.has("header_size")) img.header_size_field = m.get_u32("header_size");
-    auto ov = OsVersion::parse(m.get("os_version"), m.get("os_patch_level"));
-    if (ov) img.os_version = *ov;
+    img.os_version = OsVersion::parse(m.get("os_version"), m.get("os_patch_level"));
     img.cmdline = m.get("cmdline");
     img.cmdline_tail = m.get_tail("cmdline_tail");
     img.extra_cmdline_tail = m.get_tail("extra_cmdline_tail");
@@ -1380,27 +1397,36 @@ Bytes repack_dtbo(const Manifest& m, const fs::path& dir, const RepackOptions& o
 
 // --------------------------------------------------------------- dtb --
 
+// The blobs are the flattened device trees at the start of the file, back to back, each as long as its header says;
+// what is behind the last one (the zeros a partition image is filled up with, a trailer) is the envelope's, as in the
+// other images.
 void unpack_dtb(const Bytes& data, const fs::path& dir) {
-    auto blobs = split_fdt_blobs(data);
+    const FdtBlobs split = split_fdt_blobs(data);
+    if (split.blobs.empty()) throw FormatError("this is not a dtb: it does not start with a flattened device tree");
     Manifest m;
     m.set("type", "dtb");
-    m.set_u32("blob_count", static_cast<uint32_t>(blobs.size()));
-    for (size_t i = 0; i < blobs.size(); ++i) {
+    m.set_u32("blob_count", static_cast<uint32_t>(split.blobs.size()));
+    for (size_t i = 0; i < split.blobs.size(); ++i) {
         std::string filename = "blob" + std::to_string(i) + ".dtb";
         m.set("blob" + std::to_string(i) + "_file", filename);
-        write_file(dir / filename, blobs[i]);
+        write_file(dir / filename, split.blobs[i]);
     }
+    save_envelope(m, dir, Envelope::capture(data, 0, split.consumed), data, 0, split.consumed);
     m.save(dir / "manifest.txt",
            "abr dtb manifest -- edit then `abr repack " + dir.string() + " -o out.dtb`");
 }
 
-Bytes repack_dtb(const Manifest& m, const fs::path& dir) {
+Bytes repack_dtb(const Manifest& m, const fs::path& dir, const RepackOptions& opt) {
     uint32_t count = m.get_count("blob_count", 0);
     if (count == 0) throw FormatError("manifest.txt: blob_count is 0; a dtb has at least one blob (blob0_file=...)");
     std::vector<Bytes> blobs;
-    for (uint32_t i = 0; i < count; ++i)
-        blobs.push_back(read_file(dir / m.get_path("blob" + std::to_string(i) + "_file")));
-    return join_fdt_blobs(blobs);
+    for (uint32_t i = 0; i < count; ++i) {
+        const std::string key = "blob" + std::to_string(i) + "_file";
+        const std::string name = m.get_path(key);
+        blobs.push_back(read_file(dir / name));
+        check_fdt_blob(blobs.back(), key + " (" + textquote::quote_shown(name) + ")");
+    }
+    return assemble_envelope(m, dir, join_fdt_blobs(blobs), opt);
 }
 
 // ------------------------------------------------------------- vbmeta --
@@ -2033,24 +2059,16 @@ legacy::ChromeosInfo load_chromeos_fields(const Manifest& m, const fs::path& dir
     // flags 0x1, a config and a bootloader of one space each (futility will not take an empty file for either).
     const bool fresh = !m.has("chromeos_keyblock_file");
     c.keyblock = fresh ? legacy::chromeos_dev_keyblock() : load_raw(m, dir, "chromeos_keyblock");
-    if (m.has("chromeos_preamble_version")) {
-        const std::string text = m.get("chromeos_preamble_version");
-        unsigned major = 0, minor = 0;
-        char end = 0;
-        if (std::sscanf(text.c_str(), "%u.%u%c", &major, &minor, &end) != 2)
-            throw FormatError("chromeos_preamble_version in manifest.txt is \"" + text + "\"; it is a version like 2.2");
-        c.preamble_major = major;
-        c.preamble_minor = minor;
-    }
+    std::tie(c.preamble_major, c.preamble_minor) = m.get_version("chromeos_preamble_version", c.preamble_major, c.preamble_minor);
     c.kernel_version = m.get_u32("chromeos_kernel_version", 1);
     const uint64_t flags = m.get_addr("chromeos_flags", fresh ? 1 : 0);
     if (flags > 0xFFFFFFFFull) throw FormatError("chromeos_flags in manifest.txt does not fit in 32 bits");
     c.flags = static_cast<uint32_t>(flags);
     c.body_load_address = m.get_addr("chromeos_body_load_address", 0x100000);
     if (m.has("chromeos_bootloader_address")) c.bootloader_address = m.get_addr("chromeos_bootloader_address", 0);
-    c.bootloader_size = m.get_u32("chromeos_bootloader_size", legacy::kChromeosAlign);
+    c.bootloader_size = static_cast<uint32_t>(m.get_size("chromeos_bootloader_size", legacy::kChromeosAlign));
     c.vmlinuz_header_address = m.get_addr("chromeos_vmlinuz_header_address", 0);
-    c.pad = m.get_u32("chromeos_vblock_size", legacy::kChromeosDefaultPad);
+    c.pad = static_cast<uint32_t>(m.get_size("chromeos_vblock_size", legacy::kChromeosDefaultPad));
     const Bytes one_space{' '};
     c.config = (m.has("chromeos_config_file") || !fresh) ? load_raw(m, dir, "chromeos_config") : one_space;
     c.params = load_raw(m, dir, "chromeos_params");
@@ -2519,10 +2537,11 @@ void print_info(const fs::path& path) {
             break;
         }
         case Fmt::DTB: {
-            auto blobs = split_fdt_blobs(data);
-            std::cout << "fdt blobs: " << blobs.size() << "\n";
-            for (size_t i = 0; i < blobs.size(); ++i)
-                std::cout << "  [" << i << "] " << blobs[i].size() << " bytes\n";
+            const FdtBlobs split = split_fdt_blobs(data);
+            std::cout << "fdt blobs: " << split.blobs.size() << "\n";
+            for (size_t i = 0; i < split.blobs.size(); ++i)
+                std::cout << "  [" << i << "] " << split.blobs[i].size() << " bytes\n";
+            print_envelope_info(Envelope::capture(data, 0, split.consumed));
             break;
         }
         case Fmt::VBMETA: {
@@ -2654,6 +2673,26 @@ void print_info(const fs::path& path) {
 
 // ------------------------------------------------------------- dispatch --
 
+// The image `repack` is about to write must be one that abr knows again: looked at the way `unpack` looks at a file (the wrappers
+// off, then the magic and the layout), it is the kind of image the manifest says. What `identify` calls `data` and `unpack` refuses
+// is no result of a repack, whatever made it -- a header that is not one, bytes in front of the image that push it out of place.
+void check_known_again(const Bytes& image, Fmt wanted) {
+    Wrappers wrap;
+    Fmt got = Fmt::UNKNOWN;
+    std::string why;
+    try {
+        const Bytes& payload = peel_wrappers(image, wrap);
+        got = detect_format(payload);
+        if (got == Fmt::UNKNOWN) why = describe_unknown(payload);
+    } catch (const FormatError& e) {
+        why = e.what();
+    }
+    if (got == wanted) return;
+    throw FormatError(std::string("the image abr would write is not ") + (wanted == Fmt::UNKNOWN ? "an image" : "a " + std::string(fmt_name(wanted)) + " image") +
+                      " that it knows again: " + (got == Fmt::UNKNOWN ? why : "it would be taken for a " + std::string(fmt_name(got)) + " image") +
+                      " (something in the directory does not agree with the rest of it: a file in front of the image, a header)");
+}
+
 // Rebuilds the file described by an unpacked directory, once (see build_image).
 Bytes build_image_once(const fs::path& dir, const RepackOptions& opt) {
     Manifest m = Manifest::load(dir / "manifest.txt");
@@ -2663,7 +2702,7 @@ Bytes build_image_once(const fs::path& dir, const RepackOptions& opt) {
         case Fmt::BOOT: result = repack_boot(m, dir, opt); break;
         case Fmt::VENDOR_BOOT: result = repack_vendor_boot(m, dir, opt); break;
         case Fmt::DTBO: result = repack_dtbo(m, dir, opt); break;
-        case Fmt::DTB: result = repack_dtb(m, dir); break;
+        case Fmt::DTB: result = repack_dtb(m, dir, opt); break;
         case Fmt::VBMETA: result = repack_vbmeta(m, dir, opt); break;
         case Fmt::UIMAGE: result = repack_uimage(m, dir, opt); break;
         case Fmt::ELF_BOOT: result = repack_elf_boot(m, dir, opt); break;
@@ -2708,6 +2747,7 @@ Bytes build_image_once(const fs::path& dir, const RepackOptions& opt) {
         result = wrap_dhtb(result, dhtb);
     }
     if (m.get_bool("has_chromeos", false)) result = apply_chromeos_wrapper(m, dir, result, opt, true);
+    check_known_again(result, f);
     return result;
 }
 
@@ -2863,6 +2903,11 @@ void do_repack(const fs::path& dir, const fs::path& out, const RepackOptions& op
     Manifest m = Manifest::load(dir / "manifest.txt");
     Fmt f = fmt_from_name(m.get("type"));
     Bytes result = build_image(dir, opt);
+    // The image is not written over a file this repack has read: the manifest, a component, a key, a file of the ramdisk
+    // directory, or what a symbolic link among them leads to.
+    if (const fs::path read = find_read_file(out); !read.empty())
+        throw FormatError("-o " + shown(out.string()) + " is a file this repack has read (" + shown(read.string()) +
+                          "); the image would be written over it. Name another file");
     write_file(out, result);
     std::cout << "repacked " << fmt_name(f) << " -> " << out.string() << " (" << result.size()
               << " bytes)\n";

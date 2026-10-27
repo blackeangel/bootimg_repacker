@@ -53,6 +53,8 @@ public:
     uint64_t get_bounded(const std::string& key, uint64_t def, unsigned bits) const;
     // A number that is at least `lo` and at most `hi` (a level of compression, a count).
     int64_t get_int(const std::string& key, int64_t def, int64_t lo, int64_t hi) const;
+    // A version "2.2": two decimal numbers of a 32-bit word each, a dot between them, nothing else.
+    std::pair<uint32_t, uint32_t> get_version(const std::string& key, uint32_t def_major, uint32_t def_minor) const;
     // The size of an image or of a partition (`pad_to`, `avb_partition_size`, ...): at most kMaxImageSize, because no
     // image of the family is bigger and a value beyond it only makes abr ask for memory it cannot have.
     uint64_t get_size(const std::string& key, uint64_t def = 0) const;

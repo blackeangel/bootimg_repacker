@@ -5050,6 +5050,33 @@ rp_set rp_dir blob_count 0
 rp_refused rp_dir "a dtb of no blob" "blob_count is 0"
 rp_report "counts that no image has (65537, 4294967295, -1, letters) of ramdisks, descriptors, entries and blobs, and a dtb of no blob, are refused with the key and the value, and nothing is written"
 
+# page sizes: unpack refuses a header that has one that no flash has; repack wrote such an image from a manifest (found by the fuzzer: an
+# image that unpack then refused, and 2^31 made it ask for 8 GiB)
+rp_fresh boot_v2.img rp_dir
+rp_fresh vendor_boot_v4.img rp_dirv
+for rp_v in 3 256 511 777 1000 0x1000001 2147483648 4294967295 -1 12abc; do
+    for rp_kind in "rp_dir boot image" "rp_dirv vendor_boot"; do
+        read -r rp_d rp_what <<<"$rp_kind"
+        rm -rf rp_try
+        cp -a "$rp_d" rp_try
+        rp_set rp_try page_size "$rp_v"
+        case "$rp_v" in -1 | 12abc) rp_want="manifest.txt: page_size=$rp_v is not a number" ;; *) rp_want="$rp_what page_size " ;; esac
+        rp_refused rp_try "$rp_what page_size=$rp_v" "$rp_want"
+    done
+done
+for rp_v in 512 2048 4096 65536; do
+    for rp_kind in "rp_dir boot image" "rp_dirv vendor_boot"; do
+        read -r rp_d rp_what <<<"$rp_kind"
+        rm -rf rp_try rp_try_re
+        cp -a "$rp_d" rp_try
+        rp_set rp_try page_size "$rp_v"
+        if rp_made rp_try "$rp_what page_size=$rp_v" && "$ABR" unpack "$rp_run" -o rp_try_re >/dev/null 2>&1; then
+            grep -q -x "page_size=$rp_v" rp_try_re/manifest.txt || rp_bad="$rp_bad [$rp_what page_size=$rp_v came back as: $(grep '^page_size=' rp_try_re/manifest.txt)]"
+        fi
+    done
+done
+rp_report "page sizes that no flash has (3, 256, 777, 2^31, 4294967295, a number that is none) in the manifest of a boot image and of a vendor_boot are refused when the image is written, with the reason, and the sizes that are fine (512 to 64 KiB) come back as they were said"
+
 # true and false, hexadecimal digits, the size of a partition
 rp_fresh dtbo_built.img rp_dir
 for rp_v in maybe tru 2 on -1; do
@@ -5095,6 +5122,15 @@ rm -rf rp_try
 cp -a rp_dir rp_try
 rp_set rp_try pad_to 0x80000
 rp_made rp_try "pad_to=0x80000" && { [ "$(wc -c <"$rp_run" | tr -d ' ')" = 524288 ] || rp_bad="$rp_bad [pad_to=0x80000 is $(wc -c <"$rp_run" | tr -d ' ') bytes]"; }
+rp_fresh cros_dev22.blob rp_dir
+for rp_k in chromeos_bootloader_size chromeos_vblock_size; do
+    for rp_v in 2147483648 4294967295 1073741825; do
+        rm -rf rp_try
+        cp -a rp_dir rp_try
+        rp_set rp_try "$rp_k" "$rp_v"
+        rp_refused rp_try "$rp_k=$rp_v" "manifest.txt: $rp_k=$rp_v is more than 1024 MiB"
+    done
+done
 rp_report "flags that are neither true nor false, hexadecimal digits of an odd number or none, a size no image has (pad_to) are refused with the key, and what spells true and false in any case is taken"
 
 # what is no file is not read
@@ -5176,12 +5212,14 @@ fi
 rp_report "raw copies that are not the component they are for (cut short, another stream, no stream) are refused with the file named, a copy that is gone makes the component compressed again, and an untouched directory is the image"
 
 # text of the directory in a message: no control character gets through, with the filter that makes output safe turned off
-rp_esc_ck() {  # <dir> <label>: repack of <dir> says something, and none of it is a control character
+rp_esc_ck() {  # <dir> <label> [<more arguments of repack>]: repack of <dir> says something, and none of it is a control character
+    local d="$1" label="$2"
+    shift 2
     rp_n=$((rp_n + 1))
     rm -f rp_esc.img rp_esc.log
-    ABR_UNFILTERED_OUTPUT=1 timeout 120 "$ABR" repack "$1" -o rp_esc.img >rp_esc.log 2>&1
-    [ -s rp_esc.log ] || { rp_bad="$rp_bad [$2: no message]"; return; }
-    rp_clean rp_esc.log || rp_bad="$rp_bad [$2: a control character in: $(head -c 160 rp_esc.log | od -c | head -3)]"
+    ABR_UNFILTERED_OUTPUT=1 timeout 120 "$ABR" repack "$d" -o rp_esc.img "$@" >rp_esc.log 2>&1
+    [ -s rp_esc.log ] || { rp_bad="$rp_bad [$label: no message]"; return; }
+    rp_clean rp_esc.log || rp_bad="$rp_bad [$label: a control character in: $(head -c 160 rp_esc.log | od -c | head -3)]"
 }
 rp_esc_val='"\x1b]0;pwned\x07 \x9b2J \xc2\x85 \x1b[2J"'
 for rp_case in "boot_v2.img page_size" "boot_v2.img pad_to" "dtbo_built.img acpio" "vbmeta_signed.img flags" "v2.dtb blob_count"; do
@@ -5190,6 +5228,17 @@ for rp_case in "boot_v2.img page_size" "boot_v2.img pad_to" "dtbo_built.img acpi
     rp_set rp_dir "$rp_key" "$rp_esc_val"
     rp_esc_ck rp_dir "$rp_img $rp_key=<escape sequences>"
 done
+# a key file that is no key: the character that is wrong is in the message, as it is, with an escape sequence in it
+printf -- '-----BEGIN RSA PRIVATE KEY-----\nAAAA\x8b\x1b[2JBBBB\n-----END RSA PRIVATE KEY-----\n' >rp_badkey.pem
+rp_fresh a1_v1.img rp_dir
+printf x >>rp_dir/kernel
+rp_esc_ck rp_dir "--avb1-key: a PEM with a byte that is not base64" --avb1-key rp_badkey.pem
+if [ "$RD_WINE" = 0 ]; then
+    # a name of a file that is not UTF-8
+    rp_fresh vendor_boot_v4.img rp_dir
+    rp_set rp_dir ramdisk0_file '"\xff"'
+    rp_esc_ck rp_dir "ramdisk0_file is a name that is not UTF-8"
+fi
 rd_image mkbootfs >/dev/null 2>&1
 rp_fresh rdimg_mkbootfs.img rp_dir
 if [ -f rp_dir/ramdisk.meta ]; then
@@ -5212,6 +5261,319 @@ else
     rp_bad="$rp_bad [rdimg_mkbootfs.img: no ramdisk.meta]"
 fi
 rp_report "values, lines and names of a directory with escape sequences in them (manifest.txt, ramdisk.meta, a file name of the tree) come into no message as they are"
+
+# ---- the dtb and the OSIP image: what is behind the last blob, what is a blob, what tells an OSIP image -----------------
+# Found by the second campaign of tests/tools/fuzz_repack.py, and by a dtb file with zeros behind it: those were dropped on
+# unpack ("an untouched repack does NOT reproduce this image": 192 bytes back of 1192), a dtb whose blob was no device tree was
+# written and then not known by `identify`, and an OSIP image whose header file was noise was written and refused by `unpack`.
+# Behind the last blob of a dtb is the envelope's, as in the other images: zero or 0xFF fill up to the size of a partition
+# (padded again after an edit), anything else (a trailer) as it was; a blob is a flattened device tree, as long as its header
+# says -- that is what finds the next one.
+head -c 3000 /dev/zero >dt_zero.bin
+head -c 3000 /dev/zero | tr '\0' '\377' >dt_ff.bin
+printf 'TRAILER-OF-A-DTB-PARTITION-%060d' 0 >dt_trailer.bin
+cat concat.dtb dt_zero.bin >dt_zero.dtb
+cat a.dtb dt_ff.bin >dt_ff.dtb
+cat concat.dtb dt_trailer.bin >dt_trailer.dtb
+cat a.dtb dt_trailer.bin dt_zero.bin >dt_trailer_zero.dtb
+{ echo '/dts-v1/;'; printf '/ { model = "%s"; compatible = "test,big"; };\n' "$(head -c 300 /dev/zero | tr '\0' 'x')"; } >dt_big.dts
+dtc -I dts -O dtb -o dt_big.dtb dt_big.dts 2>/dev/null
+for dt_img in dt_zero dt_ff dt_trailer dt_trailer_zero; do
+    rp_n=$((rp_n + 1))
+    rm -rf rp_dtd
+    if ! "$ABR" unpack "$dt_img.dtb" -o rp_dtd >rp_dt.log 2>&1; then
+        rp_bad="$rp_bad [$dt_img: unpack: $(head -c 160 rp_dt.log)]"
+        continue
+    fi
+    grep -q -F "reproduces this image byte-for-byte" rp_dt.log || rp_bad="$rp_bad [$dt_img: unpack does not say it is exact: $(head -c 160 rp_dt.log)]"
+    rp_made rp_dtd "$dt_img" && { cmp -s "$rp_run" "$dt_img.dtb" || rp_bad="$rp_bad [$dt_img: the untouched directory is not the image]"; }
+    case "$dt_img" in
+        dt_zero) grep -q '^pad_byte=0x0$' rp_dtd/manifest.txt && grep -q "^pad_to=$(wc -c <dt_zero.dtb | tr -d ' ')\$" rp_dtd/manifest.txt && [ ! -e rp_dtd/tail.bin ] || rp_bad="$rp_bad [$dt_img: fill not in the manifest]" ;;
+        dt_ff) grep -q '^pad_byte=0xff$' rp_dtd/manifest.txt || rp_bad="$rp_bad [$dt_img: the fill byte is not 0xff in the manifest]" ;;
+        dt_trailer) cmp -s rp_dtd/tail.bin dt_trailer.bin && ! grep -q '^pad_to=' rp_dtd/manifest.txt || rp_bad="$rp_bad [$dt_img: the trailer is not tail.bin]" ;;
+        dt_trailer_zero) cmp -s rp_dtd/tail.bin dt_trailer.bin && grep -q '^pad_byte=0x0$' rp_dtd/manifest.txt || rp_bad="$rp_bad [$dt_img: trailer and fill]" ;;
+    esac
+    case "$dt_img" in
+        dt_zero|dt_ff|dt_trailer_zero) said "padding: *0x.. fill up to $(wc -c <"$dt_img.dtb" | tr -d ' ') bytes" "$ABR" info "$dt_img.dtb" || rp_bad="$rp_bad [$dt_img: info does not name the fill]" ;;
+    esac
+    case "$dt_img" in
+        dt_trailer|dt_trailer_zero) said "trailing: *$(wc -c <dt_trailer.bin | tr -d ' ') bytes after the image" "$ABR" info "$dt_img.dtb" || rp_bad="$rp_bad [$dt_img: info does not name the trailer]" ;;
+    esac
+done
+# an edit of a blob: the image is as long as it was (the fill is made up again), the blob is the new one
+rp_fresh dt_zero.dtb rp_dtd
+cp dt_big.dtb rp_dtd/blob0.dtb
+if rp_made rp_dtd "a bigger first blob"; then
+    [ "$(wc -c <"$rp_run" | tr -d ' ')" = "$(wc -c <dt_zero.dtb | tr -d ' ')" ] || rp_bad="$rp_bad [a bigger blob: the image is not as long as it was]"
+    cmp -s -n "$(wc -c <dt_big.dtb | tr -d ' ')" "$rp_run" dt_big.dtb || rp_bad="$rp_bad [a bigger blob: it is not the first one]"
+    cmp -s -i "$(wc -c <dt_big.dtb | tr -d ' ')":0 -n 192 "$rp_run" a.dtb || rp_bad="$rp_bad [a bigger blob: the second one moved]"
+fi
+rp_fresh dt_trailer.dtb rp_dtd
+cp dt_big.dtb rp_dtd/blob0.dtb
+rp_n=$((rp_n + 1))
+"$ABR" repack rp_dtd -o "$rp_run" >rp_dt.log 2>&1 && grep -q "kept as they were" rp_dt.log || rp_bad="$rp_bad [an edit with a trailer behind: no warning: $(head -c 160 rp_dt.log)]"
+rp_report "dtb files with something behind the last blob (zero fill, 0xFF fill, a trailer, a trailer and fill) come back byte for byte, are said to, keep it as a fill (padded up to the old size after an edit) or a file; a trailer behind an edited blob is warned of"
+
+rp_fresh dt_zero.dtb rp_dtd
+for rp_case in "blob0.dtb|a text|is not a flattened device tree" "blob1.dtb|a text for the second blob|blob1_file (blob1.dtb) is not a flattened device tree"; do
+    IFS='|' read -r rp_f rp_what rp_want <<<"$rp_case"
+    rm -rf rp_try
+    cp -a rp_dtd rp_try
+    printf 'this is not a device tree, it is a text of some length, more than the 40 bytes of a header\n' >"rp_try/$rp_f"
+    rp_refused rp_try "$rp_what" "$rp_want"
+done
+rm -rf rp_try
+cp -a rp_dtd rp_try
+head -c 191 a.dtb >rp_try/blob0.dtb
+rp_refused rp_try "a blob a byte short" "blob0_file (blob0.dtb) is 191 bytes, but the totalsize in its header is 192"
+{ cat a.dtb; printf x; } >rp_try/blob0.dtb
+rp_refused rp_try "a blob a byte too long" "blob0_file (blob0.dtb) is 193 bytes, but the totalsize in its header is 192"
+printf '\320\015\376\355' >rp_try/blob0.dtb
+rp_refused rp_try "a blob of the magic alone" "is cut short"
+head -c 39 a.dtb >rp_try/blob0.dtb
+rp_refused rp_try "a blob of 39 bytes" "is cut short"
+: >rp_try/blob0.dtb
+rp_refused rp_try "a blob that is empty" "is not a flattened device tree"
+# what the first abr made of a trailer: a blob of no device tree behind the others
+rm -rf rp_try
+cp -a rp_dtd rp_try
+rp_set rp_try blob_count 3
+rp_set rp_try blob2_file blob2.dtb
+cp dt_trailer.bin rp_try/blob2.dtb
+rp_refused rp_try "a trailer as a third blob" "blob2_file (blob2.dtb) is not a flattened device tree"
+rp_report "a dtb blob that is no flattened device tree (a text, nothing, the magic alone, 39 bytes, a trailer as a blob) or is not as long as its header says (a byte short, a byte too long) is refused, with the key and the file named, and nothing is written"
+
+dt_patch_total() {  # <in> <out> <totalsize>: the dtb with the big-endian totalsize of its first blob replaced
+    python3 -I - "$@" <<'PYEOF'
+import struct, sys
+d = bytearray(open(sys.argv[1], "rb").read())
+d[4:8] = struct.pack(">I", int(sys.argv[3], 0))
+open(sys.argv[2], "wb").write(d)
+PYEOF
+}
+dt_unpack_refused() {  # <file> <label> <text the message has>: unpack of the file is refused with that text, and leaves no directory
+    local f="$1" label="$2" want="$3"
+    rm -rf rp_dtu rp_dtu.log
+    rp_n=$((rp_n + 1))
+    if timeout 60 "$ABR" unpack "$f" -o rp_dtu >rp_dtu.log 2>&1; then
+        rp_bad="$rp_bad [$label: taken]"
+    elif [ -e rp_dtu ]; then
+        rp_bad="$rp_bad [$label: a directory is left behind]"
+    elif ! grep -q -F -- "$want" rp_dtu.log; then
+        rp_bad="$rp_bad [$label: said: $(head -c 160 rp_dtu.log)]"
+    elif grep -q -E 'std::|bad_alloc|vector::|terminate|Aborted|Segmentation' rp_dtu.log; then
+        rp_bad="$rp_bad [$label: said what a library says: $(head -c 160 rp_dtu.log)]"
+    fi
+}
+dt_patch_total a.dtb dt_long.dtb 4096
+dt_unpack_refused dt_long.dtb "a totalsize past the end of the file" "has a totalsize of 4096 bytes, which is more than the 192 the file has left"
+dt_patch_total a.dtb dt_short.dtb 8
+dt_unpack_refused dt_short.dtb "a totalsize of 8" "is less than its header (40)"
+dt_patch_total a.dtb dt_zero_total.dtb 0
+dt_unpack_refused dt_zero_total.dtb "a totalsize of 0" "is less than its header (40)"
+{ printf '\320\015\376\355'; head -c 16 /dev/zero; } >dt_cut.dtb
+dt_unpack_refused dt_cut.dtb "20 bytes that start with the magic" "this dtb is cut short"
+{ cat a.dtb; dt_patch_total a.dtb dt_second.tmp 4096; cat dt_second.tmp; } >dt_second_long.dtb
+dt_unpack_refused dt_second_long.dtb "a second blob whose totalsize runs past the end" "the FDT blob at offset 192 has a totalsize of 4096"
+rp_report "a dtb that is cut short (20 bytes), whose totalsize is less than the header or runs past the end of the file, in the first blob or in a later one, is refused on unpack with where, and no directory is left"
+
+# the OSIP image: a header of the image is told by its first 7 bytes, an image without one by the bootstub
+rp_fresh osip_u4.img rp_osd
+rm -rf rp_try
+cp -a rp_osd rp_try
+head -c 512 /dev/zero | tr '\0' 'A' >rp_try/osip_header.bin
+rp_refused rp_try "a header of noise" 'the OSIP header does not start with "$OS$"'
+head -c 512 /dev/zero >rp_try/osip_header.bin
+rp_refused rp_try "a header of zeros" 'the OSIP header does not start with "$OS$"'
+{ printf '$OS$\000\000\001'; head -c 505 /dev/urandom; } >rp_try/osip_header.bin
+if rp_made rp_try "a header with the magic and noise behind it"; then
+    said "OSIP bootimg" "$ABR" identify "$rp_run" || rp_bad="$rp_bad [a header with the magic: not known for an OSIP image]"
+    rm -rf rp_try_re
+    "$ABR" unpack "$rp_run" -o rp_try_re >/dev/null 2>&1 || rp_bad="$rp_bad [a header with the magic: the image is not unpacked again]"
+fi
+rp_fresh osip_h4.img rp_osd
+rm -rf rp_try
+cp -a rp_osd rp_try
+{ printf '\000'; tail -c +2 rp_osd/bootstub.bin; } >rp_try/bootstub.bin
+rp_refused rp_try "a headerless image with another bootstub" "is told by its bootstub, which starts with FC FA BC 00"
+rm -rf rp_try rp_try_re
+cp -a rp_osd rp_try
+rp_made rp_try "an untouched headerless image" && { cmp -s "$rp_run" osip_h4.img || rp_bad="$rp_bad [the untouched headerless image is not the image]"; }
+rp_report "an OSIP image whose header is not one (noise, zeros) or that has none and whose bootstub does not start like one is refused, with that said -- the image would not be known again -- and one whose header has the magic is made and unpacked again"
+
+# ---- an image abr would not know again is not written; the claim of a prefix_kind is checked; versions are numbers; a tail has a limit --
+# Found by the third campaign of tests/tools/fuzz_repack.py: a Nook image whose prefix.bin got a byte in front (written, and `identify`
+# calls it data: the name that tells a Nook header is at byte 64), `tail size 4294967295` in ramdisk.meta (4 GiB of zeros; AddressSanitizer
+# refuses the allocation), a ChromeOS version that is a control byte (it was in the message as it was, and read by sscanf: "%u" takes a
+# sign and an overflow is undefined). And os_version / os_patch_level, read by the same sscanf: "14.0.0abc" was 14.0.0, "-1.0.0" a huge
+# number cut to 7 bits, and a text that was none was dropped without a word (the header got zero).
+for rp_case in "nook:NOOK:1048576" "nooktab:NOOKTAB:262144"; do
+    IFS=: read -r rp_t rp_kind rp_hdr <<<"$rp_case"
+    rp_fresh "fx/boot_v0_$rp_t.img" rp_nk
+    rp_made rp_nk "an untouched $rp_t directory" && { cmp -s "$rp_run" "fx/boot_v0_$rp_t.img" || rp_bad="$rp_bad [$rp_t: the untouched directory is not the image]"; }
+    rm -rf rp_try
+    cp -a rp_nk rp_try
+    { printf x; cat rp_nk/prefix.bin; } >rp_try/prefix.bin
+    rp_refused rp_try "$rp_t: a byte in front of the signing header" "prefix.bin is not a $rp_kind signing header any more"
+    head -c $((rp_hdr - 1)) rp_nk/prefix.bin >rp_try/prefix.bin
+    rp_refused rp_try "$rp_t: a signing header a byte short" "prefix.bin is $((rp_hdr - 1)) bytes; a $rp_kind signing header is $rp_hdr bytes"
+    head -c "$rp_hdr" /dev/zero >rp_try/prefix.bin
+    rp_refused rp_try "$rp_t: a signing header of zeros" "prefix.bin is not a $rp_kind signing header any more"
+    cp rp_nk/prefix.bin rp_try/prefix.bin
+    rp_set rp_try prefix_kind BOGUS
+    rp_refused rp_try "$rp_t: prefix_kind=BOGUS" "prefix_kind=BOGUS is not a kind of header that abr knows"
+done
+# what comes out is an image abr knows again: a wrapper of 70000 bytes pushes the boot image out of the 64 KiB where it is looked for
+rp_fresh boot_v2.img rp_dir
+rm -rf rp_try
+cp -a rp_dir rp_try
+head -c 70000 /dev/zero | tr '\0' 'x' >rp_try/prefix.bin
+rp_set rp_try prefix_file prefix.bin
+rp_refused rp_try "a vendor wrapper of 70000 bytes in front of a boot image" "is not a boot image that it knows again"
+head -c 1000 /dev/zero | tr '\0' 'x' >rp_try/prefix.bin
+if rp_made rp_try "a vendor wrapper of 1000 bytes in front of a boot image"; then
+    said "AOSP bootimg" "$ABR" identify "$rp_run" || rp_bad="$rp_bad [a wrapper of 1000 bytes: identify does not say it is a boot image]"
+fi
+rp_report "images with a prefix that is no Nook header any more (a byte in front, a byte short, zeros, a prefix_kind that is none) or a wrapper that pushes the image out of place are refused, with that said, and nothing is written; an untouched Nook directory is the image, a small wrapper is taken"
+
+# a tail of a ramdisk: a size, an alignment -- of at most 1 GiB
+rd_image mkbootfs >/dev/null 2>&1
+rp_fresh rdimg_mkbootfs.img rp_dir
+if [ -f rp_dir/ramdisk.meta ]; then
+    for rp_case in "tail size 4294967295|is more than 1024 MiB" "tail align 4294967295|is more than 1024 MiB" "tail size 1073741825|is more than 1024 MiB" \
+        "tail align 1073741825|is more than 1024 MiB" "tail size 1073741824|the ramdisk would be" "tail size 99999999999999|tail length" \
+        "tail size -1|tail length" "tail size 12abc|tail length" "tail align 0|tail align 0"; do
+        IFS='|' read -r rp_line rp_want <<<"$rp_case"
+        rm -rf rp_try
+        cp -a rp_dir rp_try
+        python3 -I - rp_try/ramdisk.meta "$rp_line" <<'PYEOF'
+import re, sys
+p, line = sys.argv[1], sys.argv[2]
+t = open(p, "rb").read().decode("utf-8")
+t2 = re.sub(r"(?m)^tail .*$", line, t, count=1)
+assert t2 != t or line in t
+open(p, "wb").write(t2.encode("utf-8"))
+PYEOF
+        rp_refused rp_try "ramdisk.meta: $rp_line" "$rp_want"
+    done
+else
+    rp_bad="$rp_bad [rdimg_mkbootfs.img: no ramdisk.meta]"
+fi
+rp_report "a tail of the ramdisk (tail size, tail align) that is more than 1 GiB, that is no number, or that makes the ramdisk more than that, is refused with the line (it was 4 GiB of zeros), and nothing is written"
+
+# versions: os_version "A.B.C" (each at most 127), os_patch_level "YYYY-MM", the preamble version of a ChromeOS blob "2.2"
+rp_fresh boot_v2.img rp_dir
+for rp_v in '14.0.0abc' '14.0.0.1' '128.0.0' '0.128.0' '0.0.128' '-1.0.0' '1..2' '1.2.' '.1' 'a' '0x10' '1000.0.0' '+1' '1,2'; do
+    rm -rf rp_try
+    cp -a rp_dir rp_try
+    rp_set rp_try os_version "$rp_v"
+    rp_refused rp_try "os_version=$rp_v" "os_version=$rp_v is not a version like 14.0.0"
+done
+for rp_v in '2024-16' '1999-05' '2128-01' '24-05' '2024/05' '2024-' '2024-5x' '2024-005' '2024-0x5' 'abcd-01' '-2024-05' '2024-05-01' '2024_05' '0001-01'; do
+    rm -rf rp_try
+    cp -a rp_dir rp_try
+    rp_set rp_try os_patch_level "$rp_v"
+    rp_refused rp_try "os_patch_level=$rp_v" "os_patch_level=$rp_v is not a patch level like 2024-05"
+done
+for rp_case in "14:14.0.0:2024-5:2024-05" "14.0:14.0.0:2024-05:2024-05" "127.127.127:127.127.127:2127-12:2127-12" "0.0.0::0000-00:" "1.2.3:1.2.3:2001-01:2001-01" \
+    "14.0.0:14.0.0:2024-15:2024-15" "9:9.0.0:0000-05:0000-05"; do
+    IFS=: read -r rp_in rp_out rp_pin rp_pout <<<"$rp_case"
+    rm -rf rp_try rp_try_re
+    cp -a rp_dir rp_try
+    rp_set rp_try os_version "$rp_in"
+    rp_set rp_try os_patch_level "$rp_pin"
+    if rp_made rp_try "os_version=$rp_in os_patch_level=$rp_pin" && "$ABR" unpack "$rp_run" -o rp_try_re >/dev/null 2>&1; then
+        grep -q "^os_version=$rp_out\$" rp_try_re/manifest.txt && grep -q "^os_patch_level=$rp_pout\$" rp_try_re/manifest.txt ||
+            rp_bad="$rp_bad [os_version=$rp_in os_patch_level=$rp_pin: the image says $(grep -E '^os_(version|patch_level)=' rp_try_re/manifest.txt | tr '\n' ' ')]"
+    fi
+done
+rp_report "an os_version that is no A.B.C of numbers up to 127 and an os_patch_level that is no YYYY-MM (a sign, a letter, a part too many or too big, a year before 2000) are refused with the key and the value, and the ones that are are the image's header"
+rp_fresh cros_dev22.blob rp_dir
+for rp_v in '2' '2.' '.2' '2.2.2' '2.x' '-2.2' '0x2.2' 'a.b' '2..2' '+2.2' '2,2'; do
+    rm -rf rp_try
+    cp -a rp_dir rp_try
+    rp_set rp_try chromeos_preamble_version "$rp_v"
+    rp_refused rp_try "chromeos_preamble_version=$rp_v" "chromeos_preamble_version=$rp_v is not a version like 2.2"
+done
+for rp_v in '4294967296.0' '2.4294967296'; do
+    rm -rf rp_try
+    cp -a rp_dir rp_try
+    rp_set rp_try chromeos_preamble_version "$rp_v"
+    rp_refused rp_try "chromeos_preamble_version=$rp_v" "chromeos_preamble_version=$rp_v does not fit in 32 bits"
+done
+rm -rf rp_try
+cp -a rp_dir rp_try
+rp_made rp_try "an untouched ChromeOS directory" && { cmp -s "$rp_run" cros_dev22.blob || rp_bad="$rp_bad [the untouched ChromeOS directory is not the blob]"; }
+rp_report "a ChromeOS preamble version that is not two numbers with a dot (a sign, a letter, a part missing or too many, 0x) or that does not fit in 32 bits is refused with the key and the value, and an untouched directory is the blob"
+
+# ---- an image is not written over a file the repack has read ---------------------------------------------------------------------
+# The fourth campaign: `-o d/ramdisk.cpio`, where ramdisk.cpio was a link to manifest.txt, wrote the image into the manifest -- the
+# directory it came from changed under the repack. A file the repack reads (the manifest, a component, a key, a file of the ramdisk
+# directory, and what a symbolic or a hard link among them leads to) is no place for the image; a file next to them is.
+rp_over() {  # <dir> <label> <output> <text the message has> [<more arguments of repack>]: repack of <dir> -o <output> is refused with that text, nothing changes
+    local d="$1" label="$2" o="$3" want="$4"
+    shift 4
+    rm -rf rp_over_before
+    cp -a "$d" rp_over_before
+    rp_n=$((rp_n + 1))
+    if timeout 120 "$ABR" repack "$d" -o "$o" "$@" >rp_over.log 2>&1; then
+        rp_bad="$rp_bad [$label: taken]"
+    elif ! grep -q -F -- "$want" rp_over.log; then
+        rp_bad="$rp_bad [$label: said: $(head -c 160 rp_over.log)]"
+    elif ! diff -r --no-dereference rp_over_before "$d" >/dev/null 2>&1; then
+        rp_bad="$rp_bad [$label: the directory changed]"
+    fi
+}
+rp_fresh boot_v2.img rp_dir
+for rp_o in manifest.txt kernel ramdisk.cpio; do
+    rm -rf rp_try
+    cp -a rp_dir rp_try
+    rp_over rp_try "-o $rp_o (a file the repack reads)" "rp_try/$rp_o" "is a file this repack has read"
+done
+rd_image mkbootfs >/dev/null 2>&1
+rp_fresh rdimg_mkbootfs.img rp_rd
+rp_f=$(cd rp_rd && find ramdisk -type f | head -1)
+if [ -n "$rp_f" ]; then
+    rm -rf rp_try
+    cp -a rp_rd rp_try
+    rp_over rp_try "-o a file of the ramdisk directory" "rp_try/$rp_f" "is a file this repack has read" --ramdisk-from tree
+else
+    rp_bad="$rp_bad [rdimg_mkbootfs.img: no file in the ramdisk directory]"
+fi
+if [ "$RD_WINE" = 0 ]; then
+    rm -rf rp_try
+    cp -a rp_dir rp_try
+    rm rp_try/ramdisk.cpio
+    ln -s manifest.txt rp_try/ramdisk.cpio
+    rp_over rp_try "-o a link (the ramdisk) that leads to the manifest" "rp_try/ramdisk.cpio" "is a file this repack has read"
+    rm -rf rp_try
+    cp -a rp_dir rp_try
+    ln rp_try/kernel rp_try/kernel_copy
+    rp_over rp_try "-o a hard link to the kernel" "rp_try/kernel_copy" "is a file this repack has read"
+    rm -rf rp_try
+    cp -a rp_dir rp_try
+    ln -s kernel rp_try/the_kernel
+    rp_over rp_try "-o a symbolic link to the kernel" "rp_try/the_kernel" "is a file this repack has read"
+fi
+rp_fresh vbmeta_signed.img rp_vb
+cp avb_test_key.pem rp_key.pem
+rp_n=$((rp_n + 1))
+if timeout 120 "$ABR" repack rp_vb -o rp_key.pem --avb-key rp_key.pem >rp_over.log 2>&1 || ! grep -q -F "is a file this repack has read" rp_over.log || ! cmp -s rp_key.pem avb_test_key.pem; then
+    rp_bad="$rp_bad [-o the key that signs: $(head -c 160 rp_over.log)]"
+fi
+# a file next to them is fine, and again over the image that was made before
+rm -rf rp_try
+cp -a rp_dir rp_try
+rp_made_to() {  # <dir> <output> <label>: repack of <dir> -o <output> works
+    rp_n=$((rp_n + 1))
+    if ! timeout 120 "$ABR" repack "$1" -o "$2" >rp_over.log 2>&1 || [ ! -s "$2" ]; then
+        rp_bad="$rp_bad [$3: refused: $(head -c 160 rp_over.log)]"
+        return 1
+    fi
+}
+rp_made_to rp_try rp_try/new.img "an output in the directory" && rp_made_to rp_try rp_try/new.img "the same output again"
+cmp -s rp_try/new.img boot_v2.img || rp_bad="$rp_bad [the output in the directory is not the image]"
+rp_report "an output that is a file the repack has read (the manifest, the kernel, the ramdisk, a file of the ramdisk directory, a key, a link or a hard link to one) is refused with that said and nothing changes; an output next to them is made, and made again over itself"
 
 # ---- a page size that cannot be one: refused with a reason, not gigabytes of zeros ---------------------------------------
 # page_size is the word of a header that the padding of every part is worked out from. 0xFFFFFFFF in it made the check at the

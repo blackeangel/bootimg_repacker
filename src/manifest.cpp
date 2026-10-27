@@ -22,13 +22,16 @@ std::string trim(const std::string& s) {
 }  // namespace
 
 Manifest Manifest::load(const std::filesystem::path& path) {
-    require_regular_file(path);  // (a fifo would be waited for)
-    std::ifstream f(path, std::ios::binary);  // CR before LF is trimmed below; no text-mode surprises
-    if (!f) throw FormatError("cannot open manifest: " + path.string());
+    // (read_file: only a regular file, of a size a manifest can have, and one of the files this run has read: the image that
+    // `repack` makes is not written over it)
+    const Bytes data = read_file(path);
+    const std::string_view text(reinterpret_cast<const char*>(data.data()), data.size());
     Manifest m;
-    std::string line;
     size_t number = 0;
-    while (std::getline(f, line)) {
+    for (size_t at = 0; at < text.size();) {  // (the lines as std::getline cuts them; CR before LF is trimmed below)
+        const size_t nl = text.find('\n', at);
+        const std::string line(text.substr(at, nl == std::string_view::npos ? std::string_view::npos : nl - at));
+        at = nl == std::string_view::npos ? text.size() : nl + 1;
         ++number;
         std::string t = trim(line);
         if (t.empty() || t[0] == '#') continue;
@@ -37,7 +40,7 @@ Manifest Manifest::load(const std::filesystem::path& path) {
         // A value that would not read back the same as plain text is written in double quotes (save() below).
         std::string value, why;
         if (!textquote::unquote(trim(t.substr(eq + 1)), value, why))
-            throw FormatError(path.string() + ", line " + std::to_string(number) + ": " + why);
+            throw FormatError(textquote::quote_shown(path.string()) + ", line " + std::to_string(number) + ": " + why);
         m.set(trim(t.substr(0, eq)), value);
     }
     return m;
@@ -156,6 +159,21 @@ int64_t Manifest::get_int(const std::string& key, int64_t def, int64_t lo, int64
 
 uint32_t Manifest::get_count(const std::string& key, uint32_t def) const {
     return static_cast<uint32_t>(get_int(key, def, 0, kMaxEntries));
+}
+
+std::pair<uint32_t, uint32_t> Manifest::get_version(const std::string& key, uint32_t def_major, uint32_t def_minor) const {
+    if (!has(key)) return {def_major, def_minor};
+    const std::string text = get(key);
+    const size_t dot = text.find('.');
+    auto digits = [](std::string_view part) {
+        return !part.empty() && part.find_first_not_of("0123456789") == std::string_view::npos;
+    };
+    const std::string_view major = std::string_view(text).substr(0, dot);
+    const std::string_view minor = dot == std::string::npos ? std::string_view() : std::string_view(text).substr(dot + 1);
+    if (dot == std::string::npos || !digits(major) || !digits(minor))
+        throw FormatError("manifest.txt: " + key + "=" + textquote::quote_shown(text) +
+                          " is not a version like 2.2 (two decimal numbers with a dot between them)");
+    return {static_cast<uint32_t>(parse_number(key, text, major, 32)), static_cast<uint32_t>(parse_number(key, text, minor, 32))};
 }
 
 uint64_t Manifest::get_size(const std::string& key, uint64_t def) const {

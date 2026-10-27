@@ -3,6 +3,8 @@
 
 #include "abr/textquote.hpp"
 
+#include <mutex>
+
 #ifdef _WIN32
 #include <fcntl.h>
 #include <io.h>
@@ -29,18 +31,48 @@ void require_regular_file(const std::filesystem::path& path) {
         throw FormatError(textquote::quote_shown(path.string()) + " is not a regular file (a device, a fifo or a socket)");
 }
 
+void require_flash_page_size(const char* what, uint64_t v) {
+    if (!is_flash_page_size(v))
+        throw FormatError(std::string(what) + " page_size " + std::to_string(v) +
+                          " is not a flash page size (a power of two from 512 bytes to 16 MiB)");
+}
+
+namespace {
+std::mutex g_reads_mutex;
+std::vector<std::filesystem::path> g_reads;  // what read_file has opened, in the order of the reads (several threads read)
+}  // namespace
+
+std::filesystem::path find_read_file(const std::filesystem::path& output) {
+    std::error_code ec;
+    if (!std::filesystem::exists(output, ec) || ec) return {};  // (nothing there to be written over)
+    std::vector<std::filesystem::path> reads;
+    {
+        std::lock_guard<std::mutex> lock(g_reads_mutex);
+        reads = g_reads;
+    }
+    for (const std::filesystem::path& p : reads) {
+        std::error_code same_ec;
+        if (std::filesystem::equivalent(output, p, same_ec) && !same_ec) return p;
+    }
+    return {};
+}
+
 Bytes read_file(const std::filesystem::path& path) {
     require_regular_file(path);
     std::ifstream f(path, std::ios::binary | std::ios::ate);
-    if (!f) throw FormatError("cannot open file for reading: " + path.string());
+    if (!f) throw FormatError("cannot open file for reading: " + textquote::quote_shown(path.string()));
     std::streamsize n = f.tellg();
-    if (n < 0) throw FormatError("cannot stat file: " + path.string());
+    if (n < 0) throw FormatError("cannot stat file: " + textquote::quote_shown(path.string()));
     if (static_cast<uint64_t>(n) > kMaxReadFile)
         throw FormatError(textquote::quote_shown(path.string()) + " is too big (" + std::to_string(n) + " bytes; abr reads at most 2 GiB of a file)");
     f.seekg(0);
     Bytes out(static_cast<size_t>(n));
     if (n > 0 && !f.read(reinterpret_cast<char*>(out.data()), n))
-        throw FormatError("short read on file: " + path.string());
+        throw FormatError("short read on file: " + textquote::quote_shown(path.string()));
+    {
+        std::lock_guard<std::mutex> lock(g_reads_mutex);
+        g_reads.push_back(path);
+    }
     return out;
 }
 
@@ -50,9 +82,9 @@ void write_file(const std::filesystem::path& path, const uint8_t* data, size_t s
         throw FormatError(textquote::quote_shown(path.string()) + " is not the name of a file (it is empty or ends in a slash)");
     if (path.has_parent_path()) std::filesystem::create_directories(path.parent_path());
     std::ofstream f(path, std::ios::binary | std::ios::trunc);
-    if (!f) throw FormatError("cannot open file for writing: " + path.string());
+    if (!f) throw FormatError("cannot open file for writing: " + textquote::quote_shown(path.string()));
     if (size > 0) f.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(size));
-    if (!f) throw FormatError("short write on file: " + path.string());
+    if (!f) throw FormatError("short write on file: " + textquote::quote_shown(path.string()));
 }
 
 void write_file(const std::filesystem::path& path, const Bytes& data) {

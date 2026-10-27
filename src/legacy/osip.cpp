@@ -161,6 +161,14 @@ size_t OsipImage::body_size() const {
 Bytes OsipImage::build() const {
     if (!header.empty() && header.size() != kOsipHeaderSize)
         throw FormatError("the OSIP header is 512 bytes, not " + std::to_string(header.size()));
+    // What tells the image apart once it is written: the header's magic, or -- an image of a device without a
+    // header -- the bootstub where the layout puts it.
+    if (!header.empty() && !has_header(header))
+        throw FormatError("the OSIP header does not start with \"$OS$\" 00 00 01, which is how an OSIP image is told; "
+                          "the image would not be known for one");
+    if (header.empty() && !matches(bootstub, 0, kBootstubMagic, sizeof kBootstubMagic))
+        throw FormatError("an OSIP image without a header is told by its bootstub, which starts with FC FA BC 00; this "
+                          "one does not, so the image would not be known for an OSIP image");
     if (!signature.empty() && signature.size() != 480 && signature.size() != 728 && signature.size() != 1024)
         throw FormatError("the signature of an OSIP image is 480, 728 or 1024 bytes (mboot reads no other), not " +
                           std::to_string(signature.size()));

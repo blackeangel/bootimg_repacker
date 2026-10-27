@@ -73,7 +73,10 @@ something bigger"). A flag is `true` or `false` (`yes`, `no`, `1`, `0` in any ca
 in pairs, a count (ramdisks, descriptors, blobs) is at most 65536 and the size of a partition (`pad_to`) at most 1 GiB. The
 files it reads are regular files: a directory, a fifo or a device (`/dev/zero`) in their place is refused at once, and
 so is `-o dir/`, which is not the name of a file. A `.abr_raw/` copy that is not the component it is for is refused too (take
-it out to have the component compressed again).
+it out to have the component compressed again). A page size is a power of two from 512 bytes to 16 MiB (the padding of every
+component is worked out from it); a dtb blob is a flattened device tree as long as its header says (that is what finds the next
+one), and an OSIP image has the header or the bootstub that tells it -- what `abr` could not tell from any other file when it
+read it again is not written.
 
 Paths may hold any characters. On Windows `abr.exe` reads the wide command line (the C runtime's `argv` holds a `?` for
 every character outside the ANSI code page: Cyrillic on a Western system, Chinese, an emoji) and works in UTF-8 from
@@ -271,7 +274,10 @@ A cmdline with white space at its ends or a line break is kept exactly
 (`osip_cmdline_file`), and an image that is a whole partition (a fill behind it)
 keeps its size. An image that is cut short, or whose bootstub, signature,
 parameter or image info is not what the layout allows, is refused with the
-reason and nothing is left behind.
+reason and nothing is left behind -- and so is a header that does not start with
+`"$OS$"`, 0, 0, 1, and an image without a header whose bootstub does not start
+with `FC FA BC 00` (the two things an OSIP image is told by: `abr` could not
+know again what it wrote).
 
 The test suite makes its images with a Python tool of its own, written from
 `mboot.c`'s layout, and, where `ABR_MBOOT` names a compiled `mboot` (osm0sis',
@@ -482,8 +488,8 @@ this in the manifest / as side files and writes it back:
 - bytes **before** the image (a vendor wrapper such as a BFBF/SSSS
   header) and **after** it (signature trailers, an AVBv1 `BootSignature`,
   a `SEANDROIDENFORCE` marker), and zero/0xFF **fill up to the original
-  partition size**; a legacy U-Boot uImage keeps what lies behind its data
-  the same way (`tail.bin`, `pad_byte`, `pad_to`);
+  partition size**; a legacy U-Boot uImage, and a dtb file (the zeros a dtb partition is filled up with, a trailer behind
+  the last blob), keep what lies behind their data the same way (`tail.bin`, `pad_byte`, `pad_to`);
 - the boot header `id` and **how it was computed** (AOSP SHA-1, SHA-1
   that also covers a Qualcomm dt blob, SHA-256, or an unrecognised value
   kept verbatim) -- after an edit the id is recomputed the same way;

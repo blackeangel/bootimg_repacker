@@ -27,7 +27,10 @@
 #include <vector>
 
 #include "abr/boot_image.hpp"
+#include "abr/asn1.hpp"
 #include "abr/byte_io.hpp"
+#include "abr/dtb.hpp"
+#include "abr/legacy/osip.hpp"
 #include "abr/manifest.hpp"
 #include "abr/textquote.hpp"
 #include "abr/uimage.hpp"
@@ -1384,7 +1387,7 @@ void test_file_helpers() {
     write_text(dir.path / "f", "abc");
     EXPECT(read_file(dir.path / "f").size() == 3);
     EXPECT_HAS(refusal_of([&] { Manifest::load(dir.path); }), "is a directory");
-    EXPECT_HAS(refusal_of([&] { Manifest::load(dir.path / "missing"); }), "cannot open manifest");
+    EXPECT_HAS(refusal_of([&] { Manifest::load(dir.path / "missing"); }), "cannot open file for reading");
 
     const Bytes data{1, 2, 3};
     EXPECT_HAS(refusal_of([&] { write_file(dir.path / "sub" / "", data); }), "not the name of a file");
@@ -1402,6 +1405,306 @@ void test_file_helpers() {
     fs::create_symlink("/dev/null", dir.path / "devnull", ec);
     if (!ec) EXPECT_HAS(refusal_of([&] { read_file(dir.path / "devnull"); }), "not a regular file");
 #endif
+}
+
+
+// What a key file says is wrong with it is shown, not put into the message: a PEM of someone else holds any byte, and a terminal
+// would obey a control byte in an error message.
+void test_base64_messages() {
+    std::puts("base64: the character that is wrong is shown as it is when it is printable, else as \\xNN");
+    int refused = 0;
+    for (int c = 0; c < 256; ++c) {
+        std::string text = "AAAA";
+        text += static_cast<char>(c);
+        text += "AAAA";
+        const std::string said = refusal_of([&] { der::base64_decode(text); });
+        const bool alphabet = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '+' || c == '/';
+        const bool skipped = c == ' ' || c == '\t' || c == '\r' || c == '\n';
+        if (alphabet || skipped) {
+            EXPECT(said.empty());
+            continue;
+        }
+        ++refused;
+        bool printable = true;
+        for (unsigned char b : said) printable = printable && b >= 0x20 && b < 0x7F;
+        EXPECT(printable);
+        if (c == '=') {
+            EXPECT_HAS(said, "data after padding");
+        } else if (c >= 0x20 && c < 0x7F) {
+            EXPECT_HAS(said, std::string("invalid character '") + static_cast<char>(c) + "'");
+        } else {
+            char shown[8];
+            std::snprintf(shown, sizeof shown, "\\x%02x", c);
+            EXPECT_HAS(said, std::string("invalid character '") + shown + "'");
+        }
+    }
+    EXPECT(refused == 256 - 64 - 4);  // (the 64 digits of the alphabet, and the four white-space bytes that are skipped)
+}
+
+
+// ---- the dtb and the OSIP image: what a blob is, what an image is told by
+
+// A "flattened device tree" of `size` bytes whose header says `total` (the rest of it zeros): not a tree, but all a split looks at.
+Bytes fdt_of(uint32_t total, size_t size) {
+    Bytes b(size, 0);
+    const uint32_t words[2] = {kFdtMagic, total};
+    for (size_t i = 0; i < 2; ++i)
+        for (size_t k = 0; k < 4 && i * 4 + k < size; ++k) b[i * 4 + k] = static_cast<uint8_t>(words[i] >> (24 - 8 * k));
+    return b;
+}
+
+Bytes concat(std::initializer_list<Bytes> parts) {
+    Bytes out;
+    for (const Bytes& p : parts) out.insert(out.end(), p.begin(), p.end());
+    return out;
+}
+
+// The blobs of a dtb file are the trees it starts with, each as long as its header says; what is behind the last one is
+// not a blob (zero fill, a trailer): `consumed` says where it begins, and what is there is not looked at.
+void test_dtb_blobs() {
+    std::puts("dtb: blobs, and what is behind them");
+    std::mt19937_64 rng(0xD7B);
+    const Bytes a = fdt_of(192, 192), b = fdt_of(100, 100);
+    {
+        const Bytes data = concat({a, b, a});
+        const FdtBlobs s = split_fdt_blobs(data);
+        EXPECT(s.blobs.size() == 3);
+        EXPECT(s.blobs.size() == 3 && s.blobs[0] == a && s.blobs[1] == b && s.blobs[2] == a);
+        EXPECT(s.consumed == data.size());
+        EXPECT(join_fdt_blobs(s.blobs) == data);
+    }
+    {
+        const Bytes behind[] = {Bytes(500, 0), Bytes(300, 0xFF), some_bytes(rng, 300), fdt_of(5000, 30), Bytes{0xD0, 0x0D}};
+        for (const Bytes& tail : behind) {
+            const FdtBlobs s = split_fdt_blobs(concat({a, tail}));
+            EXPECT(s.blobs.size() == 1 && s.blobs[0] == a);
+            EXPECT(s.consumed == a.size());
+        }
+    }
+    EXPECT(split_fdt_blobs(Bytes{}).blobs.empty());
+    EXPECT(split_fdt_blobs(Bytes(100, 0)).blobs.empty());
+    EXPECT(split_fdt_blobs(Bytes(100, 0)).consumed == 0);
+    EXPECT(split_fdt_blobs(Bytes{0xD0, 0x0D}).blobs.empty());
+    // refused: a first blob that is cut short, a totalsize that is less than a header or runs past the end of the file, anywhere
+    EXPECT_HAS(refusal_of([&] { split_fdt_blobs(fdt_of(0, 20)); }), "this dtb is cut short");
+    EXPECT_HAS(refusal_of([&] { split_fdt_blobs(fdt_of(8, 192)); }), "has a totalsize of 8 bytes, which is less than its header (40)");
+    EXPECT_HAS(refusal_of([&] { split_fdt_blobs(fdt_of(0, 192)); }), "less than its header (40)");
+    EXPECT_HAS(refusal_of([&] { split_fdt_blobs(fdt_of(39, 192)); }), "less than its header (40)");
+    EXPECT_HAS(refusal_of([&] { split_fdt_blobs(fdt_of(193, 192)); }), "has a totalsize of 193 bytes, which is more than the 192 the file has left");
+    EXPECT_HAS(refusal_of([&] { split_fdt_blobs(concat({a, fdt_of(4096, 100)})); }), "the FDT blob at offset 192 has a totalsize of 4096");
+    EXPECT_HAS(refusal_of([&] { split_fdt_blobs(concat({a, b, fdt_of(39, 100)})); }), "the FDT blob at offset 292 has a totalsize of 39");
+    EXPECT(refusal_of([&] { split_fdt_blobs(fdt_of(40, 192)); }).empty());  // (a header's worth is a blob)
+    EXPECT(split_fdt_blobs(fdt_of(40, 192)).consumed == 40);
+
+    // a blob that stands by itself
+    EXPECT(refusal_of([&] { check_fdt_blob(a, "x"); }).empty());
+    EXPECT(refusal_of([&] { check_fdt_blob(fdt_of(40, 40), "x"); }).empty());
+    EXPECT_HAS(refusal_of([&] { check_fdt_blob(Bytes{}, "the file"); }), "the file is not a flattened device tree");
+    EXPECT_HAS(refusal_of([&] { check_fdt_blob(Bytes{0xD0, 0x0D, 0xFE}, "the file"); }), "the file is not a flattened device tree");
+    EXPECT_HAS(refusal_of([&] { check_fdt_blob(some_bytes(rng, 192), "the file"); }), "is not a flattened device tree");
+    for (size_t i = 0; i < 4; ++i) {
+        Bytes t = a;
+        t[i] ^= 0x01;
+        EXPECT_HAS(refusal_of([&] { check_fdt_blob(t, "blob"); }), "blob is not a flattened device tree");
+    }
+    EXPECT_HAS(refusal_of([&] { check_fdt_blob(Bytes(a.begin(), a.begin() + 39), "blob"); }), "blob is cut short");
+    EXPECT_HAS(refusal_of([&] { check_fdt_blob(Bytes(a.begin(), a.begin() + 4), "blob"); }), "blob is cut short");
+    {
+        Bytes longer = a;
+        longer.push_back(0);
+        EXPECT_HAS(refusal_of([&] { check_fdt_blob(longer, "blob"); }), "blob is 193 bytes, but the totalsize in its header is 192");
+        EXPECT_HAS(refusal_of([&] { check_fdt_blob(Bytes(a.begin(), a.end() - 1), "blob"); }), "blob is 191 bytes, but the totalsize in its header is 192");
+    }
+    // whatever split_fdt_blobs hands out stands as a blob, and the blobs join into the file they came from
+    for (int i = 0; i < 100; ++i) {
+        Bytes data;
+        const size_t n = 1 + rng() % 4;
+        for (size_t k = 0; k < n; ++k) {
+            const size_t size = 40 + rng() % 400;
+            data = concat({data, fdt_of(static_cast<uint32_t>(size), size)});
+        }
+        const size_t blobs_end = data.size();
+        data = concat({data, some_bytes(rng, rng() % 200)});
+        const FdtBlobs s = split_fdt_blobs(data);
+        EXPECT(s.blobs.size() == n && s.consumed == blobs_end);
+        for (const Bytes& blob : s.blobs) EXPECT(refusal_of([&] { check_fdt_blob(blob, "blob"); }).empty());
+        EXPECT(concat({join_fdt_blobs(s.blobs), Bytes(data.begin() + static_cast<std::ptrdiff_t>(s.consumed), data.end())}) == data);
+    }
+}
+
+// An OSIP image is told by its header ("$OS$" 00 00 01) or, when it has none, by its bootstub (FC FA BC 00): what build()
+// writes has to be an image that parse() takes up again, whatever the pieces were.
+void test_osip_tells() {
+    std::puts("OSIP: what tells an image");
+    using namespace abr::legacy;
+    std::mt19937_64 rng(0x051B);
+    OsipImage img;
+    img.cmdline.assign(kOsipCmdlineSize, 0);
+    const std::string cmd = "console=ttyS0 androidboot.hardware=unit";
+    std::copy(cmd.begin(), cmd.end(), img.cmdline.begin());
+    img.info_rest.assign(kOsipInfoSize - kOsipInfoFixedSize, 0);
+    img.bootstub = some_bytes(rng, 4096);
+    const uint8_t stub_magic[4] = {0xFC, 0xFA, 0xBC, 0x00};
+    std::copy(stub_magic, stub_magic + 4, img.bootstub.begin());
+    img.kernel = some_bytes(rng, 700);
+    img.kernel[0] = 0xEB;  // (it follows the bootstub: not a letter there)
+    img.kernel[1] = 0x3C;
+    img.ramdisk = Bytes(300, 0);
+    std::copy_n("070701", 6, img.ramdisk.begin());
+
+    {  // no header
+        const Bytes built = img.build();
+        EXPECT(OsipImage::looks_like(built));
+        const OsipImage p = OsipImage::parse(built);
+        EXPECT(p.header.empty() && p.signature.empty() && p.cmdline == img.cmdline && p.bootstub == img.bootstub);
+        EXPECT(p.kernel == img.kernel && p.ramdisk == img.ramdisk && p.consumed == built.size());
+    }
+    {  // the bootstub of an image without a header is what tells it: not one that starts otherwise
+        for (size_t i = 0; i < 4; ++i) {
+            OsipImage other = img;
+            other.bootstub[i] ^= 0x01;
+            EXPECT_HAS(refusal_of([&] { other.build(); }), "told by its bootstub, which starts with FC FA BC 00");
+        }
+        OsipImage other = img;
+        other.bootstub.assign(8192, 0x5A);  // (an image that has a header does not need it to start any way)
+        other.header.assign(kOsipHeaderSize, 0);
+        std::copy_n("$OS$\0\0\1", 7, other.header.begin());
+        EXPECT(refusal_of([&] { other.build(); }).empty());
+    }
+    {  // a header
+        OsipImage with = img;
+        with.header.assign(kOsipHeaderSize, 0);
+        std::copy_n("$OS$\0\0\1", 7, with.header.begin());
+        for (size_t i = 7; i < with.header.size(); ++i) with.header[i] = static_cast<uint8_t>(rng());
+        const Bytes built = with.build();
+        EXPECT(OsipImage::looks_like(built));
+        const OsipImage p = OsipImage::parse(built);
+        EXPECT(p.header == with.header && p.bootstub == with.bootstub && p.kernel == with.kernel && p.ramdisk == with.ramdisk);
+        for (size_t i = 0; i < 7; ++i) {  // not one: any of the 7 bytes that tell it is something else
+            OsipImage other = with;
+            other.header[i] ^= 0x01;
+            EXPECT_HAS(refusal_of([&] { other.build(); }), "the OSIP header does not start with \"$OS$\" 00 00 01");
+        }
+        OsipImage zeros = with;
+        zeros.header.assign(kOsipHeaderSize, 0);
+        EXPECT_HAS(refusal_of([&] { zeros.build(); }), "does not start with");
+        OsipImage small = with;
+        small.header.resize(100);
+        EXPECT_HAS(refusal_of([&] { small.build(); }), "the OSIP header is 512 bytes, not 100");
+    }
+}
+
+
+// ---- versions: "2.2" of a ChromeOS preamble, "A.B.C" and "YYYY-MM" of a boot header
+
+// The rule of Manifest::get_version written again: two parts at the first dot, each of decimal digits only (at least one), and each
+// a number that fits 32 bits.
+std::optional<std::pair<uint32_t, uint32_t>> version_by_from_chars(const std::string& text) {
+    const size_t dot = text.find('.');
+    if (dot == std::string::npos) return std::nullopt;
+    uint32_t parts[2] = {0, 0};
+    const std::string_view texts[2] = {std::string_view(text).substr(0, dot), std::string_view(text).substr(dot + 1)};
+    for (int i = 0; i < 2; ++i) {
+        const std::string_view t = texts[i];
+        if (t.empty() || t.find_first_not_of("0123456789") != std::string_view::npos) return std::nullopt;
+        const auto r = std::from_chars(t.data(), t.data() + t.size(), parts[i], 10);
+        if (r.ec != std::errc() || r.ptr != t.data() + t.size()) return std::nullopt;
+    }
+    return std::make_pair(parts[0], parts[1]);
+}
+
+void test_versions() {
+    std::puts("manifest.txt: versions of a ChromeOS preamble, of an OS, of a patch level");
+    {
+        Manifest absent;
+        const auto d = absent.get_version("v", 7, 9);
+        EXPECT(d.first == 7 && d.second == 9);
+    }
+    const char* good[] = {"2.2", "2.0", "0.0", "02.02", "4294967295.4294967295", "10.20"};
+    for (const char* text : good) {
+        Manifest m;
+        m.set("v", text);
+        const auto want = version_by_from_chars(text);
+        EXPECT(want.has_value());
+        const auto got = m.get_version("v", 1, 1);
+        EXPECT(want && got.first == want->first && got.second == want->second);
+    }
+    const char* bad[] = {"", "2", "2.", ".2", ".", "2.2.2", "-2.2", "+2.2", "2.x", "x.2", "0x2.2", "2.0x2", "a.b", "2..2", "2,2", "2.2e1", "1_0.2", "\xd9\xa2.\xd9\xa2"};
+    for (const char* text : bad) {
+        Manifest m;
+        m.set("v", text);
+        EXPECT_HAS(refusal_of([&] { m.get_version("v", 1, 1); }), "is not a version like 2.2");
+    }
+    for (const char* text : {"4294967296.0", "2.4294967296", "99999999999999999999.1", "1.99999999999999999999"}) {
+        Manifest m;
+        m.set("v", text);
+        const std::string said = refusal_of([&] { m.get_version("v", 1, 1); });
+        EXPECT(contains(said, "does not fit in 32 bits") || contains(said, "is too large"));
+        EXPECT(contains(said, std::string("v=") + text));
+    }
+    {  // the value is shown as text, whatever it is
+        Manifest m;
+        m.set("v", std::string("\x08\x1b[2J"));
+        const std::string said = refusal_of([&] { m.get_version("v", 1, 1); });
+        bool printable = true;
+        for (unsigned char c : said) printable = printable && c >= 0x20 && c < 0x7F;
+        EXPECT(printable);
+    }
+    std::mt19937_64 rng(0x7E55);
+    static const char kAlphabet[] = "0123456789..x-+ ,";
+    for (int i = 0; i < 20000; ++i) {
+        std::string text;
+        const size_t n = rng() % 14;
+        for (size_t k = 0; k < n; ++k) text.push_back(kAlphabet[rng() % (sizeof kAlphabet - 1)]);
+        Manifest m;
+        m.set("v", text);
+        const auto want = version_by_from_chars(text);
+        const std::string said = refusal_of([&] { m.get_version("v", 1, 1); });
+        if (want) {
+            EXPECT(said.empty());
+            if (said.empty()) {
+                const auto got = m.get_version("v", 1, 1);
+                EXPECT(got.first == want->first && got.second == want->second);
+            }
+        } else {
+            EXPECT(!said.empty() && !contains(said, "NOT A FormatError"));
+        }
+    }
+
+    // os_version "A", "A.B", "A.B.C" (each 0..127) and os_patch_level "YYYY-MM" (a year 2000..2127 or 0, a month 0..15)
+    auto os_of = [](const std::string& v, const std::string& p) { return refusal_of([&] { OsVersion::parse(v, p); }); };
+    for (const char* text : {"", "0", "14", "14.0", "14.0.0", "127.127.127", "0.0.0", "007.01.2", "1.2.3"})
+        EXPECT(os_of(text, "").empty());
+    for (const char* text : {"14.0.0abc", "14.0.0.1", "128.0.0", "0.128.0", "0.0.128", "-1.0.0", "1..2", "1.2.", ".1", ".", "a", "0x10", "1000.0.0", "+1", "1,2", "1 2",
+                             "1.2.3 ", "0128"}) {
+        const std::string said = os_of(text, "");
+        EXPECT_HAS(said, "manifest.txt: os_version=" + textquote::quote_shown(text) + " is not a version like 14.0.0");
+    }
+    for (const char* text : {"", "2024-05", "2024-5", "2000-01", "2127-12", "0000-05", "0000-00", "2024-15", "2024-00", "2001-1"})
+        EXPECT(os_of("", text).empty());
+    for (const char* text : {"2024-16", "1999-05", "2128-01", "24-05", "2024/05", "2024-", "2024-5x", "2024-005", "2024-0x5", "abcd-01", "-2024-05", "2024-05-01",
+                             "2024_05", "0001-01", "2024", "20245-1", "2024--1", "2024-+1", "2024- 1"}) {
+        EXPECT_HAS(os_of("", text), "manifest.txt: os_patch_level=" + textquote::quote_shown(text) + " is not a patch level like 2024-05");
+    }
+    {  // what a header holds
+        const OsVersion o = OsVersion::parse("14.1.2", "2024-05");
+        EXPECT(o.major == 14 && o.minor == 1 && o.patch == 2 && o.year == 2024 && o.month == 5);
+        const OsVersion back = OsVersion::unpack(o.pack());
+        EXPECT(back.major == 14 && back.minor == 1 && back.patch == 2 && back.year == 2024 && back.month == 5);
+        EXPECT(back.to_string() == "14.1.2" && back.patch_level_string() == "2024-05");
+        const OsVersion edge = OsVersion::parse("127.127.127", "2127-15");
+        EXPECT(OsVersion::unpack(edge.pack()).to_string() == "127.127.127");
+        EXPECT(OsVersion::unpack(edge.pack()).patch_level_string() == "2127-15");
+        EXPECT(OsVersion::parse("", "").pack() == 0);
+    }
+    // every word of 32 bits that a header can hold is written as text that reads back as the same word
+    for (int i = 0; i < 5000; ++i) {
+        const uint32_t word = static_cast<uint32_t>(rng());
+        const OsVersion o = OsVersion::unpack(word);
+        const OsVersion again = OsVersion::parse(o.to_string(), o.patch_level_string());
+        // (the word is all fields: 7 bits each of the three parts of the version and of the year, 4 of the month)
+        EXPECT(again.pack() == word);
+    }
 }
 
 }  // namespace
@@ -1423,6 +1726,10 @@ int run_manifest_tests() {
     test_manifest_numbers();
     test_manifest_flags_and_lists();
     test_file_helpers();
+    test_base64_messages();
+    test_dtb_blobs();
+    test_osip_tells();
+    test_versions();
     if (g_failures == 0) std::printf("manifest: ok (%d checks)\n", g_checks);
     else std::printf("manifest: %d failure(s)\n", g_failures);
     return g_failures == 0 ? 0 : 1;

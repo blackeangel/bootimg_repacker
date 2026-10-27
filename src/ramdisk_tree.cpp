@@ -290,6 +290,9 @@ Meta parse_meta(std::string_view text) {
                 else meta_error(line_no, "tail must be 'align N' or 'size N'");
                 m.tail_value = parse_u32(b, 10, line_no, "tail length");
                 if (m.tail_align && m.tail_value == 0) meta_error(line_no, "tail align 0");
+                if (m.tail_value > kMaxImageSize)
+                    meta_error(line_no, "the tail length " + std::to_string(m.tail_value) + " is more than " +
+                                            std::to_string(kMaxImageSize >> 20) + " MiB, and no ramdisk is that big");
             } else if (key == "default") {
                 each_setting(args, line_no, [&](std::string_view k, std::string_view v) {
                     if (k == "uid") m.default_uid = parse_u32(v, 10, line_no, "uid");
@@ -1386,7 +1389,11 @@ Bytes pack_ramdisk_tree(const fs::path& dir, const std::string& prefix, size_t v
         const VolumeBuild v = build_volume(tree, dir / ramdisk_volume_meta(prefix, i), name + "/", report);
         out.insert(out.end(), v.archive.begin(), v.archive.end());
         const size_t end = out.size();
-        out.resize(v.tail_align ? align_up(end, v.tail_value) : end + v.tail_value, 0);
+        const uint64_t filled = v.tail_align ? align_up(uint64_t(end), uint64_t(v.tail_value)) : uint64_t(end) + v.tail_value;
+        if (filled > kMaxImageSize)
+            throw FormatError("the ramdisk would be " + std::to_string(filled) + " bytes with the tail of " + name + "/ (no ramdisk of the "
+                              "family is more than " + std::to_string(kMaxImageSize >> 20) + " MiB)");
+        out.resize(static_cast<size_t>(filled), 0);
         ++built;
         if (report) report->built.push_back(name);
     }

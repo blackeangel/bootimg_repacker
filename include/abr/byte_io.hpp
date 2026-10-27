@@ -67,6 +67,10 @@ void require_regular_file(const std::filesystem::path& path);
 // of the boot family is near it, and a manifest that asks for more is taken for damaged.
 inline constexpr uint64_t kMaxImageSize = 0x40000000ull;
 Bytes read_file(const std::filesystem::path& path);
+// The files read_file has read so far (in this run): `repack` asks, before it writes its image, whether the output is one of them --
+// an image written over the manifest, a component, a key it has read (or over what a symbolic or a hard link of the directory leads
+// to) is the work of the directory lost. Returns the path as it was read, or an empty path.
+std::filesystem::path find_read_file(const std::filesystem::path& output);
 void write_file(const std::filesystem::path& path, const Bytes& data);
 void write_file(const std::filesystem::path& path, const uint8_t* data, size_t size);
 
@@ -116,6 +120,9 @@ constexpr uint64_t padding_for(uint64_t value, uint64_t alignment) {
 // 16 KiB). Anything else is a header that is damaged -- or not a header -- and the padding of every part that is worked
 // out from it would be nonsense, or gigabytes of zeros.
 constexpr bool is_flash_page_size(uint64_t v) { return v >= 512 && v <= (uint64_t{16} << 20) && (v & (v - 1)) == 0; }
+// FormatError for a page size that no flash has, in the words every header reader and builder uses ("boot image page_size 777 is not a
+// flash page size ..."): what a header holds is checked when it is read, and what a manifest says when the header is written.
+void require_flash_page_size(const char* what, uint64_t v);
 
 // A dump whose last page of padding was cut off by whoever made it: the parser records how many bytes were
 // missing (`missing`) and how many of the padding the file does hold (`kept`, usually none: the file ends where

@@ -43,9 +43,7 @@ VendorBootImage VendorBootImage::parse(const Bytes& image) {
                            std::to_string(img.header_version));
     img.page_size = r.le32();
     if (img.page_size == 0) throw FormatError("vendor_boot page_size is zero");
-    if (!is_flash_page_size(img.page_size))
-        throw FormatError("vendor_boot page_size " + std::to_string(img.page_size) +
-                          " is not a flash page size (a power of two from 512 bytes to 16 MiB)");
+    require_flash_page_size("vendor_boot", img.page_size);
     img.kernel_addr = r.le32();
     img.ramdisk_addr = r.le32();
     uint32_t vendor_ramdisk_size = r.le32();
@@ -173,6 +171,7 @@ Bytes VendorBootImage::build() const {
         throw FormatError("unsupported vendor_boot header version: " +
                            std::to_string(header_version));
     uint32_t page_sz = page_size ? page_size : 4096;
+    require_flash_page_size("vendor_boot", page_sz);
 
     BinaryWriter w;
     w.bytes(reinterpret_cast<const uint8_t*>(kVendorBootMagic), kVendorBootMagicSize);

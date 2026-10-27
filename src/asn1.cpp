@@ -2,6 +2,7 @@
 #include "abr/asn1.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 
 namespace abr::der {
@@ -129,7 +130,14 @@ Bytes base64_decode(const std::string& text) {
         }
         if (pad) throw FormatError("base64: data after padding");
         int v = value(c);
-        if (v < 0) throw FormatError(std::string("base64: invalid character '") + c + "'");
+        if (v < 0) {
+            // (what the file holds is not put into a message as it is: a terminal would obey a control byte)
+            const unsigned char u = static_cast<unsigned char>(c);
+            char shown[8];
+            if (u >= 0x20 && u < 0x7F) std::snprintf(shown, sizeof shown, "%c", c);
+            else std::snprintf(shown, sizeof shown, "\\x%02x", u);
+            throw FormatError(std::string("base64: invalid character '") + shown + "'");
+        }
         acc = (acc << 6) | static_cast<uint32_t>(v);
         bits += 6;
         if (bits >= 8) {

@@ -3,6 +3,14 @@
 
 namespace abr {
 
+namespace {
+bool has_fdt_magic(const Bytes& data) {
+    if (data.size() < 4) return false;
+    BinaryReader r(data);
+    return r.be32() == kFdtMagic;
+}
+}  // namespace
+
 bool looks_like_fdt(const Bytes& data) {
     if (data.size() < kFdtHeaderSize) return false;
     BinaryReader r(data);
@@ -16,30 +24,45 @@ uint32_t fdt_total_size(const Bytes& data) {
     return r.be32();
 }
 
-std::vector<Bytes> split_fdt_blobs(const Bytes& data) {
-    std::vector<Bytes> out;
+FdtBlobs split_fdt_blobs(const Bytes& data) {
+    FdtBlobs out;
     size_t pos = 0;
     while (pos < data.size()) {
-        Bytes remaining(data.begin() + static_cast<long>(pos), data.end());
-        if (!looks_like_fdt(remaining)) {
-            // Trailing garbage/padding after the last real blob: if it's
-            // all zero, drop it silently; otherwise keep it as-is so we
-            // don't silently lose data on round-trip.
-            bool all_zero = true;
-            for (uint8_t b : remaining)
-                if (b != 0) { all_zero = false; break; }
-            if (!all_zero) out.push_back(std::move(remaining));
-            break;
+        const size_t left = data.size() - pos;
+        BinaryReader r(data);
+        r.skip(pos);
+        if (left < 4 || r.be32() != kFdtMagic) break;
+        if (left < kFdtHeaderSize) {
+            // Only the first blob is a mistake to be told; what follows the last one is not looked at.
+            if (pos != 0) break;
+            throw FormatError("this dtb is cut short: its header is " + std::to_string(kFdtHeaderSize) +
+                              " bytes and the file ends after " + std::to_string(left));
         }
-        uint32_t total = fdt_total_size(remaining);
-        if (total == 0 || total > remaining.size())
-            throw FormatError("FDT blob at offset " + std::to_string(pos) +
-                               " has an invalid totalsize");
-        out.emplace_back(remaining.begin(), remaining.begin() + total);
+        const uint32_t total = r.be32();
+        if (total < kFdtHeaderSize || total > left)
+            throw FormatError("the FDT blob at offset " + std::to_string(pos) + " has a totalsize of " +
+                              std::to_string(total) + " bytes, which " +
+                              (total < kFdtHeaderSize ? "is less than its header (" + std::to_string(kFdtHeaderSize) + ")"
+                                                      : "is more than the " + std::to_string(left) + " the file has left"));
+        out.blobs.emplace_back(data.begin() + static_cast<std::ptrdiff_t>(pos),
+                               data.begin() + static_cast<std::ptrdiff_t>(pos + total));
         pos += total;
     }
-    if (out.empty()) out.push_back(data);  // empty or unrecognized input: pass through whole
+    out.consumed = pos;
     return out;
+}
+
+void check_fdt_blob(const Bytes& blob, const std::string& what) {
+    if (!has_fdt_magic(blob))
+        throw FormatError(what + " is not a flattened device tree (a dtb blob starts with the bytes d0 0d fe ed)");
+    if (blob.size() < kFdtHeaderSize)
+        throw FormatError(what + " is cut short: the header of a flattened device tree is " + std::to_string(kFdtHeaderSize) +
+                          " bytes and the file has " + std::to_string(blob.size()));
+    const uint32_t total = fdt_total_size(blob);
+    if (total != blob.size())
+        throw FormatError(what + " is " + std::to_string(blob.size()) + " bytes, but the totalsize in its header is " +
+                          std::to_string(total) + "; the size is what finds the next blob, so the two have to agree (`dtc` writes "
+                          "the header right; bytes that belong behind the last blob go in the trailer, not in a blob)");
 }
 
 Bytes join_fdt_blobs(const std::vector<Bytes>& blobs) {
