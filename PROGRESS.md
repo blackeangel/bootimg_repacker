@@ -1485,7 +1485,7 @@ hostile ones, and text that goes into a file or onto a terminal. It found real b
 - `-DABR_SANITIZE=address,undefined` (CMake option, an interface target `abr_sanitize` that `abr_core` links; abr's own
   code is instrumented, the vendored libraries are not; refused with MSVC, Windows and `ABR_STATIC_BINARY`).
 - The whole suite runs on that build with the sanitizers' reports written to files (a test that expects an error would
-  take a sanitizer's exit status for the error it wanted): **462 of 462 now, no report** (353 when the build was added). The CI has a job for it
+  take a sanitizer's exit status for the error it wanted): **470 of 470 now, no report** (353 when the build was added). The CI has a job for it
   (`linux-x86_64 (g++-14, ASan+UBSan)`): the suite, the reports of the suite, and a short fuzz run on the images the suite made.
 - `ABR_KEEP_WORK=1 tests/run_tests.sh` keeps the directory the suite worked in: every image it made is a seed for the fuzzer.
 
@@ -1564,7 +1564,7 @@ hostile ones, and text that goes into a file or onto a terminal. It found real b
 - **Header fidelity:** the bytes behind the NUL of a text field and the non-zero bytes in the padding behind a component are
   kept now (the next two sections). What is still not kept, and why, is listed at the end of the second.
 - In-process libFuzzer targets for the parsers (the fuzzer above is a command-line fuzzer: slow, but it sees `main`).
-- A fuzz mode that damages `manifest.txt` and the component files of an unpacked directory (`repack` side).
+- (Done: a fuzz mode that damages the directory of an unpack, the `repack` side -- see "Hardening of `repack`" below.)
 
 ## Header fidelity: the bytes behind the NUL of a text field (done, 22-23 Oct 2026)
 
@@ -1745,6 +1745,145 @@ start; uImage did not use it.
   461/461 (15 checks more than before: 447 -> 462); the unit tests, 451 954 checks (1 500 more), pass on the g++, ASan+UBSan,
   clang and mingw-under-wine builds.
 - The fuzz table (same seeds, 4482 images): 164 -> **162** images, 140 -> **138** distinct findings.
+
+## Hardening of `repack`: the damaged directory of an unpack (25-26 Oct 2026)
+
+`fuzz_images.py` damages images and looks at `unpack`. `repack` reads something else: the directory `unpack` wrote -- a
+manifest that a person edits, the component files, the ramdisk directory and its `ramdisk.meta`, the raw copies in
+`.abr_raw`, the keys that sign -- and any of it may come from someone else (a directory that was downloaded, a script, an
+archive). The user's own spec asks for it: "refuse to repack a contradictory header / out-of-range offsets".
+
+### `tests/tools/fuzz_repack.py`
+
+- Unpacks every seed once (a fifth of them with `--no-tree`, a fifth with `--tree-only`, as `unpack` can be asked), copies the
+  directory for every iteration and applies one to a few mutators of six families: **manifest** (a value from a pool of
+  numbers, flags, hexadecimal strings, texts and paths; a key deleted, doubled, from another format, a value taken from
+  another image's manifest, a line that is no line, raw bytes in a line, the order of the lines), **files** (a component cut,
+  grown, flipped, swapped, deleted, renamed; a directory, a fifo, a socket or a link in its place; a stranger next to it; the
+  `.abr_raw` copies and the sizes of the layout), **tree** (the ramdisk directory: files, directories, links, device nodes and
+  fifos with names that are control characters, a 4 GiB file, a tree 1500 levels deep, 100 000 entries, hard links), **meta**
+  (every field of every line of `ramdisk.meta`, every directive, lines that are no lines), **keys** (the keys of `--avb-key`,
+  `--avb1-key`, `--avb1-cert`, `--chromeos-key`, `--chromeos-keyblock`: a PEM cut, a label that is another, a DER whose length
+  or tag is a lie, a node twice) and **output** (where `-o` points: a directory, a name that ends in a slash, a path whose
+  parent is not there, one of the files that are read). A third of the directories are also edited the way a person edits
+  (a byte of a component), so that the image is built and not replayed.
+- Judged by how abr behaves, not by what it says: a signal, a timeout, a sanitizer report, an exception of the standard
+  library that nobody meant to reach, a control character or a byte that is not UTF-8 in the output (the output filter is off
+  for the run: a message that forgets to escape is a finding, however the filter would have hidden it), and the oracles of
+  `repack`: it said nothing when it refused, it left a file or a directory behind, it changed the directory it reads (a
+  snapshot of every stat and every byte before and after), it wrote nothing or too much, the image depends on `-o` or on `-j`,
+  `identify` calls it `data`, `unpack` cannot read it again, a second `repack` of that unpack is not the image (silently:
+  `unpack` did not say it could not).
+- A run is determined by `--rng-seed`, the seed and the iteration; a finding is kept as a tar file with the damaged directory
+  and `REPRO_ARGV`, and `--repro FILE.tar` runs it again. The CI's sanitizer job runs it after the image fuzzer.
+
+### What the first campaign found (1589 damaged directories, 4148 runs, 184 s, g++ build): 19 findings in 6 classes
+
+(The table of the run: `std::bad_alloc` x31, `stoull` x16, `stoul` x9, `vector::reserve` x1, timeouts x3, the terminal
+class x13, `left-behind` x10, `empty-output` x3, `unreadable-output` x4.)
+
+1. **Numbers read by `stoul` / `stoull`**: `12abc` was 12, `-1` was 4294967295, `0x100000000` in a 32-bit field was cut to 0
+   -- the image was written, from a number nobody wrote -- and a word was an exception that said `stoul` and nothing of the
+   key.
+2. **A directory, a fifo, a device where a file should be**: `read_file` opened them as files (a directory: `std::bad_alloc`);
+   a fifo that nobody writes to is waited for for ever (the timeouts).
+3. **A size or a count that is asked for** (`pad_to=0xFFFFFFFFFFFFFFFF`: `vector::reserve`; a count of 4294967295 is a loop
+   that long and `std::bad_alloc`).
+4. **Text of the directory in a message, as it was** (13 runs): a line of `ramdisk.meta` ("unknown setting ..."), the name of a
+   new file of the tree, a path in a message -- escape sequences, a bell, bytes that are not UTF-8.
+5. **Things left behind or not made** (13 runs): `-o dir/` made an empty directory and then failed; a dtb of `blob_count=0`
+   was written as an empty file with exit status 0 (`empty-output`).
+6. **A raw copy that is not the component** (4 runs, `unreadable-output`): `.abr_raw/kernel.raw` is what goes into the image
+   while `kernel` is unchanged; a copy that was cut short, or was another stream, was built into the image where nobody
+   looks, and `unpack` refuses what came out.
+
+### The fixes
+
+- **One strict number parser** (`Manifest::parse_number`, behind `get_u32`, `get_u64`, `get_bounded`, `get_addr32`): decimal
+  digits, or `0x` and hexadecimal digits (`010` is ten), nothing else -- no sign, no unit, no white space, no text behind; the
+  value must fit the field it is for (the 32-bit address fields use `get_addr32`, the 8-bit ones `get_bounded(.., 8)`). Every
+  refusal names the key and the value (escaped). `get_count` (at most 65536), `get_size` (at most 1 GiB, the most that any
+  image of the family has), `get_int` (levels -1..22, `_tree_volumes` 1..256), strict `get_bool` (`true`/`false`/`yes`/`no`/
+  `1`/`0` in any case; a typo that reads as `false` would turn a feature off silently), `get_hex` (an odd number of digits is
+  an error), the lists of the ELF layout. Lookups go through a hash index (a manifest of 200 000 lines was quadratic).
+- `read_file` / `Manifest::load` refuse a directory, a fifo, a device or a socket (a link to one is followed and refused) and
+  a file above 2 GiB, saying so; `write_file` refuses a name that ends in a slash.
+- `check_raw_copy`: a `.abr_raw/<file>.raw` is believed only if it decompresses to the component as it was unpacked
+  (`<prefix>_orig_hash`); else it is refused with the file named and "delete it to have the component compressed again".
+- `repack_dtb` refuses `blob_count=0`. The tree reader, `ramdisk.meta` and the notes of the tree escape what they print with
+  `textquote::quote_shown`; the "unknown escape" message of the quoted-string reader is escaped too.
+- Found on the way, in the fuzzer: its DER mutator overflowed on a length above 65535 (so part of the key damage was never
+  made); fixed.
+
+### Four more campaigns (rng seeds 21-24: 2915 damaged directories and about 7000 runs each, ASan+UBSan build)
+
+Each campaign was run on the build that had the fixes of the one before; the findings of one were fixed (or the fuzzer
+corrected) before the next. 12 distinct findings in all, in 9 classes -- every one of them a `repack` that said "done" and
+wrote what the directory does not say, or what abr itself does not know again, or that died or lied on what it printed.
+
+- **A size that is a buffer** (campaign 21, 2 runs): `page_size=2147485696` of a boot image and
+  `chromeos_bootloader_size=2147483648` asked for 2 GiB (ASan: `allocation-size-too-big`; without it `std::bad_alloc`). The
+  ChromeOS size fields go through `get_size` (at most 1 GiB) now, and a page size must be a flash page size -- a power of two
+  from 512 bytes to 16 MiB -- where the manifest is read and again where a header is built (`require_flash_page_size`, in
+  `boot_image.cpp` and `vendor_boot.cpp`).
+- **A page size that `repack` takes and `unpack` refuses** (campaign 21, 5 runs, `unreadable-output`): `page_size=0777` was
+  777. The same rule.
+- **Bytes of the directory in a message** (campaign 21, 4 runs; campaign 23, 1 run): the "invalid character" of the base64
+  reader, the message of an RSA key that cannot be read, the path of a file that cannot be opened, and the text of a version
+  field were printed as they were. All of them are escaped with `textquote::quote_shown` now (`byte_io.cpp`, `asn1.cpp`,
+  `main.cpp`).
+- **A dtb blob that is not one** (campaign 22, `unknown-output`: `identify` called what `repack` wrote `data`): a bit of a blob
+  was flipped where its header says what it is, and the blob was written as it was. `check_fdt_blob` (the magic,
+  `totalsize` against the file) runs at repack with the key and the file named; `split_fdt_blobs` at unpack refuses a first
+  blob that is cut short and names the offset of a later one whose `totalsize` is a lie. A dtb with something behind its
+  last blob (zeros, 0xFF, a trailer) is round-tripped now: it goes through `envelope.hpp` like the other wrappers (the
+  fill as `pad_byte`/`pad_to`, the rest verbatim, a warning if a trailer that is not inert follows an edited blob). That
+  was a real fidelity bug, found by hand on the way: `unpack` of such a file warned that an untouched repack would not
+  give it back -- and it did not.
+- **An OSIP image that is not told for one** (campaign 22, `unreadable-output`): without `osip_signature_file` and with the
+  header garbled, the image written was the bootstub of an OSIP image without its header, which `unpack` refuses.
+  `OsipImage::build` refuses a header that does not start with `"$OS$" 00 00 01` and a header-less image whose bootstub
+  does not start with `FC FA BC 00`, and says why.
+- **A claim of the manifest that the files do not carry out** (campaign 23, `unknown-output`): `prefix_kind=NOOK` with a
+  `prefix.bin` that has a byte in front of the signing header. `check_prefix_kind` asks `identify` of the prefix (the name
+  at byte 64, or 48 on a tablet, and the size of the header) before the prefix is written into an image.
+- **The generic form of the last four**: `build_image_once` ends with `check_known_again`: what abr would write is peeled
+  of its wrappers and detected again, and it must be an image of the type the manifest says; if not, nothing is written
+  and the refusal says what it would have been taken for and that a file in front of the image, or a header, does not
+  agree with the rest of the directory.
+- **A tail of 4 GiB** (campaign 23, ASan): `ramdisk.meta` says `tail size 4294967295`. A tail is at most 1 GiB (the parser),
+  and so is the ramdisk that is packed with it.
+- **Versions read by `sscanf`** (campaign 23 and by hand): `os_version`, `os_patch_level` and `chromeos_preamble_version`
+  accepted a sign, trailing text, an overflow (undefined behaviour) and an unknown value was silently 0. `get_version`
+  ("N.N": two decimal numbers of 32 bits) and the strict `OsVersion::parse` ("14.0.0": one to three decimal numbers of at
+  most 127; "2024-05": a year from 2000 to 2127 or 0000, a month of at most 15) refuse the rest, and name the key and the
+  value (escaped).
+- **The output is a file that was read** (campaign 24, `input-changed`): `-o` was `ramdisk.cpio`, which was a link to
+  `manifest.txt`: the image was written through the link into the manifest that had just been read. `read_file` records
+  every path it read (`Manifest::load` goes through it now: it had an `ifstream` of its own, with no size cap and a path that
+  was not escaped), and `find_read_file` asks `fs::equivalent` of the output, so symbolic and hard links count; the refusal
+  names both files. (A first version cleared the record before the keys and the manifest were read: it covers the whole
+  process now.)
+- **The fuzzer** (campaign 24): a fifo that a mutator had put in the place of a file was opened by the next mutator that
+  wrote to it, and the run hung for ever (a link to `/dev/zero` would have been written through as well); `file_kind` chose
+  from a list that its own deletion had emptied. `open_regular` opens regular files and nothing else (a fifo, a device, a
+  directory: refused, never waited for; a write does not follow a link).
+
+### Verified by
+
+- 8 new groups in the CLI suite (462 -> 470; a section of its own, "repack reads what it is given with care"): 55 numbers that
+  are none or do not fit in the fields of boot, vendor_boot, vbmeta and dtbo; the edge of a 32-bit field and other spellings
+  (`010`, `0X10008000`, upper case digits: the image of the same address is the very image); 17 counts; 31 flags, hexadecimal
+  strings and sizes; 9 files that are not files (a directory or a fifo for the kernel or the manifest, a link to
+  `/dev/zero`, `/dev/zero` as the image of `info`, `identify` and `unpack`); `-o dir/`; 5 raw copies; 7 escape sequences in the
+  manifest, in `ramdisk.meta` and in the name of a file of the tree (with the output filter off). **All 8 fail on the binary of the previous commit** (a control
+  build of it: `stoul`, `bad_alloc`, a fifo that waits for ever, "taken" for a number that is none) and pass now.
+- Unit tests: 40 000 random numbers over the alphabet of numbers and of what is not, against `std::from_chars` (the rule
+  written again with the standard library), a table of 35 cases, flags, counts, sizes, levels, hex, a manifest of 200 000
+  lines, and the file helpers (a directory, a link to a directory, a link to `/dev/null`, a name that ends in a slash):
+  `abr_unit_tests manifest` 451 954 -> **492 063** checks.
+- Suites: g++-14 470/470 (all judges required), ASan+UBSan 470/470 with no report, clang-20 461/461, `abr.exe` under wine
+  469/469; the 13 real images that are images (the 14th is an ext4 filesystem) still come back byte for byte.
 
 ## Next steps (in order)
 

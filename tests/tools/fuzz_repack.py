@@ -36,6 +36,7 @@ import argparse
 import base64
 import collections
 import concurrent.futures
+import errno
 import hashlib
 import io
 import json
@@ -219,8 +220,7 @@ class Ctx:
     def aux_file(self, name, data):
         os.makedirs(self.aux, exist_ok=True)
         path = os.path.join(self.aux, name)
-        with open(path, "wb") as f:
-            f.write(data)
+        write_file(path, data)
         return path
 
     def manifest_path(self):
@@ -237,14 +237,12 @@ class Ctx:
 
     def read_manifest_lines(self):
         try:
-            with open(self.manifest_path(), "rb") as f:
-                return f.read().split(b"\n")
+            return read_file(self.manifest_path()).split(b"\n")
         except OSError:
             return None
 
     def save_manifest_lines(self, lines):
-        with open(self.manifest_path(), "wb") as f:
-            f.write(b"\n".join(lines))
+        write_file(self.manifest_path(), b"\n".join(lines))
 
     def tree_dirs(self):
         out = []
@@ -466,8 +464,7 @@ def m_manifest_reorder(ctx):
 @mutator("manifest", 8)
 def m_manifest_bytes(ctx):
     try:
-        with open(ctx.manifest_path(), "rb") as f:
-            data = f.read()
+        data = read_file(ctx.manifest_path())
     except OSError:
         return None
     r = ctx.rng
@@ -504,8 +501,7 @@ def m_manifest_bytes(ctx):
     else:
         data = bytes(r.getrandbits(8) for _ in range(r.choice((0, 1, 40, 2000))))
         note = "random bytes"
-    with open(ctx.manifest_path(), "wb") as f:
-        f.write(data)
+    write_file(ctx.manifest_path(), data)
     return "manifest as bytes: " + note
 
 
@@ -516,12 +512,10 @@ def m_manifest_foreign(ctx):
         return None
     t = ctx.rng.choice(others)
     try:
-        with open(os.path.join(t.dir, "manifest.txt"), "rb") as f:
-            data = f.read()
+        data = read_file(os.path.join(t.dir, "manifest.txt"))
     except OSError:
         return None
-    with open(ctx.manifest_path(), "wb") as f:
-        f.write(data)
+    write_file(ctx.manifest_path(), data)
     return f"manifest: the manifest of another image ({t.fmt}, {t.sha})"
 
 
@@ -544,13 +538,29 @@ def m_manifest_type(ctx):
 
 # ---- files
 
+def open_regular(path, write=False):
+    """A file object for a regular file and for nothing else. The damage this program makes includes a fifo in the place of
+    a file, a link, a device: an open of a fifo waits for a partner that never comes (the run hangs for ever), a write
+    through a link goes to where the link points, out of the work directory. Both are refused with an OSError, which the
+    mutators take as 'the damage is not made' (a read follows a link, a write does not)."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW if write else os.O_RDONLY
+    fd = os.open(path, flags | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0), 0o644)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, "not a regular file", path)
+        return os.fdopen(fd, "wb" if write else "rb")
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def read_file(path):
-    with open(path, "rb") as f:
+    with open_regular(path) as f:
         return f.read()
 
 
 def write_file(path, data):
-    with open(path, "wb") as f:
+    with open_regular(path, write=True) as f:
         f.write(data)
 
 
@@ -665,6 +675,7 @@ def m_file_kind(ctx):
     path = os.path.join(ctx.d, name)
     r = ctx.rng
     c = r.random()
+    others = [f for f in ctx.top_files() if f != name]  # (before it is taken out: the directory may have nothing else)
     rm_rf(path)
     if c < 0.25:
         os.mkdir(path)
@@ -678,7 +689,7 @@ def m_file_kind(ctx):
         os.symlink(target, path)
         note = f"a symbolic link to {show(target)}"
     elif c < 0.8:
-        other = r.choice(ctx.top_files())
+        other = r.choice(others) if others else name
         os.symlink(os.path.basename(path) if r.random() < 0.3 else other, path)
         note = "a symbolic link to a file or itself"
     elif c < 0.9:
@@ -954,7 +965,7 @@ def m_tree_big(ctx):
     parent = tree_parent(ctx, root)
     path = os.path.join(ctx.d, root, parent, "big_%d" % r.randrange(1000))
     try:
-        with open(path, "wb") as f:
+        with open_regular(path, write=True) as f:
             f.truncate(size)
     except OSError:
         return None
@@ -972,7 +983,7 @@ def m_tree_many(ctx):
     try:
         os.mkdir(base)
         for i in range(n):
-            with open(os.path.join(base, "f%d" % i), "wb") as f:
+            with open_regular(os.path.join(base, "f%d" % i), write=True) as f:
                 if i % 7 == 0:
                     f.write(b"x")
     except OSError:
@@ -1186,10 +1197,14 @@ def der_nodes(data, pos=0, end=None, depth=0):
 
 
 def der_length_bytes(n, form):
+    """The length n of a DER node: form 0 the shortest way, 1 on two bytes when it fits (else four), 2 always on four."""
     if form == 0:
-        return bytes([n]) if n < 128 else b"\x81" + bytes([n]) if n < 256 else b"\x82" + n.to_bytes(2, "big")
+        if n < 128:
+            return bytes([n])
+        size = max(1, (n.bit_length() + 7) // 8)
+        return bytes([0x80 | size]) + n.to_bytes(size, "big")
     if form == 1:
-        return b"\x82" + n.to_bytes(2, "big") if n < 65536 else b"\x84" + n.to_bytes(4, "big")
+        return b"\x82" + n.to_bytes(2, "big") if n < 65536 else b"\x84" + (n & 0xFFFFFFFF).to_bytes(4, "big")
     return b"\x84" + (n & 0xFFFFFFFF).to_bytes(4, "big")
 
 
