@@ -4,6 +4,8 @@
 #include <cstring>
 #include <string_view>
 
+#include "abr/textquote.hpp"
+
 namespace abr::cpio {
 
 namespace {
@@ -41,7 +43,10 @@ void put_field(Bytes& out, uint32_t v, bool upper) {
 uint32_t check_for(const Entry& e) { return e.type() == kRegular ? byte_sum(e.data) : 0; }
 
 void put_record(Bytes& out, Magic magic, bool upper, const Entry& e, std::string_view name) {
-    if (e.data.size() > 0xFFFFFFFFull) throw FormatError("'" + std::string(name) + "' is too large for a cpio archive");
+    if (e.data.size() > 0xFFFFFFFFull) {
+        const std::string q = textquote::quote_shown(name);  // (a name from a directory: no terminal is to obey a control character in it)
+        throw FormatError((q == name ? "'" + q + "'" : q) + " is too large for a cpio archive");
+    }
     const char* tag = magic == Magic::CRC ? "070702" : "070701";
     out.insert(out.end(), tag, tag + 6);
     put_field(out, e.ino, upper);

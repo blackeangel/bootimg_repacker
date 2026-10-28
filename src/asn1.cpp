@@ -4,6 +4,9 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <string_view>
+
+#include "abr/textquote.hpp"
 
 namespace abr::der {
 
@@ -174,6 +177,18 @@ std::string base64_encode(const Bytes& data) {
     return out;
 }
 
+namespace {
+
+// A label is whatever stands between "-----BEGIN " and the next "-----": in a file that is no key that can be all of it, and
+// it may hold anything. A message gets its first characters, escaped (a terminal would obey a control byte).
+std::string shown_label(const std::string& label) {
+    constexpr size_t kMost = 64;
+    if (label.size() <= kMost) return textquote::quote_shown(label);
+    return textquote::quote_shown(std::string_view(label).substr(0, kMost)) + "...";
+}
+
+}  // namespace
+
 std::vector<PemBlock> pem_decode(const std::string& text) {
     std::vector<PemBlock> out;
     static const std::string kBegin = "-----BEGIN ";
@@ -188,7 +203,7 @@ std::vector<PemBlock> pem_decode(const std::string& text) {
         std::string label = text.substr(label_start, label_end - label_start);
         size_t body_start = label_end + 5;
         size_t e = text.find(kEnd + label + "-----", body_start);
-        if (e == std::string::npos) throw FormatError("PEM: no matching END line for " + label);
+        if (e == std::string::npos) throw FormatError("PEM: no matching END line for " + shown_label(label));
         std::string body = text.substr(body_start, e - body_start);
         if (label.find("ENCRYPTED") != std::string::npos ||
             body.find("Proc-Type:") != std::string::npos)

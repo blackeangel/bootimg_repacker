@@ -64,6 +64,12 @@ Bytes apply_amonet(const Bytes& image, const AmonetInfo& info) {
     std::copy(info.microloader.begin(), info.microloader.end(), out.begin());
     std::copy(image.begin(), image.begin() + static_cast<std::ptrdiff_t>(kAmonetHeadSize),
               out.begin() + static_cast<std::ptrdiff_t>(kAmonetMicroloaderSize));
+    // What tells a patched image is the word in the microloader, and an unpack looks for it: without it the image is read as a
+    // boot image that has 1024 bytes in front of it, and its first page is not where the patch put it.
+    if (!has_amonet_patch(out))
+        throw FormatError("this microloader does not have the word \"microloader\" in it behind byte " + std::to_string(kWordFrom) +
+                          " (nor does the header, if the image has it), which is how Android Image Kitchen, and abr, tell an image with "
+                          "the AMONET patch; the image would not be known for one, or for the boot image it is");
     return out;
 }
 

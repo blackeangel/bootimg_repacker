@@ -2832,6 +2832,24 @@ head -c 1000 amo_ml.bin >amo_nm/microloader.bin
 amo_rc=$?
 rd_ck "a microloader of 1000 bytes is refused" test "$amo_rc" -ne 0
 rd_ck "with the reason" grep -q 'exactly 1024 bytes' amo_nm.log
+# A microloader that has not the word that tells the patch (found by the sixth campaign of fuzz_repack.py): the image written was
+# taken for a boot image with 1024 bytes in front of it, and its first page was read where it was not
+rm -f amo_nm.img
+for amo_ml_case in zeros noise; do
+    if [ "$amo_ml_case" = zeros ]; then head -c 1024 /dev/zero >amo_nm/microloader.bin; else head -c 1024 /dev/urandom | tr 'm' 'M' >amo_nm/microloader.bin; fi
+    "$ABR" repack amo_nm -o amo_nm.img >amo_nm.log 2>&1
+    amo_rc=$?
+    rd_ck "a microloader of 1024 bytes ($amo_ml_case) that has not the word that tells the patch is refused" test "$amo_rc" -ne 0
+    rd_ck "with the reason, and the way out ($amo_ml_case)" grep -q 'the word "microloader".*has_amonet=false' amo_nm.log
+    rd_ck "and no image is written ($amo_ml_case)" test ! -e amo_nm.img
+done
+{ head -c 200 /dev/zero; printf 'microloader'; head -c 813 /dev/zero; } >amo_nm/microloader.bin
+"$ABR" repack amo_nm -o amo_nm.img >amo_nm.log 2>&1
+rd_ck "the word anywhere behind byte 96 is enough" test -s amo_nm.img
+rm -rf amo_nm_u
+"$ABR" unpack amo_nm.img -o amo_nm_u >amo_nm_u.log 2>&1
+rd_ck "and the image is unpacked as the patched one it is" grep -q '^has_amonet=true$' amo_nm_u/manifest.txt
+rd_ck "with that microloader" cmp -s amo_nm_u/microloader.bin amo_nm/microloader.bin
 head -c 1500 amo.img >amo_cut.img
 rm -rf amo_cut
 "$ABR" unpack amo_cut.img -o amo_cut >amo_cut.out 2>&1
@@ -5233,6 +5251,14 @@ printf -- '-----BEGIN RSA PRIVATE KEY-----\nAAAA\x8b\x1b[2JBBBB\n-----END RSA PR
 rp_fresh a1_v1.img rp_dir
 printf x >>rp_dir/kernel
 rp_esc_ck rp_dir "--avb1-key: a PEM with a byte that is not base64" --avb1-key rp_badkey.pem
+# the label of a PEM block is text of the file as well (found by the sixth campaign of fuzz_repack.py): a control byte in it, and no
+# END line for it; and a label that is as long as the file is cut in the message
+printf -- '-----BEGIN EC PRIV\x0bATE KEY-----\nAAAA\n-----END EC PRIVATE KEY-----\n' >rp_badkey2.pem
+rp_esc_ck rp_dir "--avb1-key: a PEM whose label has a control byte and has no END line" --avb1-key rp_badkey2.pem
+grep -q -F 'no matching END line' rp_esc.log || rp_bad="$rp_bad [a PEM label with a control byte: the message is not the one about the END line]"
+{ printf -- '-----BEGIN '; head -c 100000 /dev/zero | tr '\0' 'x'; printf -- '-----\nAAAA\n'; } >rp_badkey3.pem
+rp_esc_ck rp_dir "--avb1-key: a PEM whose label is 100000 bytes long" --avb1-key rp_badkey3.pem
+[ "$(wc -c <rp_esc.log)" -lt 1000 ] || rp_bad="$rp_bad [a PEM whose label is 100000 bytes long: the message is $(wc -c <rp_esc.log) bytes]"
 if [ "$RD_WINE" = 0 ]; then
     # a name of a file that is not UTF-8
     rp_fresh vendor_boot_v4.img rp_dir
@@ -5260,7 +5286,35 @@ PYEOF
 else
     rp_bad="$rp_bad [rdimg_mkbootfs.img: no ramdisk.meta]"
 fi
-rp_report "values, lines and names of a directory with escape sequences in them (manifest.txt, ramdisk.meta, a file name of the tree) come into no message as they are"
+rp_report "values, lines and names of a directory with escape sequences in them (manifest.txt, ramdisk.meta, a file name of the tree) and the label of a PEM block come into no message as they are, and a label of 100000 bytes is cut"
+
+# the subject of the certificate in the boot signature of an image, and the target in it, are text of the image: `info` says them,
+# `unpack` notes them and `repack` warns of a certificate that is not abr's with the subject -- none of them prints a byte that a
+# terminal would act on (found by hand, after a message of a PEM label that did)
+python3 -I - a1_v1.img rp_cert.img <<'PYEOF'
+import sys
+d = bytearray(open(sys.argv[1], "rb").read())
+i = d.rfind(b"California")
+j = d.rfind(b"/boot")
+assert i > 0 and j > i
+d[i + 2] = 0x1b  # (ST=Ca<ESC>ifornia)
+d[j + 1] = 0x1b  # (the target "/<ESC>oot")
+open(sys.argv[2], "wb").write(bytes(d))
+PYEOF
+rp_n=$((rp_n + 1))
+ABR_UNFILTERED_OUTPUT=1 "$ABR" info rp_cert.img >rp_cert_info.txt 2>&1
+rp_clean rp_cert_info.txt || rp_bad="$rp_bad [info: a control byte in the certificate or the target is printed as it is]"
+grep -q -F 'ST=Ca\x1bifornia' rp_cert_info.txt || rp_bad="$rp_bad [info: the subject is not said, with the byte as an escape]"
+grep -q -F 'target "/\x1boot"' rp_cert_info.txt || rp_bad="$rp_bad [info: the target is not said, with the byte as an escape]"
+rm -rf rp_cert_u
+rp_n=$((rp_n + 1))
+ABR_UNFILTERED_OUTPUT=1 "$ABR" unpack rp_cert.img -o rp_cert_u >rp_cert_u.log 2>&1 || rp_bad="$rp_bad [unpack of the image with the odd subject failed: $(head -c 150 rp_cert_u.log)]"
+rp_clean rp_cert_u.log || rp_bad="$rp_bad [unpack: a control byte in the certificate or the target is printed as it is]"
+printf x >>rp_cert_u/kernel
+rp_esc_ck rp_cert_u "a boot signature by a certificate whose subject has a control byte, the kernel edited"
+grep -q -F 'made by' rp_esc.log || rp_bad="$rp_bad [repack: no warning of the certificate that is not abr's]"
+grep -q -F 'ST=Ca\x1bifornia' rp_esc.log || rp_bad="$rp_bad [repack: the warning does not say the subject, with the byte as an escape]"
+rp_report "a boot signature whose certificate subject and target have a control byte in them: info, unpack and the repack warning say them with the byte as an escape, and print none"
 
 # ---- the dtb and the OSIP image: what is behind the last blob, what is a blob, what tells an OSIP image -----------------
 # Found by the second campaign of tests/tools/fuzz_repack.py, and by a dtb file with zeros behind it: those were dropped on
@@ -5460,6 +5514,43 @@ else
     rp_bad="$rp_bad [rdimg_mkbootfs.img: no ramdisk.meta]"
 fi
 rp_report "a tail of the ramdisk (tail size, tail align) that is more than 1 GiB, that is no number, or that makes the ramdisk more than that, is refused with the line (it was 4 GiB of zeros), and nothing is written"
+
+# the name of the directory of the ramdisk is a value of manifest.txt, and the manifest refuses a name with a control character below
+# 0x20 in it, but not one with a C1 control (U+009B starts an escape sequence in a terminal in UTF-8 mode) or a byte that is not UTF-8:
+# where a message names the directory (the archive that is changed twice, a tail that is too big, a ramdisk.meta that is wrong), none of
+# it gets through (rp_esc_ck turns the filter that makes output safe off)
+if [ "$RD_WINE" = 0 ] && [ -f rp_dir/ramdisk.meta ]; then
+    rp_odd=$'ramdisk\xc2\x9b2J\xc2\x85x\xff'
+    rp_odd_copy() {  # <dir>: a copy of rp_dir whose ramdisk directory and the .meta of it have a name with a C1 control in it
+        rm -rf "$1"
+        cp -a rp_dir "$1"
+        mv "$1/ramdisk" "$1/$rp_odd"
+        mv "$1/ramdisk.meta" "$1/$rp_odd.meta"
+        rp_set "$1" ramdisk_tree '"ramdisk\xc2\x9b2J\xc2\x85x\xff"'
+    }
+    rp_odd_copy rp_try
+    printf x >"rp_try/$rp_odd/new_file"
+    printf '\0\0\0\0' >>rp_try/ramdisk.cpio
+    rp_esc_ck rp_try "a ramdisk directory with a C1 control in its name, changed together with the cpio"
+    grep -q -F 'have been changed since unpacking' rp_esc.log || rp_bad="$rp_bad [the odd ramdisk directory, changed with the cpio: not the message about both being changed]"
+    rp_odd_copy rp_try
+    python3 -I - "rp_try/$rp_odd.meta" "tail size 1073741824" <<'PYEOF'
+import re, sys
+p, line = sys.argv[1], sys.argv[2]
+t = open(p, "rb").read().decode("utf-8")
+t2 = re.sub(r"(?m)^tail .*$", line, t, count=1)
+assert t2 != t
+open(p, "wb").write(t2.encode("utf-8"))
+PYEOF
+    rp_esc_ck rp_try "a ramdisk directory with a C1 control in its name, a tail of 1 GiB"
+    grep -q -F 'the ramdisk would be' rp_esc.log || rp_bad="$rp_bad [the odd ramdisk directory, a tail of 1 GiB: not the message about the size]"
+    rp_odd_copy rp_try
+    printf 'bogus\n' >>"rp_try/$rp_odd.meta"
+    rp_esc_ck rp_try "a ramdisk directory with a C1 control in its name, a ramdisk.meta that is wrong"
+    rp_report "the name of the ramdisk directory with a C1 control and a byte that is not UTF-8 in it (the manifest says so, and the directory is called that) comes into no message as it is: the cpio and the directory both changed, a tail of 1 GiB, a ramdisk.meta that is wrong"
+elif [ "$RD_WINE" = 0 ]; then
+    fail "repack: the name of the ramdisk directory with a C1 control in it: rdimg_mkbootfs.img has no ramdisk.meta"
+fi
 
 # versions: os_version "A.B.C" (each at most 127), os_patch_level "YYYY-MM", the preamble version of a ChromeOS blob "2.2"
 rp_fresh boot_v2.img rp_dir

@@ -863,7 +863,7 @@ VolumeBuild build_volume(const fs::path& tree_dir, const fs::path& meta_file, co
     auto note = [&](const std::string& s) {
         if (report) report->notes.push_back(label + ": " + s);
     };
-    const std::string meta_name = to_utf8(meta_file.filename());
+    const std::string meta_name = textquote::quote_shown(to_utf8(meta_file.filename()));  // (for the messages: the name comes from the manifest)
 
     Meta meta;
     const bool have_meta = fs::exists(meta_file);
@@ -1381,17 +1381,18 @@ Bytes pack_ramdisk_tree(const fs::path& dir, const std::string& prefix, size_t v
     size_t built = 0;
     for (size_t i = 0; i < volumes; ++i) {
         const std::string name = ramdisk_volume_name(prefix, i);
+        const std::string label = textquote::quote_shown(name + "/");  // (what the messages call it: the name comes from the manifest)
         const fs::path tree = dir / name;
         if (!fs::is_directory(tree)) {
-            if (report) report->notes.push_back(name + "/: the directory is not there, so that archive is left out of the ramdisk");
+            if (report) report->notes.push_back(label + ": the directory is not there, so that archive is left out of the ramdisk");
             continue;
         }
-        const VolumeBuild v = build_volume(tree, dir / ramdisk_volume_meta(prefix, i), name + "/", report);
+        const VolumeBuild v = build_volume(tree, dir / ramdisk_volume_meta(prefix, i), label, report);
         out.insert(out.end(), v.archive.begin(), v.archive.end());
         const size_t end = out.size();
         const uint64_t filled = v.tail_align ? align_up(uint64_t(end), uint64_t(v.tail_value)) : uint64_t(end) + v.tail_value;
         if (filled > kMaxImageSize)
-            throw FormatError("the ramdisk would be " + std::to_string(filled) + " bytes with the tail of " + name + "/ (no ramdisk of the "
+            throw FormatError("the ramdisk would be " + std::to_string(filled) + " bytes with the tail of " + label + " (no ramdisk of the "
                               "family is more than " + std::to_string(kMaxImageSize >> 20) + " MiB)");
         out.resize(static_cast<size_t>(filled), 0);
         ++built;
@@ -1399,10 +1400,10 @@ Bytes pack_ramdisk_tree(const fs::path& dir, const std::string& prefix, size_t v
     }
     if (built == 0)
         throw FormatError(volumes == 1 ? squote(to_utf8(dir / prefix)) + " is not a directory"
-                                       : "none of the " + std::to_string(volumes) + " directories of the ramdisk '" + prefix +
-                                             "' is there");
+                                       : "none of the " + std::to_string(volumes) + " directories of the ramdisk " + squote(prefix) +
+                                             " is there");
     if (report && fs::exists(dir / ramdisk_volume_name(prefix, volumes)))
-        report->warnings.push_back(ramdisk_volume_name(prefix, volumes) + "/ is not part of this ramdisk (the unpack had " +
+        report->warnings.push_back(textquote::quote_shown(ramdisk_volume_name(prefix, volumes) + "/") + " is not part of this ramdisk (the unpack had " +
                                    plural(volumes, "archive", "archives") + ") and is ignored");
     return out;
 }

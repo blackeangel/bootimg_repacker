@@ -65,6 +65,13 @@ namespace {
 // sequences of a terminal, and a space at the end of a command line is not to be missed.
 std::string shown(std::string_view s) { return textquote::quote_shown(s); }
 
+// The same, for a text that a message puts in double quotes (the subject of a certificate): the quotes of `shown` when it needs
+// them, else these.
+std::string dquoted(std::string_view s) {
+    const std::string q = textquote::quote_shown(s);
+    return q == s ? "\"" + q + "\"" : q;
+}
+
 // The text fields of a header that hold bytes behind the NUL that ends their text (BinaryReader::asciiz), as
 // "cmdline 37, board_name 3" -- empty when none does. What `unpack` and `info` say of them; the bytes themselves are
 // kept (the `*_tail` keys of manifest.txt) and an untouched repack writes them back.
@@ -616,8 +623,8 @@ Bytes load_component(const Manifest& m, const fs::path& dir, const std::string& 
         }
     }
     if (tree_changed && file_changed && opt.ramdisk_from.empty())
-        throw FormatError("both " + filename + " and the directory " + tree_name +
-                          "/ have been changed since unpacking, and abr cannot merge the two. Undo one "
+        throw FormatError("both " + textquote::quote_shown(filename) + " and the directory " + textquote::quote_shown(tree_name + "/") +
+                          " have been changed since unpacking, and abr cannot merge the two. Undo one "
                           "of them, or say which one to use: --ramdisk-from tree  or  --ramdisk-from cpio");
 
     const bool use_tree = from_tree && (opt.ramdisk_from == "tree" || tree_changed || !from_file);
@@ -998,18 +1005,18 @@ size_t refresh_avb1_signature(const Manifest& m, Envelope& e, Bytes& core, uint3
     } else {
         signer = aosp_test_signer();
         if (existing && !is_aosp_test_certificate(existing->certificate))
-            warn("the original boot signature was made by \"" +
-                 certificate_subject(existing->certificate) +
-                 "\", whose private key abr does not have. The new signature uses the public "
+            warn("the original boot signature was made by " +
+                 dquoted(certificate_subject(existing->certificate)) +
+                 ", whose private key abr does not have. The new signature uses the public "
                  "AOSP test key (what Android Image Kitchen does); a bootloader that trusts only "
                  "the original key will reject the image. Use --avb1-key/--avb1-cert to sign with "
                  "your own key.");
     }
     Bytes der = build_boot_signature(core, target, signer);
     std::cout << (existing ? "re-created" : "added") << " the AVBv1 boot signature (target "
-              << target << ", signed by "
+              << shown(target) << ", signed by "
               << (signer.is_aosp_test_key ? std::string("the public AOSP test key")
-                                          : signer.subject)
+                                          : shown(signer.subject))
               << ")\n";
 
     const size_t old_size = existing ? existing->der_size : 0;
@@ -2373,8 +2380,8 @@ void print_avb1_info(const Envelope& env, const Bytes& host, size_t image_off, s
     auto sig = parse_boot_signature(env.tail, 0);
     if (!sig) return;
     Verification v = verify_boot_signature(*sig, host.data() + image_off, host.size() - image_off);
-    std::cout << "boot signature: AVBv1 (boot_signer), target " << sig->target << "\n"
-              << "  signer:       " << certificate_subject(sig->certificate)
+    std::cout << "boot signature: AVBv1 (boot_signer), target " << shown(sig->target) << "\n"
+              << "  signer:       " << shown(certificate_subject(sig->certificate))
               << (is_aosp_test_certificate(sig->certificate)
                       ? "  [public AOSP test key: abr can re-sign it]"
                       : "")
@@ -2676,7 +2683,7 @@ void print_info(const fs::path& path) {
 // The image `repack` is about to write must be one that abr knows again: looked at the way `unpack` looks at a file (the wrappers
 // off, then the magic and the layout), it is the kind of image the manifest says. What `identify` calls `data` and `unpack` refuses
 // is no result of a repack, whatever made it -- a header that is not one, bytes in front of the image that push it out of place.
-void check_known_again(const Bytes& image, Fmt wanted) {
+void check_known_again(const Bytes& image, Fmt wanted, const Manifest& m) {
     Wrappers wrap;
     Fmt got = Fmt::UNKNOWN;
     std::string why;
@@ -2687,10 +2694,31 @@ void check_known_again(const Bytes& image, Fmt wanted) {
     } catch (const FormatError& e) {
         why = e.what();
     }
-    if (got == wanted) return;
-    throw FormatError(std::string("the image abr would write is not ") + (wanted == Fmt::UNKNOWN ? "an image" : "a " + std::string(fmt_name(wanted)) + " image") +
-                      " that it knows again: " + (got == Fmt::UNKNOWN ? why : "it would be taken for a " + std::string(fmt_name(got)) + " image") +
-                      " (something in the directory does not agree with the rest of it: a file in front of the image, a header)");
+    if (got != wanted)
+        throw FormatError(std::string("the image abr would write is not ") + (wanted == Fmt::UNKNOWN ? "an image" : "a " + std::string(fmt_name(wanted)) + " image") +
+                          " that it knows again: " + (got == Fmt::UNKNOWN ? why : "it would be taken for a " + std::string(fmt_name(got)) + " image") +
+                          " (something in the directory does not agree with the rest of it: a file in front of the image, a header)");
+    // The wrappers are what the manifest says: an image that is taken for a boot image because its patch is not known for one
+    // (a microloader without the word that tells it) is another image than the one that was asked for, and an unpack of it reads
+    // the first page of the plain image where the patch is.
+    const struct {
+        const char* key;
+        bool peeled;
+        const char* what;
+    } layers[] = {
+        {"has_chromeos", wrap.chromeos.has_value(), "a ChromeOS kernel blob around it"},
+        {"has_dhtb", wrap.dhtb.has_value(), "a DHTB header"},
+        {"has_blob", wrap.blob.has_value(), "a BLOB header"},
+        {"has_loki", wrap.loki.has_value(), "the LOKI patch"},
+        {"has_amonet", wrap.amonet.has_value(), "the AMONET patch"},
+    };
+    for (const auto& l : layers) {
+        if (m.get_bool(l.key, false) == l.peeled) continue;
+        throw FormatError(std::string("the image abr would write would ") + (l.peeled ? "be taken for one with " : "not be taken for one with ") + l.what +
+                          " (manifest.txt says " + l.key + "=" + (l.peeled ? "false" : "true") +
+                          ") and abr would not know it again: something in the directory does not agree with the rest of it (a file of the wrapper, "
+                          "a header)");
+    }
 }
 
 // Rebuilds the file described by an unpacked directory, once (see build_image).
@@ -2747,7 +2775,7 @@ Bytes build_image_once(const fs::path& dir, const RepackOptions& opt) {
         result = wrap_dhtb(result, dhtb);
     }
     if (m.get_bool("has_chromeos", false)) result = apply_chromeos_wrapper(m, dir, result, opt, true);
-    check_known_again(result, f);
+    check_known_again(result, f, m);
     return result;
 }
 
