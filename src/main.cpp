@@ -1211,6 +1211,7 @@ Bytes repack_boot(const Manifest& m, const fs::path& dir, const RepackOptions& o
     img.recompute_id();  // follows id_scheme; `raw` keeps the id found in the source
 
     Bytes core = img.build();
+    img.check_reads_back(core);
     Envelope env = load_envelope(m, dir);
     const bool changed = core_changed(m, core);
     const size_t regenerated = refresh_avb1_signature(

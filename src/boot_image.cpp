@@ -393,6 +393,49 @@ BootImage BootImage::parse(const Bytes& image) {
     return img;
 }
 
+void BootImage::check_reads_back(const Bytes& built) const {
+    BootImage got;
+    try {
+        got = parse(built);
+    } catch (const FormatError& e) {
+        throw FormatError(std::string("the boot image abr would write cannot be read again (") + e.what() +
+                          "): a field of the header in manifest.txt makes it another layout than the one it is built in");
+    }
+    auto h32 = [](uint32_t v) {
+        char b[16];
+        std::snprintf(b, sizeof b, "0x%08x", v);
+        return std::string(b);
+    };
+    auto another = [&](const std::string& what) {
+        throw FormatError("the boot image abr would write would be read as another layout than the one it is built in: " + what +
+                          "; a field of the header in manifest.txt does not go with the others");
+    };
+    if (pxa && !got.pxa)
+        another("a PXA header is told by its `unknown` word at byte 36 (pxa_unknown) being no page size, the word at byte 40 (tags_addr) being "
+                "more than 8 and the one at byte 44 (page_size) being a page size from 2048 to 131072 (a power of two), and here "
+                "pxa_unknown=" + h32(pxa_unknown) + ", tags_addr=" + h32(tags_addr) + ", page_size=" +
+                std::to_string(page_size ? page_size : 2048) + " are not that");
+    if (!pxa && got.pxa) another("a header of the plain kind would be taken for a PXA one (the word at byte 36 is no page size)");
+    if (got.header_version != header_version)
+        another("header_version " + std::to_string(header_version) + " would be read as " + std::to_string(got.header_version) +
+                (header_version == 0 && !dt.empty() ? " (a device tree of " + std::to_string(dt.size()) + " bytes is a size in the word where the version is, and a word of 8 or less is a version)" : ""));
+    if ((header_version <= 2 || pxa) && got.page_size != (page_size ? page_size : 2048))
+        another("page_size " + std::to_string(page_size ? page_size : 2048) + " would be read as " + std::to_string(got.page_size));
+    const struct {
+        const char* name;
+        size_t want, have;
+    } parts[] = {{"kernel", kernel.size(), got.kernel.size()},
+                 {"ramdisk", ramdisk.size(), got.ramdisk.size()},
+                 {"second", second.size(), got.second.size()},
+                 {"dt", dt.size(), got.dt.size()},
+                 {"recovery_dtbo", recovery_dtbo.size(), got.recovery_dtbo.size()},
+                 {"dtb", dtb.size(), got.dtb.size()},
+                 {"boot_signature", boot_signature.size(), got.boot_signature.size()}};
+    for (const auto& p : parts)
+        if (p.want != p.have)
+            another(std::string("the ") + p.name + " of " + std::to_string(p.want) + " bytes would be read as one of " + std::to_string(p.have));
+}
+
 Bytes BootImage::build() const {
     BinaryWriter w;
     // What the padding behind a component held in the source (see section_padding).

@@ -296,6 +296,9 @@ def mutate(rng, data, splice_source):
     return bytes(buf), notes
 
 
+ASAN_START_FAILED = re.compile(rb"==[0-9]+==ERROR: AddressSanitizer (?:setrlimit|getrlimit)\(\) failed [0-9]+")
+
+
 class Runner:
     def __init__(self, args):
         self.abr = os.path.abspath(args.abr)
@@ -322,6 +325,16 @@ class Runner:
 
     def run(self, argv, cwd):
         """-> (status or None for a timeout, stderr bytes, seconds, stdout bytes)"""
+        # AddressSanitizer's runtime sometimes fails to start ("setrlimit() failed 1", once in some thousand runs, and not again
+        # when the same command is run again): none of abr has run, nothing is written, so the run is made again, and a start that
+        # fails three times in a row is a finding.
+        for _ in range(2):
+            result = self.run_once(argv, cwd)
+            if result[0] != 86 or not ASAN_START_FAILED.fullmatch(result[1].strip()):
+                return result
+        return self.run_once(argv, cwd)
+
+    def run_once(self, argv, cwd):
         t0 = time.time()
         proc = subprocess.Popen(
             [self.abr] + argv,

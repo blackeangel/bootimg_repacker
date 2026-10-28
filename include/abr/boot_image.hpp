@@ -143,6 +143,10 @@ struct BootImage {
 
     static BootImage parse(const Bytes& image);
     Bytes build() const;
+    // `built` is what build() wrote: it has to be read again as the same layout -- the same kind of header, the same page size and
+    // the same sizes of the parts. A header word of a manifest can make it another (a PXA `unknown` that is a page size, a CAF
+    // device tree of no more than 8 bytes, which is a header version); a FormatError, saying which, when it does.
+    void check_reads_back(const Bytes& built) const;
 
     // Digest per `id_scheme` over the current components. Empty for RAW.
     Bytes compute_id(IdScheme scheme) const;

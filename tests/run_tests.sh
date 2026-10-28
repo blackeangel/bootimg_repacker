@@ -4186,7 +4186,7 @@ cros_bad() {  # <name> <pattern> <sed expression for manifest.txt> [a file to pu
     fi
     cros_refuse_repack "$1" "cros_bad_$1" "$2"
 }
-rd_ck "a version that is no version" cros_bad ver_text 'is a version like 2.2' 's/^chromeos_preamble_version=.*/chromeos_preamble_version=banana/'
+rd_ck "a version that is no version" cros_bad ver_text 'is not a version like 2.2' 's/^chromeos_preamble_version=.*/chromeos_preamble_version=banana/'
 rd_ck "2.5" cros_bad ver_25 'is not one abr makes (2.0, 2.1 and 2.2 are)' 's/^chromeos_preamble_version=.*/chromeos_preamble_version=2.5/'
 rd_ck "3.0" cros_bad ver_30 'is not one abr makes' 's/^chromeos_preamble_version=.*/chromeos_preamble_version=3.0/'
 rd_ck "flags of more than 32 bits" cros_bad flags_big 'does not fit in 32 bits' 's/^chromeos_flags=.*/chromeos_flags=0x100000000/'
@@ -5666,6 +5666,54 @@ rp_made_to rp_try rp_try/new.img "an output in the directory" && rp_made_to rp_t
 cmp -s rp_try/new.img boot_v2.img || rp_bad="$rp_bad [the output in the directory is not the image]"
 rp_report "an output that is a file the repack has read (the manifest, the kernel, the ramdisk, a file of the ramdisk directory, a key, a link or a hard link to one) is refused with that said and nothing changes; an output next to them is made, and made again over itself"
 
+# ---- a boot header that would be read as another layout --------------------------------------------------------------------
+# Found by the eighth campaign of fuzz_repack.py: `pxa_unknown=0x1000` on a PXA image (that word is a page size, and a header whose word at
+# byte 36 is a page size is a plain one) was built, and `unpack` of it read the layout of a plain header ("need 268435712 bytes"). The
+# header that repack builds is read again before it is written, and it has to be the same kind of header with the same page size and the
+# same sizes of the parts; the same goes for a device tree of 8 bytes or less in a CAF image, which is a header version.
+rp_fresh fx/boot_pxa_030_dt.img rp_dir
+if [ -f rp_dir/manifest.txt ]; then
+    for rp_case in "pxa_unknown=0x1000" "pxa_unknown=0x800" "pxa_unknown=0x20000" "pxa_unknown=2048" "tags_addr=0x5" "tags_addr=0" "tags_addr=8" "page_size=1024"; do
+        rm -rf rp_try
+        cp -a rp_dir rp_try
+        rp_set rp_try "${rp_case%%=*}" "${rp_case#*=}"
+        rp_refused rp_try "a PXA header with $rp_case" "a field of the header in manifest.txt"
+    done
+    for rp_case in "pxa_unknown=0x40000" "pxa_unknown=0x3000000" "pxa_unknown=0" "tags_addr=9" "tags_addr=0x10000100" "page_size=4096" "page_size=131072"; do
+        rm -rf rp_try rp_try_re
+        cp -a rp_dir rp_try
+        rp_set rp_try "${rp_case%%=*}" "${rp_case#*=}"
+        if rp_made rp_try "a PXA header with $rp_case"; then
+            "$ABR" unpack "$rp_run" -o rp_try_re >/dev/null 2>&1 && grep -q '^pxa=true$' rp_try_re/manifest.txt ||
+                rp_bad="$rp_bad [a PXA header with $rp_case: unpack does not take what was written for a PXA image]"
+        fi
+    done
+else
+    rp_bad="$rp_bad [fx/boot_pxa_030_dt.img: no unpack]"
+fi
+rp_fresh fx/boot_v0_qcdt_sha1_dt.img rp_dir
+rp_dtf=$(sed -n 's/^dt_file=//p' rp_dir/manifest.txt 2>/dev/null)
+if [ -n "$rp_dtf" ] && [ -f "rp_dir/$rp_dtf" ]; then
+    for rp_len in 1 4 8; do
+        rm -rf rp_try
+        cp -a rp_dir rp_try
+        head -c "$rp_len" /dev/urandom >"rp_try/$rp_dtf"
+        rp_refused rp_try "a CAF device tree of $rp_len bytes (a header version)" "a field of the header in manifest.txt"
+    done
+    for rp_len in 9 4096; do
+        rm -rf rp_try rp_try_re
+        cp -a rp_dir rp_try
+        head -c "$rp_len" /dev/urandom >"rp_try/$rp_dtf"
+        if rp_made rp_try "a CAF device tree of $rp_len bytes"; then
+            "$ABR" unpack "$rp_run" -o rp_try_re >/dev/null 2>&1 && [ "$(wc -c <"rp_try_re/$rp_dtf")" -eq "$rp_len" ] ||
+                rp_bad="$rp_bad [a CAF device tree of $rp_len bytes: it does not come back]"
+        fi
+    done
+else
+    rp_bad="$rp_bad [fx/boot_v0_qcdt_sha1_dt.img: no dt file in the unpack]"
+fi
+rp_report "a boot header that would be read as another layout (a PXA whose unknown word, tags_addr or page size does not tell a PXA header, a CAF device tree of 8 bytes or less, which is a version) is refused with that said, and the values that keep the header what it is are taken and unpacked as the same kind of image"
+
 # ---- a page size that cannot be one: refused with a reason, not gigabytes of zeros ---------------------------------------
 # page_size is the word of a header that the padding of every part is worked out from. 0xFFFFFFFF in it made the check at the
 # end of `unpack` ask for 4 GiB of zeros (found by tests/tools/fuzz_images.py under AddressSanitizer). A flash page size is a
@@ -5772,6 +5820,7 @@ ix_expect ix_cros.blob "ChromeOS" "cmdline:        $ix_shown"
 # the messages that do not escape), which is how this test knows that the message did have the byte.
 of_bad=""
 of_n=0
+of_rawn=0
 for of_case in $'no\x1b[2Jsuch.img'@'no\x1b[2Jsuch.img' $'no\x07such.img'@'no\x07such.img' $'no\xc2\x9bsuch.img'@'no\xc2\x9bsuch.img'; do
     of_name="${of_case%@*}"
     of_shown="${of_case#*@}"
@@ -5783,9 +5832,16 @@ for of_case in $'no\x1b[2Jsuch.img'@'no\x1b[2Jsuch.img' $'no\x07such.img'@'no\x0
             of_bad="$of_bad [$of_cmd $of_shown: the message has a control character]"
         fi
         ABR_UNFILTERED_OUTPUT=1 "$ABR" $of_cmd "$of_name" >of_raw.txt 2>&1
-        grep -q -F -- "$of_name" of_raw.txt || of_bad="$of_bad [$of_cmd $of_shown: without the filter the message has no raw name: $(head -c 120 of_raw.txt)]"
+        if grep -q -F -- "$of_name" of_raw.txt; then
+            of_rawn=$((of_rawn + 1))    # the raw name: the filter is what keeps it from a terminal
+        else
+            # the name of a file is escaped where the message about it is made (read_file in byte_io.cpp: the name may come out of a
+            # damaged directory, where no filter is the first thing to see it), so without the filter it is the same
+            grep -q -F -- "$of_shown" of_raw.txt || of_bad="$of_bad [$of_cmd $of_shown: without the filter the message has neither the raw name nor the escape: $(head -c 120 of_raw.txt)]"
+        fi
     done
 done
+[ "$of_rawn" -ge 1 ] || of_bad="$of_bad [none of the $of_n messages had the raw name without the filter: the filter was not tried]"
 "$ABR" repack $'no\x1b' -o of_out.img >of_out.txt 2>&1 && of_bad="$of_bad [repack: a directory that is not there was taken]"
 grep -q -F -- 'no\x1b' of_out.txt || of_bad="$of_bad [repack: the message does not have the escape: $(head -c 120 of_out.txt)]"
 # the messages of what worked are on stdout (a C1 control is a name that Windows has too: U+009B is no character that it refuses)
@@ -5803,7 +5859,7 @@ for of_val in 0 ""; do
     grep -q -F -- 'no\x1b[2Jsuch.img' of_out.txt || of_bad="$of_bad [ABR_UNFILTERED_OUTPUT=\"$of_val\" turned the filter off]"
 done
 [ -z "$of_bad" ] &&
-    pass "output filter: an escape sequence, a bell and a C1 control in a name from the command line come out as \\xNN in the messages of info, identify, unpack and repack ($of_n runs), and without the filter (ABR_UNFILTERED_OUTPUT=1) the same messages have the raw bytes" ||
+    pass "output filter: an escape sequence, a bell and a C1 control in a name from the command line come out as \\xNN in the messages of info, identify, unpack and repack ($of_n runs), and without the filter (ABR_UNFILTERED_OUTPUT=1) the messages that name a directory or a file given on the command line have the raw bytes (where they are not escaped already, as the name of a file is by the one that reads it)" ||
     fail "output filter:$of_bad"
 
 # ---- bytes behind the NUL that ends the text of a field: kept, said, written back ----------------------------------------------

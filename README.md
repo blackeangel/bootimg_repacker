@@ -75,8 +75,12 @@ files it reads are regular files: a directory, a fifo or a device (`/dev/zero`) 
 so is `-o dir/`, which is not the name of a file. A `.abr_raw/` copy that is not the component it is for is refused too (take
 it out to have the component compressed again). A page size is a power of two from 512 bytes to 16 MiB (the padding of every
 component is worked out from it); a dtb blob is a flattened device tree as long as its header says (that is what finds the next
-one), and an OSIP image has the header or the bootstub that tells it -- what `abr` could not tell from any other file when it
-read it again is not written.
+one), and an OSIP image has the header or the bootstub that tells it, an AMONET patch the word that tells it, a PXA header
+the words that tell it -- what `abr` could not tell from any other file when it read it again is not written. That is checked
+for every image: what would be written has to be an image of the manifest's type, with the wrappers the manifest says (DHTB, BLOB,
+LOKI, AMONET, ChromeOS), and a boot header has to be read again as the same kind of header, with the same page size and the same
+sizes of its parts. Text that is not abr's (a name in the directory, a PEM label, the subject of a certificate) comes into a
+message with its control characters as escapes.
 
 Paths may hold any characters. On Windows `abr.exe` reads the wide command line (the C runtime's `argv` holds a `?` for
 every character outside the ANSI code page: Cyrillic on a Western system, Chinese, an emoji) and works in UTF-8 from

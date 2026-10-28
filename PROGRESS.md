@@ -43,7 +43,7 @@ tools" below.
 | self-contained RSA: BigInt (Knuth D, Montgomery), DER/PEM/X.509, PKCS#1 v1.5 sign/verify, PKCS#8/PKCS#1 key parsing, AVB public-key blob -- **no OpenSSL anywhere in the build** | **done + verified** (Python integers, `openssl dgst -sign`, `avbtool extract_public_key`; see "Self-contained crypto" below) |
 | manifest + CLI (`abr info/unpack/repack`) | **done** |
 | CMake: FetchContent-vendored static zlib/lz4/zstd/xz/bzip2 | **done + build-verified natively on Linux**, both the dynamic and the `-DABR_STATIC_BINARY=ON` fully-static configurations |
-| Test suite (`tests/run_tests.sh`) | **done, 462/462 passing** on g++-14 (all judges required, as in the CI) and under AddressSanitizer + UndefinedBehaviorSanitizer (no report), 453/453 on clang-20 (the nine "the judge is there" checks belong to `ABR_REQUIRE_ORACLES`, which that run did not set), 461/461 for `abr.exe` under wine (the platform's own tests differ); CI runs the matrix (g++-14, clang-20, ASan+UBSan with a fuzz run, Windows under wine, arm64 under qemu-user, android-arm64) -- see Verification |
+| Test suite (`tests/run_tests.sh`) | **done, 483/483 passing** on g++-14 (all judges required, as in the CI) and under AddressSanitizer + UndefinedBehaviorSanitizer (no report), 474/474 on clang-20 (the nine "the judge is there" checks belong to `ABR_REQUIRE_ORACLES`, which that run did not set), 481/481 for `abr.exe` under wine (the platform's own tests differ; the suite with the 14 real images and AIK's magic file: 487/487); CI runs the matrix (g++-14, clang-20, ASan+UBSan with a fuzz run, Windows under wine, arm64 under qemu-user, android-arm64) -- see Verification |
 | CMake cross toolchains (mingw-w64, Android NDK) | **done + verified** (mingw reproduced locally; NDK only provable via CI, see below) |
 | GitHub Actions static build matrix (linux-x86_64, windows-x86_64, android-arm64) | **done + verified**: run 35313499827, all 3 jobs green, all 3 static binaries produced as artifacts (abr-linux-x86_64, abr-windows-x86_64, abr-android-arm64) |
 
@@ -1815,11 +1815,12 @@ class x13, `left-behind` x10, `empty-output` x3, `unreadable-output` x4.)
 - Found on the way, in the fuzzer: its DER mutator overflowed on a length above 65535 (so part of the key damage was never
   made); fixed.
 
-### Four more campaigns (rng seeds 21-24: 2915 damaged directories and about 7000 runs each, ASan+UBSan build)
+### More campaigns (rng seeds 21-32: 2915 damaged directories and about 7000 runs each, ASan+UBSan build)
 
 Each campaign was run on the build that had the fixes of the one before; the findings of one were fixed (or the fuzzer
-corrected) before the next. 12 distinct findings in all, in 9 classes -- every one of them a `repack` that said "done" and
-wrote what the directory does not say, or what abr itself does not know again, or that died or lied on what it printed.
+corrected) before the next. 15 distinct findings in all, in 11 classes -- every one of them a `repack` that said "done" and
+wrote what the directory does not say, or what abr itself does not know again, or that died or lied on what it printed. The
+campaigns of seeds 27, 29, 31 and 32 found nothing (about 28 000 runs), after the fixes below.
 
 - **A size that is a buffer** (campaign 21, 2 runs): `page_size=2147485696` of a boot image and
   `chromeos_bootloader_size=2147483648` asked for 2 GiB (ASan: `allocation-size-too-big`; without it `std::bad_alloc`). The
@@ -1864,6 +1865,28 @@ wrote what the directory does not say, or what abr itself does not know again, o
   was not escaped), and `find_read_file` asks `fs::equivalent` of the output, so symbolic and hard links count; the refusal
   names both files. (A first version cleared the record before the keys and the manifest were read: it covers the whole
   process now.)
+- **A patch that the image does not carry by what tells it** (campaign 26, `unreadable-output`): an AMONET-patched image is told
+  by the word "microloader" behind byte 96 (Android Image Kitchen's signature, and abr's); a `microloader.bin` of noise was
+  put on, and `unpack` of what came out read a boot image with 1024 bytes in front of it, its first page where the patch
+  is ("unexpected end of data while parsing image"). `apply_amonet` refuses a microloader without the word, with the way out
+  (`has_amonet=false`). And the generic check grew: `check_known_again` also compares the wrappers -- `has_chromeos`,
+  `has_dhtb`, `has_blob`, `has_loki`, `has_amonet` of the manifest must be what `peel_wrappers` takes off the image that
+  would be written (the format alone was right here: a boot image).
+- **A header that would be read as another layout** (campaign 28, `unreadable-output`): `pxa_unknown=0x1000` on a Marvell PXA
+  image; a PXA header is told by the word at byte 36 being no page size (and `tags_addr` above 8, and a page size at byte 44),
+  so what was written was read as a plain header ("need 268435712 bytes"). The same family: a CAF device tree of 8 bytes or
+  less is a header version. `BootImage::check_reads_back` reads the header that `repack_boot` built before anything is
+  written, and it must be the same kind of header, the same version and page size and the same sizes of the parts.
+- **Text the fuzzer cannot reach, found by looking for the same fault** (campaign 25 found the first, a PEM label in the
+  message "no matching END line", with a control byte in it and as long as the file; it is escaped and cut to 64 bytes):
+  the name of the ramdisk directory (the manifest's rule for a path refuses the bytes below 0x20, not a C1 control such as
+  U+009B, which a terminal in UTF-8 mode takes for an escape sequence, nor a byte that is not UTF-8) in the messages of the
+  archive that is changed twice, of a tail that is too big, of a `ramdisk.meta` that is wrong and of the archives left out;
+  the name of a file in "too large for a cpio archive"; and the subject of the certificate and the target of an AVBv1 boot
+  signature (text of the image: `info` printed a control byte in it as it was; found by hand, then in the note of the new
+  signature and in the warning of a key that is not abr's).
+- **Not findings**: twice in 14 000 runs AddressSanitizer's own start-up failed ("setrlimit() failed 1", status 86, nothing
+  of abr had run, not again when the command was run again). The runner makes such a run again, up to three times.
 - **The fuzzer** (campaign 24): a fifo that a mutator had put in the place of a file was opened by the next mutator that
   wrote to it, and the run hung for ever (a link to `/dev/zero` would have been written through as well); `file_kind` chose
   from a list that its own deletion had emptied. `open_regular` opens regular files and nothing else (a fifo, a device, a
@@ -1871,19 +1894,31 @@ wrote what the directory does not say, or what abr itself does not know again, o
 
 ### Verified by
 
-- 8 new groups in the CLI suite (462 -> 470; a section of its own, "repack reads what it is given with care"): 55 numbers that
-  are none or do not fit in the fields of boot, vendor_boot, vbmeta and dtbo; the edge of a 32-bit field and other spellings
-  (`010`, `0X10008000`, upper case digits: the image of the same address is the very image); 17 counts; 31 flags, hexadecimal
-  strings and sizes; 9 files that are not files (a directory or a fifo for the kernel or the manifest, a link to
-  `/dev/zero`, `/dev/zero` as the image of `info`, `identify` and `unpack`); `-o dir/`; 5 raw copies; 7 escape sequences in the
-  manifest, in `ramdisk.meta` and in the name of a file of the tree (with the output filter off). **All 8 fail on the binary of the previous commit** (a control
-  build of it: `stoul`, `bad_alloc`, a fifo that waits for ever, "taken" for a number that is none) and pass now.
+- 21 new groups in the CLI suite (462 -> 483), all in a section of their own, "repack reads what it is given with care". The
+  first 8 came with the first campaign: 55 numbers that are none or do not fit in the fields of boot, vendor_boot, vbmeta and
+  dtbo; the edge of a 32-bit field and other spellings (`010`, `0X10008000`, upper case digits: the image of the same address
+  is the very image); 17 counts; 31 flags, hexadecimal strings and sizes; 9 files that are not files (a directory or a fifo for
+  the kernel or the manifest, a link to `/dev/zero`, `/dev/zero` as the image of `info`, `identify` and `unpack`); `-o dir/`;
+  5 raw copies; 7 escape sequences in the manifest, in `ramdisk.meta`, in the name of a file of the tree and in the label of a
+  PEM block (with the output filter off). The 13 that the later campaigns added: a dtb with something behind its last blob
+  (zero fill, 0xFF fill, a trailer) comes back byte for byte; a dtb blob that is no device tree, or not as long as its header
+  says; a dtb that is cut short or whose `totalsize` is a lie; an OSIP image whose header is not one; a Nook prefix that is no
+  header and a wrapper that pushes the image out of place; a tail of the ramdisk of more than 1 GiB; an `os_version` or
+  `os_patch_level` that is none; a ChromeOS preamble version that is none; an output that is a file that was read (also by a
+  link or a hard link); the name of a ramdisk directory with a C1 control and a byte that is not UTF-8 in it (not under wine);
+  an AVBv1 signature whose certificate subject and target have a control byte; a boot header that would be read as another
+  layout (PXA, CAF). **All 21 fail on the binary of `04d347c`, the last commit with a green CI run (built beside the new one,
+  its commands run under a time limit): `stoul`, `bad_alloc`, a fifo that waits for ever, "taken" for what is none, a
+  control byte in a message, an image written that `unpack` does not read** -- and pass now.
 - Unit tests: 40 000 random numbers over the alphabet of numbers and of what is not, against `std::from_chars` (the rule
   written again with the standard library), a table of 35 cases, flags, counts, sizes, levels, hex, a manifest of 200 000
-  lines, and the file helpers (a directory, a link to a directory, a link to `/dev/null`, a name that ends in a slash):
-  `abr_unit_tests manifest` 451 954 -> **492 063** checks.
-- Suites: g++-14 470/470 (all judges required), ASan+UBSan 470/470 with no report, clang-20 461/461, `abr.exe` under wine
-  469/469; the 13 real images that are images (the 14th is an ext4 filesystem) still come back byte for byte.
+  lines, and the file helpers (a directory, a link to a directory, a link to `/dev/null`, a name that ends in a slash); the
+  text of a PEM label in a message; what a dtb blob is and where a dtb's blobs end; what an OSIP image is told by; the rules of
+  `get_version`, `os_version` and `os_patch_level` written again, and every 32-bit word of a header read back as the same word:
+  `abr_unit_tests manifest` 451 954 -> 492 063 -> **518 461** checks (g++-14, clang-20 and the ASan+UBSan build).
+- Suites: g++-14 483/483 (all judges required), ASan+UBSan 483/483 with no report, clang-20 474/474, `abr.exe` under wine
+  481/481; with the 14 real images and AIK's magic file, g++-14 487/487: the 13 real images that are images (the 14th is an
+  ext4 filesystem, refused with that said) still come back byte for byte.
 
 ## Next steps (in order)
 
