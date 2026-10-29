@@ -1559,6 +1559,14 @@ if [ -x "$UNIT" ]; then
     fi
 fi
 
+if [ -x "$UNIT" ]; then
+    if out=$("$UNIT" compression 2>&1); then
+        pass "decoder size limit unit tests: every codec at, over and under the limit, zstd frames that lie, streams of a thousand times their size ($(tail -n 1 <<<"$out"))"
+    else
+        fail "decoder size limit unit tests: $(grep -E 'FAIL|failure|note' <<<"$out" | head -n 4 | tr '\n' ' ')"
+    fi
+fi
+
 # ---- archives that become directories: untouched round trip, the directory, GNU cpio's verdict
 for style in mkbootfs crc upper uppercrc owners aik dotroot explicit tail weird big volumes2 volumes3 volumes_tail; do
     if ! rd_image "$style"; then fail "ramdisk directory: could not make the $style fixture"; continue; fi

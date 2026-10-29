@@ -200,6 +200,7 @@ int run_par_tests();  // par_test.cpp
 int run_cpio_tests();  // cpio_test.cpp
 int run_legacy_tests();  // legacy_test.cpp
 int run_manifest_tests();  // manifest_test.cpp
+int run_compression_tests();  // compression_test.cpp
 
 int main(int argc, char** argv) {
     set_binary_stdio();
@@ -211,6 +212,7 @@ int main(int argc, char** argv) {
         if (cmd == "cpio") return run_cpio_tests();
         if (cmd == "legacy") return run_legacy_tests();
         if (cmd == "manifest") return run_manifest_tests();
+        if (cmd == "compression") return run_compression_tests();
         if (cmd == "sha-impl") {
             std::cout << hash::implementation_name() << "\n";
             return hash::sha_selftest() ? 0 : 1;

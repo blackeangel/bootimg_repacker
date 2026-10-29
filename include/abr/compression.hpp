@@ -39,9 +39,19 @@ std::optional<Codec> codec_from_name(std::string_view name);
 // if nothing recognizable is found (i.e. the data is treated as raw).
 Codec detect_codec(const Bytes& data);
 
+// The most a decoder lets a stream become: no kernel, ramdisk or device tree of the family comes near a gigabyte (the same as
+// the largest image, kMaxImageSize), and a stream of a few kilobytes can ask for many times that -- a gzip of zeros is a
+// thousandth of what it holds -- so what a damaged or a made-up one would take of the memory has to stop somewhere.
+inline constexpr size_t kMaxDecompressedSize = 0x40000000;
+
 // Decompresses `data` (which must actually be in `codec` format; use
 // detect_codec() first if unsure). Codec::NONE returns `data` unchanged.
-Bytes decompress(Codec codec, const Bytes& data);
+//
+// A FormatError when the stream is damaged, and when the plain data would be more than `max_size` bytes: the decoders
+// never hold more than that in memory (a decoder that works in a buffer of its own has one byte more, to tell "exactly
+// max_size" from "more", and one that makes the buffer larger as it goes needs the old and the new at the same moment).
+// Exactly `max_size` bytes is taken.
+Bytes decompress(Codec codec, const Bytes& data, size_t max_size = kMaxDecompressedSize);
 
 // Compresses `data` with `codec`. `level` is codec-specific; -1 selects
 // a sensible per-codec default (lz4_legacy: HC level 12, what Android's

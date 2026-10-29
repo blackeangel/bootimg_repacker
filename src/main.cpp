@@ -411,7 +411,9 @@ struct DecodedComponent {
     const Bytes& stored(const Bytes& raw) const { return stripped ? *stripped : raw; }
 };
 
-DecodedComponent decode_component(const Bytes& raw) {
+// `what` names the component in the message of a stream that cannot be decompressed (a damaged image, or a bomb: a stream
+// that would be more than kMaxDecompressedSize); empty, the message does not name it.
+DecodedComponent decode_component(const Bytes& raw, std::string_view what = {}) {
     DecodedComponent d;
     if (raw.empty()) return d;
     d.present = true;
@@ -422,7 +424,12 @@ DecodedComponent decode_component(const Bytes& raw) {
     }
     const Bytes& working = d.stored(raw);
     d.codec = detect_codec(working);
-    d.plain = decompress(d.codec, working);
+    try {
+        d.plain = decompress(d.codec, working);
+    } catch (const FormatError& e) {
+        throw FormatError((what.empty() ? std::string() : shown(what) + ": ") + std::string(codec_name(d.codec)) +
+                          " stream cannot be decompressed: " + e.what());
+    }
     d.plain_hash = hash::sha256(d.plain);
     return d;
 }
@@ -448,7 +455,7 @@ std::vector<DecodedComponent> save_components(const fs::path& dir,
     std::vector<DecodedComponent> out(sources.size());
     par::for_each(sources.size(), [&](size_t k) {
         const size_t i = order[k];
-        out[i] = decode_component(*sources[i].raw);
+        out[i] = decode_component(*sources[i].raw, sources[i].filename);
         if (!out[i].present) return;
         write_file(dir / sources[i].filename, out[i].plain);
         write_file(dir / ".abr_raw" / (sources[i].filename + ".raw"), out[i].stored(*sources[i].raw));
@@ -574,6 +581,23 @@ void check_raw_copy(const fs::path& raw_path, const Bytes& raw, const Bytes& sto
                       ". Delete it to have " + textquote::quote_shown(filename) + " compressed again, or unpack the image again");
 }
 
+// A component that goes into the image as it is (`<prefix>_compression=none`) is not left alone when that image is unpacked, if
+// it starts like a stream of one of the codecs: abr takes it for one and decompresses it. A stream put there that is damaged, or
+// one that would be more than kMaxDecompressedSize, would make an image that abr refuses to unpack: it is refused here, with the
+// two ways out (the plain data in the file and the compression in the manifest, or a stream that is whole).
+void check_unpacks_as_is(const Bytes& stored, const std::string& prefix, const std::string& filename) {
+    const Codec seen = detect_codec(stored);
+    if (seen == Codec::NONE) return;
+    try {
+        (void)decompress(seen, stored);
+    } catch (const FormatError& e) {
+        throw FormatError(shown(filename) + " goes into the image as it is (" + shown(prefix + "_compression=none") + "), and the " +
+                          std::string(codec_name(seen)) + " stream it starts with cannot be decompressed (" + e.what() +
+                          "): abr would refuse to unpack that image. Put the plain data in the file and name its compression in "
+                          "manifest.txt, or put a whole stream there");
+    }
+}
+
 // What goes into the image for one component. For a ramdisk that also exists as a directory (see
 // ramdisk_tree.hpp) there are two places it may have been edited, and which one counts is decided
 // by what changed since unpacking, not by file times: the file by the hash of its contents, the
@@ -590,7 +614,7 @@ Bytes load_component(const Manifest& m, const fs::path& dir, const std::string& 
     const Bytes stored_hash = m.get_hex(prefix + "_orig_hash");
     const bool has_tree_entry = m.has(prefix + "_tree");
     if (opt.ramdisk_from == "tree" && !has_tree_entry && prefix.rfind("ramdisk", 0) == 0)
-        warn("--ramdisk-from tree: " + filename + " has no directory in this unpack, the file is used");
+        warn("--ramdisk-from tree: " + shown(filename) + " has no directory in this unpack, the file is used");
 
     std::optional<Bytes> from_file;
     Bytes file_hash;
@@ -641,13 +665,20 @@ Bytes load_component(const Manifest& m, const fs::path& dir, const std::string& 
             for (const std::string& n : report.notes) note(n);
             std::string from;  // "ramdisk/", "ramdisk/ and ramdisk.vol2/", "ramdisk/, ramdisk.vol2/ and ramdisk.vol3/"
             for (size_t i = 0; i < report.built.size(); ++i)
-                from += (i == 0 ? "" : i + 1 == report.built.size() ? " and " : ", ") + report.built[i] + "/";
+                from += (i == 0 ? "" : i + 1 == report.built.size() ? " and " : ", ") + shown(report.built[i] + "/");  // (names of the manifest)
             const std::string size = std::to_string(plain.size()) + " bytes";
-            note("the " + prefix + " is built from the director" + (report.built.size() > 1 ? "ies " : "y ") + from + " (" +
+            note("the " + shown(prefix) + " is built from the director" + (report.built.size() > 1 ? "ies " : "y ") + from + " (" +
                  (report.built.size() > 1 ? std::to_string(report.built.size()) + " cpio archives one after the other, " : std::string()) +
                  size + ")");
         }
-        const Codec codec = codec_from_name(m.get(prefix + "_compression", "none")).value_or(Codec::NONE);
+        // The name of a compression that abr does not know is not taken for "none": the component would go into the image as it is,
+        // and the typo of a name (`gzp`) would be the last that anyone hears of it.
+        const std::string codec_text = m.get(prefix + "_compression", "none");
+        const std::optional<Codec> named = codec_from_name(codec_text);
+        if (!named)
+            throw FormatError("manifest.txt: " + shown(prefix + "_compression=" + codec_text) +
+                              " is none of the compressions abr knows (none, gzip, lz4_legacy, lz4, zstd, xz, lzma, bzip2, lzo)");
+        const Codec codec = *named;
         // Optional `<prefix>_level=N` in the manifest picks the compression level
         // (codec-specific; absent or -1: the codec's default -- or, on the second try of a build
         // that did not fit its partition, the densest the decoders allow).
@@ -655,6 +686,7 @@ Bytes load_component(const Manifest& m, const fs::path& dir, const std::string& 
         if (level < 0 && opt.dense) level = dense_level(codec);
         else if (level < 0 && dense_level(codec) >= 0) g_denser_would_help = true;
         result = compress(codec, plain, level);
+        if (codec == Codec::NONE) check_unpacks_as_is(result, prefix, filename);
     }
     if (m.has(prefix + "_mtk_name")) result = add_mtk_header(result, m.get(prefix + "_mtk_name"));
     return result;
@@ -1741,7 +1773,7 @@ void unpack_krnl(const Bytes& host, const fs::path& dir, const UnpackOptions& uo
     legacy::KrnlImage img = legacy::KrnlImage::parse(host);
     Manifest m;
     m.set("type", "krnl");
-    DecodedComponent part = decode_component(img.payload);
+    DecodedComponent part = decode_component(img.payload, "payload");
     const bool ramdisk = part.plain.size() < 5 || std::memcmp(part.plain.data(), "07070", 5) == 0;  // (an empty one is a ramdisk)
     const std::string prefix = ramdisk ? "ramdisk" : "kernel";
     const std::string filename = ramdisk ? "ramdisk.cpio" : "kernel";
@@ -2288,7 +2320,7 @@ void unpack_osip(const Bytes& host, const fs::path& dir, const UnpackOptions& uo
     save_raw(m, dir, "bootstub", img.bootstub, "bootstub.bin");
     save_raw(m, dir, "kernel", img.kernel, "kernel");
 
-    DecodedComponent ramdisk = decode_component(img.ramdisk);
+    DecodedComponent ramdisk = decode_component(img.ramdisk, "ramdisk");
     if (ramdisk.present) {
         fs::create_directories(dir / ".abr_raw");
         write_file(dir / "ramdisk.cpio", ramdisk.plain);

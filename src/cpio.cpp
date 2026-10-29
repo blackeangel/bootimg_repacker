@@ -42,11 +42,16 @@ void put_field(Bytes& out, uint32_t v, bool upper) {
 // (which is what GNU cpio writes).
 uint32_t check_for(const Entry& e) { return e.type() == kRegular ? byte_sum(e.data) : 0; }
 
+// A name of an entry, for a message: in single quotes when it is plain text, and one with a control character in it (an archive, or a
+// directory, can hold any bytes there) in double quotes with escapes, so that no terminal obeys it. (Not "quoted": std::quoted is
+// what a call with a std::string finds first.)
+std::string name_in_text(std::string_view name) {
+    const std::string q = textquote::quote_shown(name);
+    return q == name ? "'" + q + "'" : q;
+}
+
 void put_record(Bytes& out, Magic magic, bool upper, const Entry& e, std::string_view name) {
-    if (e.data.size() > 0xFFFFFFFFull) {
-        const std::string q = textquote::quote_shown(name);  // (a name from a directory: no terminal is to obey a control character in it)
-        throw FormatError((q == name ? "'" + q + "'" : q) + " is too large for a cpio archive");
-    }
+    if (e.data.size() > 0xFFFFFFFFull) throw FormatError(name_in_text(name) + " is too large for a cpio archive");
     const char* tag = magic == Magic::CRC ? "070702" : "070701";
     out.insert(out.end(), tag, tag + 6);
     put_field(out, e.ino, upper);
@@ -181,11 +186,11 @@ std::optional<Parsed> parse(const uint8_t* data, size_t size, std::string& error
             return std::nullopt;
         }
         if (magic == Magic::CRC && check != check_for(e)) {
-            error = "the checksum of '" + e.name + "' is wrong";
+            error = "the checksum of " + name_in_text(e.name) + " is wrong";
             return std::nullopt;
         }
         if (magic == Magic::NEWC && check != 0) {
-            error = "'" + e.name + "' has a checksum, which the 070701 format does not use";
+            error = name_in_text(e.name) + " has a checksum, which the 070701 format does not use";
             return std::nullopt;
         }
         pos = next;

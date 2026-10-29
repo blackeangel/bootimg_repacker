@@ -53,27 +53,71 @@ bool looks_like_lzma_alone(const Bytes& d) {
 
 [[noreturn]] void fail(const std::string& what) { throw FormatError(what); }
 
+// ------------------------------------------- how much a decoder may produce --
+
+// What a decoder says when the plain data would be more than `max` bytes (kMaxDecompressedSize, as a rule). The caller names the
+// codec and the component; this says what is wrong.
+[[noreturn]] void too_big(size_t max) {
+    const size_t mib = size_t(1) << 20;
+    fail("it would be more than " + (max % mib == 0 ? std::to_string(max / mib) + " MiB" : std::to_string(max) + " bytes") +
+         " decompressed, and no component of the family is that big");
+}
+
+// A decoder that works in a buffer of its own (zlib, liblzma, bzip2) has room for one byte more than it may produce: a buffer that
+// is filled up to its end holds more than `max` bytes (or exactly one more, which is as much), where `max` bytes leave a byte
+// free -- and tell a plain data of exactly `max` bytes from one that is longer.
+size_t room_for(size_t max) { return max < SIZE_MAX ? max + 1 : max; }
+
+// The size to begin a buffer with that is doubled until it holds what comes, but is never larger than `room`: the first of
+// room, room/2, room/4, ... (each rounded up) that holds `wanted`. So the last doubling goes from about half of `room` to `room`,
+// and what is held at that moment is 1.5 times `room`, not up to twice (the old buffer of nearly `room` and a new one of `room`).
+size_t first_buffer(size_t wanted, size_t room) {
+    wanted = std::max<size_t>(wanted, 1);
+    size_t n = room;
+    while (n / 2 >= wanted) n = n / 2 + (n & 1);
+    return n;
+}
+
+// The size after that one.
+size_t next_buffer(size_t size, size_t room) { return size > room / 2 ? room : size * 2; }
+
+// What a decoder that goes on as it reads (a stream, a block after block) adds to its output: no more than `max` bytes in all,
+// and the buffer grown the way above (a vector would double it past `max`).
+void append_up_to(Bytes& out, const uint8_t* p, size_t n, size_t max) {
+    if (n > max - out.size()) too_big(max);
+    if (out.capacity() - out.size() < n) out.reserve(std::max(out.size() + n, next_buffer(out.capacity(), max)));
+    out.insert(out.end(), p, p + n);
+}
+
 // ---------------------------------------------------------------- gzip --
 
-Bytes zlib_run(const Bytes& in, bool encode, int level, int window_bits) {
+// `max_out` is the most a decoder may produce; an encoder (`encode`) is not limited.
+Bytes zlib_run(const Bytes& in, bool encode, int level, int window_bits, size_t max_out = 0) {
     z_stream strm{};
     int rc = encode ? deflateInit2(&strm, level, Z_DEFLATED, window_bits, 8, Z_DEFAULT_STRATEGY)
                      : inflateInit2(&strm, window_bits);
     if (rc != Z_OK) fail("zlib init failed");
 
+    const size_t room = encode ? 0 : room_for(max_out);
     Bytes out;
-    out.resize(std::max<size_t>(64, in.size() * (encode ? 1 : 3) + 4096));
+    out.resize(encode ? std::max<size_t>(64, in.size() + 4096) : first_buffer(in.size() * 3 + 4096, room));
     strm.next_in = const_cast<Bytef*>(in.data());
     strm.avail_in = static_cast<uInt>(in.size());
     size_t produced = 0;
 
     int action = encode ? Z_FINISH : Z_FINISH;
     for (;;) {
-        if (produced == out.size()) out.resize(out.size() * 2);
+        if (produced == out.size()) {
+            if (!encode && out.size() >= room) {  // the room is filled: more than max_out
+                inflateEnd(&strm);
+                too_big(max_out);
+            }
+            out.resize(encode ? out.size() * 2 : next_buffer(out.size(), room));
+        }
         strm.next_out = out.data() + produced;
-        strm.avail_out = static_cast<uInt>(out.size() - produced);
+        strm.avail_out = static_cast<uInt>(std::min<size_t>(out.size() - produced, 0x40000000));  // (a uInt is 32 bits)
         rc = encode ? deflate(&strm, action) : inflate(&strm, action);
-        produced = out.size() - strm.avail_out;
+        produced = static_cast<size_t>(strm.next_out - out.data());
         if (rc == Z_STREAM_END) break;
         if (rc != Z_OK && rc != Z_BUF_ERROR) {
             (encode ? deflateEnd : inflateEnd)(&strm);
@@ -87,6 +131,7 @@ Bytes zlib_run(const Bytes& in, bool encode, int level, int window_bits) {
         }
     }
     (encode ? deflateEnd : inflateEnd)(&strm);
+    if (!encode && produced > max_out) too_big(max_out);  // (a stream that ends with the room filled up to its last byte)
     out.resize(produced);
     return out;
 }
@@ -95,8 +140,8 @@ Bytes gzip_compress(const Bytes& in, int level) {
     if (level < 0) level = Z_DEFAULT_COMPRESSION;
     return zlib_run(in, /*encode=*/true, level, /*windowBits=*/15 + 16);
 }
-Bytes gzip_decompress(const Bytes& in) {
-    return zlib_run(in, /*encode=*/false, 0, /*windowBits=*/15 + 32 /* auto zlib/gzip */);
+Bytes gzip_decompress(const Bytes& in, size_t max_out) {
+    return zlib_run(in, /*encode=*/false, 0, /*windowBits=*/15 + 32 /* auto zlib/gzip */, max_out);
 }
 
 // ------------------------------------------------------------ lz4 frame --
@@ -113,7 +158,7 @@ Bytes lz4_frame_compress(const Bytes& in, int level) {
     return out;
 }
 
-Bytes lz4_frame_decompress(const Bytes& in) {
+Bytes lz4_frame_decompress(const Bytes& in, size_t max_out) {
     LZ4F_decompressionContext_t ctx;
     if (LZ4F_isError(LZ4F_createDecompressionContext(&ctx, LZ4F_VERSION)))
         fail("LZ4F_createDecompressionContext failed");
@@ -123,7 +168,7 @@ Bytes lz4_frame_decompress(const Bytes& in) {
     } guard{ctx};
 
     Bytes out;
-    out.reserve(in.size() * 3 + 4096);
+    out.reserve(first_buffer(in.size() * 3 + 4096, max_out));
     size_t in_pos = 0;
     Bytes chunk(1 << 20);
     while (in_pos < in.size()) {
@@ -132,7 +177,7 @@ Bytes lz4_frame_decompress(const Bytes& in) {
         size_t rc = LZ4F_decompress(ctx, chunk.data(), &dst_size, in.data() + in_pos, &src_size,
                                      nullptr);
         if (LZ4F_isError(rc)) fail(std::string("LZ4F_decompress failed: ") + LZ4F_getErrorName(rc));
-        out.insert(out.end(), chunk.data(), chunk.data() + dst_size);
+        append_up_to(out, chunk.data(), dst_size, max_out);
         in_pos += src_size;
         if (rc == 0) break;  // frame fully decoded
         if (src_size == 0 && dst_size == 0) break;  // no progress; avoid spinning
@@ -179,12 +224,13 @@ Bytes lz4_legacy_compress(const Bytes& in, int level) {
     return w.take();
 }
 
-Bytes lz4_legacy_decompress(const Bytes& in) {
+Bytes lz4_legacy_decompress(const Bytes& in, size_t max_out) {
     BinaryReader r(in);
     if (!r.starts_with(reinterpret_cast<const char*>(kLz4LegacyMagic), 4))
         fail("not an lz4-legacy stream (bad magic)");
     r.skip(4);
     Bytes out;
+    out.reserve(first_buffer(in.size() * 3 + 4096, max_out));
     Bytes scratch(kLz4LegacyBlockSize);
     while (r.remaining() > 0) {
         if (r.remaining() < 4) break;  // trailing pad, not a real block
@@ -196,7 +242,7 @@ Bytes lz4_legacy_decompress(const Bytes& in) {
                                      static_cast<int>(block.size()),
                                      static_cast<int>(scratch.size()));
         if (n < 0) fail("LZ4_decompress_safe failed on lz4-legacy block");
-        out.insert(out.end(), scratch.data(), scratch.data() + n);
+        append_up_to(out, scratch.data(), static_cast<size_t>(n), max_out);
     }
     return out;
 }
@@ -236,7 +282,7 @@ Bytes zstd_compress(const Bytes& in, int level) {
     return out;
 }
 
-Bytes zstd_decompress(const Bytes& in) {
+Bytes zstd_decompress(const Bytes& in, size_t max_out) {
     unsigned long long content_size = ZSTD_getFrameContentSize(in.data(), in.size());
     if (content_size == ZSTD_CONTENTSIZE_ERROR) fail("not a valid zstd frame");
     if (content_size == ZSTD_CONTENTSIZE_UNKNOWN) {
@@ -248,6 +294,7 @@ Bytes zstd_decompress(const Bytes& in) {
         ZSTD_initDStream(ds);
         ZSTD_inBuffer in_buf{in.data(), in.size(), 0};
         Bytes out;
+        out.reserve(first_buffer(in.size() * 3 + 4096, max_out));
         Bytes chunk(1 << 20);
         size_t rc;
         do {
@@ -255,10 +302,13 @@ Bytes zstd_decompress(const Bytes& in) {
             rc = ZSTD_decompressStream(ds, &out_buf, &in_buf);
             if (ZSTD_isError(rc)) fail(std::string("ZSTD_decompressStream failed: ") +
                                         ZSTD_getErrorName(rc));
-            out.insert(out.end(), chunk.data(), chunk.data() + out_buf.pos);
+            append_up_to(out, chunk.data(), out_buf.pos, max_out);
         } while (in_buf.pos < in_buf.size && rc != 0);
         return out;
     }
+    // A frame that tells its size is believed no further than that: the buffer of that size is made (a made-up one asks for as many
+    // gigabytes as its eight bytes of size can say) only if it is a size the data may have.
+    if (content_size > max_out) too_big(max_out);
     Bytes out(static_cast<size_t>(content_size));
     size_t n = ZSTD_decompress(out.data(), out.size(), in.data(), in.size());
     if (ZSTD_isError(n)) fail(std::string("ZSTD_decompress failed: ") + ZSTD_getErrorName(n));
@@ -284,19 +334,22 @@ Bytes xz_compress(const Bytes& in, int level) {
     return out;
 }
 
-Bytes xz_decompress(const Bytes& in) {
-    Bytes out(std::max<size_t>(in.size() * 4, 4096));
+Bytes xz_decompress(const Bytes& in, size_t max_out) {
+    const size_t room = room_for(max_out);
+    Bytes out(first_buffer(std::max<size_t>(in.size() * 4, 4096), room));
     for (;;) {
         uint64_t memlimit = UINT64_MAX;
         size_t in_pos = 0, out_pos = 0;
         lzma_ret rc = lzma_stream_buffer_decode(&memlimit, 0, nullptr, in.data(), &in_pos,
                                                  in.size(), out.data(), &out_pos, out.size());
         if (rc == LZMA_OK) {
+            if (out_pos > max_out) too_big(max_out);  // (a stream that ends with the room filled up to its last byte)
             out.resize(out_pos);
             return out;
         }
         if (rc == LZMA_BUF_ERROR) {  // output buffer too small; grow and retry
-            out.resize(out.size() * 2);
+            if (out.size() >= room) too_big(max_out);
+            out.resize(next_buffer(out.size(), room));
             continue;
         }
         fail("lzma_stream_buffer_decode failed: rc=" + std::to_string(rc));
@@ -305,7 +358,8 @@ Bytes xz_decompress(const Bytes& in) {
 
 // -------------------------------------------------- lzma "alone" stream --
 
-Bytes lzma_stream_run(const Bytes& in, bool encode) {
+// `max_out` is the most a decoder may produce; an encoder (`encode`) is not limited.
+Bytes lzma_stream_run(const Bytes& in, bool encode, size_t max_out = 0) {
     lzma_stream strm = LZMA_STREAM_INIT;
     lzma_ret rc;
     if (encode) {
@@ -317,13 +371,20 @@ Bytes lzma_stream_run(const Bytes& in, bool encode) {
     }
     if (rc != LZMA_OK) fail("lzma alone (en|de)coder init failed: rc=" + std::to_string(rc));
 
+    const size_t room = encode ? 0 : room_for(max_out);
     Bytes out;
-    out.resize(std::max<size_t>(4096, in.size() * (encode ? 1 : 3)));
+    out.resize(encode ? std::max<size_t>(4096, in.size()) : first_buffer(std::max<size_t>(4096, in.size() * 3), room));
     strm.next_in = in.data();
     strm.avail_in = in.size();
     size_t produced = 0;
     for (;;) {
-        if (produced == out.size()) out.resize(out.size() * 2);
+        if (produced == out.size()) {
+            if (!encode && out.size() >= room) {  // the room is filled: more than max_out
+                lzma_end(&strm);
+                too_big(max_out);
+            }
+            out.resize(encode ? out.size() * 2 : next_buffer(out.size(), room));
+        }
         strm.next_out = out.data() + produced;
         strm.avail_out = out.size() - produced;
         rc = lzma_code(&strm, LZMA_FINISH);
@@ -335,6 +396,7 @@ Bytes lzma_stream_run(const Bytes& in, bool encode) {
         }
     }
     lzma_end(&strm);
+    if (!encode && produced > max_out) too_big(max_out);  // (a stream that ends with the room filled up to its last byte)
     out.resize(produced);
     return out;
 }
@@ -345,29 +407,36 @@ Bytes bzip2_compress(const Bytes& in, int level) {
     if (level < 1 || level > 9) level = 9;
     unsigned int out_len = static_cast<unsigned int>(in.size() + in.size() / 100 + 600);
     Bytes out(out_len);
-    int rc = BZ2_bzBuffToBuffCompress(reinterpret_cast<char*>(out.data()), &out_len,
-                                       const_cast<char*>(reinterpret_cast<const char*>(in.data())),
+    // (The library takes a null pointer for its data as a wrong parameter, and that is what an empty vector may have: the
+    // stream of nothing is a valid bzip2 stream, of fourteen bytes.)
+    static const char nothing = 0;
+    char* source = in.empty() ? const_cast<char*>(&nothing) : const_cast<char*>(reinterpret_cast<const char*>(in.data()));
+    int rc = BZ2_bzBuffToBuffCompress(reinterpret_cast<char*>(out.data()), &out_len, source,
                                        static_cast<unsigned int>(in.size()), level, 0, 0);
     if (rc != BZ_OK) fail("BZ2_bzBuffToBuffCompress failed: rc=" + std::to_string(rc));
     out.resize(out_len);
     return out;
 }
 
-Bytes bzip2_decompress(const Bytes& in) {
-    unsigned int out_len = static_cast<unsigned int>(std::max<size_t>(in.size() * 4, 4096));
+Bytes bzip2_decompress(const Bytes& in, size_t max_out) {
+    // (The library counts in 32 bits: a limit above what they hold is as much as they hold.)
+    const size_t room = std::min<size_t>(room_for(max_out), 0xFFFFFFFFull);
+    size_t out_len = first_buffer(std::max<size_t>(in.size() * 4, 4096), room);
     for (;;) {
-        Bytes out(out_len);
-        unsigned int produced = out_len;
+        Bytes out(out_len);  // (the buffer of the round before is gone: the library decodes from the start again)
+        unsigned int produced = static_cast<unsigned int>(out_len);
         int rc = BZ2_bzBuffToBuffDecompress(
             reinterpret_cast<char*>(out.data()), &produced,
             const_cast<char*>(reinterpret_cast<const char*>(in.data())),
             static_cast<unsigned int>(in.size()), 0, 0);
         if (rc == BZ_OK) {
+            if (produced > max_out) too_big(max_out);  // (a stream that ends with the room filled up to its last byte)
             out.resize(produced);
             return out;
         }
         if (rc == BZ_OUTBUFF_FULL) {
-            out_len *= 2;
+            if (out_len >= room) too_big(max_out);
+            out_len = next_buffer(out_len, room);
             continue;
         }
         fail("BZ2_bzBuffToBuffDecompress failed: rc=" + std::to_string(rc));
@@ -451,7 +520,7 @@ Bytes lzo_compress(const Bytes& in) {
     return w.take();
 }
 
-Bytes lzo_decompress(const Bytes& in) {
+Bytes lzo_decompress(const Bytes& in, size_t max_out) {
     lzo_init_once();
     BinaryReader r(in);
     if (!r.starts_with(reinterpret_cast<const char*>(kLzopMagic), sizeof(kLzopMagic)))
@@ -476,6 +545,7 @@ Bytes lzo_decompress(const Bytes& in) {
     const size_t c_words = ((flags & kLzopAdler32C) ? 1 : 0) + ((flags & kLzopCrc32C) ? 1 : 0);
 
     Bytes out;
+    out.reserve(first_buffer(in.size() * 3 + 4096, max_out));
     Bytes scratch(kLzoBlockSize);
     for (;;) {
         uint32_t dst_len = r.be32();
@@ -487,14 +557,14 @@ Bytes lzo_decompress(const Bytes& in) {
         if (src_len < dst_len) r.skip(4 * c_words);
         Bytes block = r.bytes(src_len);
         if (src_len == dst_len) {
-            out.insert(out.end(), block.begin(), block.end());  // stored uncompressed
+            append_up_to(out, block.data(), block.size(), max_out);  // stored uncompressed
             continue;
         }
         lzo_uint out_len = dst_len;
         int rc = lzo1x_decompress_safe(block.data(), src_len, scratch.data(), &out_len, nullptr);
         if (rc != LZO_E_OK || out_len != dst_len)
             fail("lzo1x_decompress_safe failed: rc=" + std::to_string(rc));
-        out.insert(out.end(), scratch.data(), scratch.data() + out_len);
+        append_up_to(out, scratch.data(), out_len, max_out);
     }
     return out;
 }
@@ -541,17 +611,17 @@ Codec detect_codec(const Bytes& d) {
     return Codec::NONE;
 }
 
-Bytes decompress(Codec codec, const Bytes& data) {
+Bytes decompress(Codec codec, const Bytes& data, size_t max_size) {
     switch (codec) {
         case Codec::NONE: return data;
-        case Codec::GZIP: return gzip_decompress(data);
-        case Codec::LZ4_LEGACY: return lz4_legacy_decompress(data);
-        case Codec::LZ4: return lz4_frame_decompress(data);
-        case Codec::ZSTD: return zstd_decompress(data);
-        case Codec::XZ: return xz_decompress(data);
-        case Codec::LZMA: return lzma_stream_run(data, /*encode=*/false);
-        case Codec::BZIP2: return bzip2_decompress(data);
-        case Codec::LZO: return lzo_decompress(data);
+        case Codec::GZIP: return gzip_decompress(data, max_size);
+        case Codec::LZ4_LEGACY: return lz4_legacy_decompress(data, max_size);
+        case Codec::LZ4: return lz4_frame_decompress(data, max_size);
+        case Codec::ZSTD: return zstd_decompress(data, max_size);
+        case Codec::XZ: return xz_decompress(data, max_size);
+        case Codec::LZMA: return lzma_stream_run(data, /*encode=*/false, max_size);
+        case Codec::BZIP2: return bzip2_decompress(data, max_size);
+        case Codec::LZO: return lzo_decompress(data, max_size);
     }
     fail("unknown codec");
 }

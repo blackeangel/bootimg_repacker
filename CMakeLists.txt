@@ -64,7 +64,7 @@ add_library(abr_cxx_std INTERFACE)
 target_compile_options(abr_cxx_std INTERFACE "$<$<COMPILE_LANGUAGE:CXX>:${ABR_CXX_STD_FLAG}>")
 
 option(ABR_BUILD_TESTS
-       "Build abr_unit_tests, the driver tests/run_tests.sh uses to check the self-contained crypto (BigInt/RSA/DER/SHA), the thread helper, the cpio/ramdisk-directory code and the Sony SIN/ELF readers. Off for cross builds." ON)
+       "Build abr_unit_tests, the driver tests/run_tests.sh uses to check the self-contained crypto (BigInt/RSA/DER/SHA), the thread helper, the cpio/ramdisk-directory code, the Sony SIN/ELF readers and the size limit of the decoders. Off for cross builds." ON)
 # A build for the test suite to run against with the sanitizers of GCC/Clang: what a green suite does not show -- a read past
 # the end of a damaged image, an overflow in a size that is checked too late, a signed overflow in an offset -- stops the run
 # with a report. Only abr's own code is instrumented (the vendored libraries are not: their reports are not abr's to fix, and
@@ -217,7 +217,7 @@ abr_link_statically(abr)
 
 if(ABR_BUILD_TESTS)
   add_executable(abr_unit_tests tests/unit/crypto_test.cpp tests/unit/par_test.cpp tests/unit/cpio_test.cpp
-               tests/unit/legacy_test.cpp tests/unit/manifest_test.cpp)
+               tests/unit/legacy_test.cpp tests/unit/manifest_test.cpp tests/unit/compression_test.cpp)
   target_link_libraries(abr_unit_tests PRIVATE abr_core)
   abr_link_statically(abr_unit_tests)
 endif()
