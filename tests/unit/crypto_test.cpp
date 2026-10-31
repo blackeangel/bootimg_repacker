@@ -201,6 +201,8 @@ int run_cpio_tests();  // cpio_test.cpp
 int run_legacy_tests();  // legacy_test.cpp
 int run_manifest_tests();  // manifest_test.cpp
 int run_compression_tests();  // compression_test.cpp
+int run_fdt_tests();  // fdt_test.cpp
+int run_fdt_files(int argc, char** argv);  // fdt_test.cpp
 
 int main(int argc, char** argv) {
     set_binary_stdio();
@@ -213,6 +215,8 @@ int main(int argc, char** argv) {
         if (cmd == "legacy") return run_legacy_tests();
         if (cmd == "manifest") return run_manifest_tests();
         if (cmd == "compression") return run_compression_tests();
+        if (cmd == "fdt") return run_fdt_tests();
+        if (cmd == "fdt-files") return run_fdt_files(argc, argv);
         if (cmd == "sha-impl") {
             std::cout << hash::implementation_name() << "\n";
             return hash::sha_selftest() ? 0 : 1;

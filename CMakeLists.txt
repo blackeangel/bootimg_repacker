@@ -133,6 +133,8 @@ add_library(abr_core STATIC
   src/vendor_boot.cpp
   src/dtbo.cpp
   src/dtb.cpp
+  src/fdt.cpp
+  src/dts.cpp
   src/vbmeta.cpp
   src/uimage.cpp
   src/manifest.cpp
@@ -217,7 +219,7 @@ abr_link_statically(abr)
 
 if(ABR_BUILD_TESTS)
   add_executable(abr_unit_tests tests/unit/crypto_test.cpp tests/unit/par_test.cpp tests/unit/cpio_test.cpp
-               tests/unit/legacy_test.cpp tests/unit/manifest_test.cpp tests/unit/compression_test.cpp)
+               tests/unit/legacy_test.cpp tests/unit/manifest_test.cpp tests/unit/compression_test.cpp tests/unit/fdt_test.cpp)
   target_link_libraries(abr_unit_tests PRIVATE abr_core)
   abr_link_statically(abr_unit_tests)
 endif()
