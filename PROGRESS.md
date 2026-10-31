@@ -1920,6 +1920,52 @@ campaigns of seeds 27, 29, 31 and 32 found nothing (about 28 000 runs), after th
   481/481; with the 14 real images and AIK's magic file, g++-14 487/487: the 13 real images that are images (the 14th is an
   ext4 filesystem, refused with that said) still come back byte for byte.
 
+## Streams, decoders and names (29-31 Oct 2026)
+
+What the CI run of `ee11ff0` (run 40763274252: five jobs green, the ASan job's `fuzz_repack.py` step red with a `terminal`
+finding: the warning of `--ramdisk-from tree` printed the name of a file of the directory as it was) and a hand audit of every
+message that prints what a directory or an image says turned up -- one class of faults each, all of them a `repack` that
+said "done" and wrote what `unpack` would refuse, or a program that did what a stream or a manifest told it to.
+
+- **A decoder did what the stream asked.** A gzip of 1.1 MB is a gigabyte; a zstd frame of run-length blocks is a
+  thirty-thousandth of what it holds and the header of a frame can declare a terabyte. Every decoder stops at 1 GiB
+  (`kMaxDecompressedSize`, what the largest image may be): "it would be more than 1024 MiB decompressed", a zstd frame that
+  declares more is refused before anything is allocated, the buffers of the decoders that need one grow in steps so that the
+  peak is about 1.5 times the limit. Measured on a gzip bomb of 1.1 MB: the old build unpacked it into 1.1 GB in 26.6 s with
+  3675 MiB of memory, the new one refuses it in 3.6 s with 1605 MiB. The unpack of a stream that cannot be decompressed says
+  which component it is and which codec. gzip and lz4 frames that are cut short still give the part that was there.
+- **A damaged stream put in as it is.** `<prefix>_compression=none` with a file that begins like a stream of a codec (a
+  gzip header, an lz4 or zstd magic ...) was written into the image as it was, and `unpack` of that image then refused it
+  (the new mutator `file_stream` of `fuzz_repack.py` found it on `ee11ff0` within 8 seconds). A component that goes in as it
+  is and begins like a stream is decompressed once before it is written (`check_unpacks_as_is`): the repack says which file,
+  which codec and what is wrong, and writes nothing.
+- **The name of a compression that abr does not know was "none".** `kernel_compression=gzipp` was taken for no compression (`value_or(Codec::NONE)`).
+  It is refused with the list of the ones abr knows.
+- **A name that a manifest value gives.** `segmentN_prefix` and `segmentN_role` of an ELF boot image start other keys of the
+  same manifest and go into messages; any text was taken. They are names now (`Manifest::get_name`: letters, digits,
+  underscores, 1 to 64) -- before, `segment0_prefix=a-b` wrote an image whose kernel segment is empty (size=0) without a word. The keys that a
+  message names are shown (`key_shown`), whatever they hold.
+- **Text of a directory in a message.** The name of a file in the `--ramdisk-from tree` warning and in "is built from the
+  directory", in "is too large for a cpio archive" and in the two checksum errors of the cpio reader is quoted with
+  `textquote::quote_shown` (a name that is plain is put in single quotes, any other in double quotes with escapes).
+
+### Verified by (narrowly: the full matrix is run once, after the format work)
+
+- `abr_unit_tests compression` (new): **642 checks** -- every decoder with limits on both sides of the size of the data (exactly
+  the limit is taken, one more is refused, however the decoder's buffer grew), damaged streams, the empty stream, a zstd frame
+  that declares a terabyte, streams that are a thousand times their own size; the test fails on each of 7 mutations of the
+  decoders that were made one by one. `abr_unit_tests manifest` 518 513 checks (names, and keys in
+  messages, are 52 of them).
+- CLI suite: 6 new groups of "streams: what a decoder lets one become, what goes into an image as it is, the name of a
+  compression", an extended `rp_odd` group (the "built from the directory" note, an odd file of the ramdisk with
+  `--ramdisk-from tree`), and one group of 36 cases for the names of an ELF segment. **Five of the six stream groups, the
+  extended group and the names group fail on the binary of `ee11ff0`** (the sixth is the bomb, which is not run under
+  wine).
+- Full runs before the last edit (the names, `501d515` and the tests of the streams): g++-14 490/490 with all judges
+  required, ASan+UBSan 490/490 with no report, `fuzz_images.py --iterations 4` and `fuzz_repack.py --iterations 2` (CI's
+  settings) found nothing, and neither did a longer campaign (seed 41, 2950 damaged directories); the next one (seed 42) was
+  cut at 2400 of 2950 by a restart of the machine, with nothing found so far.
+
 ## Next steps (in order)
 
 1. Remaining AIK parity: QCDT creation (Sony SIN and the ELF layouts are

@@ -82,6 +82,19 @@ LOKI, AMONET, ChromeOS), and a boot header has to be read again as the same kind
 sizes of its parts. Text that is not abr's (a name in the directory, a PEM label, the subject of a certificate) comes into a
 message with its control characters as escapes.
 
+A compressed component is decompressed to at most 1 GiB (the largest image any boot partition holds): a stream of a few
+kilobytes can ask for gigabytes -- a gzip of zeros is a thousandth of what it holds, the header of a zstd frame can declare a
+terabyte -- and `unpack` refuses one that would be more, saying which component and which codec ("ramdisk.cpio: gzip stream
+cannot be decompressed: it would be more than 1024 MiB decompressed ..."). The name of a component's compression
+(`ramdisk_compression=`) is one of `none`, `gzip`, `lz4_legacy`, `lz4`, `zstd`, `xz`, `lzma`, `bzip2`, `lzo`; any other
+name is refused, not taken for `none`. A component that goes into the image as it is (`..._compression=none`) and begins like a
+stream of one of those codecs is checked once: `unpack` would take it for that stream, so a stream that is damaged (or a bomb)
+is refused by `repack`, with the way out (the plain data in the file and the name of the compression in the manifest, or a
+whole stream), instead of being written into an image that `unpack` then refuses.
+The prefix and the role of a segment of an ELF boot image (`segmentN_prefix`, `segmentN_role`) are names -- letters, digits
+and underscores, 1 to 64 of them -- because they start other keys of the manifest; any other text is refused with the key and
+the value.
+
 Paths may hold any characters. On Windows `abr.exe` reads the wide command line (the C runtime's `argv` holds a `?` for
 every character outside the ANSI code page: Cyrillic on a Western system, Chinese, an emoji) and works in UTF-8 from
 there, and a console is switched to UTF-8 while it runs, so a path like `C:\Users\Павел\загрузка.img` comes through
@@ -703,7 +716,8 @@ that can come from someone else (a downloaded directory, a script, an archive). 
 the directory the ways a hand edit or a hostile archive would: a value of `manifest.txt` (not a number, a number that does
 not fit its field, a count of four billion, a flag that is neither `true` nor `false`, a key twice, a name that leaves the
 directory), a component file (cut, grown, a directory, a fifo or a link to `/dev/zero` in its place), the ramdisk
-directory and `ramdisk.meta`, the raw copies in `.abr_raw`, the key that signs, the `-o` argument. A directory may be
+directory and `ramdisk.meta`, the raw copies in `.abr_raw`, a stream of one of the eight codecs (whole, damaged, a bomb) in
+the place of a component with the name of its compression kept, changed or made up, the key that signs, the `-o` argument. A directory may be
 refused or taken, but `repack` must not crash, hang, run out of memory, stop with an exception of the standard library,
 print a control character or a byte that is not UTF-8 (the filter that makes output safe is turned off for the run, to see
 the messages that forget to escape), say nothing when it refuses, leave something behind, change the directory it reads or

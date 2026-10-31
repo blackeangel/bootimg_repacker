@@ -7,7 +7,9 @@ tests/tools/fuzz_images.py damages images and looks at `unpack`. This damages wh
   manifest   `manifest.txt`: a value that is too big or not a number, a key twice, not at all or from another format, a
              line that is no line, a path that leaves the directory, a manifest that belongs to another image
   files      the files of the components (cut, grown, flipped, swapped, taken out, a directory or a symbolic link in
-             their place, a stranger next to them), the raw copies in `.abr_raw`
+             their place, a stranger next to them), the raw copies in `.abr_raw`, a stream of one of the eight codecs
+             (whole, damaged, a bomb) in the place of a component with the name of its compression left, changed, or
+             not one that abr knows
   tree       the ramdisk directory (a name that is a control character, a file that is a fifo, a link to `/`, a file of
              4 GiB, a tree 1500 levels deep)
   meta       `ramdisk.meta` (a mode that is no mode, a hard link without its partner, a type that is none, a path twice)
@@ -34,18 +36,22 @@ it), and `--repro FILE.tar` runs it again. Exit status: 0 = nothing found, 1 = f
 
 import argparse
 import base64
+import bz2
 import collections
 import concurrent.futures
 import errno
+import gzip
 import hashlib
 import io
 import json
+import lzma
 import os
 import random
 import re
 import shutil
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import tarfile
@@ -745,6 +751,158 @@ def m_file_raw_sizes(ctx):
         note = "a bit flipped"
     write_file(path, data)
     return f".abr_raw/{name}: {note}"
+
+
+# ---- streams in the place of a component: what goes into the image as it is must be one that unpack takes
+
+STREAM_CODECS = ("gzip", "lz4", "lz4_legacy", "zstd", "xz", "lzma", "bzip2", "lzo")
+WRONG_COMPRESSIONS = [b"gzp", b"GZIP", b"", b"gz", b"zst", b"none ", b"lz4_frame", b"\x1b[2J", b'"\\x1b[2J"', b'"\\xff"', b"xz2", b"0",
+                      b"lzma_alone", b"bzip", b"zstd,xz", b'"gzip\\x00"']
+STREAM_TOOLS = {"zstd": ["zstd", "-q", "-c"], "lz4": ["lz4", "-q", "-c"], "lz4_legacy": ["lz4", "-q", "-l", "-c"], "lzo": ["lzop", "-c"]}
+
+
+def zstd_rle_frame(n, declared=None):
+    """A zstd frame of `n` zeros as run-length blocks (4 bytes for up to 128 KiB), with the size `declared` in its header or none."""
+    f = bytes([0x28, 0xB5, 0x2F, 0xFD])
+    f += bytes([0xE0]) + struct.pack("<Q", declared) if declared is not None else bytes([0x00, 0x38])
+    left = n
+    if n == 0:
+        return f + bytes([0x01, 0x00, 0x00])
+    while left > 0:
+        take = min(left, 131072)
+        left -= take
+        f += struct.pack("<I", (1 if left == 0 else 0) | (1 << 1) | (take << 3))[:3] + b"\x00"
+    return f
+
+
+def make_stream(rng, codec, plain):
+    """A whole stream of `codec` of `plain`, or None when this machine has nothing that makes one."""
+    try:
+        if codec == "gzip":
+            return gzip.compress(plain, rng.choice((1, 6, 9)))
+        if codec == "bzip2":
+            return bz2.compress(plain)
+        if codec == "xz":
+            return lzma.compress(plain, format=lzma.FORMAT_XZ)
+        if codec == "lzma":
+            return lzma.compress(plain, format=lzma.FORMAT_ALONE)
+        exe = shutil.which(STREAM_TOOLS[codec][0])
+        if exe is None:
+            return None
+        return subprocess.run([exe] + STREAM_TOOLS[codec][1:], input=plain, capture_output=True, timeout=60, check=True).stdout
+    except (OSError, subprocess.SubprocessError, lzma.LZMAError):
+        return None
+
+
+def damage_stream(rng, data):
+    """What a bad download, a bad flash or a bad hand does to a stream: nothing, or one of these."""
+    n = len(data)
+    c = rng.random()
+    if c < 0.25 or not n:
+        return data, "whole"
+    if c < 0.4:
+        cut = rng.choice([1, 2, 5, 12, n // 2, n - 1, n - 8, rng.randrange(n)])
+        return data[: max(0, cut)], f"cut to {max(0, cut)}"
+    if c < 0.65:
+        buf = bytearray(data)
+        for _ in range(rng.randint(1, 6)):
+            buf[rng.randrange(n)] ^= 1 << rng.randrange(8)
+        return bytes(buf), "bits flipped"
+    if c < 0.75:
+        i = rng.randrange(n)
+        j = min(n, i + rng.choice((1, 4, 16, 512)))
+        return data[:i] + (b"\xff" if rng.random() < 0.5 else b"\x00") * (j - i) + data[j:], f"bytes {i}..{j} filled"
+    if c < 0.85:
+        return data + random_bytes(rng, rng.choice((1, 4, 64, 4096))), "bytes behind it"
+    if c < 0.93:
+        return data[: rng.choice((4, 8, 16, 32))] + random_bytes(rng, rng.choice((8, 64, 1024))), "the head and garbage"
+    return data[rng.randrange(1, min(n, 16) + 1):], "the head cut off"
+
+
+_bombs = {}
+_bombs_lock = threading.Lock()
+
+
+def bomb_stream(rng):
+    """A stream that is a thousand times its own size or more (and how it is called): a zstd frame of run-length blocks of
+    1.1 GiB of zeros (33 KB), one that declares a terabyte, one that declares a gibibyte and holds a thousand bytes."""
+    kind = rng.choice(("rle", "terabyte", "gibibyte"))
+    with _bombs_lock:
+        if kind not in _bombs:
+            _bombs[kind] = {"rle": lambda: zstd_rle_frame(1100 << 20), "terabyte": lambda: zstd_rle_frame(1000, declared=1 << 40),
+                            "gibibyte": lambda: zstd_rle_frame(1000, declared=1 << 30)}[kind]()
+        return _bombs[kind], "a zstd bomb (" + kind + ")"
+
+
+@mutator("files", 9)
+def m_file_stream(ctx):
+    """A stream in the place of a component, and the name of its compression kept, changed (to another codec, to `none`: the
+    stream then goes into the image as it is, which unpack must take) or made one that abr does not know. Found by it: an
+    image that `repack` wrote with a damaged stream in it and `unpack` refused (a35)."""
+    lines = ctx.read_manifest_lines()
+    if lines is None:
+        return None
+    components = []  # (prefix, file name)
+    for line in lines:
+        k, eq, v = line.partition(b"=")
+        k = k.strip()
+        if eq and k.endswith(b"_file") and not k.startswith(b"#"):
+            name = v.strip().decode("utf-8", "replace")
+            if name and os.sep not in name and os.path.isfile(os.path.join(ctx.d, name)) and not os.path.islink(os.path.join(ctx.d, name)):
+                components.append((k[: -len(b"_file")].decode("utf-8", "replace"), name))
+    if not components:
+        return None
+    r = ctx.rng
+    prefix, name = r.choice(components)
+    path = os.path.join(ctx.d, name)
+    if r.random() < 0.06:
+        data, what = bomb_stream(r)
+        codec = "zstd"
+    else:
+        codec = r.choice(STREAM_CODECS)
+        try:
+            original = read_file(path)
+        except OSError:
+            return None
+        kind = r.random()
+        n = min(r.choice((0, 1, 100, 4096, 70000, 300000)), 1 << 20)
+        if kind < 0.4 and original:
+            plain = original[: 1 << 20]
+        elif kind < 0.7:
+            plain = bytes(n)
+        else:
+            plain = random_bytes(r, n)
+        data = make_stream(r, codec, plain)
+        if data is None:
+            return None
+        data, what = damage_stream(r, data)
+        what = f"{codec} stream of {len(plain)} bytes, {what}"
+    try:
+        write_file(path, data)
+    except OSError:
+        return None
+    # the name of the compression the manifest has for it
+    c = r.random()
+    key = (prefix + "_compression").encode()
+    if c < 0.55:
+        value, said = b"none", "none"
+    elif c < 0.7:
+        return f"{name}: {what} (the compression kept)"
+    elif c < 0.85:
+        value = r.choice(STREAM_CODECS).encode()
+        said = value.decode()
+    else:
+        value = r.choice(WRONG_COMPRESSIONS)
+        said = show(value)
+    for i, line in enumerate(lines):
+        k, eq, _ = line.partition(b"=")
+        if eq and k.strip() == key and not k.lstrip().startswith(b"#"):
+            lines[i] = key + b"=" + value
+            break
+    else:
+        lines.insert(len(lines) - 1 if lines and lines[-1] == b"" else len(lines), key + b"=" + value)
+    ctx.save_manifest_lines(lines)
+    return f"{name}: {what}, {prefix}_compression={said}"
 
 
 # ---- the ramdisk tree

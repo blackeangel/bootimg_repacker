@@ -74,6 +74,10 @@ std::string Manifest::get(const std::string& key, const std::string& def) const 
     return it == index_.end() ? def : entries_[it->second].second;
 }
 
+// A key, for a message. Keys are what the code asks for -- but a few are made of a value of the manifest (the prefix of the keys of an ELF
+// segment), and a manifest can hold anything there: no terminal is to obey a control character in a message.
+static std::string key_shown(const std::string& key) { return textquote::quote_shown(key); }
+
 // What a name that is to be found in the directory of the unpack must not be, or "" when it is fine.
 static const char* path_problem(const std::string& v) {
     if (v.empty()) return "";
@@ -97,9 +101,20 @@ static const char* path_problem(const std::string& v) {
 std::string Manifest::get_path(const std::string& key, const std::string& def) const {
     std::string v = get(key, def);
     if (const char* why = path_problem(v); *why)
-        throw FormatError("manifest.txt: " + key + "=" + textquote::quote_shown(v) + " " + why +
+        throw FormatError("manifest.txt: " + key_shown(key) + "=" + textquote::quote_shown(v) + " " + why +
                           ". A file the manifest names has to be in the directory it is in (a relative path "
                           "without '..'); copy it there");
+    return v;
+}
+
+std::string Manifest::get_name(const std::string& key, const std::string& def) const {
+    std::string v = get(key, def);
+    bool plain = !v.empty() && v.size() <= 64;
+    for (unsigned char c : v)
+        plain = plain && ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_');
+    if (!plain)
+        throw FormatError("manifest.txt: " + key_shown(key) + "=" + textquote::quote_shown(v) +
+                          " is not a name (letters, digits and underscores, 1 to 64 of them)");
     return v;
 }
 
@@ -110,7 +125,7 @@ void Manifest::set_u64(const std::string& key, uint64_t v) { set(key, std::to_st
 // may be a part of it) are for the message.
 static uint64_t parse_number(const std::string& key, const std::string& shown, std::string_view text, unsigned bits) {
     auto fail = [&](const std::string& why) {
-        throw FormatError("manifest.txt: " + key + "=" + textquote::quote_shown(shown) + " " + why);
+        throw FormatError("manifest.txt: " + key_shown(key) + "=" + textquote::quote_shown(shown) + " " + why);
     };
     if (text.empty()) fail("is empty; a number is needed (decimal, or hexadecimal with 0x)");
     unsigned base = 10;
@@ -152,7 +167,7 @@ int64_t Manifest::get_int(const std::string& key, int64_t def, int64_t lo, int64
     const uint64_t magnitude = parse_number(key, text, negative ? std::string_view(text).substr(1) : std::string_view(text), 63);
     const int64_t v = negative ? -static_cast<int64_t>(magnitude) : static_cast<int64_t>(magnitude);
     if (v < lo || v > hi)
-        throw FormatError("manifest.txt: " + key + "=" + textquote::quote_shown(text) + " is outside " + std::to_string(lo) + " .. " +
+        throw FormatError("manifest.txt: " + key_shown(key) + "=" + textquote::quote_shown(text) + " is outside " + std::to_string(lo) + " .. " +
                           std::to_string(hi));
     return v;
 }
@@ -171,7 +186,7 @@ std::pair<uint32_t, uint32_t> Manifest::get_version(const std::string& key, uint
     const std::string_view major = std::string_view(text).substr(0, dot);
     const std::string_view minor = dot == std::string::npos ? std::string_view() : std::string_view(text).substr(dot + 1);
     if (dot == std::string::npos || !digits(major) || !digits(minor))
-        throw FormatError("manifest.txt: " + key + "=" + textquote::quote_shown(text) +
+        throw FormatError("manifest.txt: " + key_shown(key) + "=" + textquote::quote_shown(text) +
                           " is not a version like 2.2 (two decimal numbers with a dot between them)");
     return {static_cast<uint32_t>(parse_number(key, text, major, 32)), static_cast<uint32_t>(parse_number(key, text, minor, 32))};
 }
@@ -179,7 +194,7 @@ std::pair<uint32_t, uint32_t> Manifest::get_version(const std::string& key, uint
 uint64_t Manifest::get_size(const std::string& key, uint64_t def) const {
     const uint64_t v = get_u64(key, def);
     if (v > kMaxImageSize)
-        throw FormatError("manifest.txt: " + key + "=" + textquote::quote_shown(get(key)) + " is more than " + std::to_string(kMaxImageSize >> 20) +
+        throw FormatError("manifest.txt: " + key_shown(key) + "=" + textquote::quote_shown(get(key)) + " is more than " + std::to_string(kMaxImageSize >> 20) +
                           " MiB, and no image of the family is that big");
     return v;
 }
@@ -201,7 +216,7 @@ bool Manifest::get_bool(const std::string& key, bool def) const {
     for (char& c : v) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     if (v == "true" || v == "1" || v == "yes") return true;
     if (v == "false" || v == "0" || v == "no") return false;
-    throw FormatError("manifest.txt: " + key + "=" + textquote::quote_shown(get(key)) +
+    throw FormatError("manifest.txt: " + key_shown(key) + "=" + textquote::quote_shown(get(key)) +
                       (v.empty() ? " is empty; it has to be true or false" : " is neither true nor false"));
 }
 
@@ -242,10 +257,10 @@ Bytes Manifest::get_hex(const std::string& key) const {
         return -1;
     };
     if (s.size() % 2 != 0)
-        throw FormatError("manifest.txt: " + key + " has an odd number of hexadecimal digits (" + std::to_string(s.size()) + ")");
+        throw FormatError("manifest.txt: " + key_shown(key) + " has an odd number of hexadecimal digits (" + std::to_string(s.size()) + ")");
     for (size_t i = 0; i + 1 < s.size(); i += 2) {
         int hi = nibble(s[i]), lo = nibble(s[i + 1]);
-        if (hi < 0 || lo < 0) throw FormatError("invalid hex value for manifest key: " + key);
+        if (hi < 0 || lo < 0) throw FormatError("invalid hex value for manifest key: " + key_shown(key));
         out.push_back(static_cast<uint8_t>((hi << 4) | lo));
     }
     return out;

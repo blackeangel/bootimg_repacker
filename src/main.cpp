@@ -1713,12 +1713,12 @@ Bytes repack_elf_boot(const Manifest& m, const fs::path& dir, const RepackOption
     uint32_t count = m.get_count("segment_count", 0);
     std::vector<std::string> segment_prefixes;
     for (uint32_t i = 0; i < count; ++i)
-        segment_prefixes.push_back(m.get("segment" + std::to_string(i) + "_prefix", "segment" + std::to_string(i)));
+        segment_prefixes.push_back(m.get_name("segment" + std::to_string(i) + "_prefix", "segment" + std::to_string(i)));
     std::vector<Bytes> segment_data = load_components(m, dir, segment_prefixes, opt);
     for (uint32_t i = 0; i < count; ++i) {
         std::string p = "segment" + std::to_string(i);
         legacy::ElfSegment s;
-        s.role = m.get(p + "_role", "kernel");
+        s.role = m.get_name(p + "_role", "kernel");
         s.flags = m.get_u32(p + "_flags", 0);
         s.addr = m.get_addr(p + "_addr", 0);
         s.data = std::move(segment_data[i]);

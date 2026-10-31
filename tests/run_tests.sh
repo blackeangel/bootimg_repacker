@@ -5324,6 +5324,257 @@ grep -q -F 'made by' rp_esc.log || rp_bad="$rp_bad [repack: no warning of the ce
 grep -q -F 'ST=Ca\x1bifornia' rp_esc.log || rp_bad="$rp_bad [repack: the warning does not say the subject, with the byte as an escape]"
 rp_report "a boot signature whose certificate subject and target have a control byte in them: info, unpack and the repack warning say them with the byte as an escape, and print none"
 
+# ---- the name of a segment of an ELF boot image: letters, digits and underscores ---------------------------------------------------------
+# What manifest.txt says of a segment of an ELF boot image is two names: `segmentN_prefix` starts the keys that name the file and the
+# compression of the segment (kernel_file, kernel_compression ...), `segmentN_role` is what goes into the messages and tells a note
+# (cmdline) from a load. The names that unpack writes are letters, digits and underscores, up to 64 of them; a manifest with another was
+# taken as it was, so that a key made of what a manifest held (any byte, escape sequences too) was looked up and printed, and a name like
+# "a-b" or "a/b" made a segment that no file belonged to: an image without a kernel, written without a word (found by the audit of what
+# abr prints of a directory). Now it is refused with the key and the value, and no image is left.
+rp_elf_name() {  # <label> <key> <value>: the unpack of elftool3.img with that value in it
+    local label="$1" key="$2" val="$3"
+    rp_n=$((rp_n + 1))
+    rm -rf rp_en rp_en.img rp_en.log
+    cp -a elf_u_elftool3 rp_en
+    rp_set rp_en "$key" "$val"
+    if ABR_UNFILTERED_OUTPUT=1 timeout 60 "$ABR" repack rp_en -o rp_en.img >rp_en.log 2>&1; then
+        rp_bad="$rp_bad [$label: written all the same]"
+        return
+    fi
+    grep -q -F "manifest.txt: $key=" rp_en.log || rp_bad="$rp_bad [$label: the key and the value are not said: $(head -c 120 rp_en.log)]"
+    grep -q -F "is not a name (letters, digits and underscores, 1 to 64 of them)" rp_en.log || rp_bad="$rp_bad [$label: not said to be no name: $(head -c 120 rp_en.log)]"
+    [ ! -e rp_en.img ] || rp_bad="$rp_bad [$label: an image is left]"
+    rp_clean rp_en.log || rp_bad="$rp_bad [$label: a control character in: $(head -c 160 rp_en.log | od -c | head -3)]"
+}
+rp_k64="$(head -c 64 /dev/zero | tr '\0' 'k')"
+rp_k65="$(head -c 65 /dev/zero | tr '\0' 'k')"
+for rp_key in segment0_prefix segment1_prefix segment2_prefix segment0_role segment2_role; do
+    rp_elf_name "$rp_key=a-b" "$rp_key" "a-b"
+    rp_elf_name "$rp_key=a/b" "$rp_key" "a/b"
+    rp_elf_name "$rp_key=../x" "$rp_key" "../x"
+    rp_elf_name "$rp_key=a b" "$rp_key" "a b"
+    rp_elf_name "$rp_key= (empty)" "$rp_key" ""
+    rp_elf_name "$rp_key=65 letters" "$rp_key" "$rp_k65"
+    rp_elf_name "$rp_key=<escape sequences>" "$rp_key" "$rp_esc_val"
+done
+# a name that is none of the names unpack writes is a name all the same: 64 letters; upper case, digits and underscores -- the keys of the segment follow it
+rm -rf rp_en rp_en.img
+cp -a elf_u_elftool3 rp_en
+sed -i -e "s/^segment0_prefix=kernel\$/segment0_prefix=$rp_k64/" -e "s/^kernel_/${rp_k64}_/" rp_en/manifest.txt
+sed -i -e 's/^segment2_prefix=cmdline$/segment2_prefix=Cmd_Line_9/' -e 's/^cmdline_/Cmd_Line_9_/' rp_en/manifest.txt
+rp_n=$((rp_n + 1))
+if "$ABR" repack rp_en -o rp_en.img >rp_en.log 2>&1; then
+    cmp -s rp_en.img elf_k/c/elftool3.img || rp_bad="$rp_bad [a prefix of 64 letters and one with upper case, digits and underscores: the image is not the one that was unpacked]"
+else
+    rp_bad="$rp_bad [a prefix of 64 letters and one with upper case, digits and underscores: refused: $(head -c 150 rp_en.log)]"
+fi
+rp_report "names of an ELF segment (the prefix and the role in manifest.txt) that are none (a hyphen, a slash, '..', a space, nothing, 65 letters, escape sequences) are refused with the key and the value, no image is left and no control character is printed; 64 letters, upper case, digits and underscores are names"
+
+# ---- streams: what a decoder lets one become, what goes into an image as it is, the name of a compression -----------------------------
+# A stream of a few kilobytes can ask for gigabytes: a gzip of zeros is a thousandth of what it holds, a zstd frame of run-length blocks a
+# thirty-thousandth, and the header of a zstd frame can declare a terabyte. The decoders stop at 1 GiB (what the largest image may be): "it
+# would be more than 1024 MiB decompressed" (the old build unpacked a gzip of 1.1 MB into 1.1 GB, in 26 s and 3.7 GB of memory). The unpack
+# of a stream that cannot be decompressed names the component and the codec. A component that repack puts into an image as it is
+# (<prefix>_compression=none) and that begins like a stream of a codec is decompressed once before it is written: unpack does that to
+# every image, and an image that abr refuses to unpack is not one to write (found by tests/tools/fuzz_repack.py: a damaged stream put
+# in as a file made `repack` write such an image). The name of a compression that abr does not know is not "none". And the text of a
+# directory, or of an archive, comes into no message as it is (the ASan job of CI found the --ramdisk-from tree warning).
+cs_mk() {  # <codec> <file> <out>: the stream of that codec of the file, made by the tool of the codec (not abr); fails when the tool is not there
+    case "$1" in
+        gzip) command -v gzip >/dev/null && gzip -9 -c "$2" >"$3" ;;
+        lz4) command -v lz4 >/dev/null && lz4 -q -c "$2" >"$3" ;;
+        lz4_legacy) command -v lz4 >/dev/null && lz4 -q -l -c "$2" >"$3" ;;
+        zstd) command -v zstd >/dev/null && zstd -q -c "$2" >"$3" ;;
+        xz) command -v xz >/dev/null && xz -c "$2" >"$3" ;;
+        lzma) command -v xz >/dev/null && xz --format=lzma -c <"$2" >"$3" ;;  # (from a pipe: the size is not in the header, as abr's own)
+        bzip2) command -v bzip2 >/dev/null && bzip2 -c "$2" >"$3" ;;
+        lzo) command -v lzop >/dev/null && lzop -c <"$2" >"$3" ;;
+        *) return 1 ;;
+    esac
+}
+cs_codecs="gzip lz4 lz4_legacy zstd xz lzma bzip2 lzo"
+rm -rf cs
+mkdir cs
+seq 1 20000 >cs/plain
+# one stream of each codec that its first bytes name and that cannot be decompressed, and the two zstd frames that ask for too much: a
+# frame of run-length blocks (1.1 GiB of zeros in 33 KB, no size in its header) and one that declares a terabyte (and holds a thousand bytes)
+python3 -I - cs <<'PYEOF'
+import struct, sys
+out = sys.argv[1]
+def w(name, data):
+    open(out + "/" + name, "wb").write(data)
+w("bad.gzip", bytes.fromhex("1f8b0800000000000003") + b"\xff" * 16)
+w("bad.lz4", bytes.fromhex("04224d18") + bytes.fromhex("640000") + b"\x00" * 16)
+w("bad.lz4_legacy", bytes.fromhex("02214c18") + struct.pack("<I", 16) + b"\xff" * 16)
+w("bad.zstd", bytes.fromhex("28b52ffd") + b"\xff" * 8)
+w("bad.xz", bytes.fromhex("fd377a585a00") + b"\xff" * 20)
+w("bad.lzma", bytes.fromhex("5d00008000") + b"\xff" * 8 + b"\x01" * 24)
+w("bad.bzip2", b"BZh9" + bytes.fromhex("314159265359") + b"\xff" * 24)
+lzop = bytes([0x89, 0x4c, 0x5a, 0x4f, 0x00, 0x0d, 0x0a, 0x1a, 0x0a]) + struct.pack(">HHH", 0x1040, 0x2080, 0x0940) + bytes([1, 5])
+lzop += struct.pack(">IIII", 0x03000001, 0x81a4, 0, 0) + bytes([0]) + struct.pack(">I", 0) + struct.pack(">III", 1000, 500, 0) + b"\xff" * 500
+w("bad.lzo", lzop)
+
+def zstd_rle(n, declared=None):  # n zeros as run-length blocks of at most 128 KiB; the size in the header is `declared`, or none
+    f = bytes([0x28, 0xb5, 0x2f, 0xfd])
+    f += bytes([0xe0]) + struct.pack("<Q", declared) if declared is not None else bytes([0x00, 0x38])
+    left = n
+    while left > 0:
+        take = min(left, 131072)
+        left -= take
+        h = (1 if left == 0 else 0) | (1 << 1) | (take << 3)
+        f += struct.pack("<I", h)[:3] + b"\x00"
+    return f
+w("bomb.zst", zstd_rle(1100 << 20))
+w("lie.zst", zstd_rle(1000, declared=1 << 40))
+PYEOF
+
+# unpack: the message names the component and the codec, for every codec, and nothing is left behind
+for cs_c in $cs_codecs; do
+    rp_n=$((rp_n + 1))
+    python3 "$MKBOOTIMG" >/dev/null --header_version 0 --kernel kernel.gz --ramdisk "cs/bad.$cs_c" -o "cs/img_bad.img"
+    rm -rf cs/d_bad
+    if timeout 120 "$ABR" unpack cs/img_bad.img -o cs/d_bad >cs/unpack.log 2>&1; then
+        rp_bad="$rp_bad [$cs_c: a damaged stream was unpacked]"
+    elif ! grep -q -F -- "ramdisk.cpio: $cs_c stream cannot be decompressed: " cs/unpack.log; then
+        rp_bad="$rp_bad [$cs_c: said: $(head -c 160 cs/unpack.log)]"
+    elif [ -e cs/d_bad ]; then
+        rp_bad="$rp_bad [$cs_c: a directory was left behind]"
+    fi
+done
+rp_report "images whose ramdisk is a damaged stream of each of the eight codecs are refused by unpack with the component and the codec named, and nothing is left behind"
+
+# repack: a damaged stream that goes in as it is would make an image that abr refuses to unpack
+for cs_c in $cs_codecs; do
+    rp_fresh boot_v2.img rp_dir
+    cp "cs/bad.$cs_c" rp_dir/kernel
+    rp_set rp_dir kernel_compression none
+    rp_refused rp_dir "kernel: a damaged $cs_c stream, kernel_compression=none" "the $cs_c stream it starts with cannot be decompressed"
+    grep -q -F 'kernel goes into the image as it is (kernel_compression=none)' rp_run.log || rp_bad="$rp_bad [$cs_c: the message does not name the file and the key: $(head -c 160 rp_run.log)]"
+    grep -q -F 'abr would refuse to unpack that image' rp_run.log || rp_bad="$rp_bad [$cs_c: the message does not say why]"
+done
+rp_fresh boot_v2.img rp_dir
+cp cs/bad.xz rp_dir/ramdisk.cpio
+rp_set rp_dir ramdisk_compression none
+rp_refused rp_dir "ramdisk: a damaged xz stream, ramdisk_compression=none" "ramdisk.cpio goes into the image as it is (ramdisk_compression=none)"
+rp_report "a damaged stream of each codec that goes into the image as it is (kernel_compression=none), and one in the ramdisk, is refused with the file, the key and the way out, and nothing is written"
+
+# what is whole goes in as it is, and unpack takes it for a stream of its codec; plain data goes in as it is
+for cs_c in $cs_codecs; do
+    if ! cs_mk "$cs_c" cs/plain "cs/ok.$cs_c" 2>/dev/null; then echo "SKIP: a whole $cs_c stream that goes into the image as it is (no tool for $cs_c)"; continue; fi
+    rp_fresh boot_v2.img rp_dir
+    cp "cs/ok.$cs_c" rp_dir/kernel
+    rp_set rp_dir kernel_compression none
+    if rp_made rp_dir "a whole $cs_c stream, kernel_compression=none"; then
+        rm -rf rp_re
+        "$ABR" unpack "$rp_run" -o rp_re >/dev/null 2>&1
+        grep -q "^kernel_compression=$cs_c\$" rp_re/manifest.txt && cmp -s rp_re/kernel cs/plain ||
+            rp_bad="$rp_bad [$cs_c: the image says $(grep '^kernel_compression=' rp_re/manifest.txt)]"
+    fi
+done
+rp_fresh boot_v2.img rp_dir
+cp cs/plain rp_dir/kernel
+rp_set rp_dir kernel_compression none
+if rp_made rp_dir "plain data, kernel_compression=none"; then
+    rm -rf rp_re
+    "$ABR" unpack "$rp_run" -o rp_re >/dev/null 2>&1
+    grep -q '^kernel_compression=none$' rp_re/manifest.txt && cmp -s rp_re/kernel cs/plain || rp_bad="$rp_bad [plain data: the image says $(grep '^kernel_compression=' rp_re/manifest.txt)]"
+fi
+rp_report "a whole stream of each codec that goes into the image as it is (kernel_compression=none) is taken, and the image unpacks it as that codec; plain data stays plain"
+
+# the name of a compression
+for cs_v in gzp GZIP gz zst lz4_frame bzip xz2 '""'; do
+    rp_fresh boot_v2.img rp_dir
+    cp cs/plain rp_dir/kernel
+    rp_set rp_dir kernel_compression "$cs_v"
+    cs_shown="${cs_v#\"}"
+    cs_shown="${cs_shown%\"}"
+    rp_refused rp_dir "kernel_compression=$cs_v" "manifest.txt: kernel_compression=$cs_shown is none of the compressions abr knows (none, gzip, lz4_legacy, lz4, zstd, xz, lzma, bzip2, lzo)"
+done
+rp_fresh boot_v2.img rp_dir
+cp cs/plain rp_dir/kernel
+rp_set rp_dir kernel_compression "$rp_esc_val"
+rp_esc_ck rp_dir "kernel_compression=<escape sequences>"
+grep -q -F 'is none of the compressions abr knows' rp_esc.log || rp_bad="$rp_bad [kernel_compression=<escape sequences>: not the message about the name]"
+for cs_v in none gzip lz4_legacy lz4 zstd xz lzma bzip2 lzo; do
+    rp_fresh boot_v2.img rp_dir
+    cp cs/plain rp_dir/kernel
+    rp_set rp_dir kernel_compression "$cs_v"
+    if rp_made rp_dir "kernel_compression=$cs_v"; then
+        rm -rf rp_re
+        "$ABR" unpack "$rp_run" -o rp_re >/dev/null 2>&1
+        grep -q "^kernel_compression=$cs_v\$" rp_re/manifest.txt && cmp -s rp_re/kernel cs/plain || rp_bad="$rp_bad [$cs_v: the image says $(grep '^kernel_compression=' rp_re/manifest.txt)]"
+    fi
+done
+rp_report "a name of a compression that is none of the nine (a typo, another case, an empty name, escape sequences) is refused with the key, the name and the nine; each of the nine is taken, and is what the image says"
+
+# bombs: a gzip of 1.1 GB of zeros (1.1 MB), a zstd frame of run-length blocks (33 KB), a zstd header that declares a terabyte. The limit
+# is 1 GiB, the message says so, and the memory is not that of the old build (it unpacked the gzip into 3.7 GB). Not under wine or an emulator.
+if [ "$RD_WINE" = 0 ] && [ -z "${ABR_RUNNER:-}" ]; then
+    python3 -I - cs <<'PYEOF'
+import sys, zlib
+co = zlib.compressobj(6, zlib.DEFLATED, 31)
+with open(sys.argv[1] + "/bomb.gz", "wb") as f:
+    chunk = bytes(1 << 20)
+    for _ in range(1100):
+        f.write(co.compress(chunk))
+    f.write(co.flush())
+PYEOF
+    for cs_c in gz zst; do
+        rp_n=$((rp_n + 1))
+        python3 "$MKBOOTIMG" >/dev/null --header_version 0 --kernel kernel.gz --ramdisk "cs/bomb.$cs_c" -o cs/img_bomb.img
+        rm -rf cs/d_bomb
+        if timeout 300 "$ABR" unpack cs/img_bomb.img -o cs/d_bomb >cs/unpack.log 2>&1; then
+            rp_bad="$rp_bad [bomb.$cs_c: unpacked into $(du -sk cs/d_bomb | cut -f1) KB]"
+        elif ! grep -q -F -- "stream cannot be decompressed: it would be more than 1024 MiB decompressed, and no component of the family is that big" cs/unpack.log; then
+            rp_bad="$rp_bad [bomb.$cs_c: said: $(head -c 160 cs/unpack.log)]"
+        elif [ -e cs/d_bomb ]; then
+            rp_bad="$rp_bad [bomb.$cs_c: a directory was left behind]"
+        fi
+        rm -rf cs/d_bomb
+    done
+    rp_n=$((rp_n + 1))
+    python3 "$MKBOOTIMG" >/dev/null --header_version 0 --kernel kernel.gz --ramdisk cs/lie.zst -o cs/img_lie.img
+    if timeout 60 "$ABR" unpack cs/img_lie.img -o cs/d_lie >cs/unpack.log 2>&1; then
+        rp_bad="$rp_bad [lie.zst: unpacked]"
+    elif ! grep -q -F -- "ramdisk.cpio: zstd stream cannot be decompressed: it would be more than 1024 MiB decompressed" cs/unpack.log; then
+        rp_bad="$rp_bad [lie.zst: said: $(head -c 160 cs/unpack.log)]"
+    fi
+    # the same stream put in as it is: repack refuses it too (what it would be to unpack is what it says)
+    rp_fresh boot_v2.img rp_dir
+    cp cs/bomb.zst rp_dir/kernel
+    rp_set rp_dir kernel_compression none
+    rp_refused rp_dir "kernel: a zstd bomb, kernel_compression=none" "the zstd stream it starts with cannot be decompressed (it would be more than 1024 MiB decompressed"
+    rm -f cs/bomb.gz cs/bomb.zst cs/img_bomb.img
+    rp_report "streams of a thousand times their size (a gzip of 1.1 GB of zeros, a zstd frame of run-length blocks, a zstd header that declares a terabyte) are refused at 1024 MiB by unpack with the codec named, and by repack where they would go in as they are"
+fi
+
+# text of an archive in a message: the checksum errors of a cpio archive name its entries (an entry can be called anything)
+python3 -I - cs <<'PYEOF'
+import sys
+def rec(magic, ino, mode, name, data, check):
+    nm = name.encode("latin-1") + b"\0"
+    out = magic.encode() + b"".join(b"%08x" % v for v in (ino, mode, 0, 0, 1, 0, len(data), 0, 0, 0, 0, len(nm), check)) + nm
+    out += b"\0" * ((4 - len(out) % 4) % 4) + data
+    return out + b"\0" * ((4 - len(out) % 4) % 4)
+a = rec("070702", 1, 0o100644, "a\x1b[2Jb\x9bX", b"hello", 12345) + rec("070702", 0, 0, "TRAILER!!!", b"", 0)  # a wrong checksum
+open(sys.argv[1] + "/crc_wrong.cpio", "wb").write(a)
+b = rec("070701", 1, 0o100644, "c\x1b[2Jd\x9bY", b"hello", 7) + rec("070701", 0, 0, "TRAILER!!!", b"", 0)  # a checksum where there is none
+open(sys.argv[1] + "/newc_check.cpio", "wb").write(b)
+PYEOF
+for cs_c in crc_wrong newc_check; do
+    rp_n=$((rp_n + 1))
+    python3 "$MKBOOTIMG" >/dev/null --header_version 0 --kernel kernel.gz --ramdisk "cs/$cs_c.cpio" -o cs/img_cpio.img
+    rm -rf cs/d_cpio
+    ABR_UNFILTERED_OUTPUT=1 timeout 120 "$ABR" unpack cs/img_cpio.img -o cs/d_cpio >cs/unpack.log 2>&1
+    if ! grep -q -F 'stays a file only' cs/unpack.log; then
+        rp_bad="$rp_bad [$cs_c: not the note that the ramdisk stays a file: $(head -c 160 cs/unpack.log)]"
+    elif ! rp_clean cs/unpack.log; then
+        rp_bad="$rp_bad [$cs_c: a control character in: $(head -c 200 cs/unpack.log | od -c | head -3)]"
+    fi
+done
+rp_report "the note that a ramdisk stays a file because an entry of the cpio archive has a wrong checksum (crc), or has one where the format has none (newc), names the entry with its control characters escaped (the filter that makes output safe turned off)"
+rm -rf cs
+
 # ---- the dtb and the OSIP image: what is behind the last blob, what is a blob, what tells an OSIP image -----------------
 # Found by the second campaign of tests/tools/fuzz_repack.py, and by a dtb file with zeros behind it: those were dropped on
 # unpack ("an untouched repack does NOT reproduce this image": 192 bytes back of 1192), a dtb whose blob was no device tree was
@@ -5555,7 +5806,21 @@ PYEOF
     rp_odd_copy rp_try
     printf 'bogus\n' >>"rp_try/$rp_odd.meta"
     rp_esc_ck rp_try "a ramdisk directory with a C1 control in its name, a ramdisk.meta that is wrong"
-    rp_report "the name of the ramdisk directory with a C1 control and a byte that is not UTF-8 in it (the manifest says so, and the directory is called that) comes into no message as it is: the cpio and the directory both changed, a tail of 1 GiB, a ramdisk.meta that is wrong"
+    # (the note that the ramdisk is built from the directory, on a repack that works: found in the same place by a look at what else
+    # printed the name of a directory)
+    rp_odd_copy rp_try
+    printf x >"rp_try/$rp_odd/new_file"
+    rp_esc_ck rp_try "a ramdisk directory with a C1 control in its name, changed: the note that the ramdisk is built from it"
+    grep -q -F 'is built from the directory' rp_esc.log || rp_bad="$rp_bad [the odd ramdisk directory, changed: not the note that the ramdisk is built from it]"
+    # the name of the file of the ramdisk is text of the manifest as well: --ramdisk-from tree names the file that has no directory
+    # (found by the ASan job of CI with tests/tools/fuzz_repack.py: the name was printed as it was)
+    rp_fresh boot_v2.img rp_try
+    mv rp_try/ramdisk.cpio "rp_try/$rp_odd.cpio"
+    mv rp_try/.abr_raw/ramdisk.cpio.raw "rp_try/.abr_raw/$rp_odd.cpio.raw"
+    rp_set rp_try ramdisk_file '"ramdisk\xc2\x9b2J\xc2\x85x\xff.cpio"'
+    rp_esc_ck rp_try "a ramdisk file with a C1 control in its name, --ramdisk-from tree where there is no directory" --ramdisk-from tree
+    grep -q -F 'has no directory in this unpack' rp_esc.log || rp_bad="$rp_bad [the odd ramdisk file, --ramdisk-from tree: not the warning that it has no directory]"
+    rp_report "the name of the ramdisk directory with a C1 control and a byte that is not UTF-8 in it (the manifest says so, and the directory is called that) comes into no message as it is: the cpio and the directory both changed, a tail of 1 GiB, a ramdisk.meta that is wrong, the note that the ramdisk is built from the directory -- and neither does the name of a ramdisk file that --ramdisk-from tree finds no directory for"
 elif [ "$RD_WINE" = 0 ]; then
     fail "repack: the name of the ramdisk directory with a C1 control in it: rdimg_mkbootfs.img has no ramdisk.meta"
 fi

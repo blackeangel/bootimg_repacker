@@ -10,7 +10,9 @@
 //   * a manifest that was written by hand, or by an earlier abr, reads as it always did (white space around the key
 //     and the value, CRLF line ends, comments, lines without '=');
 //   * a quoted value that is wrong is an error that says which line;
-//   * the name of a file a manifest asks repack to open has to lie in the directory of the manifest.
+//   * the name of a file a manifest asks repack to open has to lie in the directory of the manifest;
+//   * a name that a value gives (the prefix of an ELF segment) is letters, digits and underscores, and a key goes into a message
+//     as text that a terminal only shows.
 #include <algorithm>
 #include <charconv>
 #include <cstdint>
@@ -18,6 +20,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <optional>
 #include <random>
@@ -1378,6 +1381,104 @@ void test_manifest_flags_and_lists() {
     EXPECT(big.has("key199999") && !big.has("key200000") && big.get("key7") == "seven" && big.get("key0") == "0");
 }
 
+// A name that a manifest value gives (the prefix and the role of an ELF segment: they become the start of other keys of the same
+// manifest) is made of letters, digits and underscores; and no key goes into a message as it is -- a key can hold any byte,
+// because the prefix of a segment is taken from the manifest.
+void test_manifest_names() {
+    std::puts("manifest.txt: a name is letters, digits and underscores; a key in a message is shown, not put in as it is");
+    Manifest m;
+    EXPECT(m.get_name("absent", "segment0") == "segment0");
+    for (const char* v : {"kernel", "ramdisk", "segment0", "a", "_", "0", "A_b_9", "ipl", "extra12", "KERNEL"}) {
+        m.set("role", v);
+        EXPECT(m.get_name("role", "kernel") == v);
+    }
+    const std::string longest(64, 'x');
+    m.set("role", longest);
+    EXPECT(m.get_name("role", "kernel") == longest);
+    for (const std::string& v :
+         {std::string(), std::string(65, 'x'), std::string(4096, 'x'), std::string("a-b"), std::string("a b"), std::string(" a"),
+          std::string("a "), std::string("a.b"), std::string("a/b"), std::string(".."), std::string("a\\b"), std::string("a=b"),
+          std::string("\xd0\xb0"), std::string("a\xd0\xb0"), std::string("a\nb"), std::string("a\tb"), std::string("a\0b", 3),
+          std::string("\x1b[2J"), std::string("\x9b" "2J"), std::string("kernel,"), std::string("kernel\r"), std::string("a\x7f")}) {
+        m.set("role", v);
+        const std::string said = refusal_of([&] { m.get_name("role", "kernel"); });
+        ++g_checks;
+        if (!contains(said, "role=") || !contains(said, "is not a name (letters, digits and underscores, 1 to 64 of them)") ||
+            contains(said, "NOT A FormatError")) {
+            ++g_failures;
+            std::printf("  FAIL: role=\"%s\" gave: \"%s\"\n", printable(v).c_str(), printable(said).c_str());
+        }
+        for (unsigned char c : said)  // (what the value holds is shown, not put into the message)
+            if (c < 0x20 || c == 0x7F) {
+                ++g_checks;
+                ++g_failures;
+                std::printf("  FAIL: role=\"%s\": the message has the byte %02x\n", printable(v).c_str(), c);
+                break;
+            }
+    }
+    {
+        m.set("role", "\x1b[2J");
+        const std::string said = refusal_of([&] { m.get_name("role", "kernel"); });
+        EXPECT_HAS(said, "\\x1b");
+        EXPECT_HAS(said, "role=");
+    }
+    // the key too: every reading of a number, a flag, a version, a size, a hex string and a path that is refused says the key
+    // as text that a terminal only shows
+    const std::string key = "a\x1b[2Jb\x9b" "c\x01_x";
+    const std::string shown = textquote::quote_shown(key);
+    EXPECT(shown.find('\x1b') == std::string::npos && shown.find('\x01') == std::string::npos);
+    struct Reading {
+        const char* what;
+        std::function<void()> read;
+    };
+    m.set(key, "?");
+    const Reading readings[] = {
+        {"get_u32", [&] { m.get_u32(key); }},
+        {"get_u64", [&] { m.get_u64(key); }},
+        {"get_bounded", [&] { m.get_bounded(key, 0, 16); }},
+        {"get_addr32", [&] { m.get_addr32(key); }},
+        {"get_addr", [&] { m.get_addr(key); }},
+        {"get_count", [&] { m.get_count(key); }},
+        {"get_size", [&] { m.get_size(key); }},
+        {"get_int", [&] { m.get_int(key, 0, 0, 9); }},
+        {"get_bool", [&] { m.get_bool(key); }},
+        {"get_version", [&] { m.get_version(key, 1, 0); }},
+        {"get_hex (a digit)", [&] { m.get_hex(key); }},
+        {"get_name", [&] { m.get_name(key, "x"); }},
+    };
+    for (const Reading& r : readings) {
+        const std::string said = refusal_of(r.read);
+        ++g_checks;
+        bool plain = true;
+        for (unsigned char c : said) plain = plain && c >= 0x20 && c != 0x7F && c != 0x9B;
+        if (!contains(said, shown) || !plain || contains(said, "NOT A FormatError")) {
+            ++g_failures;
+            std::printf("  FAIL: %s: the key is not shown: \"%s\"\n", r.what, printable(said).c_str());
+        }
+    }
+    m.set(key, "../x");
+    {
+        const std::string said = refusal_of([&] { m.get_path(key); });
+        ++g_checks;
+        if (!contains(said, shown) || contains(said, "\x1b") || contains(said, "NOT A FormatError")) {
+            ++g_failures;
+            std::printf("  FAIL: get_path: the key is not shown: \"%s\"\n", printable(said).c_str());
+        }
+    }
+    m.set(key, "abc");  // (an odd number of digits)
+    {
+        const std::string said = refusal_of([&] { m.get_hex(key); });
+        ++g_checks;
+        if (!contains(said, shown) || contains(said, "\x1b") || contains(said, "NOT A FormatError")) {
+            ++g_failures;
+            std::printf("  FAIL: get_hex (odd): the key is not shown: \"%s\"\n", printable(said).c_str());
+        }
+    }
+    // a key that is plain is said as it is
+    m.set("page_size", "x");
+    EXPECT_HAS(refusal_of([&] { m.get_u32("page_size"); }), "manifest.txt: page_size=x");
+}
+
 // A file that is a directory, a name that is none: said, and nothing is made.
 void test_file_helpers() {
     std::puts("read_file and write_file: only files, and only names of files");
@@ -1725,6 +1826,7 @@ int run_manifest_tests() {
     test_uimage_consumed();
     test_manifest_numbers();
     test_manifest_flags_and_lists();
+    test_manifest_names();
     test_file_helpers();
     test_base64_messages();
     test_dtb_blobs();

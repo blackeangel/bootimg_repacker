@@ -41,6 +41,11 @@ public:
     // ../../.ssh/id_rsa must not get that file built into an image.)
     std::string get_path(const std::string& key, const std::string& def = "") const;
 
+    // A name: letters, digits and underscores, 1 to 64 of them (what unpack writes for the role of an ELF segment, and for the prefix
+    // of its keys: "kernel", "ramdisk", "extra0", "segment3"). The value goes into the names of the keys that are read next
+    // (`<prefix>_file`, `<prefix>_compression`, ...), and what is anything else is a FormatError that names the key and the value.
+    std::string get_name(const std::string& key, const std::string& def) const;
+
     // Numbers: decimal digits, or 0x and hexadecimal digits, and nothing else -- no sign, no octal ("010" is ten), no
     // trailing text, no white space inside. What is not a number, or does not fit in the field it is read for (a value
     // above 32 bits for a 32-bit field is refused, not cut to it), is a FormatError that names the key and the value.
