@@ -2090,12 +2090,42 @@ sandbox's CPU has no SHA extension, and md5 and sha384 have no hardware path in 
 - `abr` checks no signature (the key of a configuration, `required`, the `hashed-nodes` list) and makes none.
 - `fit.its` is the part of the source language a tree needs: nothing that takes `dtc`'s preprocessor, labels or references.
 
+## uImage: the names of the header fields (done, 2 Nov 2026)
+
+`repack` read the four one-byte fields of a legacy U-Boot header -- operating system, architecture, image type, compression --
+by name, from a table that had 3 operating systems, 8 architectures and 9 types, and took any name that was not in it for 0 without a
+word; `unpack` wrote `unknown` for a value that was not in it. An image with another value did not come back: the CLI group made
+for it, run on the binary of `ee11ff0`, finds that 40 of the 69 images that `mkimage` makes (one for every name of its lists)
+come back different, and says "an untouched repack does NOT reproduce this image exactly" -- `-O netbsd`, `-A sparc`, `-A powerpc`,
+`-T kernel_noload` among them (two more, `-A alpha` and `-O openbsd`, came back by luck: the lookup of the name `unknown` found
+the lowest number that had no name).
+
+- **The tables** (`include/abr/uimage.hpp`, `src/uimage.cpp`) are those of `mkimage` (u-boot-tools 2025.10): the names are the
+  ones that `mkimage -O help`, `-A help`, `-T help` and `-C help` list (26 operating systems, 25 architectures, 7 compressions,
+  11 types), the numbers are what it writes into the header for each of them (read from the files it made). The types are those
+  that go into a legacy header; the others (`imximage`, `rkimage`, ...) are headers of their own, and a legacy image that has one of
+  their numbers has the number. `invalid` is 0 for all four; `mkimage -T invalid` writes a kernel (2), so the test expects that.
+  `x86` (3) was `i386`, and `fdt_legacy` is a name of mkimage for 8 (`flat_dt`): both are read and never written.
+- **A value that has no name is its number** (`os=99`), in decimal or `0x` hex up to 255; "unknown" is gone. `repack` takes a name in
+  any case (mkimage takes it so) or a number, and refuses anything else with the names that are known (alphabetical, as mkimage
+  lists them) -- it was a silent 0.
+- `mkimage -T firmware_ivt` writes a header whose size says more than the file has (the room for the CSF that a signing tool puts
+  behind it): `abr` refuses such a file as truncated, as it does any, and the test completes that header (the size and the two CRCs)
+  and keeps the type that `mkimage` wrote.
+
+Verified by (narrowly): `abr_unit_tests manifest` 521455 checks (the group has the new `test_uimage_names`: every number of the four
+fields has a name or is its own number and reads back, the names of the table with their numbers, case, the old names, numbers and what
+is none); the CLI, two new blocks in `tests/run_tests.sh` (142 and 34 checks): 69 images that `mkimage` made are unpacked under their
+names and packed to the same bytes, an image with values no table has (99, 77, 99, 66) is its numbers and comes back, `info` says them,
+a name in any case, a decimal or a hex number is the same value, the old names are read, 17 wrong values are refused with the list.
+**Both blocks fail on the binary of `ee11ff0`.** Not done: a real device's uImage with an operating system or a type outside
+`mkimage`'s lists has not been seen (the numbers are kept anyway).
+
 ## Next steps (in order)
 
 1. The formats that are left, in this order, one commit each and only
    narrow checks until all of them are in (the user's order of 31 Oct):
-   strict os/arch/image-type/compression names in `repack_uimage` (an
-   unknown name is 0 today, silently); QCDT creation (`dtbTool` v1-v3: a
+   QCDT creation (`dtbTool` v1-v3: a
    table of the dtbs of a directory, chosen by `qcom,msm-id` /
    `board-id` / `pmic-id`); MBN and the Qualcomm ELF loaders (the hash
    segment, a SHA-256 per segment, the signature and the certificate chain

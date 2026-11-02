@@ -1596,15 +1596,19 @@ Bytes repack_uimage(const Manifest& m, const fs::path& dir, const RepackOptions&
     img.timestamp = m.get_u32("timestamp", 0);
     img.load_addr = m.get_addr32("load_addr", 0);
     img.entry_point = m.get_addr32("entry_point", 0);
-    auto lookup = [](std::string_view name, auto name_fn, uint8_t max) -> uint8_t {
-        for (int i = 0; i <= max; ++i)
-            if (name_fn(static_cast<uint8_t>(i)) == name) return static_cast<uint8_t>(i);
-        return 0;
+    // A name from U-Boot's table of the field (`mkimage -O help` ...), or a number up to 255: what is neither is refused, with the
+    // names that are known (it was 0, "invalid" or "none", without a word).
+    auto field = [&m](UbootField f, const char* fallback) -> uint8_t {
+        const std::string key = uboot_field_key(f);
+        const std::string text = m.get(key, fallback);
+        if (const std::optional<uint8_t> v = uboot_value(f, text)) return *v;
+        throw FormatError("manifest.txt: " + shown(key + "=" + text) + " is none of the names of U-Boot's table for it (" + uboot_names(f) +
+                          ") and no number up to 255");
     };
-    img.os = lookup(m.get("os", "linux"), uboot_os_name, 30);
-    img.arch = lookup(m.get("arch", "arm64"), uboot_arch_name, 30);
-    img.type = lookup(m.get("image_type", "kernel"), uboot_type_name, 12);
-    img.comp = lookup(m.get("compression", "none"), uboot_comp_name, 6);
+    img.os = field(UbootField::OS, "linux");
+    img.arch = field(UbootField::ARCH, "arm64");
+    img.type = field(UbootField::TYPE, "kernel");
+    img.comp = field(UbootField::COMP, "none");
     img.name = m.get("name");
     img.name_tail = m.get_tail("name_tail");
     img.data = load_raw(m, dir, "data");

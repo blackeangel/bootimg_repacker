@@ -1159,6 +1159,95 @@ void test_uimage_consumed() {
     }
 }
 
+// The names of the four fields of the header: what mkimage lists for them, with the numbers it writes (the tables of the test are
+// taken from `mkimage -O help` ... and from the header of what it makes -- see tests/run_tests.sh for that comparison), a number
+// for what has no name, and nothing else.
+void test_uimage_names() {
+    std::puts("uImage: the names of os, arch, type and compression");
+    struct Row {
+        UbootField field;
+        const char* name;
+        int value;
+    };
+    static const Row rows[] = {
+        {UbootField::OS, "invalid", 0},    {UbootField::OS, "openbsd", 1},   {UbootField::OS, "netbsd", 2},
+        {UbootField::OS, "freebsd", 3},    {UbootField::OS, "4_4bsd", 4},    {UbootField::OS, "linux", 5},
+        {UbootField::OS, "u-boot", 17},    {UbootField::OS, "arm-trusted-firmware", 25}, {UbootField::OS, "efi", 28},
+        {UbootField::ARCH, "invalid", 0},  {UbootField::ARCH, "arm", 2},     {UbootField::ARCH, "x86", 3},
+        {UbootField::ARCH, "arm64", 22},   {UbootField::ARCH, "x86_64", 24}, {UbootField::ARCH, "riscv", 26},
+        {UbootField::TYPE, "invalid", 0},  {UbootField::TYPE, "kernel", 2},  {UbootField::TYPE, "flat_dt", 8},
+        {UbootField::TYPE, "kernel_noload", 14}, {UbootField::TYPE, "firmware_ivt", 32},
+        {UbootField::COMP, "none", 0},     {UbootField::COMP, "gzip", 1},    {UbootField::COMP, "zstd", 6},
+    };
+    for (const Row& r : rows) {
+        EXPECT(uboot_value(r.field, r.name) == std::optional<uint8_t>(static_cast<uint8_t>(r.value)));
+        EXPECT(uboot_name(r.field, static_cast<uint8_t>(r.value)) == r.name);
+    }
+    // every number: a name, or the number; and it reads back as what it was
+    for (UbootField f : {UbootField::OS, UbootField::ARCH, UbootField::TYPE, UbootField::COMP})
+        for (int v = 0; v < 256; ++v) {
+            const std::string text = uboot_name(f, static_cast<uint8_t>(v));
+            EXPECT(!text.empty() && text != "unknown");
+            EXPECT(uboot_value(f, text) == std::optional<uint8_t>(static_cast<uint8_t>(v)));
+        }
+    // the names an older abr wrote, and mkimage's other name for the device tree of a legacy image: read, and written as the others
+    EXPECT(uboot_value(UbootField::ARCH, "i386") == std::optional<uint8_t>(3));
+    EXPECT(uboot_name(UbootField::ARCH, 3) == "x86");
+    EXPECT(uboot_value(UbootField::TYPE, "fdt_legacy") == std::optional<uint8_t>(8));
+    EXPECT(uboot_name(UbootField::TYPE, 8) == "flat_dt");
+    // numbers: decimal or 0x, up to 255, nothing else
+    EXPECT(uboot_value(UbootField::OS, "21") == std::optional<uint8_t>(21));
+    EXPECT(uboot_value(UbootField::OS, "0x15") == std::optional<uint8_t>(21));
+    EXPECT(uboot_value(UbootField::OS, "0X15") == std::optional<uint8_t>(21));
+    EXPECT(uboot_value(UbootField::OS, "255") == std::optional<uint8_t>(255));
+    EXPECT(uboot_value(UbootField::OS, "0xff") == std::optional<uint8_t>(255));
+    EXPECT(uboot_value(UbootField::OS, "010") == std::optional<uint8_t>(10));  // a leading zero is not octal
+    for (const char* bad : {"", " ", "256", "0x100", "-1", "+1", "1.5", "0x", "0xg", "12a", "1 ", " 1", "linuxx", "unknown", "none ", "linux\n",
+                            "99999999999999999999", "gz", "gzip2", "arm 64", "k"})
+        EXPECT(!uboot_value(UbootField::OS, bad) && !uboot_value(UbootField::ARCH, bad) && !uboot_value(UbootField::COMP, bad) &&
+               !uboot_value(UbootField::TYPE, bad));
+    // a name in any case, as mkimage takes it
+    EXPECT(uboot_value(UbootField::OS, "Linux") == std::optional<uint8_t>(5));
+    EXPECT(uboot_value(UbootField::OS, "LINUX") == std::optional<uint8_t>(5));
+    EXPECT(uboot_value(UbootField::OS, "U-Boot") == std::optional<uint8_t>(17));
+    EXPECT(uboot_value(UbootField::ARCH, "Arm64") == std::optional<uint8_t>(22));
+    EXPECT(uboot_value(UbootField::COMP, "GZIP") == std::optional<uint8_t>(1));
+    EXPECT(uboot_value(UbootField::OS, "4_4BSD") == std::optional<uint8_t>(4));
+    // a name is only a name of its own field
+    EXPECT(!uboot_value(UbootField::OS, "arm64"));
+    EXPECT(!uboot_value(UbootField::ARCH, "linux"));
+    EXPECT(!uboot_value(UbootField::COMP, "kernel"));
+    EXPECT(!uboot_value(UbootField::TYPE, "gzip"));
+    // the lists for the messages hold every name once
+    EXPECT_HAS(uboot_names(UbootField::OS), "4_4bsd");
+    EXPECT_HAS(uboot_names(UbootField::OS), "vxworks");
+    EXPECT_HAS(uboot_names(UbootField::ARCH), "x86_64");
+    EXPECT_HAS(uboot_names(UbootField::TYPE), "kernel_noload");
+    EXPECT_HAS(uboot_names(UbootField::COMP), "zstd");
+    EXPECT(uboot_names(UbootField::ARCH).find("i386") == std::string::npos);  // the old name is read, not offered
+    EXPECT(std::string(uboot_field_key(UbootField::TYPE)) == "image_type");
+    // the parts of a header: whatever the four bytes hold comes back from build()
+    std::mt19937_64 rng(0x0541);
+    for (int i = 0; i < 400; ++i) {
+        UImage u;
+        u.os = static_cast<uint8_t>(rng());
+        u.arch = static_cast<uint8_t>(rng());
+        u.type = static_cast<uint8_t>(rng());
+        u.comp = static_cast<uint8_t>(rng());
+        u.data = some_bytes(rng, rng() % 40);
+        const Bytes built = u.build();
+        const UImage back = UImage::parse(built);
+        EXPECT(back.os == u.os && back.arch == u.arch && back.type == u.type && back.comp == u.comp);
+        // by the names it would be written in a manifest
+        UImage again;
+        again.data = u.data;
+        again.os = *uboot_value(UbootField::OS, uboot_name(UbootField::OS, back.os));
+        again.arch = *uboot_value(UbootField::ARCH, uboot_name(UbootField::ARCH, back.arch));
+        again.type = *uboot_value(UbootField::TYPE, uboot_name(UbootField::TYPE, back.type));
+        again.comp = *uboot_value(UbootField::COMP, uboot_name(UbootField::COMP, back.comp));
+        EXPECT(again.build() == built);
+    }
+}
 
 // ---- the numbers, flags and lists of a manifest
 
@@ -1824,6 +1913,7 @@ int run_manifest_tests() {
     test_boot_padding();
     test_vendor_boot_padding();
     test_uimage_consumed();
+    test_uimage_names();
     test_manifest_numbers();
     test_manifest_flags_and_lists();
     test_manifest_names();

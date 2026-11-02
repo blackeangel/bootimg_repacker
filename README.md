@@ -440,6 +440,15 @@ detected; will be repacked using AOSP format!") and writes an AOSP boot image. `
 OS/ABI byte is not `0x61` is no boot image to the signature file of Android Image Kitchen (`abr identify` says `ELF (ARM)`, as
 `file` does, and AIK stops with "Unrecognized format."); `abr unpack` opens it all the same.
 
+### U-Boot legacy images (uImage)
+
+The `os`, `arch`, `image_type` and `compression` of the 64-byte header are the names that `mkimage -O help`, `-A help`, `-T help` and
+`-C help` list for them (`linux`, `arm64`, `kernel`, `gzip`, ...; a name in any case is read, as `mkimage` reads it). A value that no
+name stands for is its number (`os=99`), and comes back as it was. A name that is none of the table's, or a number above 255, is
+refused by `repack` with the names that are known. The payload is kept as it was found: it is not decompressed, whatever
+`compression` says. The tests make an image with `mkimage` for every name of the four lists (69 images: the types that go into a
+legacy header) and compare the repack with it byte for byte.
+
 ### U-Boot FIT images
 
 A FIT image (U-Boot's flattened image tree, what `mkimage -f image.its image.itb` makes) is a flattened device tree: `/images` holds the

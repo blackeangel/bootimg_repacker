@@ -6514,6 +6514,123 @@ else
     fail "the warning about the trailer behind an edited uImage is missing, or there is one about fill"
 fi
 
+# ---- uImage: the names of the os, arch, type and compression fields ---------------------------------------------------------------
+# What `mkimage` writes into the header for every name of `-O help`, `-A help`, `-T help` and `-C help` (the types that go into a legacy
+# header) is unpacked under the name it was given and packed again to the same bytes; a value that has no name is its number, and
+# comes back as well; a name that is none of the table's (or a number above 255) is refused with the names that are known, where it was
+# a 0 ("invalid", "none") that nobody was told of.
+ui_payload=ui_nm_payload.bin
+head -c 300 /dev/urandom >"$ui_payload"
+ui_names_of() {  # <-O|-A|-T|-C>: the names mkimage lists
+    mkimage "$1" help 2>&1 | sed -n 's/^\t\([^ \t][^ \t]*\)[ \t][ \t]*.*$/\1/p'
+}
+ui_made=0
+for ui_flag in A O T C; do
+    case "$ui_flag" in A) ui_key=arch ;; O) ui_key=os ;; T) ui_key=image_type ;; C) ui_key=compression ;; esac
+    ui_list="$(ui_names_of "-$ui_flag")"
+    rp_n=$((rp_n + 1))
+    [ -n "$ui_list" ] || { rp_bad="$rp_bad [mkimage -$ui_flag help lists no names]"; continue; }
+    for ui_name in $ui_list; do
+        ui_a=arm64 ui_o=linux ui_t=kernel ui_c=none
+        case "$ui_flag" in A) ui_a=$ui_name ;; O) ui_o=$ui_name ;; T) ui_t=$ui_name ;; C) ui_c=$ui_name ;; esac
+        rm -f ui_nm.img
+        mkimage -q -A "$ui_a" -O "$ui_o" -T "$ui_t" -C "$ui_c" -a 0x1000 -e 0x1000 -n "names" -d "$ui_payload" ui_nm.img >/dev/null 2>&1 || continue
+        [ "$(head -c 4 ui_nm.img | od -An -tx1 | tr -d ' \n')" = 27051956 ] || continue  # a type that has a header of its own
+        # mkimage -T firmware_ivt declares room for the CSF that a signing tool appends later: the file is shorter than its header says.
+        # The header is completed (the size and the two CRCs), the value of the type is the one mkimage wrote.
+        python3 -I - ui_nm.img <<'PYEOF'
+import struct, sys, zlib
+path = sys.argv[1]
+d = bytearray(open(path, "rb").read())
+size = struct.unpack(">I", d[12:16])[0]
+if 64 + size != len(d):
+    struct.pack_into(">I", d, 12, len(d) - 64)
+    struct.pack_into(">I", d, 24, zlib.crc32(bytes(d[64:])) & 0xFFFFFFFF)
+    struct.pack_into(">I", d, 4, 0)
+    struct.pack_into(">I", d, 4, zlib.crc32(bytes(d[:64])) & 0xFFFFFFFF)
+    open(path, "wb").write(bytes(d))
+PYEOF
+        ui_made=$((ui_made + 1))
+        rp_n=$((rp_n + 1))
+        rm -rf ui_nm_d
+        if ! "$ABR" unpack ui_nm.img -o ui_nm_d >ui_nm.log 2>&1; then
+            rp_bad="$rp_bad [$ui_key=$ui_name: unpack: $(head -c 120 ui_nm.log)]"
+            continue
+        fi
+        # what the manifest says: the name given, but for what mkimage turns into another value (-T invalid is a kernel) or names otherwise
+        ui_want="$ui_name"
+        [ "$ui_flag" = T ] && [ "$ui_name" = invalid ] && ui_want=kernel
+        [ "$ui_flag" = T ] && [ "$ui_name" = fdt_legacy ] && ui_want=flat_dt
+        grep -q -x -- "$ui_key=$ui_want" ui_nm_d/manifest.txt || rp_bad="$rp_bad [$ui_key=$ui_name: the manifest says $(grep -- "^$ui_key=" ui_nm_d/manifest.txt | head -c 60), not $ui_want]"
+        grep -q -F "reproduces this image byte-for-byte" ui_nm.log || rp_bad="$rp_bad [$ui_key=$ui_name: unpack does not say it is exact: $(head -c 120 ui_nm.log)]"
+        if rp_made ui_nm_d "$ui_key=$ui_name"; then
+            cmp -s "$rp_run" ui_nm.img || rp_bad="$rp_bad [$ui_key=$ui_name: not the file mkimage made]"
+        fi
+    done
+done
+[ "$ui_made" -ge 60 ] || { rp_n=$((rp_n + 1)); rp_bad="$rp_bad [only $ui_made images made by mkimage: its lists changed?]"; }
+rp_report "checks of the names of the os, arch, type and compression fields of a uImage ($ui_made images that mkimage made, one for every name of its lists): each is unpacked under its name and packed to the same bytes"
+
+# a value that no table has is its number
+python3 -I - <<'PYEOF'
+import struct, zlib
+data = bytes(range(200))
+hdr = bytearray(struct.pack(">IIIIIIIBBBB32s", 0x27051956, 0, 1700000000, len(data), 0x8000, 0x8040, zlib.crc32(data) & 0xFFFFFFFF, 99, 77, 99, 66, b"odd values"))
+struct.pack_into(">I", hdr, 4, zlib.crc32(bytes(hdr)) & 0xFFFFFFFF)
+open("ui_nm_odd.img", "wb").write(bytes(hdr) + data)
+PYEOF
+rm -rf ui_nm_odd_d
+rp_n=$((rp_n + 1))
+if "$ABR" unpack ui_nm_odd.img -o ui_nm_odd_d >ui_nm.log 2>&1; then
+    for ui_line in os=99 arch=77 image_type=99 compression=66; do
+        grep -q -x -- "$ui_line" ui_nm_odd_d/manifest.txt || rp_bad="$rp_bad [odd values: the manifest has no $ui_line: $(grep -E '^(os|arch|image_type|compression)=' ui_nm_odd_d/manifest.txt | tr '\n' ' ' | head -c 120)]"
+    done
+    grep -q -i "unknown" ui_nm_odd_d/manifest.txt && rp_bad="$rp_bad [odd values: the manifest says unknown]"
+    grep -q -F "reproduces this image byte-for-byte" ui_nm.log || rp_bad="$rp_bad [odd values: unpack does not say it is exact: $(head -c 160 ui_nm.log)]"
+    grep -q '^warning' ui_nm.log && rp_bad="$rp_bad [odd values: a warning: $(grep '^warning' ui_nm.log | head -c 120)]"
+    if rp_made ui_nm_odd_d "odd values"; then
+        cmp -s "$rp_run" ui_nm_odd.img || rp_bad="$rp_bad [odd values: the repack is not the image]"
+    fi
+    "$ABR" info ui_nm_odd.img >ui_nm_info.log 2>&1
+    grep -q 'os/arch: *99/77' ui_nm_info.log && grep -q 'type: *99' ui_nm_info.log && grep -q 'compression: *66' ui_nm_info.log && ! grep -q -i unknown ui_nm_info.log ||
+        rp_bad="$rp_bad [odd values: info: $(grep -E 'os/arch|type|compression' ui_nm_info.log | tr '\n' ' ' | head -c 160)]"
+else
+    rp_bad="$rp_bad [odd values: unpack: $(head -c 160 ui_nm.log)]"
+fi
+# the same bytes by another way of writing the value: a name in any case, a number in decimal or hex, the names that older abr wrote
+rm -rf ui_nm_v
+"$ABR" unpack uimage_plain.img -o ui_nm_v >/dev/null 2>&1
+for ui_case in "os=Linux" "os=LINUX" "os=5" "os=0x5" "os=0X05" "arch=ARM64" "arch=22" "arch=0x16" "image_type=KERNEL" "image_type=2" "compression=None" "compression=0"; do
+    rm -rf ui_nm_w
+    cp -a ui_nm_v ui_nm_w
+    rp_set ui_nm_w "${ui_case%%=*}" "${ui_case#*=}"
+    if rp_made ui_nm_w "$ui_case"; then
+        cmp -s "$rp_run" uimage_plain.img || rp_bad="$rp_bad [$ui_case: not the image it is another way of writing]"
+    fi
+done
+rm -rf ui_nm_w
+cp -a ui_nm_v ui_nm_w
+rp_set ui_nm_w arch i386
+rp_set ui_nm_w image_type fdt_legacy
+rp_made ui_nm_w "the old names" && {
+    rp_n=$((rp_n + 1))
+    [ "$(od -An -tu1 -j29 -N2 "$rp_run" | tr -s ' ' | sed 's/^ //')" = "3 8" ] || rp_bad="$rp_bad [i386 and fdt_legacy are not 3 and 8: $(od -An -tu1 -j29 -N2 "$rp_run")]"
+}
+# what is no name and no number is refused, with the names that are known
+for ui_case in "os=linuxx" "os=Linux2" "os=unknown" "os=" "os=256" "os=0x100" "os=-1" "os=1.5" "os=99999999999999999999" "arch=arm65" "arch=aarch64" "image_type=kern" "image_type=flat_dtb" "compression=gz" "compression=gzipp" "compression=lz4_legacy" "compression=300"; do
+    rm -rf ui_nm_w
+    cp -a ui_nm_v ui_nm_w
+    rp_set ui_nm_w "${ui_case%%=*}" "${ui_case#*=}"
+    rp_refused ui_nm_w "$ui_case" "manifest.txt: $ui_case is none of the names of U-Boot's table for it ("
+done
+rm -rf ui_nm_w
+cp -a ui_nm_v ui_nm_w
+rp_set ui_nm_w os linuxx
+rp_n=$((rp_n + 1))
+"$ABR" repack ui_nm_w -o "$rp_run" >rp_run.log 2>&1
+grep -q -F "4_4bsd, " rp_run.log && grep -q -F "vxworks) and no number up to 255" rp_run.log || rp_bad="$rp_bad [the refusal does not list the names: $(head -c 160 rp_run.log)]"
+rp_report "checks of a uImage whose values have no name or are written another way: the numbers are kept as numbers and come back byte for byte, info says them, a name in any case or a number in decimal or hex is the same value, the names an older abr wrote are read, and a name that is none of the table's (or a number above 255) is refused with the names that are known"
+
 # ---- U-Boot FIT images: a file for every image, the tree as text ------------------------------------------------------------------
 # What `mkimage -f` makes -- a flattened device tree whose /images hold the kernel, the ramdisk and the device trees, the data in the tree or
 # behind it (-E: data-size and data-offset, -E -B n a different alignment, -E -p n: data-position) -- is unpacked into `fit.its` (the tree as
