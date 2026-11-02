@@ -317,9 +317,6 @@ std::string Identity::unsupported_note() const {
             return "this has the bootstub of an Intel OSIP image without its header (Android Image Kitchen opens "
                    "such an image with mboot), but not where the layout puts it (4096 bytes behind the cmdline, which "
                    "starts the file or follows a signature of 480, 728 or 1024 bytes); abr cannot unpack it";
-        case Kind::QCDT:
-            return "this is a Qualcomm device-tree table (QCDT), a part of boot images rather than a "
-                   "container of its own";
         case Kind::MTK:
             return "this is a kernel or ramdisk with an MTK header, a part of a boot image rather "
                    "than a container of its own; abr removes that header when it unpacks the "

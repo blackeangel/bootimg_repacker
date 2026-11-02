@@ -3,20 +3,20 @@
 #
 # tests/run_tests.sh compares abr with the programs Android Image Kitchen runs for the formats abr opens by itself: rkcrc
 # (Rockchip), blobpack and blobunpack (ASUS blobs), mboot (Intel OSIP), loki_tool (LOKI), pxa-mkbootimg and pxa-unpackbootimg
-# (Marvell PXA), sony_dump (Sony SIN) and elftool (Sony ELF boot images). None of them is part of this repository, and several
-# have no licence file: they are fetched at the commits the tests were written against, compiled here, and the suite only runs
-# them -- nothing of them goes into abr.
+# (Marvell PXA), sony_dump (Sony SIN), elftool (Sony ELF boot images) and dtbtool (the Qualcomm device tree table). None of them is
+# part of this repository, and several have no licence file: they are fetched at the commits the tests were written against, compiled
+# here, and the suite only runs them -- nothing of them goes into abr.
 #
 #     .github/scripts/build_oracles.sh <directory> [name ...]
 #
-# builds into <directory>/bin (every one, or the names given: rkcrc blobtools mboot loki pxa sony_dump elftool) and prints one
+# builds into <directory>/bin (every one, or the names given: rkcrc blobtools mboot loki pxa sony_dump elftool dtbtool) and prints one
 # VARIABLE=/path line on stdout for each program that was built -- the variables tests/run_tests.sh reads (ABR_RKCRC, ABR_BLOBPACK,
-# ABR_BLOBUNPACK, ABR_MBOOT, ABR_LOKI_TOOL, PXA_MKBOOTIMG, PXA_UNPACKBOOTIMG, ABR_SONY_DUMP, ABR_ELFTOOL). In GitHub Actions:
+# ABR_BLOBUNPACK, ABR_MBOOT, ABR_LOKI_TOOL, PXA_MKBOOTIMG, PXA_UNPACKBOOTIMG, ABR_SONY_DUMP, ABR_ELFTOOL, ABR_DTBTOOL). In GitHub Actions:
 #
 #     .github/scripts/build_oracles.sh "$RUNNER_TEMP/oracles" | tee -a "$GITHUB_ENV"
 #
 # What goes wrong is said on stderr, and the exit status is 1 if any of them could not be built; the others are built all the same.
-# (Needs git, gcc, g++, make and the zlib headers.)
+# (Needs git, gcc, g++, make and the zlib headers; dtbtool runs `dtc`, which has to be on the PATH when the suite runs.)
 set -u
 
 out="$(realpath -m "${1:?usage: build_oracles.sh <directory> [name ...]}")"
@@ -97,11 +97,17 @@ build_elftool() {  # osm0sis/elftool (srl3gx's; no licence text in its sources)
         announce elftool "ABR_ELFTOOL=$out/bin/elftool"
 }
 
+build_dtbtool() {  # the dtbTool of the Code Aurora Forum, in LineageOS/android_device_qcom_common (BSD-3-Clause, by its header; version 3 of the table)
+    fetch android_device_qcom_common https://github.com/LineageOS/android_device_qcom_common.git d1dacc6c79481f2f1e720a2cb14401a3593c4e26 &&
+        gcc -O2 -w -o "$out/bin/dtbtool" "$out/src/android_device_qcom_common/dtbtool/dtbtool.c" &&
+        announce dtbtool "ABR_DTBTOOL=$out/bin/dtbtool"
+}
+
 names=("$@")
-[ ${#names[@]} -gt 0 ] || names=(rkcrc blobtools mboot loki pxa sony_dump elftool)
+[ ${#names[@]} -gt 0 ] || names=(rkcrc blobtools mboot loki pxa sony_dump elftool dtbtool)
 for n in "${names[@]}"; do
     case "$n" in
-        rkcrc | blobtools | mboot | loki | pxa | sony_dump | elftool) ;;
+        rkcrc | blobtools | mboot | loki | pxa | sony_dump | elftool | dtbtool) ;;
         *)
             say "unknown name: $n"
             failed=1

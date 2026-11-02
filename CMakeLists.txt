@@ -136,6 +136,7 @@ add_library(abr_core STATIC
   src/fdt.cpp
   src/dts.cpp
   src/fit.cpp
+  src/qcdt.cpp
   src/vbmeta.cpp
   src/uimage.cpp
   src/manifest.cpp

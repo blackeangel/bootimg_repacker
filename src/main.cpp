@@ -50,6 +50,7 @@
 #include "abr/legacy/sin.hpp"
 #include "abr/manifest.hpp"
 #include "abr/parallel.hpp"
+#include "abr/qcdt.hpp"
 #include "abr/ramdisk_tree.hpp"
 #include "abr/sha.hpp"
 #include "abr/textquote.hpp"
@@ -90,7 +91,7 @@ std::string tails_text(std::initializer_list<std::pair<const char*, const Bytes*
 
 // ------------------------------------------------------------ detection --
 
-enum class Fmt { BOOT, VENDOR_BOOT, DTBO, DTB, FIT, VBMETA, UIMAGE, ELF_BOOT, KRNL, BLOB, OSIP, CHROMEOS, UNKNOWN };
+enum class Fmt { BOOT, VENDOR_BOOT, DTBO, DTB, FIT, QCDT, VBMETA, UIMAGE, ELF_BOOT, KRNL, BLOB, OSIP, CHROMEOS, UNKNOWN };
 
 // Where the "ANDROID!" container starts: within the first kMagicSearchLimit bytes (a vendor
 // wrapper in front of it), or -- Barnes & Noble Nook images -- right behind the fixed-size
@@ -110,6 +111,7 @@ Fmt detect_format(const Bytes& d) {
     if (d.size() >= 8 && std::memcmp(d.data(), "ANDROID!", 8) == 0) return Fmt::BOOT;
     if (d.size() >= 8 && std::memcmp(d.data(), "VNDRBOOT", 8) == 0) return Fmt::VENDOR_BOOT;
     if (d.size() >= 4 && std::memcmp(d.data(), "AVB0", 4) == 0) return Fmt::VBMETA;
+    if (qcdt::looks_like(d)) return Fmt::QCDT;
     if (has_chromeos_header(d)) return Fmt::CHROMEOS;
     if (d.size() >= 4) {
         uint32_t be = (uint32_t(d[0]) << 24) | (uint32_t(d[1]) << 16) | (uint32_t(d[2]) << 8) | d[3];
@@ -198,6 +200,7 @@ const char* fmt_name(Fmt f) {
         case Fmt::DTBO: return "dtbo";
         case Fmt::DTB: return "dtb";
         case Fmt::FIT: return "fit";
+        case Fmt::QCDT: return "qcdt";
         case Fmt::VBMETA: return "vbmeta";
         case Fmt::UIMAGE: return "uimage";
         case Fmt::ELF_BOOT: return "elf_boot";
@@ -216,6 +219,7 @@ Fmt fmt_from_name(const std::string& s) {
     if (s == "dtbo") return Fmt::DTBO;
     if (s == "dtb") return Fmt::DTB;
     if (s == "fit") return Fmt::FIT;
+    if (s == "qcdt") return Fmt::QCDT;
     if (s == "vbmeta") return Fmt::VBMETA;
     if (s == "uimage") return Fmt::UIMAGE;
     if (s == "elf_boot") return Fmt::ELF_BOOT;
@@ -1083,6 +1087,94 @@ size_t refresh_avb1_signature(const Manifest& m, Envelope& e, Bytes& core, uint3
     return e.tail.size() - rest.size();
 }
 
+// ------------------------------------------------------------------ qcdt --
+//
+// A Qualcomm device tree table (abr/qcdt.hpp) is keys of a manifest and a file for every tree it holds: the same keys for a table that is a file
+// of its own (no prefix, the trees beside the manifest) and for the `dt` of a boot image (`dt_`, the trees in dt/). An entry says the board its
+// tree is for by numbers, and the tree by its number.
+
+std::string qcdt_tree_file(const std::string& subdir, size_t i) {
+    return (subdir.empty() ? "" : subdir + "/") + "dtb" + std::to_string(i) + ".dtb";
+}
+
+void save_qcdt(Manifest& m, const fs::path& dir, const std::string& prefix, const std::string& subdir, const qcdt::Table& t) {
+    m.set_u32(prefix + "version", t.version);
+    m.set_u32(prefix + "page_size", t.page_size);
+    m.set_u32(prefix + "entry_count", static_cast<uint32_t>(t.entries.size()));
+    for (size_t i = 0; i < t.entries.size(); ++i) {
+        const qcdt::Entry& e = t.entries[i];
+        const std::string p = prefix + "entry" + std::to_string(i) + "_";
+        m.set_addr(p + "chipset", e.chipset);
+        m.set_addr(p + "platform", e.platform);
+        if (t.version >= 2) m.set_addr(p + "subtype", e.subtype);
+        m.set_addr(p + "revision", e.revision);
+        if (t.version >= 3)
+            for (size_t k = 0; k < e.pmic.size(); ++k) m.set_addr(p + "pmic" + std::to_string(k), e.pmic[k]);
+        m.set_u64(p + "dtb", e.dtb);
+    }
+    m.set_u32(prefix + "dtb_count", static_cast<uint32_t>(t.dtbs.size()));
+    for (size_t j = 0; j < t.dtbs.size(); ++j) {
+        const std::string file = qcdt_tree_file(subdir, j);
+        m.set(prefix + "dtb" + std::to_string(j) + "_file", file);
+        write_file(dir / file, t.dtbs[j]);
+    }
+}
+
+// What a manifest says (it is read all, whatever the version: a subtype in a version 1 table is a contradiction that qcdt::build says, not a key
+// that goes unread).
+qcdt::Table load_qcdt(const Manifest& m, const fs::path& dir, const std::string& prefix) {
+    qcdt::Table t;
+    if (!m.has(prefix + "version"))
+        throw FormatError("manifest.txt has no " + shown(prefix + "version") + " (1, 2 or 3: the width of an entry of the table)");
+    t.version = m.get_u32(prefix + "version");
+    t.page_size = m.get_u32(prefix + "page_size", qcdt::kDefaultPageSize);
+    const uint32_t entries = m.get_count(prefix + "entry_count", 0);
+    for (uint32_t i = 0; i < entries; ++i) {
+        const std::string p = prefix + "entry" + std::to_string(i) + "_";
+        qcdt::Entry e;
+        e.chipset = m.get_addr32(p + "chipset", 0);
+        e.platform = m.get_addr32(p + "platform", 0);
+        e.subtype = m.get_addr32(p + "subtype", 0);
+        e.revision = m.get_addr32(p + "revision", 0);
+        for (size_t k = 0; k < e.pmic.size(); ++k) e.pmic[k] = m.get_addr32(p + "pmic" + std::to_string(k), 0);
+        if (!m.has(p + "dtb")) throw FormatError("manifest.txt has no " + shown(p + "dtb") + " (the number of the device tree the entry is for)");
+        e.dtb = static_cast<size_t>(m.get_bounded(p + "dtb", 0, 32));
+        t.entries.push_back(e);
+    }
+    const uint32_t trees = m.get_count(prefix + "dtb_count", 0);
+    for (uint32_t j = 0; j < trees; ++j) {
+        const std::string key = prefix + "dtb" + std::to_string(j) + "_file";
+        const std::string name = m.get_path(key);
+        if (name.empty()) throw FormatError("manifest.txt has no " + shown(key) + " (the file of device tree " + std::to_string(j) + ")");
+        t.dtbs.push_back(read_file(dir / name));
+    }
+    return t;
+}
+
+// A line for `info`: "version 2, page size 2048, 9 entries, 2 device trees".
+std::string qcdt_summary(const qcdt::Table& t) {
+    return "version " + std::to_string(t.version) + ", page size " + std::to_string(t.page_size) + ", " + std::to_string(t.entries.size()) +
+           (t.entries.size() == 1 ? " entry, " : " entries, ") + std::to_string(t.dtbs.size()) + (t.dtbs.size() == 1 ? " device tree" : " device trees");
+}
+
+void unpack_qcdt(const Bytes& data, const fs::path& dir) {
+    qcdt::Table t;
+    try {
+        t = qcdt::parse(data);
+    } catch (const FormatError& e) {
+        throw FormatError(std::string("this is a Qualcomm device tree table (QCDT), but abr cannot write it again byte for byte: ") + e.what());
+    }
+    Manifest m;
+    m.set("type", "qcdt");
+    save_qcdt(m, dir, "", "", t);
+    save_envelope(m, dir, Envelope::capture(data, 0, t.consumed), data, 0, t.consumed);
+    m.save(dir / "manifest.txt", "abr qcdt manifest -- edit then `abr repack " + dir.string() + " -o dt.img`");
+}
+
+Bytes repack_qcdt(const Manifest& m, const fs::path& dir, const RepackOptions& opt) {
+    return assemble_envelope(m, dir, qcdt::build(load_qcdt(m, dir, "")), opt);
+}
+
 // ------------------------------------------------------------- boot.img --
 
 std::string hex_words(const std::array<uint32_t, 4>& w) {
@@ -1165,7 +1257,24 @@ void unpack_boot(const Bytes& whole, const fs::path& dir, const UnpackOptions& u
         record_component(m, "second", "second", parts[2]);
         save_ramdisk_trees(m, dir, {{"ramdisk", "ramdisk.cpio", &parts[1]}}, uo);
     }
-    save_raw(m, dir, "dt", img.dt, "dt.img");
+    {
+        // A Qualcomm device tree table that abr can write again byte for byte is unpacked into its trees and its entries; any other dt is a file.
+        bool table = false;
+        if (qcdt::looks_like(img.dt)) {
+            try {
+                const qcdt::Table t = qcdt::parse(img.dt, img.page_size);
+                if (t.consumed != img.dt.size())
+                    throw FormatError(std::to_string(img.dt.size() - t.consumed) + " bytes follow the table inside dt_size (" +
+                                      std::to_string(img.dt.size()) + " bytes), and the table ends at " + std::to_string(t.consumed));
+                m.set("dt_format", "qcdt");
+                save_qcdt(m, dir, "dt_", "dt", t);
+                table = true;
+            } catch (const FormatError& e) {
+                note(std::string("the dt of this image is a Qualcomm device tree table, and it is kept as the file dt.img: ") + e.what());
+            }
+        }
+        if (!table) save_raw(m, dir, "dt", img.dt, "dt.img");
+    }
     save_raw(m, dir, "recovery_dtbo", img.recovery_dtbo, "recovery_dtbo.img");
     save_raw(m, dir, "dtb", img.dtb, "dtb");
     save_raw(m, dir, "boot_signature", img.boot_signature, "boot_signature.bin");
@@ -1246,7 +1355,16 @@ Bytes repack_boot(const Manifest& m, const fs::path& dir, const RepackOptions& o
         img.ramdisk = std::move(parts[1]);
         img.second = std::move(parts[2]);
     }
-    img.dt = load_raw(m, dir, "dt");
+    if (m.has("dt_format")) {
+        if (m.get("dt_format") != "qcdt")
+            throw FormatError("manifest.txt: dt_format=" + shown(m.get("dt_format")) + " is not a format abr knows (qcdt)");
+        if (m.has("dt_file"))
+            throw FormatError("manifest.txt has dt_file and dt_format=qcdt: the dt of the image is either a file or a table made of the entries and trees "
+                              "of the manifest. Take out the one that is not meant");
+        img.dt = qcdt::build(load_qcdt(m, dir, "dt_"));
+    } else {
+        img.dt = load_raw(m, dir, "dt");
+    }
     img.recovery_dtbo = load_raw(m, dir, "recovery_dtbo");
     img.dtb = load_raw(m, dir, "dtb");
     img.boot_signature = load_raw(m, dir, "boot_signature");
@@ -2797,7 +2915,19 @@ void print_info(const fs::path& path) {
             std::cout << "ramdisk:        " << img.ramdisk.size() << " bytes ("
                        << codec_name(detect_codec(img.ramdisk)) << ")\n";
             if (!img.second.empty()) std::cout << "second:         " << img.second.size() << " bytes\n";
-            if (!img.dt.empty()) std::cout << "dt (QCDT):      " << img.dt.size() << " bytes\n";
+            if (!img.dt.empty()) {
+                std::cout << "dt (QCDT):      " << img.dt.size() << " bytes";
+                if (qcdt::looks_like(img.dt)) {
+                    std::string about;
+                    try {
+                        about = qcdt_summary(qcdt::parse(img.dt, img.page_size));
+                    } catch (const FormatError& e) {
+                        about = std::string("kept as a file: ") + e.what();
+                    }
+                    std::cout << " (" << about << ")";
+                }
+                std::cout << "\n";
+            }
             if (!img.recovery_dtbo.empty())
                 std::cout << "recovery_dtbo:  " << img.recovery_dtbo.size() << " bytes\n";
             if (!img.dtb.empty()) std::cout << "dtb:            " << img.dtb.size() << " bytes\n";
@@ -2860,6 +2990,32 @@ void print_info(const fs::path& path) {
             for (size_t i = 0; i < split.blobs.size(); ++i)
                 std::cout << "  [" << i << "] " << split.blobs[i].size() << " bytes\n";
             print_envelope_info(Envelope::capture(data, 0, split.consumed));
+            break;
+        }
+        case Fmt::QCDT: {
+            qcdt::Table t;
+            try {
+                t = qcdt::parse(data);
+            } catch (const FormatError& e) {
+                std::cout << "unpack:      no, " << e.what() << "\n";
+                break;
+            }
+            std::cout << "table:       " << qcdt_summary(t) << "\n";
+            for (size_t i = 0; i < t.entries.size(); ++i) {
+                const qcdt::Entry& e = t.entries[i];
+                char line[200];
+                std::snprintf(line, sizeof line, "chipset=0x%x platform=0x%x", e.chipset, e.platform);
+                std::cout << "  [" << i << "] " << line;
+                if (t.version >= 2) std::cout << " subtype=0x" << std::hex << e.subtype << std::dec;
+                std::cout << " revision=0x" << std::hex << e.revision << std::dec;
+                if (t.version >= 3) {
+                    std::cout << " pmic=";
+                    for (size_t k = 0; k < e.pmic.size(); ++k) std::cout << (k ? "," : "") << "0x" << std::hex << e.pmic[k] << std::dec;
+                }
+                std::cout << " -> device tree " << e.dtb << "\n";
+            }
+            for (size_t j = 0; j < t.dtbs.size(); ++j) std::cout << "  device tree " << j << ": " << t.dtbs[j].size() << " bytes\n";
+            print_envelope_info(Envelope::capture(data, 0, t.consumed));
             break;
         }
         case Fmt::FIT: {
@@ -3081,6 +3237,7 @@ Bytes build_image_once(const fs::path& dir, const RepackOptions& opt) {
         case Fmt::DTBO: result = repack_dtbo(m, dir, opt); break;
         case Fmt::DTB: result = repack_dtb(m, dir, opt); break;
         case Fmt::FIT: result = repack_fit(m, dir, opt); break;
+        case Fmt::QCDT: result = repack_qcdt(m, dir, opt); break;
         case Fmt::VBMETA: result = repack_vbmeta(m, dir, opt); break;
         case Fmt::UIMAGE: result = repack_uimage(m, dir, opt); break;
         case Fmt::ELF_BOOT: result = repack_elf_boot(m, dir, opt); break;
@@ -3213,6 +3370,7 @@ void do_unpack(const fs::path& in, const fs::path& outdir, const UnpackOptions& 
             case Fmt::VENDOR_BOOT: unpack_vendor_boot(payload, outdir, uo); break;
             case Fmt::DTBO: unpack_dtbo(payload, outdir); break;
             case Fmt::DTB: unpack_dtb(payload, outdir); break;
+            case Fmt::QCDT: unpack_qcdt(payload, outdir); break;
             case Fmt::FIT: {
                 std::string why;
                 if (!unpack_fit(payload, outdir, uo, why)) {
@@ -3286,6 +3444,40 @@ void do_unpack(const fs::path& in, const fs::path& outdir, const UnpackOptions& 
     }
 }
 
+// `abr qcdt`: what dtbTool does. The trees are the files of the directories (the ones whose names end in .dtb, in the subdirectories as well but
+// not in those whose names start with a dot) and the files named, in the order of their paths (dtbTool takes them in the order the file system
+// lists them, and the order is in the table where two trees are for the same board).
+void do_qcdt(const std::vector<fs::path>& inputs, const fs::path& out, const qcdt::MakeOptions& opt) {
+    std::vector<fs::path> files;
+    for (const fs::path& in : inputs) {
+        if (!fs::is_directory(in)) {
+            files.push_back(in);  // a file that is named is taken, whatever its name
+            continue;
+        }
+        for (fs::recursive_directory_iterator it(in, fs::directory_options::skip_permission_denied), end; it != end; ++it) {
+            const std::string name = it->path().filename().string();
+            if (it->is_directory()) {
+                if (!name.empty() && name[0] == '.') it.disable_recursion_pending();
+            } else if (it->is_regular_file() && name.size() > 4 && name.compare(name.size() - 4, 4, ".dtb") == 0) {
+                files.push_back(it->path());
+            }
+        }
+    }
+    std::sort(files.begin(), files.end(), [](const fs::path& a, const fs::path& b) { return a.generic_string() < b.generic_string(); });
+    files.erase(std::unique(files.begin(), files.end()), files.end());
+    if (files.empty()) throw FormatError("there is no device tree to make a table of: no file whose name ends in .dtb in " + shown(inputs.front().string()));
+    std::vector<qcdt::Source> sources;
+    sources.reserve(files.size());
+    for (const fs::path& f : files) sources.push_back({f.string(), read_file(f)});
+    qcdt::Made made = qcdt::make(sources, opt);
+    for (const std::string& n : made.notes) note(n);
+    const Bytes table = qcdt::build(made.table);
+    if (const fs::path read = find_read_file(out); !read.empty())
+        throw FormatError("-o " + shown(out.string()) + " is a file this run has read (" + shown(read.string()) + "); the table would be written over it. Name another file");
+    write_file(out, table);
+    std::cout << "wrote " << out.string() << ": a QCDT table (" << qcdt_summary(made.table) << "), " << table.size() << " bytes\n";
+}
+
 void do_repack(const fs::path& dir, const fs::path& out, const RepackOptions& opt) {
     Manifest m = Manifest::load(dir / "manifest.txt");
     Fmt f = fmt_from_name(m.get("type"));
@@ -3333,6 +3525,10 @@ void usage() {
         "                              [--avb1-key <key> [--avb1-cert <cert.pem|cert.der>]]\n"
         "                              [--ramdisk-from tree|cpio]\n"
         "                              [--chromeos-key <.vbprivk> [--chromeos-keyblock <.keyblock>]]\n"
+        "  abr qcdt <directory|file.dtb>... -o <dt.img> [--page-size N] [--version 1|2|3]\n"
+        "                                 make a Qualcomm device tree table of the device trees (what\n"
+        "                                 dtbTool makes: an entry for every board a tree is for, by its\n"
+        "                                 qcom,msm-id, qcom,board-id and qcom,pmic-id)\n"
         "  abr identify [-b] <file>...    what it is, worded like Android Image Kitchen's\n"
         "                                 `file -m androidbootimg.magic` (-b: the label only)\n\n"
         "  -j N         threads to use (default: the number of cores, at most 16; 1 = one\n"
@@ -3354,7 +3550,8 @@ void usage() {
         "Supported: boot.img/init_boot.img/boot-debug.img/boot-test-harness.img,\n"
         "recovery.img/recovery-two-step.img (header v0-v4), vendor_boot.img/\n"
         "vendor_boot-debug.img/vendor_kernel_boot.img (header v3-v4), dtbo.img,\n"
-        "raw dtb, vbmeta.img/vbmeta_system.img (AVB), U-Boot legacy uImage and FIT image, Sony ELF\n"
+        "raw dtb, Qualcomm device tree tables (QCDT: a dt.img, or the dt of a boot image), vbmeta.img/\n"
+        "vbmeta_system.img (AVB), U-Boot legacy uImage and FIT image, Sony ELF\n"
         "boot images, Rockchip KRNL (kernel.img / boot.img), ASUS blobs (\"MSM-RADIO-UPDATE\",\n"
         "signed with the SIGNBLOB header or not), Intel OSIP boot images, ChromeOS kernel blobs\n"
         "(the vboot format of a Chromebook's kernel partition).\n"
@@ -3501,6 +3698,33 @@ int main(int argc, char** argv) {
                 }
             }
             return status;
+        } else if (cmd == "qcdt") {
+            std::vector<fs::path> inputs;
+            fs::path out;
+            qcdt::MakeOptions opt;
+            const auto whole = [](const std::string& option, const std::string& text, uint64_t lo, uint64_t hi) {
+                bool digits = !text.empty() && text.size() <= 10;
+                for (const char c : text) digits = digits && c >= '0' && c <= '9';
+                const uint64_t v = digits ? std::stoull(text) : 0;
+                if (!digits || v < lo || v > hi)
+                    throw FormatError("qcdt: " + option + " takes a whole number from " + std::to_string(lo) + " to " + std::to_string(hi) + ", not " +
+                                      shown(text));
+                return v;
+            };
+            for (size_t i = 0; i < args.size(); ++i) {
+                const std::string& a = args[i];
+                if ((a == "-o" || a == "--output") && i + 1 < args.size()) out = args[++i];
+                else if ((a == "-s" || a == "--page-size") && i + 1 < args.size())
+                    opt.page_size = static_cast<uint32_t>(whole(a, args[++i], 1, qcdt::kMaxPageSize));
+                else if (a == "--version" && i + 1 < args.size()) opt.version = static_cast<uint32_t>(whole(a, args[++i], 1, 3));
+                else if (a.rfind("-", 0) == 0 && a.size() > 1) {
+                    std::cerr << "qcdt: unknown option " << shown(a) << " (or it needs a value)\n";
+                    return 1;
+                } else inputs.push_back(a);
+            }
+            if (inputs.empty()) { usage(); return 1; }
+            if (out.empty()) { std::cerr << "qcdt: -o <output file> is required\n"; return 1; }
+            do_qcdt(inputs, out, opt);
         } else if (cmd == "repack") {
             if (args.empty()) { usage(); return 1; }
             fs::path dir = args[0];
