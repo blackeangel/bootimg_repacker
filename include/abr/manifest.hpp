@@ -96,4 +96,8 @@ private:
     std::unordered_map<std::string, size_t> index_;              // key -> its place in entries_ (a manifest can have many lines)
 };
 
+// What a file name that is to be found in the directory of an unpack must not be (get_path() refuses it), or "" when it is fine:
+// the same rule for the names that other files of the directory give (the /incbin/ of fit.its).
+const char* path_problem(const std::string& value);
+
 }  // namespace abr

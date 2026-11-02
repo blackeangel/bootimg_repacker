@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Known-answer vectors for abr's SHA-1/SHA-256/SHA-512, computed with Python's hashlib.
+"""Known-answer vectors for abr's MD5 and SHA-1/SHA-256/SHA-384/SHA-512, computed with Python's hashlib.
 
 usage: gen_sha_vectors.py <blob-out> <expect-out>
 
@@ -25,7 +25,7 @@ with open(blob_path, 'wb') as f:
 chunks = [0, 1, 7, 63, 64, 65, 4097]
 with open(expect_path, 'w', newline='\n') as f:
     for n in lengths:
-        for alg in ('sha1', 'sha256', 'sha512'):
+        for alg in ('md5', 'sha1', 'sha256', 'sha384', 'sha512'):
             digest = hashlib.new(alg, blob[:n]).hexdigest()
             for c in chunks:
                 f.write(f"{alg} {n} {c} {digest}\n")

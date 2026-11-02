@@ -285,7 +285,11 @@ Tree parse(const Bytes& data, Layout* layout_out) {
                 Property p;
                 p.name = std::move(name);
                 p.value.assign(data.begin() + static_cast<std::ptrdiff_t>(pos), data.begin() + static_cast<std::ptrdiff_t>(pos + vlen));
-                pad_zero(pos + vlen, next);
+                for (size_t i = pos + vlen; i < next; ++i)
+                    if (data[i] != 0) {  // (kept: the property says what is behind its value)
+                        p.pad.assign(data.begin() + static_cast<std::ptrdiff_t>(pos + vlen), data.begin() + static_cast<std::ptrdiff_t>(next));
+                        break;
+                    }
                 pos = next;
                 if (child_seen.back()) not_canonical("a property comes after a subnode (a node's properties are written before its subnodes)");
                 stack.back()->props.push_back(std::move(p));
@@ -404,7 +408,8 @@ Bytes build(const Tree& tree, size_t slack) {
             st.be32(static_cast<uint32_t>(p.value.size()));
             st.be32(name_offset(p.name));
             st.bytes(p.value);
-            st.align(4);
+            if (!p.pad.empty() && p.pad.size() == padding_size(p.value.size())) st.bytes(p.pad);
+            else st.align(4);
         } else if (f.next_child < f.node->children.size()) {
             const Node& c = f.node->children[f.next_child++];
             open(c);  // (`f` is not used again)

@@ -26,6 +26,10 @@
 // print() writes a property as a list of strings when its bytes are one (printable characters, each string at least one long,
 // the last NUL), as cells when its length is a multiple of 4, as bytes otherwise -- any of the three gives the same bytes back,
 // whichever way the source had it. parse(print(tree)) is the tree.
+//
+// The one thing that is not the language: the bytes behind a value that are not zero (fdt::Property::pad; mkimage leaves some behind
+// the `hashed-nodes` of a signature) are in a comment right behind the property, `hashed-nodes = "/"; /* abr: padding 98 3e b2 */`.
+// dtc reads it as the comment it is; parse() reads it back, and says no to one that is anywhere else or does not fit the value.
 #pragma once
 
 #include <string>

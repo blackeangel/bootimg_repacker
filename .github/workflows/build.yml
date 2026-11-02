@@ -18,7 +18,7 @@ defaults:
 env:
   # tests/run_tests.sh skips the comparisons with a judge that is not there; here, where every judge is built or installed,
   # a missing one is a failure (a skipped comparison would pass unseen).
-  ABR_REQUIRE_ORACLES: futility,cpio,rkcrc,blobtools,mboot,loki,pxa,sony_dump,elftool
+  ABR_REQUIRE_ORACLES: futility,cpio,rkcrc,blobtools,mboot,loki,pxa,sony_dump,elftool,dumpimage
 
 # abr is C++26: GCC >= 14 and Clang >= 17 have the mode, the Ubuntu 24.04 default
 # GCC 13 does not (see CMakeLists.txt), so every job names its compiler.

@@ -8,6 +8,7 @@
 #include "abr/dtb.hpp"
 #include "abr/dtbo.hpp"
 #include "abr/envelope.hpp"
+#include "abr/fit.hpp"
 #include "abr/uimage.hpp"
 
 using namespace std::string_view_literals;
@@ -242,6 +243,11 @@ Identity identify(const Bytes& d) {
             return id;
         }
         if (be == kFdtMagic) {
+            if (fit::looks_like(d)) {
+                id.kind = Kind::FIT;
+                id.label = "U-Boot FIT image (flattened image tree)";
+                return id;
+            }
             id.kind = Kind::DTB;
             id.label = "flattened device tree";
             return id;
@@ -294,6 +300,7 @@ std::string Identity::aik_type() const {
         case Kind::VBMETA: return "vbmeta";
         case Kind::DTBO: return "dtbo";
         case Kind::DTB: return "dtb";
+        case Kind::FIT: return "FIT";
         case Kind::UNKNOWN: break;
     }
     return "data";

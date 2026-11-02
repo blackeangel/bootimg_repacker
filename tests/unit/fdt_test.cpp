@@ -7,8 +7,10 @@
 //
 //   * a tree of random nodes, properties of every length (the padding of a value to 4 bytes), a reservation map, free space behind
 //     the strings: build() then parse() is the tree, the layout is canonical, and build() of what parse() found is the blob again;
-//   * what is not laid out the way abr writes it (a NOP token, a property behind a subnode, padding that is not zero, free space
-//     that is not zero, blocks in another order, version 16) parses and says why it is not canonical;
+//   * what is not laid out the way abr writes it (a NOP token, a property behind a subnode, padding behind a node name that is not
+//     zero, free space that is not zero, blocks in another order, version 16) parses and says why it is not canonical;
+//   * the bytes behind a value that are not zero (mkimage leaves some behind a signature) are the property's: they come back from
+//     build(), they are in the text as a comment right behind the property, and the text is refused where the comment is not;
 //   * a blob that is cut anywhere, or has a byte changed anywhere, is a FormatError or a tree -- and when it is a tree whose layout
 //     is canonical, build() gives the blob (8000 damaged blobs);
 //   * names are found in the strings block as libfdt finds them (the end of a longer name is a name), a name that is not there is
@@ -16,6 +18,7 @@
 //   * the text: every kind of value, comments, escapes, /bits/, octal and character numbers; what is not read says so with the
 //     line (labels, references, expressions, a node twice, a property twice, a property after a subnode, a second root, nesting
 //     above the limit, a number that does not fit); parse(print(tree)) is the tree, for 3000 random trees and for damaged text.
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <iostream>
@@ -71,7 +74,9 @@ std::string refusal_of(F&& f) {
 bool same_node(const fdt::Node& a, const fdt::Node& b) {
     if (a.name != b.name || a.props.size() != b.props.size() || a.children.size() != b.children.size()) return false;
     for (size_t i = 0; i < a.props.size(); ++i)
-        if (a.props[i].name != b.props[i].name || a.props[i].value != b.props[i].value || a.props[i].incbin != b.props[i].incbin) return false;
+        if (a.props[i].name != b.props[i].name || a.props[i].value != b.props[i].value || a.props[i].incbin != b.props[i].incbin ||
+            a.props[i].pad != b.props[i].pad)
+            return false;
     for (size_t i = 0; i < a.children.size(); ++i)
         if (!same_node(a.children[i], b.children[i])) return false;
     return true;
@@ -125,6 +130,11 @@ void random_children(std::mt19937_64& rng, fdt::Node& n, size_t depth, size_t& b
         do p.name = random_name(rng, 14);
         while (n.find_prop(p.name));
         p.value = random_value(rng);
+        if (fdt::padding_size(p.value.size()) != 0 && rng() % 3 == 0) {  // what the tool that made room for it left there
+            p.pad.resize(fdt::padding_size(p.value.size()));
+            for (uint8_t& b : p.pad) b = static_cast<uint8_t>(rng());
+            if (std::all_of(p.pad.begin(), p.pad.end(), [](uint8_t b) { return b == 0; })) p.pad[0] = 1;
+        }
         n.props.push_back(std::move(p));
     }
     if (depth >= 5) return;
@@ -312,9 +322,22 @@ void test_fdt_layouts() {
         EXPECT_HAS(lay.why, "after a subnode");
         EXPECT(t.root.props.size() == 1);
     }
-    {
+    {  // what is behind a value is the property's: the blob comes back as it is
         Hand h = ok;
         h.structure = minimal_structure(false, false, true);
+        const Bytes blob = h.build();
+        fdt::Layout lay;
+        const fdt::Tree t = fdt::parse(blob, &lay);
+        EXPECT(lay.canonical);
+        EXPECT(t.root.props.size() == 1 && t.root.props[0].value == (Bytes{1, 2, 3}) && t.root.props[0].pad == (Bytes{0x55}));
+        EXPECT(fdt::build(t, lay.slack) == blob);
+    }
+    {  // what is behind the name of a node is nobody's
+        Hand h = ok;
+        h.structure = minimal_structure(false, false, false);
+        const auto a = std::find(h.structure.begin(), h.structure.end(), uint8_t{'a'});
+        EXPECT(a != h.structure.end());
+        if (a != h.structure.end()) *(a + 2) = 0x55;
         fdt::Layout lay;
         fdt::parse(h.build(), &lay);
         EXPECT(!lay.canonical);
@@ -759,11 +782,111 @@ void test_dts_roundtrip() {
     EXPECT(violations == 0 && read > 0 && refused > 0);
 }
 
+void test_fdt_padding() {
+    std::puts("fdt: the bytes behind a value that are not zero belong to the property");
+    // every length of value: build() writes them, parse() finds them, the text has them
+    for (size_t len = 0; len < 14; ++len) {
+        fdt::Tree t;
+        fdt::Property p;
+        p.name = "p";
+        p.value.assign(len, 0x7a);
+        p.pad.assign(fdt::padding_size(len), 0);
+        if (!p.pad.empty()) p.pad.back() = 0x98;
+        t.root.props.push_back(p);
+        t.root.props.push_back({"q", {1, 2, 3, 4}, ""});
+        const Bytes blob = fdt::build(t);
+        fdt::Layout lay;
+        const fdt::Tree back = fdt::parse(blob, &lay);
+        EXPECT(lay.canonical && same_tree(t, back) && back.root.props[0].pad == p.pad);
+        EXPECT(fdt::build(back, lay.slack) == blob);
+        const std::string text = dts::print(t);
+        if (p.pad.empty()) EXPECT(!contains(text, "abr: padding"));
+        else EXPECT_HAS(text, "/* abr: padding");
+        EXPECT(same_tree(t, dts::parse(text)));
+    }
+    {  // the text of one
+        fdt::Tree t;
+        t.root.props.push_back({"p", {1, 2, 3, 4, 5}, "", {0xaa, 0, 0x0f}});
+        EXPECT_HAS(dts::print(t), "p = [01 02 03 04 05]; /* abr: padding aa 00 0f */\n");
+        fdt::Tree s;
+        s.root.props.push_back({"s", {'a', 'b', 0}, "", {5}});
+        EXPECT_HAS(dts::print(s), "s = \"ab\"; /* abr: padding 05 */\n");
+    }
+    {  // a padding that is not as long as the one of the value is not written and not kept: zeros are
+        fdt::Tree t;
+        t.root.props.push_back({"p", {1, 2, 3, 4, 5}, "", {9, 9}});
+        const Bytes blob = fdt::build(t);
+        fdt::Layout lay;
+        const fdt::Tree back = fdt::parse(blob, &lay);
+        EXPECT(lay.canonical && back.root.props[0].pad.empty());
+        EXPECT(!contains(dts::print(t), "abr: padding"));
+        t.root.props[0].value = {1, 2, 3, 4};  // (a value that was changed to one with no padding)
+        t.root.props[0].pad = {7};
+        EXPECT(fdt::parse(fdt::build(t)).root.props[0].pad.empty());
+        EXPECT(!contains(dts::print(t), "abr: padding"));
+    }
+    {  // the comment, read
+        const fdt::Tree t = dts::parse(
+            "/dts-v1/;\n/ {\n"
+            "  a = [01 02 03]; /* abr: padding 7f */\n"
+            "  b = [01]; /* x */\n  /*abr: padding   01 02\t03*/\n"
+            "  c = \"xy\"; // zero padding is no padding\n  /* abr: padding 00 */\n"
+            "  d = [01 02 03 04 05 06];  /* abr: padding AA bb */\n"
+            "  e = <1>;\n"
+            "};\n");
+        EXPECT(t.root.props.size() == 5);
+        EXPECT(t.root.find_prop("a")->pad == (Bytes{0x7f}));
+        EXPECT(t.root.find_prop("b")->pad == (Bytes{1, 2, 3}));
+        EXPECT(t.root.find_prop("c")->pad.empty());
+        EXPECT(t.root.find_prop("d")->pad == (Bytes{0xaa, 0xbb}));
+        EXPECT(t.root.find_prop("e")->pad.empty());
+        // and it comes out of print() the way it went in
+        const fdt::Tree again = dts::parse(dts::print(t));
+        EXPECT(same_tree(t, again));
+    }
+    struct Bad {
+        const char* text;
+        const char* says;
+        size_t line;
+    };
+    const Bad bad[] = {
+        {"/dts-v1/;\n/ {\n  /* abr: padding 01 */\n  a = [01 02 03];\n};", "not right behind a property", 3},
+        {"/dts-v1/;\n/ {\n  a = [01 02 03] /* abr: padding 01 */;\n};", "not right behind a property", 3},
+        {"/dts-v1/;\n/ {\n  n { /* abr: padding 01 */ };\n};", "not right behind a property", 3},
+        {"/dts-v1/;\n/ {\n  n { };\n  /* abr: padding 01 */\n};", "not right behind a property", 4},
+        {"/* abr: padding 01 */\n/dts-v1/;\n/ { };", "not right behind a property", 1},
+        {"/dts-v1/;\n/ { };\n/* abr: padding 01 */\n", "not right behind a property", 3},
+        {"/dts-v1/;\n/ {\n  a = [01 02 03]; /* abr: padding 01 02 */\n};", "lists 2 byte(s), and its value of 3 bytes has 1 of padding", 3},
+        {"/dts-v1/;\n/ {\n  a = [01 02 03 04 05]; /* abr: padding 01 */\n};", "lists 1 byte(s), and its value of 5 bytes has 3 of padding", 3},
+        {"/dts-v1/;\n/ {\n  a = <1>; /* abr: padding 01 */\n};", "has 0 of padding", 3},
+        {"/dts-v1/;\n/ {\n  a; /* abr: padding 01 */\n};", "has 0 of padding", 3},
+        {"/dts-v1/;\n/ {\n  a = [01]; /* abr: padding 01 02 03 04 */\n};", "lists 4 bytes; the padding behind a value is 1 to 3", 3},
+        {"/dts-v1/;\n/ {\n  a = [01]; /* abr: padding */\n};", "lists 0 bytes", 3},
+        {"/dts-v1/;\n/ {\n  a = [01]; /* abr: padding 1 */\n};", "two hexadecimal digits", 3},
+        {"/dts-v1/;\n/ {\n  a = [01]; /* abr: padding 123 */\n};", "two hexadecimal digits", 3},
+        {"/dts-v1/;\n/ {\n  a = [01]; /* abr: padding zz */\n};", "two hexadecimal digits", 3},
+        {"/dts-v1/;\n/ {\n  a = [01]; /* abr: paddings 01 */\n};", "two hexadecimal digits", 3},
+        {"/dts-v1/;\n/ {\n  a = [01]; /* abr: padding 01 */ /* abr: padding 02 */\n};", "two comments", 3},
+        {"/dts-v1/;\n/ {\n  a = /incbin/(\"f\"); /* abr: padding 01 */\n};", "whose value is a file", 3},
+    };
+    for (const Bad& b : bad) {
+        const std::string said = refusal_of([&] { dts::parse(b.text, "t.dts"); });
+        ++g_checks;
+        if (!contains(said, b.says) || !contains(said, "t.dts: line " + std::to_string(b.line) + ":")) {
+            ++g_failures;
+            std::printf("  FAIL: \"%s\" gave: \"%s\" (wanted \"%s\" on line %zu)\n", b.text, said.c_str(), b.says, b.line);
+        }
+    }
+    // other comments that look a little like it are comments
+    EXPECT(refusal_of([&] { dts::parse("/dts-v1/;\n/ {\n  a = [01]; /* abr */ /* padding 01 02 03 04 */ // abr: padding\n};"); }).empty());
+}
+
 }  // namespace
 
 int run_fdt_tests() {
     test_fdt_roundtrip();
     test_fdt_layouts();
+    test_fdt_padding();
     test_fdt_damaged();
     test_fdt_name_places();
     test_fdt_strings();

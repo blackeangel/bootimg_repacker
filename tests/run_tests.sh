@@ -1015,7 +1015,7 @@ if [ -x "$UNIT" ]; then
         fail "BigInt disagrees with Python integers ($out)"
     fi
 
-    # SHA-1/-256/-512 against Python's hashlib on the lengths where the padding
+    # MD5 and SHA-1/-256/-384/-512 against Python's hashlib on the lengths where the padding
     # falls differently (0..129 bytes, block boundaries, 55/56) and with the input
     # fed in different chunk sizes -- once with whatever the CPU offers (x86 SHA-NI,
     # ARMv8 SHA1/SHA2) and once forced to the portable code, so both implementations
@@ -1024,14 +1024,14 @@ if [ -x "$UNIT" ]; then
         sha_auto=$("$UNIT" sha-check sha_blob.bin sha_expect.txt 2>&1) && sha_auto_ok=1 || sha_auto_ok=0
         sha_port=$(ABR_SHA_IMPL=portable "$UNIT" sha-check sha_blob.bin sha_expect.txt 2>&1) && sha_port_ok=1 || sha_port_ok=0
         if [ $sha_auto_ok -eq 1 ]; then
-            pass "SHA-1/256/512 agree with hashlib, hardware-selected implementation ($sha_auto)"
+            pass "MD5 and SHA-1/256/384/512 agree with hashlib, hardware-selected implementation ($sha_auto)"
         else
-            fail "SHA-1/256/512 disagree with hashlib, hardware-selected implementation ($sha_auto)"
+            fail "MD5 and SHA-1/256/384/512 disagree with hashlib, hardware-selected implementation ($sha_auto)"
         fi
         if [ $sha_port_ok -eq 1 ] && [ "$(ABR_SHA_IMPL=portable "$UNIT" sha-impl)" = "portable" ]; then
-            pass "SHA-1/256/512 agree with hashlib, portable implementation ($sha_port)"
+            pass "MD5 and SHA-1/256/384/512 agree with hashlib, portable implementation ($sha_port)"
         else
-            fail "SHA-1/256/512 disagree with hashlib, portable implementation ($sha_port)"
+            fail "MD5 and SHA-1/256/384/512 disagree with hashlib, portable implementation ($sha_port)"
         fi
     else
         fail "could not generate the SHA test vectors"
@@ -6514,6 +6514,650 @@ else
     fail "the warning about the trailer behind an edited uImage is missing, or there is one about fill"
 fi
 
+# ---- U-Boot FIT images: a file for every image, the tree as text ------------------------------------------------------------------
+# What `mkimage -f` makes -- a flattened device tree whose /images hold the kernel, the ramdisk and the device trees, the data in the tree or
+# behind it (-E: data-size and data-offset, -E -B n a different alignment, -E -p n: data-position) -- is unpacked into `fit.its` (the tree as
+# device tree source, `data = /incbin/("file")` for the data of an image) and the files of the images. An untouched directory is the file
+# again; an image that changed size moves the ones behind it, and its hash nodes are made again. The judges: mkimage builds the same file from
+# the same text (but for the time it writes), tests/tools/fit_tool.py (its own reader of the tree) checks every hash and every place of data
+# with hashlib, dumpimage extracts the images the way U-Boot's tools do, GNU cpio lists an edited ramdisk.
+FIT_TOOL="$TOOLS/fit_tool.py"
+FIT_DUMPIMAGE=0
+command -v dumpimage >/dev/null 2>&1 && FIT_DUMPIMAGE=1
+python3 -I - <<'PYEOF'
+import random
+r = random.Random(20261101)
+for name, size in (("fit_kernel.bin", 3000), ("fit_kernel2.bin", 3517), ("fit_extra.bin", 333)):
+    open(name, "wb").write(bytes(r.randrange(256) for _ in range(size)))
+PYEOF
+cp a.dtb fit_fdt.dtb
+python3 "$RDG" mkbootfs fit_rd.cpio
+cat >fit.its <<'ITS'
+/dts-v1/;
+/ {
+    description = "abr test FIT";
+    #address-cells = <1>;
+    images {
+        kernel-1 {
+            description = "kernel";
+            data = /incbin/("fit_kernel.bin");
+            type = "kernel";
+            arch = "arm64";
+            os = "linux";
+            compression = "none";
+            load = <0x80080000>;
+            entry = <0x80080000>;
+            hash-1 { algo = "sha256"; };
+            hash-2 { algo = "crc32"; };
+        };
+        fdt-1 {
+            description = "device tree";
+            data = /incbin/("fit_fdt.dtb");
+            type = "flat_dt";
+            arch = "arm64";
+            compression = "none";
+            hash-1 { algo = "sha1"; };
+        };
+        ramdisk-1 {
+            description = "ramdisk";
+            data = /incbin/("fit_rd.cpio");
+            type = "ramdisk";
+            arch = "arm64";
+            os = "linux";
+            compression = "none";
+            hash-1 { algo = "md5"; };
+        };
+    };
+    configurations {
+        default = "conf-1";
+        conf-1 {
+            description = "the only one";
+            kernel = "kernel-1";
+            fdt = "fdt-1";
+            ramdisk = "ramdisk-1";
+        };
+    };
+};
+ITS
+sed 's/fit_kernel\.bin/fit_kernel2.bin/' fit.its >fit_new.its
+
+fit_ck() {  # <label> <command ...>: one more check, a command that has to succeed
+    local label="$1"
+    shift
+    rp_n=$((rp_n + 1))
+    "$@" >fit_ck.log 2>&1 || rp_bad="$rp_bad [$label: $(head -c 200 fit_ck.log)]"
+}
+fit_norm() {  # <in> <out> [<names to zero>...]: the file with the time mkimage wrote (and what else is asked) zeroed
+    local in="$1" out="$2"
+    shift 2
+    python3 -I "$FIT_TOOL" zero "$in" "$out" timestamp "$@"
+}
+fit_same_as() {  # <label> <file> <mkimage's file> [<more names to zero>...]: the same bytes but for the time (and what else is named)
+    local label="$1" a="$2" b="$3"
+    shift 3
+    rp_n=$((rp_n + 1))
+    fit_norm "$a" fit_norm_a.bin "$@" && fit_norm "$b" fit_norm_b.bin "$@" || { rp_bad="$rp_bad [$label: fit_tool did not read it]"; return; }
+    cmp -s fit_norm_a.bin fit_norm_b.bin || rp_bad="$rp_bad [$label: not what mkimage makes of it ($(cmp fit_norm_a.bin fit_norm_b.bin 2>&1 | head -c 100))]"
+}
+
+fit_same_tree_as() {  # <label> <file> <mkimage's file>: the same properties with the same values in the same order (the free space behind the strings may differ)
+    local label="$1"
+    rp_n=$((rp_n + 1))
+    if fit_norm "$2" fit_norm_a.bin && fit_norm "$3" fit_norm_b.bin && python3 -I "$FIT_TOOL" dump fit_norm_a.bin >fit_dump_a.txt &&
+        python3 -I "$FIT_TOOL" dump fit_norm_b.bin >fit_dump_b.txt; then
+        cmp -s fit_dump_a.txt fit_dump_b.txt || rp_bad="$rp_bad [$label: the tree is not the one mkimage makes ($(diff fit_dump_a.txt fit_dump_b.txt | head -c 160))]"
+    else
+        rp_bad="$rp_bad [$label: fit_tool did not read it]"
+    fi
+}
+
+fit_made=0
+for fit_lay in "inline:" "E:-E" "EB8:-E -B 8" "EB1000:-E -B 0x1000" "Ep800:-E -p 0x800" "Ep1000B8:-E -p 0x1000 -B 8"; do
+    fit_name="${fit_lay%%:*}"
+    fit_flags="${fit_lay#*:}"
+    # shellcheck disable=SC2086
+    if ! mkimage $fit_flags -f fit.its "fit_$fit_name.itb" >/dev/null 2>fit_mk.log; then
+        rp_n=$((rp_n + 1))
+        rp_bad="$rp_bad [$fit_name: mkimage: $(head -c 160 fit_mk.log)]"
+        continue
+    fi
+    fit_made=$((fit_made + 1))
+    rp_n=$((rp_n + 1))
+    rm -rf "fit_d_$fit_name"
+    if ! "$ABR" unpack "fit_$fit_name.itb" -o "fit_d_$fit_name" >fit_un.log 2>&1; then
+        rp_bad="$rp_bad [$fit_name: unpack: $(head -c 160 fit_un.log)]"
+        continue
+    fi
+    grep -q -F "reproduces this image byte-for-byte" fit_un.log || rp_bad="$rp_bad [$fit_name: unpack does not say it is exact: $(head -c 160 fit_un.log)]"
+    grep -q '^type=fit$' "fit_d_$fit_name/manifest.txt" || rp_bad="$rp_bad [$fit_name: not unpacked as a fit]"
+    # the files of the images are the data that went in; fit.its says where they go
+    cmp -s "fit_d_$fit_name/kernel_1" fit_kernel.bin && cmp -s "fit_d_$fit_name/fdt_1.dtb" fit_fdt.dtb || rp_bad="$rp_bad [$fit_name: the files are not the data]"
+    grep -q -F 'data = /incbin/("kernel_1");' "fit_d_$fit_name/fit.its" || rp_bad="$rp_bad [$fit_name: fit.its does not name the file of the kernel]"
+    # an untouched directory is the file
+    if rp_made "fit_d_$fit_name" "$fit_name: untouched"; then
+        cmp -s "$rp_run" "fit_$fit_name.itb" || rp_bad="$rp_bad [$fit_name: the untouched directory is not the file]"
+    fi
+    # what the judges say of the file mkimage made (so that the fixture is one)
+    fit_ck "$fit_name: fit_tool verify (the file mkimage made)" python3 -I "$FIT_TOOL" verify "fit_$fit_name.itb"
+    # identify and info
+    [ "$("$ABR" identify "fit_$fit_name.itb" 2>&1)" = "fit_$fit_name.itb: U-Boot FIT image (flattened image tree)" ] || rp_bad="$rp_bad [$fit_name: identify: $("$ABR" identify "fit_$fit_name.itb" 2>&1 | head -c 120)]"
+    "$ABR" info "fit_$fit_name.itb" >fit_info.log 2>&1
+    grep -q '^format: fit$' fit_info.log && grep -q '^images: *3$' fit_info.log && grep -q 'kernel-1: 3000 bytes' fit_info.log ||
+        rp_bad="$rp_bad [$fit_name: info: $(head -c 200 fit_info.log)]"
+    case "$fit_name" in
+        inline) grep -q 'in the tree' fit_info.log || rp_bad="$rp_bad [$fit_name: info does not say the data is in the tree]" ;;
+        Ep*) grep -q 'data-position' fit_info.log || rp_bad="$rp_bad [$fit_name: info does not say data-position]" ;;
+        *) grep -q 'data-offset' fit_info.log || rp_bad="$rp_bad [$fit_name: info does not say data-offset]" ;;
+    esac
+done
+rp_report "checks of FIT images that mkimage made in 6 layouts (the data in the tree, behind it by offset, by position, with other alignments) are taken apart into fit.its and a file for every image, come back byte for byte, and are named by identify and info ($fit_made made)"
+[ "$fit_made" -eq 6 ] || fail "FIT: mkimage made $fit_made of 6 layouts"
+
+for fit_lay in "inline:" "E:-E" "EB8:-E -B 8" "EB1000:-E -B 0x1000" "Ep800:-E -p 0x800" "Ep1000B8:-E -p 0x1000 -B 8"; do
+    fit_name="${fit_lay%%:*}"
+    fit_flags="${fit_lay#*:}"
+    [ -f "fit_$fit_name.itb" ] || continue
+    # a kernel of another size: what is behind it moves, the hashes are made again -- the file is the one mkimage makes of the same text
+    rp_fresh "fit_$fit_name.itb" "fit_e_$fit_name"
+    cp fit_kernel2.bin "fit_e_$fit_name/kernel_1"
+    if rp_made "fit_e_$fit_name" "$fit_name: a new kernel"; then
+        cp "$rp_run" "fit_e_$fit_name.itb"
+        # shellcheck disable=SC2086
+        mkimage $fit_flags -f fit_new.its "fit_o_$fit_name.itb" >/dev/null 2>&1
+        fit_same_as "$fit_name: a new kernel" "fit_e_$fit_name.itb" "fit_o_$fit_name.itb"
+        fit_ck "$fit_name: a new kernel: fit_tool verify" python3 -I "$FIT_TOOL" verify "fit_e_$fit_name.itb"
+        grep -q "the hash of kernel-1 was made again (2 hash nodes)" rp_run.log || rp_bad="$rp_bad [$fit_name: the repack does not say the hashes were made again: $(head -c 200 rp_run.log)]"
+        grep -q '^warning' rp_run.log && rp_bad="$rp_bad [$fit_name: a warning: $(grep '^warning' rp_run.log | head -c 160)]"
+        if [ "$FIT_DUMPIMAGE" = 1 ]; then
+            rm -f fit_x.bin
+            rp_n=$((rp_n + 1))
+            dumpimage -T flat_dt -p 0 -o fit_x.bin "fit_e_$fit_name.itb" >/dev/null 2>&1 && cmp -s fit_x.bin fit_kernel2.bin || rp_bad="$rp_bad [$fit_name: dumpimage does not extract the new kernel]"
+            rm -f fit_x.bin
+            rp_n=$((rp_n + 1))
+            dumpimage -T flat_dt -p 1 -o fit_x.bin "fit_e_$fit_name.itb" >/dev/null 2>&1 && cmp -s fit_x.bin fit_fdt.dtb || rp_bad="$rp_bad [$fit_name: dumpimage does not extract the device tree behind the new kernel]"
+        fi
+    fi
+    # the same directory again over the new file: what changed is only what was made again
+    rp_fresh "fit_e_$fit_name.itb" "fit_e2_$fit_name"
+    if rp_made "fit_e2_$fit_name" "$fit_name: the new file unpacked and packed"; then
+        cmp -s "$rp_run" "fit_e_$fit_name.itb" || rp_bad="$rp_bad [$fit_name: the edited file does not come back]"
+    fi
+done
+rp_report "checks of a kernel of another size in a FIT (6 layouts) gives the file mkimage makes of the same text but for its clock, with the hashes made again and the images behind it moved; fit_tool finds every hash right, dumpimage extracts the images"
+
+# ---- a trailer behind a FIT, the zero fill of a partition
+cp fit_EB8.itb fit_tail.itb
+printf 'TRAILER-OF-A-FIT-PARTITION-0123456789' >>fit_tail.itb
+cp fit_EB8.itb fit_fill.itb
+head -c $((131072 - $(wc -c <fit_EB8.itb))) /dev/zero >>fit_fill.itb
+for fit_img in fit_tail fit_fill; do
+    rp_n=$((rp_n + 1))
+    rm -rf "fit_d_$fit_img"
+    if ! "$ABR" unpack "$fit_img.itb" -o "fit_d_$fit_img" >fit_un.log 2>&1; then
+        rp_bad="$rp_bad [$fit_img: unpack: $(head -c 160 fit_un.log)]"
+        continue
+    fi
+    grep -q '^type=fit$' "fit_d_$fit_img/manifest.txt" || rp_bad="$rp_bad [$fit_img: not unpacked as a fit]"
+    grep -q -F "reproduces this image byte-for-byte" fit_un.log || rp_bad="$rp_bad [$fit_img: unpack does not say it is exact: $(head -c 160 fit_un.log)]"
+    if rp_made "fit_d_$fit_img" "$fit_img: untouched"; then
+        cmp -s "$rp_run" "$fit_img.itb" || rp_bad="$rp_bad [$fit_img: the untouched directory is not the image]"
+    fi
+    case "$fit_img" in
+        fit_tail) printf 'TRAILER-OF-A-FIT-PARTITION-0123456789' | cmp -s - "fit_d_$fit_img/tail.bin" || rp_bad="$rp_bad [$fit_img: tail.bin is not the trailer]" ;;
+        fit_fill) grep -q '^pad_byte=0x0$' "fit_d_$fit_img/manifest.txt" && grep -q '^pad_to=131072$' "fit_d_$fit_img/manifest.txt" && [ ! -e "fit_d_$fit_img/tail.bin" ] ||
+            rp_bad="$rp_bad [$fit_img: the fill is not in the manifest]" ;;
+    esac
+    # a kernel of another size: the trailer stays behind the FIT, the fill is made up again to the size of the partition
+    cp fit_kernel2.bin "fit_d_$fit_img/kernel_1"
+    if rp_made "fit_d_$fit_img" "$fit_img: a new kernel"; then
+        fit_ck "$fit_img: a new kernel: fit_tool verify" python3 -I "$FIT_TOOL" verify "$rp_run"
+        case "$fit_img" in
+            fit_tail) [ "$(tail -c 37 "$rp_run")" = 'TRAILER-OF-A-FIT-PARTITION-0123456789' ] || rp_bad="$rp_bad [$fit_img: the trailer is not behind the new FIT]" ;;
+            fit_fill) [ "$(wc -c <"$rp_run" | tr -d ' ')" = 131072 ] || rp_bad="$rp_bad [$fit_img: the image is $(wc -c <"$rp_run" | tr -d ' ') bytes, not the 131072 of the partition]" ;;
+        esac
+    fi
+done
+rp_report "checks of a FIT with a trailer behind it and a FIT filled with zeros up to 128 KiB: both come back byte for byte, the trailer is tail.bin and the fill is pad_to, an edit keeps the trailer behind the FIT and the size of the partition"
+
+# ---- a ramdisk image of a FIT is a directory
+if [ "$HAVE_GNU_CPIO" = 1 ]; then
+    for fit_name in inline EB8 Ep800; do
+        rp_fresh "fit_$fit_name.itb" "fit_r_$fit_name"
+        rp_n=$((rp_n + 1))
+        if [ -d "fit_r_$fit_name/ramdisk_1" ] && [ -f "fit_r_$fit_name/ramdisk_1.meta" ] && [ -f "fit_r_$fit_name/ramdisk_1.cpio" ]; then
+            printf 'put in by hand\n' >"fit_r_$fit_name/ramdisk_1/hello.txt"
+            if rp_made "fit_r_$fit_name" "$fit_name: a file in the ramdisk directory"; then
+                grep -q "the hash of ramdisk-1 was made again (1 hash node)" rp_run.log || rp_bad="$rp_bad [$fit_name: the md5 of the ramdisk was not made again: $(head -c 200 rp_run.log)]"
+                fit_ck "$fit_name: ramdisk edit: fit_tool verify" python3 -I "$FIT_TOOL" verify "$rp_run"
+                if [ "$FIT_DUMPIMAGE" = 1 ]; then
+                    rm -f fit_x.cpio
+                    rp_n=$((rp_n + 1))
+                    if dumpimage -T flat_dt -p 2 -o fit_x.cpio "$rp_run" >/dev/null 2>&1; then
+                        fit_listing="$(cpio -it --quiet <fit_x.cpio 2>/dev/null)"
+                        grep -q -x 'hello.txt' <<<"$fit_listing" && grep -q -x 'init.rc' <<<"$fit_listing" || rp_bad="$rp_bad [$fit_name: cpio does not list the ramdisk as edited: $(head -c 120 <<<"$fit_listing")]"
+                    else
+                        rp_bad="$rp_bad [$fit_name: dumpimage does not extract the ramdisk]"
+                    fi
+                fi
+            fi
+        else
+            rp_bad="$rp_bad [$fit_name: the ramdisk is not a directory with its meta file]"
+        fi
+    done
+else
+    echo "note: the FIT ramdisk directory checks are skipped (no GNU cpio)"
+fi
+rp_report "checks of the ramdisk of a FIT edited as a directory (3 layouts): a file put in lands in the ramdisk the image holds, its md5 is made again, GNU cpio lists the edited ramdisk, fit_tool finds every hash right"
+
+# ---- the images of a FIT that are compressed streams: unpacked decompressed, put back with their codec
+if command -v gzip >/dev/null 2>&1; then
+    gzip -9n -c fit_kernel.bin >fit_kernel.bin.gz
+    gzip -9n -c fit_rd.cpio >fit_rd.cpio.gz
+    sed -e 's/fit_kernel\.bin/fit_kernel.bin.gz/' -e 's/fit_rd\.cpio/fit_rd.cpio.gz/' fit.its >fit_gz.its
+    # compression = "gzip" in the kernel and the ramdisk (the first and the third `compression = "none";`), none in the device tree
+    python3 -I - <<'PYEOF'
+t = open("fit_gz.its").read()
+parts = t.split('compression = "none";')
+assert len(parts) == 4, len(parts)
+open("fit_gz.its", "w").write(parts[0] + 'compression = "gzip";' + parts[1] + 'compression = "none";' + parts[2] + 'compression = "gzip";' + parts[3])
+PYEOF
+    for fit_lay in "inline:" "EB8:-E -B 8"; do
+        fit_name="${fit_lay%%:*}"
+        fit_flags="${fit_lay#*:}"
+        # shellcheck disable=SC2086
+        if ! mkimage $fit_flags -f fit_gz.its "fit_gz_$fit_name.itb" >/dev/null 2>fit_mk.log; then
+            rp_n=$((rp_n + 1))
+            rp_bad="$rp_bad [$fit_name: mkimage: $(head -c 160 fit_mk.log)]"
+            continue
+        fi
+        rp_fresh "fit_gz_$fit_name.itb" "fit_g_$fit_name"
+        rp_n=$((rp_n + 1))
+        # what comes out is the decompressed kernel and ramdisk, and the manifest says which codec they were in
+        cmp -s fit_kernel.bin "fit_g_$fit_name/kernel_1" || rp_bad="$rp_bad [$fit_name: kernel_1 is not the decompressed kernel]"
+        rp_n=$((rp_n + 1))
+        cmp -s fit_rd.cpio "fit_g_$fit_name/ramdisk_1.cpio" || rp_bad="$rp_bad [$fit_name: ramdisk_1.cpio is not the decompressed ramdisk]"
+        rp_n=$((rp_n + 1))
+        grep -q '^kernel_1_compression=gzip$' "fit_g_$fit_name/manifest.txt" && grep -q '^ramdisk_1_compression=gzip$' "fit_g_$fit_name/manifest.txt" &&
+            grep -q '^fdt_1_compression=none$' "fit_g_$fit_name/manifest.txt" || rp_bad="$rp_bad [$fit_name: the manifest does not say which images are gzip]"
+        if rp_made "fit_g_$fit_name" "$fit_name: gzip images, untouched"; then
+            cmp -s "$rp_run" "fit_gz_$fit_name.itb" || rp_bad="$rp_bad [$fit_name: the untouched directory is not the image]"
+        fi
+        # another kernel: it goes in as a gzip stream (the compression that the image says), its hashes are of that stream
+        cp fit_kernel2.bin "fit_g_$fit_name/kernel_1"
+        if rp_made "fit_g_$fit_name" "$fit_name: a new kernel in a gzip image"; then
+            grep -q '^warning' rp_run.log && rp_bad="$rp_bad [$fit_name: a warning: $(grep '^warning' rp_run.log | head -c 160)]"
+            fit_ck "$fit_name: gzip images: fit_tool verify" python3 -I "$FIT_TOOL" verify "$rp_run"
+            if [ "$FIT_DUMPIMAGE" = 1 ]; then
+                rm -f fit_x.gz
+                rp_n=$((rp_n + 1))
+                if dumpimage -T flat_dt -p 0 -o fit_x.gz "$rp_run" >/dev/null 2>&1; then
+                    gzip -t fit_x.gz >/dev/null 2>&1 && gzip -dc fit_x.gz | cmp -s - fit_kernel2.bin ||
+                        rp_bad="$rp_bad [$fit_name: what dumpimage extracts as the kernel is not a gzip stream of the new kernel]"
+                else
+                    rp_bad="$rp_bad [$fit_name: dumpimage does not extract the kernel]"
+                fi
+            fi
+        fi
+        # a file in the ramdisk directory: the ramdisk is a gzip stream again, and lists the file
+        if [ "$HAVE_GNU_CPIO" = 1 ] && [ "$FIT_DUMPIMAGE" = 1 ]; then
+            rp_fresh "fit_gz_$fit_name.itb" "fit_g2_$fit_name"
+            printf 'put in by hand\n' >"fit_g2_$fit_name/ramdisk_1/hello.txt"
+            if rp_made "fit_g2_$fit_name" "$fit_name: a file in the ramdisk of a gzip image"; then
+                fit_ck "$fit_name: gzip ramdisk edit: fit_tool verify" python3 -I "$FIT_TOOL" verify "$rp_run"
+                rm -f fit_x.gz
+                rp_n=$((rp_n + 1))
+                if dumpimage -T flat_dt -p 2 -o fit_x.gz "$rp_run" >/dev/null 2>&1 && gzip -t fit_x.gz >/dev/null 2>&1; then
+                    fit_listing="$(gzip -dc fit_x.gz | cpio -it --quiet 2>/dev/null)"
+                    grep -q -x 'hello.txt' <<<"$fit_listing" && grep -q -x 'init.rc' <<<"$fit_listing" ||
+                        rp_bad="$rp_bad [$fit_name: cpio does not list the ramdisk as edited: $(head -c 120 <<<"$fit_listing")]"
+                else
+                    rp_bad="$rp_bad [$fit_name: the ramdisk of the edited image is not a gzip stream]"
+                fi
+            fi
+        fi
+    done
+else
+    echo "note: the checks of the compressed images of a FIT are skipped (no gzip)"
+fi
+rp_report "checks of the images of a FIT that are gzip streams (2 layouts): they come out decompressed, the manifest has the codec, an untouched directory is the image, another kernel and a file in the ramdisk go in as gzip streams, their hashes are of the streams (fit_tool), dumpimage and GNU cpio read them"
+
+# ---- editing fit.its: a number of the tree, an image put in, what the text says that the files do not
+fit_edit() {  # <file> <old text> <new text>: the first <old text> of the file replaced by <new text>; fails when it is not there
+    OLD="$2" NEW="$3" python3 -I - "$1" <<'PYEOF'
+import os, sys
+p = sys.argv[1]
+t = open(p, "rb").read().decode("utf-8")
+o, n = os.environ["OLD"], os.environ["NEW"]
+if o not in t:
+    sys.exit("not found: " + o)
+open(p, "wb").write(t.replace(o, n, 1).encode("utf-8"))
+PYEOF
+}
+if [ -f fit_EB8.itb ]; then
+    rp_fresh fit_EB8.itb fit_t_its
+    fit_edit fit_t_its/fit.its 'load = <0x80080000>;' 'load = <0x80090000>;'
+    if rp_made fit_t_its "an edited load address"; then
+        [ "$(python3 -I "$FIT_TOOL" get "$rp_run" /images/kernel-1 load)" = 80090000 ] || rp_bad="$rp_bad [the load address is not in the image]"
+        [ "$(cmp -l fit_EB8.itb "$rp_run" | wc -l | tr -d ' ')" = 1 ] || rp_bad="$rp_bad [an edited load address changed more than that byte of the file]"
+        grep -q -E 'made again|^warning' rp_run.log && rp_bad="$rp_bad [an edited load address: the repack says: $(head -c 160 rp_run.log)]"
+    fi
+    # a property of the text that the image keeps its place for: the image is built with the new one
+    rp_fresh fit_EB8.itb fit_t_its
+    fit_edit fit_t_its/fit.its 'compression = "none";' 'compression = "gzip";'
+    rp_n=$((rp_n + 1))
+    "$ABR" repack fit_t_its -o "$rp_run" >rp_run.log 2>&1 && grep -q -F "says compression = gzip in fit.its, and its data goes into the image as none" rp_run.log ||
+        rp_bad="$rp_bad [compression = gzip over data that is not: no warning: $(head -c 200 rp_run.log)]"
+fi
+fit_extra_text='		extra-1 {
+			description = "an image put in";
+			type = "firmware";
+			data = /incbin/("fit_extra.bin");
+			hash-1 { algo = "sha256"; };
+		};
+'
+for fit_lay in "inline:" "EB8:-E -B 8" "Ep800:-E -p 0x800"; do
+    fit_name="${fit_lay%%:*}"
+    fit_flags="${fit_lay#*:}"
+    [ -f "fit_$fit_name.itb" ] || continue
+    rp_fresh "fit_$fit_name.itb" "fit_n_$fit_name"
+    cp fit_extra.bin "fit_n_$fit_name/"
+    fit_edit "fit_n_$fit_name/fit.its" '	};
+
+	configurations {' "
+$fit_extra_text	};
+
+	configurations {"
+    if rp_made "fit_n_$fit_name" "$fit_name: an image put in"; then
+        fit_ck "$fit_name: an image put in: fit_tool verify" python3 -I "$FIT_TOOL" verify "$rp_run"
+        [ "$(python3 -I "$FIT_TOOL" images "$rp_run" | wc -l | tr -d ' ')" = 4 ] || rp_bad="$rp_bad [$fit_name: the image put in is not there]"
+        grep -q 'extra-1 hash-1 sha256 ok' <(python3 -I "$FIT_TOOL" verify "$rp_run") || rp_bad="$rp_bad [$fit_name: the sha256 of the image put in was not made]"
+        # what mkimage makes of the same text with the image in it
+        python3 -I - <<'PYEOF'
+t = open("fit.its", "rb").read().decode("utf-8")
+new = '''        extra-1 {
+            description = "an image put in";
+            type = "firmware";
+            data = /incbin/("fit_extra.bin");
+            hash-1 { algo = "sha256"; };
+        };
+'''
+t = t.replace("    };\n    configurations {", new + "    };\n    configurations {", 1)
+open("fit_new2.its", "wb").write(t.encode("utf-8"))
+PYEOF
+        # shellcheck disable=SC2086
+        mkimage $fit_flags -f fit_new2.its "fit_n_o_$fit_name.itb" >/dev/null 2>&1
+        # (a tree that grew has the free space behind its strings that dtc left, which is not something abr can know: the file is the same
+        # when the tree is padded to what -B says, and the tree is the same when it is not)
+        case "$fit_name" in
+            inline) fit_same_tree_as "$fit_name: an image put in" "$rp_run" "fit_n_o_$fit_name.itb" ;;
+            *) fit_same_as "$fit_name: an image put in" "$rp_run" "fit_n_o_$fit_name.itb" ;;
+        esac
+        if [ "$FIT_DUMPIMAGE" = 1 ]; then
+            rm -f fit_x.bin
+            rp_n=$((rp_n + 1))
+            dumpimage -T flat_dt -p 3 -o fit_x.bin "$rp_run" >/dev/null 2>&1 && cmp -s fit_x.bin fit_extra.bin || rp_bad="$rp_bad [$fit_name: dumpimage does not extract the image put in]"
+        fi
+    fi
+done
+rp_report "checks of edits of fit.its: a load address changes that byte and nothing else; compression that says gzip over data that is not is warned of; an image put in (with a hash node that has an algorithm and no value) gets its data, its place and its sha256, and is the file mkimage makes of the same text (-E -B 8, -E -p 0x800; the tree of it, for the data in the tree)"
+
+# ---- a signed FIT: it is a FIT, an edit says what it makes wrong, and the file is what mkimage makes but for the signature
+mkdir -p fit_keys
+openssl genrsa -out fit_keys/dev.key 2048 >/dev/null 2>&1
+cat >fit_sig.its <<'ITS'
+/dts-v1/;
+/ {
+    description = "abr test FIT, signed";
+    #address-cells = <1>;
+    images {
+        kernel-1 {
+            description = "kernel";
+            data = /incbin/("fit_kernel.bin");
+            type = "kernel";
+            arch = "arm64";
+            os = "linux";
+            compression = "none";
+            load = <0x80080000>;
+            entry = <0x80080000>;
+            hash-1 { algo = "sha256"; };
+        };
+        fdt-1 {
+            description = "device tree";
+            data = /incbin/("fit_fdt.dtb");
+            type = "flat_dt";
+            arch = "arm64";
+            compression = "none";
+            hash-1 { algo = "sha256"; };
+        };
+    };
+    configurations {
+        default = "conf-1";
+        conf-1 {
+            description = "the only one";
+            kernel = "kernel-1";
+            fdt = "fdt-1";
+            signature-1 {
+                algo = "sha256,rsa2048";
+                key-name-hint = "dev";
+                sign-images = "kernel", "fdt";
+            };
+        };
+    };
+};
+ITS
+sed 's/fit_kernel\.bin/fit_kernel2.bin/' fit_sig.its >fit_sig_new.its
+fit_signed=0
+for fit_lay in "inline:" "EB8:-E -B 8"; do
+    fit_name="${fit_lay%%:*}"
+    fit_flags="${fit_lay#*:}"
+    # shellcheck disable=SC2086
+    if ! mkimage $fit_flags -f fit_sig.its -k fit_keys -r "fit_signed_$fit_name.itb" >fit_mk.log 2>&1; then
+        echo "note: this mkimage cannot sign a FIT ($(tail -n 1 fit_mk.log | head -c 120)): the signed FIT checks are skipped"
+        break
+    fi
+    fit_signed=$((fit_signed + 1))
+    rp_n=$((rp_n + 1))
+    rm -rf "fit_sd_$fit_name"
+    if ! "$ABR" unpack "fit_signed_$fit_name.itb" -o "fit_sd_$fit_name" >fit_un.log 2>&1; then
+        rp_bad="$rp_bad [$fit_name: unpack: $(head -c 160 fit_un.log)]"
+        continue
+    fi
+    # (mkimage leaves bytes that are not zero behind `hashed-nodes`: the file is still a FIT, and those bytes are in fit.its)
+    grep -q '^type=fit$' "fit_sd_$fit_name/manifest.txt" || rp_bad="$rp_bad [$fit_name: a signed FIT is not unpacked as a FIT: $(grep -h 'note:' fit_un.log | head -c 200)]"
+    grep -q -F '/* abr: padding' "fit_sd_$fit_name/fit.its" || rp_bad="$rp_bad [$fit_name: the bytes behind hashed-nodes are not in fit.its]"
+    grep -q -F "reproduces this image byte-for-byte" fit_un.log || rp_bad="$rp_bad [$fit_name: unpack does not say it is exact]"
+    if rp_made "fit_sd_$fit_name" "$fit_name: untouched signed"; then
+        cmp -s "$rp_run" "fit_signed_$fit_name.itb" || rp_bad="$rp_bad [$fit_name: the untouched directory is not the signed FIT]"
+        grep -q '^warning' rp_run.log && rp_bad="$rp_bad [$fit_name: an untouched signed FIT is warned of: $(grep '^warning' rp_run.log | head -c 160)]"
+    fi
+    "$ABR" info "fit_signed_$fit_name.itb" >fit_info.log 2>&1
+    grep -q '^signatures: *1 ' fit_info.log && grep -q '(signed)' fit_info.log || rp_bad="$rp_bad [$fit_name: info does not say the FIT is signed: $(head -c 200 fit_info.log)]"
+    # a new kernel: the signature is not made again, and the repack says which it is
+    cp fit_kernel2.bin "fit_sd_$fit_name/kernel_1"
+    if rp_made "fit_sd_$fit_name" "$fit_name: a new kernel in a signed FIT"; then
+        grep -q -F "the signatures that cover it (/configurations/conf-1/signature-1) are not made again" rp_run.log ||
+            rp_bad="$rp_bad [$fit_name: the repack does not say that the signature is not made again: $(head -c 240 rp_run.log)]"
+        cp "$rp_run" "fit_signed_e_$fit_name.itb"
+        # shellcheck disable=SC2086
+        mkimage $fit_flags -f fit_sig_new.its -k fit_keys -r "fit_signed_o_$fit_name.itb" >/dev/null 2>&1
+        # the same file but for the time, the signature (it is the old one) and what mkimage's memory left behind `hashed-nodes`
+        fit_same_as "$fit_name: a new kernel in a signed FIT" "fit_signed_e_$fit_name.itb" "fit_signed_o_$fit_name.itb" signature-1:value +hashed-nodes
+        fit_ck "$fit_name: a new kernel in a signed FIT: fit_tool verify" python3 -I "$FIT_TOOL" verify "fit_signed_e_$fit_name.itb"
+        # the key that signed the file can sign it again: mkimage accepts what abr made (its time is not the time of the old signature)
+        if [ "$fit_name" = inline ]; then
+            cp "fit_signed_e_$fit_name.itb" fit_resign.itb
+            fit_ck "$fit_name: mkimage -F signs the edited FIT again" mkimage -F -k fit_keys -r fit_resign.itb
+        fi
+    fi
+    # fit.its edited (a description): the signatures may not fit it any more -- said
+    rp_fresh "fit_signed_$fit_name.itb" "fit_sd2_$fit_name"
+    fit_edit "fit_sd2_$fit_name/fit.its" 'description = "kernel";' 'description = "the kernel";'
+    rp_n=$((rp_n + 1))
+    "$ABR" repack "fit_sd2_$fit_name" -o "$rp_run" >rp_run.log 2>&1 && grep -q -F "fit.its was edited and the FIT has signatures (/configurations/conf-1/signature-1)" rp_run.log ||
+        rp_bad="$rp_bad [$fit_name: fit.its edited in a signed FIT: $(head -c 240 rp_run.log)]"
+done
+if [ "$fit_signed" -gt 0 ]; then
+    rp_report "checks of FITs that mkimage signed ($fit_signed layouts): they are FITs (the bytes mkimage leaves behind hashed-nodes are in fit.its), they come back byte for byte, info says they are signed, a new kernel says which signature is not made again and gives the file mkimage makes of the same text but for the time, the old signature and those bytes, mkimage -F signs the edited one again (the data in the tree); an edit of fit.its is warned of"
+else
+    rp_bad=""
+    rp_n=0
+fi
+
+# ---- a file that abr cannot give back as a FIT is a device tree, and is said to be
+cat >fit_both.dts <<'DTS'
+/dts-v1/;
+/ {
+    images {
+        kernel-1 {
+            data = <0x01020304>;
+            data-size = <16>;
+            data-offset = <0>;
+        };
+    };
+};
+DTS
+printf '/dts-v1/;\n/ { images { }; };\n' >fit_noimages.dts
+printf '/dts-v1/;\n/ { images { kernel-1 { description = "no data"; }; }; configurations { }; };\n' >fit_nodata.dts
+for fit_n in fit_both fit_noimages fit_nodata; do
+    dtc -I dts -O dtb -o "$fit_n.itb" "$fit_n.dts" >/dev/null 2>&1
+done
+for fit_n in fit_both fit_noimages fit_nodata; do
+    rp_n=$((rp_n + 1))
+    rm -rf "fit_d_$fit_n"
+    if ! "$ABR" unpack "$fit_n.itb" -o "fit_d_$fit_n" >fit_un.log 2>&1; then
+        rp_bad="$rp_bad [$fit_n: unpack: $(head -c 160 fit_un.log)]"
+        continue
+    fi
+    grep -q -F "reproduces this image byte-for-byte" fit_un.log || rp_bad="$rp_bad [$fit_n: unpack does not say it is exact: $(head -c 160 fit_un.log)]"
+    if rp_made "fit_d_$fit_n" "$fit_n: untouched"; then
+        cmp -s "$rp_run" "$fit_n.itb" || rp_bad="$rp_bad [$fit_n: the untouched directory is not the file]"
+    fi
+    case "$fit_n" in
+        fit_both)
+            grep -q '^type=dtb$' "fit_d_$fit_n/manifest.txt" || rp_bad="$rp_bad [$fit_n: not unpacked as a dtb]"
+            grep -q -F "this is a U-Boot FIT image, but abr cannot put it back as one (the image kernel-1 has \`data\` and also data-size, data-offset or data-position)" fit_un.log ||
+                rp_bad="$rp_bad [$fit_n: the unpack does not say why it is no FIT: $(head -c 240 fit_un.log)]"
+            "$ABR" info "$fit_n.itb" >fit_info.log 2>&1
+            grep -q '^unpack: *as a plain device tree, because ' fit_info.log || rp_bad="$rp_bad [$fit_n: info does not say why it is a plain device tree: $(head -c 300 fit_info.log)]"
+            ;;
+        fit_noimages)
+            grep -q '^type=dtb$' "fit_d_$fit_n/manifest.txt" && ! grep -q 'FIT' fit_un.log || rp_bad="$rp_bad [$fit_n: /images with no image is a plain device tree: $(head -c 200 fit_un.log)]"
+            ;;
+        fit_nodata)
+            grep -q '^type=fit$' "fit_d_$fit_n/manifest.txt" || rp_bad="$rp_bad [$fit_n: images without data are a FIT: $(head -c 200 fit_un.log)]"
+            ;;
+    esac
+done
+rp_report "checks of device trees that have /images: one whose image has data and also data-size is unpacked as a plain device tree with the reason said (and comes back byte for byte), /images without an image is a plain device tree, images without data are a FIT"
+
+# ---- repack of a FIT directory is refused with the reason, and writes nothing
+fit_dir=fit_d_EB8
+if [ -d "$fit_dir" ]; then
+    rm -rf fit_try
+    cp -a "$fit_dir" fit_try
+    rm fit_try/fit.its
+    rp_refused fit_try "fit.its is not there" "fit.its"
+    rm -rf fit_try
+    cp -a "$fit_dir" fit_try
+    rp_set fit_try fit_data sideways
+    rp_refused fit_try "fit_data=sideways" "fit_data=sideways is none of inline, offset, position"
+    for fit_v in 6 2 3 0 -8 abc 99999999999; do
+        rm -rf fit_try
+        cp -a "$fit_dir" fit_try
+        rp_set fit_try fit_align "$fit_v"
+        rp_refused fit_try "fit_align=$fit_v" "fit_align"
+    done
+    rm -rf fit_try
+    cp -a "$fit_dir" fit_try
+    fit_edit fit_try/fit.its 'load = <0x80080000>;' 'load = <0x80080000>'
+    rp_refused fit_try "a ';' missing in fit.its" "fit.its: line 22: expected ';' at the end of the property"
+    rm -rf fit_try
+    cp -a "$fit_dir" fit_try
+    fit_edit fit_try/fit.its 'data = /incbin/("kernel_1");' 'data = /incbin/("nothing.bin");'
+    rp_refused fit_try "an image whose file is not there" "the image kernel-1 has data = /incbin/(nothing.bin) and there is no such file in the directory"
+    rm -rf fit_try
+    cp -a "$fit_dir" fit_try
+    fit_edit fit_try/fit.its 'data = /incbin/("kernel_1");' 'data = /incbin/("../fit_kernel.bin");'
+    rp_refused fit_try "a file of an image outside the directory" "a name that goes through '..'"
+    rm -rf fit_try
+    cp -a "$fit_dir" fit_try
+    fit_edit fit_try/fit.its 'data = /incbin/("kernel_1");' 'data = /incbin/("/etc/hostname");'
+    rp_refused fit_try "a file of an image with an absolute name" "a name that"
+    rm -rf fit_try
+    cp -a "$fit_dir" fit_try
+    rm fit_try/kernel_1
+    rp_refused fit_try "the file of an image is gone" "kernel_1"
+    rm -rf fit_try
+    cp -a "$fit_dir" fit_try
+    fit_edit fit_try/fit.its 'data-offset = <0xbb8>;' 'data-offset = <0x10>;'
+    rp_refused fit_try "two images on top of each other" "the images kernel-1 and fdt-1 overlap"
+    rm -rf fit_try
+    python3 -I - <<'PYEOF'
+t = open("fit_d_Ep800/fit.its", "rb").read().decode("utf-8")
+t = t.replace('description = "abr test FIT";', 'description = "' + "x" * 3000 + '";', 1)
+import shutil, os
+shutil.rmtree("fit_try", ignore_errors=True)
+shutil.copytree("fit_d_Ep800", "fit_try", symlinks=True)
+open("fit_try/fit.its", "wb").write(t.encode("utf-8"))
+PYEOF
+    rp_refused fit_try "a tree that grows into the first image (data-position)" "reaches the image kernel-1 at data-position 2048"
+    rm -rf fit_try
+    cp -a "$fit_dir" fit_try
+    python3 -I - <<'PYEOF'
+t = open("fit_try/fit.its", "rb").read().decode("utf-8")
+i, j = t.index("\timages {"), t.index("\tconfigurations {")
+open("fit_try/fit.its", "wb").write((t[:i] + t[j:]).encode("utf-8"))
+PYEOF
+    rp_refused fit_try "no /images" "has no /images node"
+    rm -rf fit_try
+    cp -a "$fit_dir" fit_try
+    fit_edit fit_try/fit.its 'data = /incbin/("kernel_1");' 'data = /incbin/("kernel_1"), <1>;'
+    rp_refused fit_try "a value next to /incbin/" "/incbin/ has to be the only value"
+    # the strings of the tree gone: said, and the FIT is still made (the names come in the order of their use)
+    rm -rf fit_try
+    cp -a "$fit_dir" fit_try
+    rm fit_try/.abr_raw/fit_strings.bin
+    rp_n=$((rp_n + 1))
+    "$ABR" repack fit_try -o "$rp_run" >rp_run.log 2>&1 && grep -q -F "fit_strings.bin is not there: the strings of the tree are written in the order of their first use" rp_run.log ||
+        rp_bad="$rp_bad [the strings of the tree are gone: $(head -c 200 rp_run.log)]"
+    python3 -I "$FIT_TOOL" verify "$rp_run" >/dev/null 2>&1 || rp_bad="$rp_bad [the strings of the tree are gone: the FIT that was made is not right]"
+else
+    rp_bad="$rp_bad [fit_d_EB8 is not there]"
+fi
+rp_report "checks of repack refusals for a FIT directory (fit.its gone, fit_data that is none of the three places, an alignment that is not a power of two, a text with a syntax error and its line, a file of an image that is gone or out of the directory, images on top of each other, a tree grown into the first image, no /images, a value next to /incbin/); the strings of the tree gone are warned of"
+
+# ---- a FIT as the kernel of a ChromeOS (vboot) blob: the wrapper stays, the FIT is taken apart, an edit is signed again
+mkdir -p fit_cros
+CROS_TOOL="$TOOLS/chromeos_tool.py"
+if python3 -I "$CROS_TOOL" devkeys "$REPO_ROOT/src/legacy/chromeos_devkeys.cpp" fit_cros >/dev/null 2>&1 &&
+    python3 -I "$CROS_TOOL" make fit_cros.blob --kernel fit_EB8.itb --keyblock fit_cros/kernel.keyblock --key fit_cros/kernel_data_key.vbprivk >/dev/null 2>&1; then
+    rp_n=$((rp_n + 1))
+    rm -rf fit_d_cros
+    if "$ABR" unpack fit_cros.blob -o fit_d_cros >fit_un.log 2>&1; then
+        grep -q '^type=fit$' fit_d_cros/manifest.txt && grep -q '^has_chromeos=true$' fit_d_cros/manifest.txt ||
+            rp_bad="$rp_bad [the FIT in a ChromeOS blob is not unpacked as a FIT inside the wrapper: $(head -c 200 fit_un.log)]"
+        grep -q -F "reproduces this image byte-for-byte" fit_un.log || rp_bad="$rp_bad [the FIT in a ChromeOS blob: unpack does not say it is exact]"
+        if rp_made fit_d_cros "the FIT in a ChromeOS blob: untouched"; then
+            cmp -s "$rp_run" fit_cros.blob || rp_bad="$rp_bad [the FIT in a ChromeOS blob: the untouched directory is not the blob]"
+        fi
+        cp fit_kernel2.bin fit_d_cros/kernel_1
+        if rp_made fit_d_cros "the FIT in a ChromeOS blob: a new kernel"; then
+            cp "$rp_run" fit_cros_new.blob
+            fit_ck "the FIT in a ChromeOS blob: a new kernel: the blob is signed" python3 -I "$CROS_TOOL" verify fit_cros_new.blob
+            fit_ck "the FIT in a ChromeOS blob: a new kernel: the kernel field" python3 -I "$CROS_TOOL" kernel fit_cros_new.blob fit_cros_k.itb
+            fit_ck "the FIT in a ChromeOS blob: a new kernel: fit_tool verify" python3 -I "$FIT_TOOL" verify fit_cros_k.itb
+            [ "$(python3 -I "$FIT_TOOL" images fit_cros_k.itb | head -n 1)" = "kernel-1 3517 offset 0" ] ||
+                rp_bad="$rp_bad [the FIT in a ChromeOS blob: the kernel field does not hold the new kernel]"
+        fi
+    else
+        rp_bad="$rp_bad [the FIT in a ChromeOS blob: unpack: $(head -c 200 fit_un.log)]"
+    fi
+else
+    rp_n=$((rp_n + 1))
+    rp_bad="$rp_bad [the ChromeOS blob around a FIT could not be made]"
+fi
+rp_report "checks of a FIT that is the kernel of a ChromeOS (vboot) blob: unpacked as a FIT inside the wrapper, an untouched directory is the blob, a new kernel gives a blob whose signatures verify (the independent tool) and whose kernel field is the FIT with the new kernel"
+
 # ---- paths that are not ASCII --------------------------------------------------------------------------------
 # Cyrillic, an accent, Chinese and an emoji (four bytes in UTF-8, a surrogate pair on Windows) in the names of the
 # image, of the directory it is unpacked to and of the file it is packed to, and in a file name the manifest holds.
@@ -6652,7 +7296,7 @@ done
 # Judges that have to be there. A judge that is not (rkcrc, mboot, sony_dump, ...) is a note in its section and the
 # comparisons with it are skipped, which is right on a machine that has not got it and wrong in a run that is meant to have
 # them all (the CI): a skipped comparison passes unseen. ABR_REQUIRE_ORACLES=<names, separated by commas> makes the absence
-# of the named judges a failure: futility, cpio, rkcrc, blobtools, mboot, loki, pxa, sony_dump, elftool. A name that is not
+# of the named judges a failure: futility, cpio, rkcrc, blobtools, mboot, loki, pxa, sony_dump, elftool, dumpimage. A name that is not
 # on this list is a failure too (a misspelt name would otherwise check nothing).
 # =========================================================================
 oracle_have() {
@@ -6666,6 +7310,7 @@ oracle_have() {
         pxa) [ -n "${PXA_MKBOOTIMG:-}" ] && [ -x "$PXA_MKBOOTIMG" ] && [ -n "${PXA_UNPACKBOOTIMG:-}" ] && [ -x "$PXA_UNPACKBOOTIMG" ] ;;
         sony_dump) [ -n "${SIN_DUMP:-}" ] && [ -x "$SIN_DUMP" ] ;;
         elftool) elf_tool_ok ;;
+        dumpimage) [ "$FIT_DUMPIMAGE" = 1 ] ;;
         *) return 2 ;;
     esac
 }
@@ -6679,7 +7324,7 @@ if [ -n "${ABR_REQUIRE_ORACLES:-}" ]; then
         oracle_have "$oracle"
         case $? in
             0) pass "the judge '$oracle' is there (ABR_REQUIRE_ORACLES)" ;;
-            2) fail "ABR_REQUIRE_ORACLES names '$oracle', which is not a judge of this suite (futility, cpio, rkcrc, blobtools, mboot, loki, pxa, sony_dump, elftool)" ;;
+            2) fail "ABR_REQUIRE_ORACLES names '$oracle', which is not a judge of this suite (futility, cpio, rkcrc, blobtools, mboot, loki, pxa, sony_dump, elftool, dumpimage)" ;;
             *) fail "the judge '$oracle' is required (ABR_REQUIRE_ORACLES) and is not there: its comparisons were skipped" ;;
         esac
     done

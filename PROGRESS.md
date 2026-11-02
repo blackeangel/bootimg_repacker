@@ -22,6 +22,8 @@ tools" below.
 | dtb (raw/concatenated FDT) | **done + verified** |
 | vbmeta (AVB): vbmeta.img, vbmeta_system.img, footer-on-other-partitions | **done + verified**, incl. RSA signing (images made by the real `avbtool` round-trip exactly; images `abr` re-signed pass `avbtool verify_image`) |
 | uboot: U-Boot legacy uImage | **done + verified** |
+| U-Boot FIT images (`mkimage -f`: `.itb`, `.fit`; the data in the tree, `-E`, `-E -B n`, `-E -p N`) | **done + verified** (1 Nov 2026) against the real `mkimage` and `dumpimage` (u-boot-tools 2025.10, run as oracles), `dtc` 1.7.0 and an independent Python reader (`tests/tools/fit_tool.py`, hashes with `hashlib`): `fit.its` plus a file for every image (a ramdisk also as a directory), an untouched FIT comes back byte for byte in all six layouts `mkimage` was run with (and signed with `-k`), a new kernel or an image put in is the file `mkimage` makes of the same text, the hash nodes of a changed image are made again (crc32, md5, sha1, sha256, sha384, sha512), signatures are kept and named when an edit makes them wrong; **no FIT image of a device has been tried**, and `abr` neither checks nor makes a signature, see "U-Boot FIT images" |
+| flattened device tree as a tree (`abr::fdt`) and as source text (`abr::dts`) | **done + verified** (31 Oct 2026, commit `57e8331`; the bytes behind a value 1 Nov): 51 device trees of real images and the blobs of `dtc` (`-@`, `-p`, `-V 16`) come back byte for byte, the ones that do not (a version 16 blob, NOP tokens, a property behind a subnode, ...) are said not to be canonical; see "U-Boot FIT images" |
 | ELF boot images (Sony/Xperia `kernel.elf`) | **done + verified** against the real `elftool` (compiled, not vendored) and an independent Python tool and C++ writer: kernel / ramdisk (a directory) / `ipl` / `rpm` / command line by `p_flags`, positional roles for unflagged segments, ELF32 and ELF64; an image in elftool's layout is built from the manifest alone, any other layout (padding, another start of the data, own `e_entry`/OS-ABI/`p_align`/`p_memsz`/`p_paddr`, data in another order, empty segments) is kept and written back; 16 layouts in the CLI suite, 60,000+ unit checks; no real `kernel.elf` has been tried, see "Sony ELF boot images" |
 | Sony SIN containers v1-v3 (AIK: `sony_dump`) | **done + verified** against the real `sony_dump` (compiled from its source, not vendored: no licence file) and an independent Python tool: the container comes off and is never put back (AIK forgets it too), what is inside is unpacked as it is on its own; MMCF with `ADDR` / `LZ4A` parts (decoded on several threads when large), loader, data in front; damaged containers are refused with the reason; no real `.sin` has been tried, see "Sony SIN containers" |
 | Rockchip KRNL images (`kernel.img`, SDK `boot.img`) | **done + verified** against the real `rkcrc -k` (compiled, not vendored) and an independent Python tool: the payload (kernel, or a compressed cpio ramdisk -> `ramdisk.cpio` + `ramdisk/`), Rockchip's own CRC (polynomial 0x04C10DB7), partition fill, wrong stored CRC kept |
@@ -39,11 +41,11 @@ tools" below.
 | AVBv1 `BootSignature` (pre-AVB `boot_signer`, DER blob after the image): detect, verify (`info`, unpack warning), re-create after an edit with the AOSP test key or `--avb1-key/--avb1-cert` (AIK `name.pk8`+`name.x509.pem` naming too), add to an unsigned image | **done + verified** against the real AOSP `boot_signer` (compiled from its Java sources) and an independent Python/openssl signer: same bytes from the same key and image; abr-re-signed images pass `boot_signer -verify`; real-device AVBv1 images read VALID |
 | compression: gzip, lz4, lz4-legacy (HC 12, as Android builds it), zstd, xz, lzma(alone), bzip2, lzo (genuine lzop framing) | **done + verified, all algorithms**, each also read back by the real `gzip`/`lz4`/`zstd`/`xz`/`bzip2`/`lzop` |
 | multithreading (`-j N`): components of an image, LZ4 legacy blocks, zstd workers | **done + verified**: bytes identical for any thread count (suite, every codec), `abr::par` unit-tested, TSan/ASan-clean; see "Threads, and what the codecs taught us" |
-| bundled SHA-1/256/512 | **done**, self-test passes, catches its own transcription bug once already (see Verification below) |
+| bundled MD5 and SHA-1/256/384/512 | **done**, self-test passes, catches its own transcription bug once already (see Verification below); MD5 and SHA-384 (the hash nodes of a FIT image) are checked against vectors from Python's `hashlib` |
 | self-contained RSA: BigInt (Knuth D, Montgomery), DER/PEM/X.509, PKCS#1 v1.5 sign/verify, PKCS#8/PKCS#1 key parsing, AVB public-key blob -- **no OpenSSL anywhere in the build** | **done + verified** (Python integers, `openssl dgst -sign`, `avbtool extract_public_key`; see "Self-contained crypto" below) |
 | manifest + CLI (`abr info/unpack/repack`) | **done** |
 | CMake: FetchContent-vendored static zlib/lz4/zstd/xz/bzip2 | **done + build-verified natively on Linux**, both the dynamic and the `-DABR_STATIC_BINARY=ON` fully-static configurations |
-| Test suite (`tests/run_tests.sh`) | **done, 483/483 passing** on g++-14 (all judges required, as in the CI) and under AddressSanitizer + UndefinedBehaviorSanitizer (no report), 474/474 on clang-20 (the nine "the judge is there" checks belong to `ABR_REQUIRE_ORACLES`, which that run did not set), 481/481 for `abr.exe` under wine (the platform's own tests differ; the suite with the 14 real images and AIK's magic file: 487/487); CI runs the matrix (g++-14, clang-20, ASan+UBSan with a fuzz run, Windows under wine, arm64 under qemu-user, android-arm64) -- see Verification |
+| Test suite (`tests/run_tests.sh`) | **done**; the last full runs (those of "Streams, decoders and names"): 490/490 on g++-14 (all judges required, as in the CI) and under AddressSanitizer + UndefinedBehaviorSanitizer (no report); the clang-20 and wine runs are older (at 483 checks: 474/474 on clang-20 -- the nine "the judge is there" checks belong to `ABR_REQUIRE_ORACLES`, which that run did not set --, 481/481 for `abr.exe` under wine, the suite with the 14 real images and AIK's magic file 487/487). Since then the groups of the FIT work (ten blocks, 152 checks of the CLI; the unit groups `fdt` and `fit`) have been run on their own only: the whole matrix is run once, after the work on formats is done (see "Next steps"). CI runs the matrix (g++-14, clang-20, ASan+UBSan with a fuzz run, Windows under wine, arm64 under qemu-user, android-arm64) -- see Verification |
 | CMake cross toolchains (mingw-w64, Android NDK) | **done + verified** (mingw reproduced locally; NDK only provable via CI, see below) |
 | GitHub Actions static build matrix (linux-x86_64, windows-x86_64, android-arm64) | **done + verified**: run 35313499827, all 3 jobs green, all 3 static binaries produced as artifacts (abr-linux-x86_64, abr-windows-x86_64, abr-android-arm64) |
 
@@ -623,7 +625,7 @@ language.
     packages instead, for fast local iteration -- not the shipping
     default.
 - **No crypto library at all.** Hashing (boot `id`, AVB digests) uses the
-  bundled SHA-1/256/512 (`src/sha.cpp`); AVB RSA signing/verification, the
+  bundled MD5 and SHA-1/256/384/512 (`src/sha.cpp`); AVB RSA signing/verification, the
   big-integer arithmetic under it and the DER/PEM/X.509 reading of key files
   are `src/bigint.cpp`, `src/rsa.cpp`, `src/asn1.cpp`. OpenSSL was used for
   the first AVB signing and removed once those were verified (it had made
@@ -682,7 +684,8 @@ language.
   kernel_cmdline, chain_partition) for `info` output only, read-only.
 - "uboot" is interpreted as U-Boot's legacy `mkimage`/uImage container
   (magic 0x27051956). FIT (Flattened Image Tree), U-Boot's newer
-  format, is **not** implemented -- possible follow-up.
+  format, was not implemented at first; it is since 1 Nov 2026 (see
+  "U-Boot FIT images").
 
 ## Repo / GitHub
 
@@ -710,7 +713,7 @@ compiled from source and used only as oracles, never as a dependency.
 | AOSP boot / recovery, header v0-v4; vendor_boot / vendor_kernel_boot | done |
 | AOSP-PXA (`pxa-unpackbootimg`) | done, oracle-verified |
 | ELF (`unpackelf` / `elftool`) | done, oracle-verified; layouts other than elftool's are kept (see "Sony ELF boot images" below) |
-| U-Boot legacy uImage (`dumpimage` / `mkimage`) | done; FIT (flattened image tree) not |
+| U-Boot legacy uImage (`dumpimage` / `mkimage`) | done; FIT images (flattened image tree) too, since 1 Nov 2026 (see "U-Boot FIT images" below) |
 | MTK 512-byte header on kernel/ramdisk (`mkmtkhdr`) | done, oracle-verified |
 | DHTB wrapper (`dhtbsign`) | done, oracle-verified |
 | NOOK (1 MiB) / NOOKTAB (256 KiB) header (`master_boot.key`) | done, as a constant prefix; synthetic fixtures only |
@@ -1350,7 +1353,7 @@ Negative controls: twenty-six mutations of the code (the hash taken by the wrong
 
 Not done, and not claimed: **no real Chromebook partition has been tried** (none at hand; the blobs in the suite hold Android
 boot images and random bytes); the 8192-bit algorithms (9 to 11) are in the code and not in the tests; the keyblock's own
-signature is not checked; x86 blobs are refused; a FIT image as the kernel field (abr does not read FIT yet) is read as one device-tree blob (the whole FIT, `blob0.dtb`) and round-trips byte for byte; the kernel and the device trees inside it are not taken apart.
+signature is not checked; x86 blobs are refused; a FIT image as the kernel field is unpacked as a FIT inside the wrapper since 1 Nov 2026 (see "U-Boot FIT images"; before that it was read as one device-tree blob, `blob0.dtb`, which is still what a FIT that `abr` cannot put back byte for byte is).
 
 ## Windows: the command line in UTF-8 (done, 17 Oct 2026)
 
@@ -1966,18 +1969,152 @@ said "done" and wrote what `unpack` would refuse, or a program that did what a s
   settings) found nothing, and neither did a longer campaign (seed 41, 2950 damaged directories); the next one (seed 42) was
   cut at 2400 of 2950 by a restart of the machine, with nothing found so far.
 
+## U-Boot FIT images (done, 31 Oct - 1 Nov 2026)
+
+A FIT image -- U-Boot's flattened image tree, what `mkimage -f image.its image.itb` makes -- is a flattened device tree whose
+`/images` hold the kernel, the ramdisks and the device trees and whose `/configurations` say which of them go together. It
+needed a layer for device trees first, three layers in all:
+
+- **`abr::fdt`** (`include/abr/fdt.hpp`, `src/fdt.cpp`; commit `57e8331`): a blob as nodes and properties in blob order, the
+  strings block as it was found (a name is looked up the way libfdt looks it up -- the first occurrence, or the tail of a
+  longer name --, a new name is appended, nothing is taken out), the memory reservation map, the header words that are not
+  sizes and the free space behind the strings. `Layout::canonical` says whether `build()` gives the blob back: it is false for
+  NOP tokens, a property after a subnode, bytes that are not zero in the padding of a node name or in the free space, blocks
+  out of order, a version other than 17 and a name that is not at the first place its text has -- such a blob parses, and
+  is a plain device tree to the layers above. Depth, number of nodes, the length of a name and the size of the strings block
+  are limited. *New on 1 Nov:* `Property::pad`, the bytes behind a value up to a multiple of 4, kept when one of them is not
+  zero. `mkimage -k <dir> -r` leaves what was in its memory behind the value of `hashed-nodes` (it depends on the content); a
+  signed FIT fell back to a plain device tree for that reason until the bytes were kept.
+- **`abr::dts`** (`include/abr/dts.hpp`, `src/dts.cpp`; the same commit): a tree as device tree source and back -- strings,
+  `<cells>`, `[bytes]`, `/bits/ 8|16|32|64`, `/incbin/("file")`, `/memreserve/`, comments --, with the line in every refusal.
+  What a tree of a blob does not need is refused, not skipped: labels and references (`&x`), expressions and macros,
+  `/delete-node/` and `/delete-property/`, `/include/`, `/plugin/`, a second root node, a node or a property twice. The bytes
+  of `Property::pad` are the one thing that is not the language: they are a comment right behind the property,
+  `hashed-nodes = "/"; /* abr: padding 98 3e b2 */`, which `dtc` and `mkimage` read as the comment it is and `abr` reads back
+  (a comment that is anywhere else, or does not fit the length of the value, is an error).
+- **`abr::fit`** (`include/abr/fit.hpp`, `src/fit.cpp`; 1 Nov): the images and the layout of a FIT.
+
+### What the layout is
+
+The data of an image is in the tree (`data`, `mkimage` without `-E`), or behind it: `mkimage -E` writes `data-size` and
+`data-offset` (counted from the end of the tree, which is taken to be a multiple of 4), `mkimage -E -p N` writes `data-size` and
+`data-position` (from the start of the file); `-B n` aligns what goes behind. `abr::fit::Layout` is the place (inline, offset,
+position), `align` (the biggest power of two that every place of an image is a multiple of), `end_align` (the zeros up to a
+multiple of it behind the last image, when there are some), `slack` (zeros behind the strings) and `tree_align`. The last one
+was found against `mkimage` itself: `-E` pads the end of the tree to a multiple of its `-B` (`totalsize` is the end of the
+strings, aligned), where without `-E` the free space is what `dtc` leaves (mkimage asks it for padding), which depends on how big
+the tree was when `dtc` wrote it. `tree_align` is derived -- the smallest power of two `t >= 4` with `align_up(used, t) == totalsize` -- and kept as
+`fit_tree_align`; when there is none the tree has `fdt_slack` zeros.
+
+### unpack and repack
+
+- `abr unpack`: `fit.its` (the tree as source, `data = /incbin/("kernel_1");`) and a file for every image: `kernel_1`,
+  `fdt_1.dtb`, `ramdisk_1.cpio`, other types `.bin` (the file is named for the node: letters, digits and underscores, never a
+  name of the manifest, of the envelope files or of a Windows device). The components go through the same pipeline as those of a
+  boot image: the codec of a compressed image is found and kept (`<prefix>_compression`), what was read is replayed when the file
+  is untouched, a ramdisk is also a directory with its `.meta` when it can be one, a trailer behind the FIT is `tail.bin` and the
+  zero fill of a partition is `pad_to`. The manifest has `type=fit`, `fit_data`, `fit_align`, `fit_end_align`, `fit_tree_align`,
+  `fdt_slack`, `fdt_last_comp_version`, `fdt_boot_cpuid_phys`, `fit_strings=kept` with `.abr_raw/fit_strings.bin`, and the hash of
+  the text (`fit_its_hash`, to know that it was edited).
+- A file that has `/images` and that `abr` cannot give back byte for byte is unpacked as the plain device tree it is, and
+  `unpack` and `info` say why: a tree that is not laid out the way `dtc` and libfdt write one, images that overlap, an image with
+  `data` and also `data-offset`, two images of one name, bytes that are not zero between the images, images some inline and some
+  behind, a number that is not a 32-bit number where one is read, a tree that does not come back from its own text. `open()` finds
+  this out by building the file again before it says yes.
+- `abr repack`: the text is read again (`dts::parse`), the files go back into `data`, the layout is kept when no image changed
+  size (the numbers `data-size`, `data-offset` / `data-position` of the text are used) and made again otherwise (each image at
+  the next multiple of `align` behind the one before; the properties are written again, a new one first in its node as `mkimage`
+  does). The hash nodes of an image whose data changed (a file that is not the unpacked one, an image put in, a `data = <...>`
+  edited in the text) are made again: crc32 (four bytes, big endian), md5, sha1, sha256, sha384, sha512, `value` first in a node
+  that has none; an algorithm abr does not know is left as it is and said. A compression property that does not agree with
+  the codec the data is stored in is warned of.
+- Signatures are never made again. When an image that a signature covers (its own, or one named by a configuration's
+  `signature-N`) changed, the repack names the signatures that no longer match; when only the text was edited and there are
+  signatures, it says so. `info` says how many there are. (`mkimage -F -k <keys> -r` signs an edited FIT whose data is in the
+  tree again; the tests do that, and `-F` is not used on a FIT with data behind the tree: it writes `data` next to
+  `data-offset`, and `abr` then reads the result as a plain device tree.)
+- A FIT in the kernel field of a ChromeOS (vboot) blob is unpacked as a FIT inside the wrapper (it was one device-tree blob
+  before): an untouched directory is the blob, a new kernel gives a blob whose signatures verify with the independent
+  `tests/tools/chromeos_tool.py`.
+- `abr identify`: "U-Boot FIT image (flattened image tree)". `abr info`: the description, the tree, one line per image (where
+  its data is, type, arch, os, compression, load, entry, hash algorithms, signatures), the configurations.
+
+### MD5 and SHA-384 in `src/sha.cpp`
+
+The hash nodes of a FIT image use them, with the ones that were there. MD5 as in RFC 1321; SHA-384 is the SHA-512 core with its
+own initial values and the digest cut to 48 bytes. `tests/tools/gen_sha_vectors.py` (Python's `hashlib`) makes 1008 vectors for each
+of the five algorithms; `abr_unit_tests sha-check` finds 5040 vectors and no mismatch (the portable implementation: the
+sandbox's CPU has no SHA extension, and md5 and sha384 have no hardware path in any case).
+
+### Verified by (narrowly: the full matrix is run once, after the format work)
+
+- Unit groups: `abr_unit_tests fdt` **11622 checks** (random trees, hand-built layouts, damaged blobs, the places of names, the dts
+  syntax and its round trip, the bytes behind a value), `abr_unit_tests fit` **25513 checks** (random FITs -- data of every length,
+  hash nodes of every algorithm, configurations -- through `open()` and `build()`, the layouts, the end of the tree, refusals, hash
+  nodes, signatures, padding, damaged files).
+- Files other tools made, `abr_unit_tests fdt-files` (58 files: 51 device trees of the real images, blobs of `dtc` with `-@`,
+  `-p` and `-V 16`, FITs of `mkimage`): 56 are canonical and come back byte for byte; the other two are a text file and a version
+  16 blob, refused / called not canonical as they should be. `fit-files` (41 files: FITs that `mkimage` made in the six layouts, signed ones among them, and the files that `abr` repacked of
+  them; a few are in the list twice): 40 are FITs that come back byte for byte; the one that is not is `resigned_E8.itb`, the file
+  `mkimage -F` made of an `-E` FIT, which has `data` and `data-offset` (refused with that reason, and unpacked as a plain device tree).
+- CLI, the new group of `tests/run_tests.sh` (ten blocks, **152 checks**, run on their own): FITs made by `mkimage` in six layouts
+  (the data in the tree, `-E`, `-E -B 8`, `-E -B 0x1000`, `-E -p 0x800`, `-E -p 0x1000 -B 8`) are unpacked, come back byte for
+  byte and are named by `identify` and `info` (18); a kernel of another size in each layout is the file `mkimage` makes of the same
+  text but for the clock it writes, with the hashes made again, `fit_tool.py verify` finding every hash right and `dumpimage`
+  extracting the new kernel and the device tree behind it (36); a trailer and a zero fill (8); a file put into the ramdisk
+  directory, `cpio` listing it and the md5 made again (12); a kernel and a ramdisk that are gzip streams, in two layouts --
+  unpacked decompressed with the codec in the manifest, an untouched directory is the image, another kernel and a file in the
+  ramdisk go back in as gzip streams whose hashes `fit_tool.py` finds right, `dumpimage` and `cpio` read them (20); edits of `fit.its` -- a load address changes that byte and nothing
+  else, a compression that says gzip over data that is not is warned of, an image put in with a hash node that has an algorithm
+  and no value gets its data, its place and its sha256 and is what `mkimage` makes of the same text (for the data in the tree the
+  trees are compared, not the bytes: the free space is `dtc`'s) (14); signed FITs, two layouts (13); device trees that have
+  `/images` and are not FITs (6); 19 refusals of `repack` (`fit.its` gone, a `fit_data` that is none of the three places, an
+  alignment that is not a power of two, a syntax error and its line, a file of an image gone or outside the directory, images
+  on top of each other, a tree grown into the first image, no `/images`, a value next to `/incbin/`, the strings of the tree gone
+  warned of); a FIT as the kernel of a ChromeOS blob (6). **Negative control: on the binary of `ee11ff0`, which has no FIT, the
+  group fails in all ten blocks** (PASS=0 FAIL=10). `tests/run_tests.sh` has the group before "paths that are not ASCII"; the
+  judges are `mkimage` and `dumpimage` (u-boot-tools 2025.10 here), `dtc` 1.7.0 and `tests/tools/fit_tool.py`, a reader of FIT
+  images of its own (the tree as libfdt reads it; the data where `data`, `data-offset` or `data-position` says it is; every hash
+  with `hashlib`); `dumpimage` is in `ABR_REQUIRE_ORACLES` of the workflow.
+- Not done in this round (the user's order of 31 Oct: all formats first): `tests/tools/fuzz_images.py` and `fuzz_repack.py` do not
+  have a FIT as a seed yet; the new unit tests have not been validated by mutation (planned: the padding ignored by `build()`,
+  dropped by the parser, never printed, a comment accepted anywhere, padding behind inline `data` taken, `recorded` sizes, hash
+  nodes not made again, `tree_align` broken); CI has not run the group (the versions of `mkimage` and `dtc` of its Ubuntu may be
+  other than the ones used here, and a different `mkimage` could write a tree in another way).
+
+### Not claimed
+
+- **No FIT image of a device has been tried** (none at hand); the images are those that `mkimage` and `dtc` make of a text of
+  the tests, and a FIT that some other build system makes may be laid out in another way; `abr` then says that it is a plain
+  device tree, and why.
+- `abr` checks no signature (the key of a configuration, `required`, the `hashed-nodes` list) and makes none.
+- `fit.its` is the part of the source language a tree needs: nothing that takes `dtc`'s preprocessor, labels or references.
+
 ## Next steps (in order)
 
-1. Remaining AIK parity: QCDT creation (Sony SIN and the ELF layouts are
-   done). The stages 2 and 3 of the user's own spec need a scope
-   decision before anything is built.
+1. The formats that are left, in this order, one commit each and only
+   narrow checks until all of them are in (the user's order of 31 Oct):
+   strict os/arch/image-type/compression names in `repack_uimage` (an
+   unknown name is 0 today, silently); QCDT creation (`dtbTool` v1-v3: a
+   table of the dtbs of a directory, chosen by `qcom,msm-id` /
+   `board-id` / `pmic-id`); MBN and the Qualcomm ELF loaders (the hash
+   segment, a SHA-256 per segment, the signature and the certificate chain
+   kept and named when what they cover changed); CPIO odc/binary as trees
+   and hard links; `loki patch`; what is left of dtb/MTK (an AVB footer on a
+   dtb, blobs separated by padding, the raw MTK header). Then one full run
+   of the whole matrix (see below). The stages 2 and 3 of the user's own
+   spec need a scope decision before anything is built (asked, not yet
+   answered).
 2. Housekeeping: AIK-like default levels as an opt-in, gzip OS-byte
    determinism, `zlib-ng` for faster gzip, splitting `main.cpp`.
 3. Run the CI matrix on every push (the workflow only runs on `main`, pull
    requests and manual dispatch: dispatch it with
    `gh api -X POST repos/<repo>/actions/workflows/build.yml/dispatches -f ref=<branch>`).
 
-CI status of the branch: run 40145515015 (commit `04d347c`, the bytes behind a uImage) green on all **six** jobs: the
+CI status of the branch: the newest run is 40763274252 (commit `ee11ff0`): five jobs green and the fuzz step of the ASan job red
+(a `terminal` finding, fixed in `501d515`); `501d515`, `5cb929f`, `57e8331` and the FIT work have had **no CI run** -- the next one
+is part of the matrix that is run once after the formats are done. The run before it, 40145515015 (commit `04d347c`, the bytes
+behind a uImage), was green on all **six** jobs: the
 annotations of the jobs say "462 passed, 0 failed" for linux g++-14, clang-20, the ASan+UBSan build and arm64 under qemu-user,
 "461 passed, 0 failed" for Windows under wine; android-arm64 only builds. The run before it, 40123468084 (commit `780f063`,
 padding behind the components), was green on the same six (447 passed, 446 for Windows); 40038351307 (commit `7bccfc0`, the
@@ -2220,7 +2357,8 @@ Useful as a checklist; wrong in places, and much wider than `abr`:
   after a payload change"* -- right, and now actually enforced (see above).
 - Stage 1 also lists **CPIO** (newc/crc/odc/binary), **MBN**, **FIT/ITB**
   and Qualcomm **ELF** loaders -- CPIO is done for newc/crc (odc and binary
-  are kept as files, see below); the others are not in abr yet (abr's ELF is
+  are kept as files, see below), FIT/ITB is done (1 Nov 2026, see "U-Boot FIT
+  images"); MBN and the Qualcomm ELF loaders are not in abr yet (abr's ELF is
   the Sony boot-image ELF). Stage 2/3 (Rockchip, Amlogic upgrade packages, MediaTek
   logo/md1img, Tegra BLOB/BCT, Samsung tar.md5, sparse) is a different and
   much larger scope than "the boot-image family"; some of it already has a
@@ -2233,8 +2371,12 @@ Useful as a checklist; wrong in places, and much wider than `abr`:
    AOSP test key or `--avb1-key/--avb1-cert`; self-contained RSA).
 2. ~~**CPIO ramdisk as a directory tree**~~ -- **done** for newc and crc
    (see "The ramdisk as a directory"); odc and binary archives stay files.
-3. Remaining AIK parity: QCDT creation (SIN, PXA, KRNL/RKCRC, AMONET, BLOB,
-   OSIP, LOKI, NOOK, ChromeOS are done).
-4. Spec stage 1 leftovers: MBN, FIT/ITB. Spec stages 2/3: scope decision.
+3. Remaining AIK parity: QCDT creation (`dtbTool`: a table made from
+   several dtbs) and `loki patch` (the search in an `aboot.img`, loki's table
+   of targets). Sony SIN, PXA, KRNL/RKCRC, AMONET, BLOB, OSIP, ChromeOS and
+   the unpack / repack of LOKI are done, NOOK and SIN with synthetic fixtures
+   only.
+4. Spec stage 1 leftovers: MBN and the Qualcomm ELF loaders, CPIO odc/binary
+   as trees and hard links (FIT/ITB is done). Spec stages 2/3: scope decision.
 5. Housekeeping: CI should run the quirk suite; `main.cpp` is ~1200 lines
    and should be split per format.

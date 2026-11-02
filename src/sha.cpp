@@ -618,7 +618,15 @@ constexpr uint64_t kSha512K[80] = {
 };
 }  // namespace
 
-Sha512::Sha512() {
+Sha512::Sha512(Variant variant) {
+    if (variant == Variant::SHA384) {
+        h_[0] = 0xcbbb9d5dc1059ed8ULL; h_[1] = 0x629a292a367cd507ULL;
+        h_[2] = 0x9159015a3070dd17ULL; h_[3] = 0x152fecd8f70e5939ULL;
+        h_[4] = 0x67332667ffc00b31ULL; h_[5] = 0x8eb44a8768581511ULL;
+        h_[6] = 0xdb0c2e0d64f98fa7ULL; h_[7] = 0x47b5481dbefa4fa4ULL;
+        digest_size_ = 48;
+        return;
+    }
     h_[0] = 0x6a09e667f3bcc908ULL; h_[1] = 0xbb67ae8584caa73bULL;
     h_[2] = 0x3c6ef372fe94f82bULL; h_[3] = 0xa54ff53a5f1d36f1ULL;
     h_[4] = 0x510e527fade682d1ULL; h_[5] = 0x9b05688c2b3e6c1fULL;
@@ -691,6 +699,94 @@ Bytes Sha512::finish() {
 
     Bytes out(64);
     for (int i = 0; i < 8; ++i) store_be64(out.data() + i * 8, h_[i]);
+    out.resize(digest_size_);
+    return out;
+}
+
+// -------------------------------------------------------------------- MD5 --
+
+namespace {
+// floor(2^32 * abs(sin(i + 1))), RFC 1321 3.4 (written out: the value must not depend on the sin() of the C library)
+constexpr uint32_t kMd5K[64] = {
+    0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
+    0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+    0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+    0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+    0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+    0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+    0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+    0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
+};
+constexpr int kMd5S[64] = {
+    7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+    4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+};
+}  // namespace
+
+Md5::Md5() {
+    h_[0] = 0x67452301; h_[1] = 0xefcdab89; h_[2] = 0x98badcfe; h_[3] = 0x10325476;
+}
+
+void Md5::process_block(const uint8_t block[64]) {
+    uint32_t m[16];
+    for (int i = 0; i < 16; ++i)
+        m[i] = uint32_t(block[i * 4]) | (uint32_t(block[i * 4 + 1]) << 8) | (uint32_t(block[i * 4 + 2]) << 16) |
+               (uint32_t(block[i * 4 + 3]) << 24);
+    uint32_t a = h_[0], b = h_[1], c = h_[2], d = h_[3];
+    for (int i = 0; i < 64; ++i) {
+        uint32_t f;
+        int g;
+        if (i < 16) { f = (b & c) | (~b & d); g = i; }
+        else if (i < 32) { f = (d & b) | (~d & c); g = (5 * i + 1) % 16; }
+        else if (i < 48) { f = b ^ c ^ d; g = (3 * i + 5) % 16; }
+        else { f = c ^ (b | ~d); g = (7 * i) % 16; }
+        f = f + a + kMd5K[i] + m[g];
+        a = d; d = c; c = b;
+        b = b + rotl32(f, kMd5S[i]);
+    }
+    h_[0] += a; h_[1] += b; h_[2] += c; h_[3] += d;
+}
+
+void Md5::update(const uint8_t* data, size_t len) {
+    total_bits_ += uint64_t(len) * 8;
+    while (len > 0) {
+        size_t n = std::min(len, size_t(64) - buffer_len_);
+        std::memcpy(buffer_ + buffer_len_, data, n);
+        buffer_len_ += n;
+        data += n;
+        len -= n;
+        if (buffer_len_ == 64) {
+            process_block(buffer_);
+            buffer_len_ = 0;
+        }
+    }
+}
+
+Bytes Md5::finish() {
+    const uint64_t bits = total_bits_;
+    auto absorb = [&](const uint8_t* p, size_t n) {
+        while (n > 0) {
+            size_t k = std::min(n, size_t(64) - buffer_len_);
+            std::memcpy(buffer_ + buffer_len_, p, k);
+            buffer_len_ += k;
+            p += k;
+            n -= k;
+            if (buffer_len_ == 64) {
+                process_block(buffer_);
+                buffer_len_ = 0;
+            }
+        }
+    };
+    uint8_t pad = 0x80;
+    absorb(&pad, 1);
+    uint8_t zero = 0;
+    while (buffer_len_ != 56) absorb(&zero, 1);
+    uint8_t lenbuf[8];
+    for (int i = 0; i < 8; ++i) lenbuf[i] = uint8_t(bits >> (8 * i));
+    absorb(lenbuf, 8);
+    Bytes out(16);
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 4; ++j) out[i * 4 + j] = uint8_t(h_[i] >> (8 * j));
     return out;
 }
 
@@ -706,14 +802,26 @@ Bytes sha256(const uint8_t* data, size_t len) {
     h.update(data, len);
     return h.finish();
 }
+Bytes sha384(const uint8_t* data, size_t len) {
+    Sha384 h;
+    h.update(data, len);
+    return h.finish();
+}
 Bytes sha512(const uint8_t* data, size_t len) {
     Sha512 h;
     h.update(data, len);
     return h.finish();
 }
+Bytes md5(const uint8_t* data, size_t len) {
+    Md5 h;
+    h.update(data, len);
+    return h.finish();
+}
 Bytes sha1(const Bytes& data) { return sha1(data.data(), data.size()); }
 Bytes sha256(const Bytes& data) { return sha256(data.data(), data.size()); }
+Bytes sha384(const Bytes& data) { return sha384(data.data(), data.size()); }
 Bytes sha512(const Bytes& data) { return sha512(data.data(), data.size()); }
+Bytes md5(const Bytes& data) { return md5(data.data(), data.size()); }
 
 bool sha_selftest() {
     const Bytes abc = {'a', 'b', 'c'};
@@ -733,6 +841,10 @@ bool sha_selftest() {
     ok = ok && hex(sha512(abc)) ==
                    "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39"
                    "a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f";
+    ok = ok && hex(sha384(abc)) ==
+                   "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed"
+                   "8086072ba1e7cc2358baeca134c825a7";
+    ok = ok && hex(md5(abc)) == "900150983cd24fb0d6963f7d28e17f72";
     return ok;
 }
 

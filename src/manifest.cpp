@@ -79,7 +79,7 @@ std::string Manifest::get(const std::string& key, const std::string& def) const 
 static std::string key_shown(const std::string& key) { return textquote::quote_shown(key); }
 
 // What a name that is to be found in the directory of the unpack must not be, or "" when it is fine.
-static const char* path_problem(const std::string& v) {
+const char* path_problem(const std::string& v) {
     if (v.empty()) return "";
     for (unsigned char c : v)
         if (c < 0x20 || c == 0x7F) return "has a control character in it";

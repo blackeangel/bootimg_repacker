@@ -14,11 +14,12 @@
 //     nothing is ever taken out, so a name that is no longer used stays;
 //   * the memory reservation map and the three header words that are not sizes (version, last_comp_version,
 //     boot_cpuid_phys);
-//   * how much free space the blob has behind its strings (libfdt, which mkimage uses, leaves some).
+//   * how much free space the blob has behind its strings (libfdt, which mkimage uses, leaves some);
+//   * the bytes behind a value that are not zero (Property::pad).
 //
 // The layout is the one dtc and libfdt write: header (40 bytes), the reservation map, the structure block, the strings
 // block, free space. A blob that is laid out in another way (the blocks in another order, with gaps, an older version,
-// bytes that are not zero in the free space or in the padding of a name or a value, NOP tokens, a structure block with
+// bytes that are not zero in the free space or in the padding of a node name, NOP tokens, a structure block with
 // something behind its END) still parses, but `Layout::canonical` says it is not what build() writes; the caller that needs
 // the bytes back (fit.cpp) says no to it.
 //
@@ -40,6 +41,9 @@ namespace abr::fdt {
 inline constexpr size_t kMaxDepth = 64;
 inline constexpr size_t kMaxItems = 1u << 20;  // nodes and properties together
 
+// The number of bytes that follow a value of this many bytes, up to a multiple of 4.
+inline constexpr size_t padding_size(size_t value_size) { return (4 - value_size % 4) % 4; }
+
 struct Property {
     std::string name;
     Bytes value;
@@ -47,6 +51,11 @@ struct Property {
     // that has its bytes. A tree with a property that has an `incbin` cannot be built until the caller has put the bytes
     // in `value` and cleared it.
     std::string incbin;
+    // The bytes behind the value, up to a multiple of 4, when they are not all zero: a tool that makes room for a property and does
+    // not clear it leaves what was there (mkimage does behind the `hashed-nodes` of a signature), and the blob is only that blob with
+    // them. Empty means zeros, which is what dtc writes. It counts only when it is as long as the padding of `value` is
+    // (padding_size()): another length means the value is not the one it was behind, and the padding is zeros.
+    Bytes pad;
 };
 
 struct Node {

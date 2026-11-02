@@ -2,6 +2,7 @@
 #include "abr/dts.hpp"
 
 #include <cstdio>
+#include <optional>
 
 #include "abr/textquote.hpp"
 
@@ -106,7 +107,17 @@ void print_node(std::string& out, const fdt::Node& n, size_t depth, bool root) {
             }
             out += ']';
         }
-        out += ";\n";
+        out += ';';
+        if (!p.pad.empty() && p.pad.size() == fdt::padding_size(p.value.size())) {
+            out += " /* abr: padding";
+            for (uint8_t b : p.pad) {
+                char buf[8];
+                std::snprintf(buf, sizeof buf, " %02x", b);
+                out += buf;
+            }
+            out += " */";
+        }
+        out += '\n';
     }
     if (!n.props.empty() && !n.children.empty()) out += '\n';
     for (size_t i = 0; i < n.children.size(); ++i) {
@@ -142,12 +153,14 @@ public:
             } else if (c == '/' && i_ + 1 < s_.size() && s_[i_ + 1] == '*') {
                 const size_t start_line = line_;
                 i_ += 2;
+                const size_t body_from = i_;
                 for (;;) {
                     if (i_ + 1 >= s_.size()) {
                         line_ = start_line;
                         fail("a comment that is not closed");
                     }
                     if (s_[i_] == '*' && s_[i_ + 1] == '/') {
+                        note_comment(s_.substr(body_from, i_ - body_from), start_line);
                         i_ += 2;
                         break;
                     }
@@ -158,6 +171,24 @@ public:
                 return;
             }
         }
+    }
+
+    // The comment `abr: padding 98 3e b2` that comes right behind the ';' that ends a property (print() writes it there): the bytes
+    // behind the value that are not zeros (fdt::Property::pad). `at_line` is the line it is on. A comment of this kind anywhere
+    // else is an error: it would be lost.
+    std::optional<Bytes> take_pad(size_t& at_line) {
+        pad_allowed_ = true;
+        skip();
+        pad_allowed_ = false;
+        std::optional<Bytes> r = std::move(pad_);
+        pad_.reset();
+        at_line = pad_line_;
+        return r;
+    }
+
+    [[noreturn]] void fail_at(size_t at_line, const std::string& why) {
+        line_ = at_line;
+        fail(why);
     }
 
     bool eof() {
@@ -306,10 +337,46 @@ public:
     void raw_advance() { ++i_; }
 
 private:
+    // A block comment that has been read: one that starts with "abr: padding" is what take_pad() hands over.
+    void note_comment(std::string_view body, size_t at_line) {
+        constexpr std::string_view kTag = "abr: padding";
+        auto blank = [](char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; };
+        size_t a = 0, b = body.size();
+        while (a < b && blank(body[a])) ++a;
+        while (b > a && blank(body[b - 1])) --b;
+        const std::string_view text = body.substr(a, b - a);
+        if (!text.starts_with(kTag)) return;
+        const size_t saved = line_;
+        line_ = at_line;
+        if (!pad_allowed_) fail("the comment \"abr: padding\" is not right behind a property (it tells what is behind the value of the one before it)");
+        if (pad_) fail("two comments \"abr: padding\" behind one property");
+        const std::string_view rest = text.substr(kTag.size());
+        Bytes bytes;
+        for (size_t i = 0; i < rest.size();) {
+            if (rest[i] == ' ' || rest[i] == '\t') {
+                ++i;
+                continue;
+            }
+            if (i + 2 > rest.size() || hex_value(rest[i]) < 0 || hex_value(rest[i + 1]) < 0 ||
+                (i + 2 < rest.size() && rest[i + 2] != ' ' && rest[i + 2] != '\t'))
+                fail("the comment \"abr: padding\" lists bytes, each as two hexadecimal digits");
+            bytes.push_back(static_cast<uint8_t>(hex_value(rest[i]) * 16 + hex_value(rest[i + 1])));
+            i += 2;
+        }
+        if (bytes.empty() || bytes.size() > 3)
+            fail("the comment \"abr: padding\" lists " + std::to_string(bytes.size()) + " bytes; the padding behind a value is 1 to 3");
+        pad_ = std::move(bytes);
+        pad_line_ = at_line;
+        line_ = saved;
+    }
+
     std::string_view s_;
     std::string what_;
     size_t i_ = 0;
     size_t line_ = 1;
+    bool pad_allowed_ = false;
+    std::optional<Bytes> pad_;
+    size_t pad_line_ = 0;
 };
 
 void put_be(Bytes& out, uint64_t v, unsigned bytes) {
@@ -423,6 +490,21 @@ void parse_body(Reader& r, fdt::Node& node, size_t depth, size_t& items) {
                 r.fail("expected '=', '{' or ';' after the name " + textquote::quote_shown(name));
             }
             r.expect(';', "at the end of the property");
+            size_t pad_line = 0;
+            if (std::optional<Bytes> pad = r.take_pad(pad_line)) {
+                if (!p.incbin.empty())
+                    r.fail_at(pad_line, "the comment \"abr: padding\" is behind the property " + textquote::quote_shown(name) +
+                                            ", whose value is a file: its padding is the one of the bytes of the file");
+                if (pad->size() != fdt::padding_size(p.value.size()))
+                    r.fail_at(pad_line, "the comment \"abr: padding\" behind the property " + textquote::quote_shown(name) + " lists " +
+                                            std::to_string(pad->size()) + " byte(s), and its value of " + std::to_string(p.value.size()) +
+                                            " bytes has " + std::to_string(fdt::padding_size(p.value.size())) + " of padding");
+                for (uint8_t b : *pad)
+                    if (b != 0) {
+                        p.pad = std::move(*pad);
+                        break;
+                    }
+            }
             node.props.push_back(std::move(p));
         }
     }

@@ -144,10 +144,14 @@ int run_sha_check(const char* blob_path, const char* expect_path) {
             return 2;
         }
         Bytes got;
-        if (alg == "sha1")
+        if (alg == "md5")
+            got = hash_chunked<hash::Md5>(blob.data(), len, chunk);
+        else if (alg == "sha1")
             got = hash_chunked<hash::Sha1>(blob.data(), len, chunk);
         else if (alg == "sha256")
             got = hash_chunked<hash::Sha256>(blob.data(), len, chunk);
+        else if (alg == "sha384")
+            got = hash_chunked<hash::Sha384>(blob.data(), len, chunk);
         else if (alg == "sha512")
             got = hash_chunked<hash::Sha512>(blob.data(), len, chunk);
         else {
@@ -203,6 +207,8 @@ int run_manifest_tests();  // manifest_test.cpp
 int run_compression_tests();  // compression_test.cpp
 int run_fdt_tests();  // fdt_test.cpp
 int run_fdt_files(int argc, char** argv);  // fdt_test.cpp
+int run_fit_tests();  // fit_test.cpp
+int run_fit_files(int argc, char** argv);  // fit_test.cpp
 
 int main(int argc, char** argv) {
     set_binary_stdio();
@@ -217,6 +223,8 @@ int main(int argc, char** argv) {
         if (cmd == "compression") return run_compression_tests();
         if (cmd == "fdt") return run_fdt_tests();
         if (cmd == "fdt-files") return run_fdt_files(argc, argv);
+        if (cmd == "fit") return run_fit_tests();
+        if (cmd == "fit-files") return run_fit_files(argc, argv);
         if (cmd == "sha-impl") {
             std::cout << hash::implementation_name() << "\n";
             return hash::sha_selftest() ? 0 : 1;

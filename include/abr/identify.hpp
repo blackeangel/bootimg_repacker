@@ -67,6 +67,7 @@ enum class Kind {
     VBMETA,
     DTBO,
     DTB,
+    FIT,  // a flattened device tree with an /images node: a U-Boot FIT image
 };
 
 enum class Patch { NONE, LOKI, AMONET };

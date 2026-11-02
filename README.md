@@ -17,6 +17,7 @@ build-time contents:
 | dtb | raw or concatenated Flattened Device Tree blobs |
 | vbmeta (AVB) | `vbmeta.img`, `vbmeta_system.img`, and AVB footers appended to other partitions |
 | uboot | U-Boot's legacy `mkimage`/uImage container |
+| U-Boot FIT image | what `mkimage -f` makes (`.itb`, `.fit`): a flattened device tree whose `/images` hold the kernel, ramdisks and device trees, the data in the tree or behind it (`-E`, `-E -B n`, `-E -p n`); see below |
 | ELF boot image | Sony/Xperia-style boot images that are an ELF file with the kernel/ramdisk as segments (the `kernel.elf` of an Xperia: kernel, ramdisk, `ipl`, `rpm`, command line); see below |
 | Sony SIN (v1-v3) | the `.sin` files of Xperia firmware (`boot.sin`, `kernel.sin`, `FOTAKernel.sin`, ...): the container comes off, what is inside is unpacked as it would be on its own; see below |
 | Rockchip KRNL | Rockchip's `kernel.img` and `boot.img` (`"KRNL"`, the size, a kernel or a gzip cpio ramdisk, Rockchip's own CRC) |
@@ -439,6 +440,46 @@ detected; will be repacked using AOSP format!") and writes an AOSP boot image. `
 OS/ABI byte is not `0x61` is no boot image to the signature file of Android Image Kitchen (`abr identify` says `ELF (ARM)`, as
 `file` does, and AIK stops with "Unrecognized format."); `abr unpack` opens it all the same.
 
+### U-Boot FIT images
+
+A FIT image (U-Boot's flattened image tree, what `mkimage -f image.its image.itb` makes) is a flattened device tree: `/images` holds the
+kernel, the ramdisks and the device trees, `/configurations` says which of them go together, and an image has hash nodes (`crc32`,
+`md5`, `sha1`, `sha256`, `sha384`, `sha512`) and perhaps signatures. The data of an image is in the tree (`data`), or behind it:
+`mkimage -E` takes it out and writes `data-size` and `data-offset` (counted from the end of the tree, rounded up to 4), `mkimage -E -p N`
+writes `data-size` and `data-position` (counted from the start of the file), and `-B n` aligns what goes behind.
+
+`abr unpack` writes `fit.its`, the tree as device tree source, and a file for every image: `data = /incbin/("kernel_1");` in
+`fit.its` names the file of `kernel-1`, a `flat_dt` image is `fdt_1.dtb`, a ramdisk is `ramdisk_1.cpio` and, as in a boot image, a
+directory `ramdisk_1/` with `ramdisk_1.meta` (an image that is a compressed stream, a kernel or a ramdisk, is decompressed for
+editing, and compressed again with the codec it had; the tests do that with gzip). `abr repack` puts it together again: an untouched directory is the file byte for byte -- the places of the images, how
+the end of the tree is padded (to the `-B` it was made with, or by the number of bytes it had), the free space behind the strings, the
+strings block as it was, the bytes that mkimage leaves behind the `hashed-nodes` of a signature (they are in `fit.its` as a comment
+`/* abr: padding 98 3e b2 */` right behind the property), a trailer or zero fill behind the FIT.
+
+What can be edited: the file of an image (an image that changed size moves the ones behind it: each goes to the next multiple of the
+alignment the FIT had, and `data-size` and `data-offset` / `data-position` are written again), the ramdisk as a directory, and `fit.its`
+itself -- any property, an image put in (a node with `data = /incbin/("file")`; a `hash-1 { algo = "sha256"; };` in it gets its `value`),
+an image taken out. The hash nodes of an image whose data changed are made again; a hash with an algorithm `abr` does not know is left
+as it is, and said. The text is the part of the device tree source language that a tree needs: strings, `<cells>`, `[bytes]`, `/bits/`,
+`/incbin/`, `/memreserve/`, comments; labels, references (`&node`), expressions, macros, `/include/`, `/delete-node/`, `/delete-property/` and a node or a
+property twice are refused, with the line.
+
+`abr` signs no FIT image and checks no signature (`info` says how many there are, and which images and configurations have them). A
+signature node (`signature-1` in a configuration or an image) is kept as it is, and when an edit makes it wrong -- an image it covers
+changed, or `fit.its` was edited -- the repack says which ones. A FIT that was edited can be signed again with `mkimage -F -k <keys> -r
+image.itb` (the tests do that for a FIT with its data in the tree).
+
+A file that has `/images` but that `abr` cannot give back byte for byte as a FIT (a tree that is not laid out the way `dtc` and libfdt
+write one, images that overlap, an image with `data` and also `data-offset`, two images of one name, bytes that are not zero between the
+images, ...) is unpacked as a plain device tree, and `unpack` and `info` say why. A FIT image in the kernel field of a ChromeOS (vboot)
+blob is unpacked as a FIT inside the wrapper.
+
+The tests make FIT images with `mkimage` in six layouts (the data in the tree, `-E`, `-E -B 8`, `-E -B 0x1000`, `-E -p 0x800`,
+`-E -p 0x1000 -B 8`), also signed with `-k`, and judge `abr` by `mkimage` (an image with a new kernel, or an image put in, is the file
+`mkimage` makes of the same text, but for the time it writes and the signature that was not made again), by `dumpimage` (it extracts the
+images of what `abr` wrote) and by `tests/tools/fit_tool.py`, a reader of FIT images of its own that checks every hash with `hashlib`.
+No FIT image of a device has been tried.
+
 ### Threads and compression levels
 
 `abr` uses several cores where that pays: the components of an image (kernel,
@@ -550,6 +591,8 @@ this in the manifest / as side files and writes it back:
   (`section padding:`). Dumps whose last padding was trimmed keep working: the bytes the dump holds are kept, and the
   rebuilt image ends where the dump did;
 - a **Marvell PXA** header (`pxa=true`, and its `unknown` word);
+- of a **FIT image** the layout the images had, the free space and the padding of the tree and the strings block (see
+  "U-Boot FIT images");
 - the text of `manifest.txt` itself. It is plain text, one `key=value` per line, and a value that would not read
   back as it was -- white space at either end (a command line that ends in a space: there are such images), a line
   break, a quote or a backslash, a control byte -- is written in double quotes with the escapes of C (`\n`, `\t`,
@@ -662,7 +705,8 @@ Pass the Windows build instead and the suite runs the real `abr.exe` under
 code paths (the SHA1/SHA2 instructions) without a device:
 `ABR_RUNNER="qemu-aarch64 -cpu max" ./tests/run_tests.sh build-arm64/abr`.
 
-The suite needs `python3`, `dtc`, `mkimage` and `openssl` on the PATH. When
+The suite needs `python3`, `dtc`, `mkimage` and `openssl` on the PATH (`dumpimage`, which comes with `mkimage`, is a judge of
+the FIT checks and is not needed to run the rest). When
 `gzip`, `lz4`, `zstd`, `xz`, `bzip2` and `lzop` are installed it also feeds
 what `abr` compressed to those programs (a missing one skips only that
 check). The
@@ -732,11 +776,11 @@ runs it again.)
 
 Beyond those, the suite compares `abr` with the programs Android Image Kitchen runs for the formats `abr` opens by
 itself -- `rkcrc`, `blobpack` / `blobunpack`, `mboot`, `loki_tool`, `pxa-mkbootimg` / `pxa-unpackbootimg`, `sony_dump`,
-`elftool` (and `futility`, GNU `cpio`). They are not part of this repository (several have no licence file):
+`elftool` (and `futility`, GNU `cpio`, and `mkimage` / `dumpimage` for the FIT images). They are not part of this repository (several have no licence file):
 `.github/scripts/build_oracles.sh <directory>` fetches them at the commits the tests were written against, compiles
 them and prints the variables that tell the suite where they are (`ABR_RKCRC`, `ABR_BLOBPACK`, `ABR_BLOBUNPACK`,
 `ABR_MBOOT`, `ABR_LOKI_TOOL`, `PXA_MKBOOTIMG`, `PXA_UNPACKBOOTIMG`, `ABR_SONY_DUMP`, `ABR_ELFTOOL`). A judge that is not
-there is a note in its section and the comparisons with it are skipped; `ABR_REQUIRE_ORACLES=futility,cpio,rkcrc,blobtools,mboot,loki,pxa,sony_dump,elftool`
+there is a note in its section and the comparisons with it are skipped; `ABR_REQUIRE_ORACLES=futility,cpio,rkcrc,blobtools,mboot,loki,pxa,sony_dump,elftool,dumpimage`
 (any of those names) makes a missing one a failure instead, which is how the CI runs the suite.
 
 ### Cross-compiling
@@ -780,7 +824,8 @@ beyond what every Android system already provides.
 
 ### Cryptography: nothing external
 
-`abr` links no crypto library. SHA-1/256/512, big-integer arithmetic,
+`abr` links no crypto library. MD5, SHA-1/256/384/512 (the hash nodes of a FIT image use all of them, with CRC-32),
+big-integer arithmetic,
 RSA PKCS#1 v1.5 signing and verification, and the small DER/PEM/X.509
 reader that key files need are all part of the binary (`src/bigint.cpp`,
 `src/rsa.cpp`, `src/asn1.cpp`, `src/sha.cpp`), so `--avb-key` works the
@@ -956,8 +1001,8 @@ Two smaller gaps:
   `abr identify` already names it; what is missing is unpacking and packing
   it. See `PROGRESS.md` for the plan. (Sony SIN is read, and never written:
   the container is Sony's. SIN v4 and v5 are not read.)
-- U-Boot's newer FIT (Flattened Image Tree) format -- only the older
-  legacy `mkimage` container is supported.
+- Signatures of a FIT image (checking them, making them): the signature nodes are kept, and the repack says which an edit makes
+  wrong.
 - Filesystems (ext4, F2FS, EROFS, SquashFS) and sparse images: out of
   scope; see the sibling tools in the same suite.
 

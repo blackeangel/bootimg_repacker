@@ -32,7 +32,10 @@
 #include "abr/compression.hpp"
 #include "abr/dtb.hpp"
 #include "abr/dtbo.hpp"
+#include "abr/dts.hpp"
 #include "abr/envelope.hpp"
+#include "abr/fdt.hpp"
+#include "abr/fit.hpp"
 #include "abr/identify.hpp"
 #include "abr/legacy/amonet.hpp"
 #include "abr/legacy/avb1.hpp"
@@ -87,7 +90,7 @@ std::string tails_text(std::initializer_list<std::pair<const char*, const Bytes*
 
 // ------------------------------------------------------------ detection --
 
-enum class Fmt { BOOT, VENDOR_BOOT, DTBO, DTB, VBMETA, UIMAGE, ELF_BOOT, KRNL, BLOB, OSIP, CHROMEOS, UNKNOWN };
+enum class Fmt { BOOT, VENDOR_BOOT, DTBO, DTB, FIT, VBMETA, UIMAGE, ELF_BOOT, KRNL, BLOB, OSIP, CHROMEOS, UNKNOWN };
 
 // Where the "ANDROID!" container starts: within the first kMagicSearchLimit bytes (a vendor
 // wrapper in front of it), or -- Barnes & Noble Nook images -- right behind the fixed-size
@@ -111,7 +114,7 @@ Fmt detect_format(const Bytes& d) {
     if (d.size() >= 4) {
         uint32_t be = (uint32_t(d[0]) << 24) | (uint32_t(d[1]) << 16) | (uint32_t(d[2]) << 8) | d[3];
         if (be == kDtTableMagic || be == kAcpioTableMagic) return Fmt::DTBO;
-        if (be == kFdtMagic) return Fmt::DTB;
+        if (be == kFdtMagic) return fit::looks_like(d) ? Fmt::FIT : Fmt::DTB;
         if (be == kUimageMagic) return Fmt::UIMAGE;
     }
     if (BlobImage::looks_like(d)) return Fmt::BLOB;
@@ -194,6 +197,7 @@ const char* fmt_name(Fmt f) {
         case Fmt::VENDOR_BOOT: return "vendor_boot";
         case Fmt::DTBO: return "dtbo";
         case Fmt::DTB: return "dtb";
+        case Fmt::FIT: return "fit";
         case Fmt::VBMETA: return "vbmeta";
         case Fmt::UIMAGE: return "uimage";
         case Fmt::ELF_BOOT: return "elf_boot";
@@ -211,6 +215,7 @@ Fmt fmt_from_name(const std::string& s) {
     if (s == "vendor_boot") return Fmt::VENDOR_BOOT;
     if (s == "dtbo") return Fmt::DTBO;
     if (s == "dtb") return Fmt::DTB;
+    if (s == "fit") return Fmt::FIT;
     if (s == "vbmeta") return Fmt::VBMETA;
     if (s == "uimage") return Fmt::UIMAGE;
     if (s == "elf_boot") return Fmt::ELF_BOOT;
@@ -603,9 +608,11 @@ void check_unpacks_as_is(const Bytes& stored, const std::string& prefix, const s
 // by what changed since unpacking, not by file times: the file by the hash of its contents, the
 // directory by the hash of the archive that is built from it. Nothing changed: the bytes the image
 // had are replayed. One changed: that one wins. Both: abr cannot merge them and says so, unless
-// --ramdisk-from names the one to use.
+// --ramdisk-from names the one to use. `replayed`, when given, says which of the two it was: true
+// for the bytes the image had, false for a component that was made (compressed) again.
 Bytes load_component(const Manifest& m, const fs::path& dir, const std::string& prefix,
-                     const RepackOptions& opt) {
+                     const RepackOptions& opt, bool* replayed = nullptr) {
+    if (replayed) *replayed = false;
     const std::string key = prefix + "_file";
     if (!m.has(key)) return {};
     const std::string filename = m.get_path(key);
@@ -660,6 +667,7 @@ Bytes load_component(const Manifest& m, const fs::path& dir, const std::string& 
     if (original && fs::exists(raw_path)) {
         result = read_file(raw_path);  // untouched: the very bytes the image had
         check_raw_copy(raw_path, result, stored_hash, filename);
+        if (replayed) *replayed = true;
     } else {
         if (use_tree) {
             for (const std::string& n : report.notes) note(n);
@@ -695,7 +703,9 @@ Bytes load_component(const Manifest& m, const fs::path& dir, const std::string& 
 // load_component() for several components at once, on several threads (the
 // recompression of an edited one is where the time goes). In input order.
 std::vector<Bytes> load_components(const Manifest& m, const fs::path& dir,
-                                   const std::vector<std::string>& prefixes, const RepackOptions& opt) {
+                                   const std::vector<std::string>& prefixes, const RepackOptions& opt,
+                                   std::vector<char>* replayed = nullptr) {
+    if (replayed) replayed->assign(prefixes.size(), 0);
     std::vector<uintmax_t> size(prefixes.size(), 0);
     std::vector<size_t> order(prefixes.size());
     for (size_t i = 0; i < prefixes.size(); ++i) {
@@ -710,7 +720,9 @@ std::vector<Bytes> load_components(const Manifest& m, const fs::path& dir,
     std::vector<Bytes> out(prefixes.size());
     par::for_each(prefixes.size(), [&](size_t k) {
         const size_t i = order[k];
-        out[i] = load_component(m, dir, prefixes[i], opt);
+        bool again = false;
+        out[i] = load_component(m, dir, prefixes[i], opt, &again);
+        if (replayed) (*replayed)[i] = again ? 1 : 0;
     });
     return out;
 }
@@ -1597,6 +1609,268 @@ Bytes repack_uimage(const Manifest& m, const fs::path& dir, const RepackOptions&
     img.name_tail = m.get_tail("name_tail");
     img.data = load_raw(m, dir, "data");
     return assemble_envelope(m, dir, img.build(), opt);
+}
+
+// ----------------------------------------------------------------- fit --
+//
+// A U-Boot FIT image (abr/fit.hpp). `fit.its` is the tree of it as text. The data of every image is a file of its own, named for the
+// node of the image (kernel-1 is `kernel_1`, fdt@1 is `fdt_1.dtb`, ramdisk-1 is `ramdisk_1.cpio` and the directory `ramdisk_1/`), and
+// `data = /incbin/("file")` says in fit.its where it goes. An image whose data was behind the tree has such a `data` too, and keeps its
+// data-size and data-offset (data-position): repack makes them again when the size of an image changed. What the text cannot say is
+// kept beside it: the strings block of the tree in .abr_raw/fit_strings.bin, and in the manifest where the images were (`fit_data`:
+// inline, offset or position), what they are aligned to, how the end of the tree is padded (to a multiple of `fit_tree_align`, or by
+// `fdt_slack` bytes) and the words of the header that are not sizes.
+// A file that this cannot give back byte for byte is not unpacked as a FIT: it is a dtb, and unpack says why.
+
+std::string ascii_lower(std::string s) {
+    for (char& c : s)
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    return s;
+}
+
+// The name of a component for the node of an image: letters, digits and underscores (what a manifest takes for a name).
+std::string fit_word(const std::string& node_name) {
+    std::string s;
+    for (unsigned char c : node_name) {
+        if (s.size() == 40) break;
+        const bool plain = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+        s += plain ? static_cast<char>(c) : '_';
+    }
+    return s.empty() ? "image" : s;
+}
+
+// What Windows takes for a device whatever the extension: such a name is not given to a file.
+bool is_device_file_name(const std::string& lower) {
+    if (lower == "con" || lower == "prn" || lower == "aux" || lower == "nul") return true;
+    return lower.size() == 4 && (lower.compare(0, 3, "com") == 0 || lower.compare(0, 3, "lpt") == 0) && lower[3] >= '1' && lower[3] <= '9';
+}
+
+struct FitName {
+    std::string prefix;    // the component's name in the manifest
+    std::string filename;  // its file
+};
+
+// One name for every image, none that another name of the directory or a key of the manifest could be (prefix, tail, fit, fdt and
+// type are the beginnings of keys of its own; the files are those of the envelope, the manifest and the text).
+std::vector<FitName> fit_names(const std::vector<fit::Image>& images) {
+    static const std::set<std::string> reserved_prefix = {"prefix", "tail", "fit", "fdt", "type", "pad", "core", "component"};
+    static const std::set<std::string> reserved_file = {"manifest.txt", "fit.its", "prefix.bin", "tail.bin"};
+    std::set<std::string> used;  // in lower case: a directory may be on a file system that does not tell the cases apart
+    std::vector<FitName> out;
+    for (const fit::Image& im : images) {
+        std::string word = fit_word(im.name);
+        if (is_device_file_name(ascii_lower(word))) word = "img_" + word;
+        const char* ext = im.type == "ramdisk" ? ".cpio" : im.type == "flat_dt" ? ".dtb" : im.type == "kernel" ? "" : ".bin";
+        std::string prefix = word;
+        for (unsigned n = 2; used.count(ascii_lower(prefix)) || reserved_prefix.count(ascii_lower(prefix)) ||
+                             reserved_file.count(ascii_lower(prefix + ext));
+             ++n)
+            prefix = word + "_" + std::to_string(n);
+        used.insert(ascii_lower(prefix));
+        out.push_back({prefix, prefix + ext});
+    }
+    return out;
+}
+
+// The image's own idea of its compression (the `compression` property) against the codec its data is stored with. "none" is no
+// claim: a ramdisk that is a gzip file is "none" for U-Boot, which hands it to the kernel as it is.
+bool fit_compression_agrees(const std::string& said, const std::string& stored) {
+    if (said.empty() || said == "none" || said == stored) return true;
+    if (said == "lz4" && stored == "lz4_legacy") return true;
+    static const std::set<std::string> known = {"gzip", "bzip2", "lzma", "lzo", "lz4", "zstd"};
+    return known.count(said) == 0;
+}
+
+bool unpack_fit(const Bytes& data, const fs::path& dir, const UnpackOptions& uo, std::string& why) {
+    std::optional<fit::Opened> opened = fit::open(data, why);
+    if (!opened) return false;
+    fit::Opened& o = *opened;
+    fdt::Node* images = o.tree.root.find_child("images");
+    const std::vector<FitName> names = fit_names(o.images);
+
+    std::vector<ComponentSource> sources;
+    for (size_t i = 0; i < o.images.size(); ++i) sources.push_back({&o.images[i].data, names[i].filename});
+    std::vector<DecodedComponent> parts = save_components(dir, sources);
+
+    Manifest m;
+    m.set("type", "fit");
+    m.set("fit_file", "fit.its");
+    m.set("fit_data", fit::place_name(o.layout.place));
+    if (o.layout.place != fit::Place::INLINE) {
+        m.set_u32("fit_align", static_cast<uint32_t>(o.layout.align));
+        m.set_u32("fit_end_align", static_cast<uint32_t>(o.layout.end_align));
+        if (o.layout.tree_align) m.set_u32("fit_tree_align", static_cast<uint32_t>(o.layout.tree_align));
+    }
+    m.set_u32("fdt_slack", static_cast<uint32_t>(o.layout.slack));
+    m.set_u32("fdt_last_comp_version", o.tree.last_comp_version);
+    m.set_u32("fdt_boot_cpuid_phys", o.tree.boot_cpuid_phys);
+    fs::create_directories(dir / ".abr_raw");
+    write_file(dir / ".abr_raw" / "fit_strings.bin", o.tree.strings);
+    m.set("fit_strings", "kept");
+
+    uint32_t recorded = 0;
+    for (size_t i = 0; i < o.images.size(); ++i) {
+        if (!parts[i].present) continue;  // an image without data is `data;` in the text
+        record_component(m, names[i].prefix, names[i].filename, parts[i]);
+        m.set("component" + std::to_string(recorded++) + "_prefix", names[i].prefix);
+        images->children[o.images[i].index].find_prop("data")->incbin = names[i].filename;
+    }
+    m.set_u32("fit_components", recorded);
+
+    std::vector<TreeJob> jobs;
+    for (size_t i = 0; i < o.images.size(); ++i)
+        if (o.images[i].type == "ramdisk" && parts[i].present) jobs.push_back({names[i].prefix, names[i].filename, &parts[i]});
+    save_ramdisk_trees(m, dir, jobs, uo);
+
+    const std::string text =
+        "// A U-Boot FIT image, as abr unpacked it. `data = /incbin/(\"file\")` is the data of an image: the file is in this directory\n"
+        "// (data-size and data-offset or data-position are made again by repack when the size of an image changed).\n\n" +
+        dts::print(o.tree);
+    write_file(dir / "fit.its", reinterpret_cast<const uint8_t*>(text.data()), text.size());
+    m.set_hex("fit_its_hash", hash::sha256(reinterpret_cast<const uint8_t*>(text.data()), text.size()));
+
+    const Envelope env = Envelope::capture(data, 0, o.consumed);
+    save_envelope(m, dir, env, data, 0, o.consumed);
+    if (!env.tail.empty()) note(std::to_string(env.tail.size()) + " bytes after the FIT are kept verbatim (tail.bin)");
+    for (const std::string& w : fit::wrong_hashes(o.tree, o.images)) warn(w);
+    std::cout << "fit: " << o.images.size() << (o.images.size() == 1 ? " image" : " images") << ", "
+              << (o.layout.place == fit::Place::INLINE ? "the data is in the tree"
+                  : o.layout.place == fit::Place::OFFSET ? "the data is behind the tree (data-offset)"
+                                                          : "the data is behind the tree (data-position)")
+              << " -> " << (dir / "fit.its").generic_string() << "\n";
+    m.save(dir / "manifest.txt", "abr fit manifest -- edit fit.its or the files of the images, then `abr repack " + dir.string() + " -o out.itb`");
+    return true;
+}
+
+Bytes repack_fit(const Manifest& m, const fs::path& dir, const RepackOptions& opt) {
+    const std::string its_name = m.get_path("fit_file", "fit.its");
+    const Bytes text = read_file(dir / its_name);
+    fdt::Tree tree = dts::parse(std::string_view(reinterpret_cast<const char*>(text.data()), text.size()), its_name);
+    tree.last_comp_version = m.get_u32("fdt_last_comp_version", 16);
+    tree.boot_cpuid_phys = m.get_u32("fdt_boot_cpuid_phys", 0);
+    if (m.get("fit_strings") == "kept") {
+        const fs::path file = dir / ".abr_raw" / "fit_strings.bin";
+        if (!fs::exists(file)) {
+            warn(shown(file.generic_string()) + " is not there: the strings of the tree are written in the order of their first use, so the tree is not the bytes it was");
+        } else {
+            Bytes strings = read_file(file);
+            if (strings.size() > (size_t{1} << 20))
+                warn(shown(file.generic_string()) + " is more than a mebibyte, which a tree does not have: it is not used");
+            else
+                tree.strings = std::move(strings);
+        }
+    }
+
+    fit::Layout layout;
+    const std::string place_text = m.get("fit_data", "inline");
+    const std::optional<fit::Place> place = fit::place_from_name(place_text);
+    if (!place) throw FormatError("manifest.txt: " + shown("fit_data=" + place_text) + " is none of inline, offset, position");
+    layout.place = *place;
+    layout.align = static_cast<size_t>(m.get_int("fit_align", 4, 4, int64_t{1} << 24));
+    layout.end_align = static_cast<size_t>(m.get_int("fit_end_align", 1, 1, int64_t{1} << 24));
+    layout.tree_align = static_cast<size_t>(m.get_int("fit_tree_align", 0, 0, int64_t{1} << 24));
+    layout.slack = static_cast<size_t>(m.get_int("fdt_slack", 0, 0, int64_t{1} << 20));
+
+    // The files that the unpack made components of (the data that was in the image, as it was or changed), by name.
+    std::map<std::string, std::string> prefix_of;
+    const uint32_t component_count = m.get_count("fit_components", 0);
+    for (uint32_t i = 0; i < component_count; ++i) {
+        const std::string key = "component" + std::to_string(i) + "_prefix";
+        const std::string prefix = m.get_name(key, "image");
+        if (!m.has(prefix + "_file")) throw FormatError("manifest.txt: " + shown(key + "=" + prefix) + " but there is no " + shown(prefix + "_file"));
+        prefix_of[m.get_path(prefix + "_file")] = prefix;
+    }
+
+    fdt::Node* images = tree.root.find_child("images");
+    if (!images) throw FormatError(shown(its_name) + " has no /images node: it is not a FIT image any more");
+    struct Slot {
+        size_t index;        // the image: a child of /images
+        std::string prefix;  // the component that holds its data; empty for a file that is not one (an image put in)
+        std::string file;
+    };
+    std::vector<Slot> slots;
+    std::set<size_t> changed;  // the images whose data is not what the image had
+    for (size_t i = 0; i < images->children.size(); ++i) {
+        fdt::Node& n = images->children[i];
+        fdt::Property* d = n.find_prop("data");
+        if (!d) {
+            if (layout.place != fit::Place::INLINE && (n.find_prop("data-size") || n.find_prop("data-offset") || n.find_prop("data-position")))
+                warn("the image " + shown(n.name) + " has data-size or data-offset but no `data` in " + shown(its_name) +
+                     ": no data is put in the file for it");
+            continue;
+        }
+        if (d->incbin.empty()) continue;  // the bytes are in the text
+        if (const char* problem = path_problem(d->incbin); *problem)
+            throw FormatError(shown(its_name) + ": the image " + shown(n.name) + " has data = /incbin/(" + shown(d->incbin) + "), a name that " + problem +
+                              ". A file of an image has to be in the directory it is in (a relative path without '..'); copy it there");
+        const auto known = prefix_of.find(d->incbin);
+        slots.push_back({i, known == prefix_of.end() ? std::string() : known->second, d->incbin});
+    }
+    std::vector<std::string> wanted;
+    for (const Slot& s : slots)
+        if (!s.prefix.empty()) wanted.push_back(s.prefix);
+    std::vector<char> replayed;
+    std::vector<Bytes> loaded = load_components(m, dir, wanted, opt, &replayed);
+    size_t at = 0;
+    for (const Slot& s : slots) {
+        fdt::Node& n = images->children[s.index];
+        fdt::Property* d = n.find_prop("data");
+        if (!s.prefix.empty()) {
+            d->value = std::move(loaded[at]);
+            if (!replayed[at]) changed.insert(s.index);
+            std::string said;
+            const std::string stored = m.get(s.prefix + "_compression", "none");
+            if (n.get_string("compression", said) && !fit_compression_agrees(said, stored))
+                warn("the image " + shown(n.name) + " says compression = " + shown(said) + " in " + shown(its_name) + ", and its data goes into the image as " +
+                     shown(stored) + " (" + shown(s.prefix + "_compression") + " in manifest.txt): the two do not agree");
+            ++at;
+        } else {
+            const fs::path file = dir / s.file;
+            if (!fs::exists(file))
+                throw FormatError(shown(its_name) + ": the image " + shown(n.name) + " has data = /incbin/(" + shown(s.file) + ") and there is no such file in the directory");
+            d->value = read_file(file);  // a file that is none of the unpacked components goes in as it is
+            changed.insert(s.index);
+        }
+        d->incbin.clear();
+    }
+
+    // The text is not the one that was unpacked: what its bytes say (a `data = <...>`, a hash, a signature) was edited as well.
+    const Bytes unpacked_hash = m.get_hex("fit_its_hash");
+    const bool text_edited = unpacked_hash.empty() || hash::sha256(text) != unpacked_hash;
+    if (text_edited)
+        for (size_t i = 0; i < images->children.size(); ++i) {
+            const fdt::Property* d = images->children[i].find_prop("data");
+            if (d && std::none_of(slots.begin(), slots.end(), [&](const Slot& s) { return s.index == i; })) changed.insert(i);
+        }
+
+    const std::vector<size_t> to_refresh(changed.begin(), changed.end());
+    std::vector<std::string> notes;
+    const size_t refreshed = fit::refresh_hashes(tree, to_refresh, notes);
+    for (const std::string& n : notes) warn(n);
+    std::set<std::string> changed_names;
+    std::string changed_list;
+    for (size_t i : to_refresh) {
+        changed_names.insert(images->children[i].name);
+        changed_list += (changed_list.empty() ? "" : ", ") + shown(images->children[i].name);
+    }
+    if (refreshed)
+        note("the hash of " + changed_list + " was made again (" + std::to_string(refreshed) + (refreshed == 1 ? " hash node" : " hash nodes") + ")");
+    const std::vector<std::string> stale = fit::stale_signatures(tree, changed_names);
+    auto join = [](const std::vector<std::string>& v) {
+        std::string out;
+        for (const std::string& s : v) out += (out.empty() ? "" : ", ") + shown(s);
+        return out;
+    };
+    if (!stale.empty()) {
+        warn("the data of " + changed_list + " is not what it was, and the signatures that cover it (" + join(stale) +
+             ") are not made again: abr signs no FIT image, so they do not match any more (mkimage -F -k <keys> -r signs a FIT image whose data is in the tree again)");
+    } else if (text_edited) {
+        if (const std::vector<std::string> all = fit::signatures(tree); !all.empty())
+            warn(shown(its_name) + " was edited and the FIT has signatures (" + join(all) +
+                 ") that abr does not make again: they may not match what was changed (mkimage -F -k <keys> -r signs a FIT image whose data is in the tree again)");
+    }
+
+    return assemble_envelope(m, dir, fit::build(std::move(tree), layout), opt);
 }
 
 // ----------------------------------------------------------- elf_boot --
@@ -2584,6 +2858,43 @@ void print_info(const fs::path& path) {
             print_envelope_info(Envelope::capture(data, 0, split.consumed));
             break;
         }
+        case Fmt::FIT: {
+            fdt::Layout fl;
+            const fdt::Tree tree = fdt::parse(data, &fl);
+            const fdt::Node* images = tree.root.find_child("images");
+            std::string text;
+            if (tree.root.get_string("description", text)) std::cout << "description: " << shown(text) << "\n";
+            std::cout << "tree:        " << fl.total_size << " bytes (flattened device tree version " << tree.version
+                      << (fl.canonical ? "" : "; not laid out the way dtc writes one: " + fl.why) << ")\n";
+            std::cout << "images:      " << images->children.size() << "\n";
+            for (size_t i = 0; i < images->children.size(); ++i) {
+                const fdt::Node& n = images->children[i];
+                uint64_t size = 0, where = 0;
+                std::string place = "no data";
+                if (const fdt::Property* d = n.find_prop("data")) {
+                    size = d->value.size();
+                    place = "in the tree";
+                } else if (n.get_u64("data-size", size)) {
+                    if (n.get_u64("data-offset", where)) place = "behind the tree, data-offset " + std::to_string(where);
+                    else if (n.get_u64("data-position", where)) place = "behind the tree, data-position " + std::to_string(where);
+                }
+                std::cout << "  [" << i << "] " << shown(n.name) << ": " << size << " bytes, " << place;
+                if (const std::string d = fit::describe_image(n); !d.empty()) std::cout << "; " << d;
+                std::cout << "\n";
+            }
+            for (const std::string& c : fit::describe_configurations(tree)) std::cout << "  configuration " << c << "\n";
+            if (const std::vector<std::string> sigs = fit::signatures(tree); !sigs.empty())
+                std::cout << "signatures:  " << sigs.size() << " (abr checks none of them and signs none)\n";
+            std::string why;
+            if (const std::optional<fit::Opened> o = fit::open(data, why)) {
+                std::cout << "unpack:      as a FIT image (the data is " << fit::place_name(o->layout.place) << ")\n";
+                for (const std::string& w : fit::wrong_hashes(o->tree, o->images)) std::cout << "hash:        " << w << "\n";
+                print_envelope_info(Envelope::capture(data, 0, o->consumed));
+            } else {
+                std::cout << "unpack:      as a plain device tree, because " << why << "\n";
+            }
+            break;
+        }
         case Fmt::VBMETA: {
             VbmetaImage v = VbmetaImage::parse(data);
             std::cout << "algorithm:  " << avb_algorithm_name(v.algorithm_type) << "\n";
@@ -2727,6 +3038,7 @@ void check_known_again(const Bytes& image, Fmt wanted, const Manifest& m) {
     } catch (const FormatError& e) {
         why = e.what();
     }
+    if (wanted == Fmt::DTB && got == Fmt::FIT) got = Fmt::DTB;  // (a FIT image is a device tree, and one that was unpacked as one stays one)
     if (got != wanted)
         throw FormatError(std::string("the image abr would write is not ") + (wanted == Fmt::UNKNOWN ? "an image" : "a " + std::string(fmt_name(wanted)) + " image") +
                           " that it knows again: " + (got == Fmt::UNKNOWN ? why : "it would be taken for a " + std::string(fmt_name(got)) + " image") +
@@ -2764,6 +3076,7 @@ Bytes build_image_once(const fs::path& dir, const RepackOptions& opt) {
         case Fmt::VENDOR_BOOT: result = repack_vendor_boot(m, dir, opt); break;
         case Fmt::DTBO: result = repack_dtbo(m, dir, opt); break;
         case Fmt::DTB: result = repack_dtb(m, dir, opt); break;
+        case Fmt::FIT: result = repack_fit(m, dir, opt); break;
         case Fmt::VBMETA: result = repack_vbmeta(m, dir, opt); break;
         case Fmt::UIMAGE: result = repack_uimage(m, dir, opt); break;
         case Fmt::ELF_BOOT: result = repack_elf_boot(m, dir, opt); break;
@@ -2896,6 +3209,15 @@ void do_unpack(const fs::path& in, const fs::path& outdir, const UnpackOptions& 
             case Fmt::VENDOR_BOOT: unpack_vendor_boot(payload, outdir, uo); break;
             case Fmt::DTBO: unpack_dtbo(payload, outdir); break;
             case Fmt::DTB: unpack_dtb(payload, outdir); break;
+            case Fmt::FIT: {
+                std::string why;
+                if (!unpack_fit(payload, outdir, uo, why)) {
+                    note("this is a U-Boot FIT image, but abr cannot put it back as one (" + why + "): it is unpacked as a plain device tree");
+                    f = Fmt::DTB;
+                    unpack_dtb(payload, outdir);
+                }
+                break;
+            }
             case Fmt::VBMETA: unpack_vbmeta(payload, outdir); break;
             case Fmt::UIMAGE: unpack_uimage(payload, outdir); break;
             case Fmt::ELF_BOOT: unpack_elf_boot(payload, outdir, uo); break;
@@ -3028,7 +3350,7 @@ void usage() {
         "Supported: boot.img/init_boot.img/boot-debug.img/boot-test-harness.img,\n"
         "recovery.img/recovery-two-step.img (header v0-v4), vendor_boot.img/\n"
         "vendor_boot-debug.img/vendor_kernel_boot.img (header v3-v4), dtbo.img,\n"
-        "raw dtb, vbmeta.img/vbmeta_system.img (AVB), U-Boot legacy uImage, Sony ELF\n"
+        "raw dtb, vbmeta.img/vbmeta_system.img (AVB), U-Boot legacy uImage and FIT image, Sony ELF\n"
         "boot images, Rockchip KRNL (kernel.img / boot.img), ASUS blobs (\"MSM-RADIO-UPDATE\",\n"
         "signed with the SIGNBLOB header or not), Intel OSIP boot images, ChromeOS kernel blobs\n"
         "(the vboot format of a Chromebook's kernel partition).\n"
