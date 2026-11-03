@@ -34,6 +34,8 @@ jobs:
           - { cc: clang-20, cxx: clang++-20, package: false }
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # the build number of the version (1.YYYYMMDD.N) counts the commits of the day
 
       - name: Install build tools + test-suite oracles
         run: |
@@ -125,6 +127,8 @@ jobs:
       ABR_KEEP_WORK: "1"
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # the build number of the version (1.YYYYMMDD.N) counts the commits of the day
 
       - name: Install build tools + test-suite oracles
         run: |
@@ -241,6 +245,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # the build number of the version (1.YYYYMMDD.N) counts the commits of the day
 
       # Clang + the distribution's mingw-w64 runtime: a C++26 compiler for
       # Windows without downloading a toolchain (Ubuntu's mingw GCC is 13).
@@ -322,6 +328,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # the build number of the version (1.YYYYMMDD.N) counts the commits of the day
 
       - name: Install the cross toolchain, qemu and the test-suite oracles
         run: |
@@ -376,6 +384,8 @@ jobs:
       NDK_VERSION: r29
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # the build number of the version (1.YYYYMMDD.N) counts the commits of the day
 
       - name: Install cmake/ninja
         run: |

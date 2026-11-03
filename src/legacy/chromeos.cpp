@@ -402,12 +402,12 @@ Bytes apply_chromeos(const Bytes& kernel, const ChromeosInfo& info, const Chrome
     if (signing.keyblock) {
         const Bytes& kb = *signing.keyblock;
         if (!has_chromeos_header(kb))
-            throw FormatError("the keyblock given (--chromeos-keyblock) is not a keyblock: it does not start with \"CHROMEOS\"");
+            throw FormatError("the keyblock given (keys/chromeos.keyblock) is not a keyblock: it does not start with \"CHROMEOS\"");
         if (kb.size() < kKeyblockHeaderSize)
-            throw FormatError("the keyblock given (--chromeos-keyblock) is cut short: its header is " +
+            throw FormatError("the keyblock given (keys/chromeos.keyblock) is cut short: its header is " +
                               std::to_string(kKeyblockHeaderSize) + " bytes and the file has " + std::to_string(kb.size()));
         if (get64(kb, 16) != kb.size())
-            throw FormatError("the keyblock given (--chromeos-keyblock) says it is " + std::to_string(get64(kb, 16)) +
+            throw FormatError("the keyblock given (keys/chromeos.keyblock) says it is " + std::to_string(get64(kb, 16)) +
                               " bytes; the file has " + std::to_string(kb.size()));
     }
     const Bytes& keyblock = signing.keyblock ? *signing.keyblock : info.keyblock;
@@ -421,9 +421,9 @@ Bytes apply_chromeos(const Bytes& kernel, const ChromeosInfo& info, const Chrome
     if (signing.key) {
         const ChromeosKey& k = *signing.key;
         if (!data_key.rsa || data_key.algorithm != k.algorithm || data_key.rsa->n != k.rsa.n)
-            throw FormatError("the key given (--chromeos-key) is not the data key of the keyblock (" +
-                              std::string(signing.keyblock ? "the one given with --chromeos-keyblock" : "the blob's; the keyblock "
-                                          "made for the key is given with --chromeos-keyblock") + ")");
+            throw FormatError("the key given (keys/chromeos.vbprivk) is not the data key of the keyblock (" +
+                              std::string(signing.keyblock ? "the one given as keys/chromeos.keyblock" : "the blob's; the keyblock "
+                                          "made for the key goes in keys/chromeos.keyblock") + ")");
     }
 
     {
@@ -447,8 +447,8 @@ Bytes apply_chromeos(const Bytes& kernel, const ChromeosInfo& info, const Chrome
     } else if (is_dev_data_key(data_key)) {
         key = chromeos_dev_key();
     } else if (signing.keyblock) {
-        throw FormatError("the keyblock given (--chromeos-keyblock) has a data key of which abr has no key: pass the key "
-                          "with --chromeos-key");
+        throw FormatError("the keyblock given (keys/chromeos.keyblock) has a data key of which abr has no key: put the key "
+                          "in keys/chromeos.vbprivk");
     } else {
         use_keyblock = &chromeos_dev_keyblock();
         key = chromeos_dev_key();

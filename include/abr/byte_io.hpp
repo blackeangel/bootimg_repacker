@@ -45,7 +45,7 @@ public:
 };
 
 // The rebuilt image is bigger than the partition it came out of. Its own kind of error because a
-// denser compression of what was edited can cure it: `repack` tries that before it gives up.
+// denser compression of what was edited can cure it: `pack` tries that before it gives up.
 class DoesNotFit : public FormatError {
 public:
     using FormatError::FormatError;
@@ -67,7 +67,7 @@ void require_regular_file(const std::filesystem::path& path);
 // of the boot family is near it, and a manifest that asks for more is taken for damaged.
 inline constexpr uint64_t kMaxImageSize = 0x40000000ull;
 Bytes read_file(const std::filesystem::path& path);
-// The files read_file has read so far (in this run): `repack` asks, before it writes its image, whether the output is one of them --
+// The files read_file has read so far (in this run): `pack` asks, before it writes its image, whether the output is one of them --
 // an image written over the manifest, a component, a key it has read (or over what a symbolic or a hard link of the directory leads
 // to) is the work of the directory lost. Returns the path as it was read, or an empty path.
 std::filesystem::path find_read_file(const std::filesystem::path& output);

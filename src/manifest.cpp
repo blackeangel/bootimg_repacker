@@ -23,7 +23,7 @@ std::string trim(const std::string& s) {
 
 Manifest Manifest::load(const std::filesystem::path& path) {
     // (read_file: only a regular file, of a size a manifest can have, and one of the files this run has read: the image that
-    // `repack` makes is not written over it)
+    // `pack` makes is not written over it)
     const Bytes data = read_file(path);
     const std::string_view text(reinterpret_cast<const char*>(data.data()), data.size());
     Manifest m;

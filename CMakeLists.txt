@@ -215,7 +215,9 @@ function(abr_link_statically target)
   endif()
 endfunction()
 
+include(cmake/AbrVersion.cmake)
 add_executable(abr src/main.cpp)
+target_include_directories(abr PRIVATE "${CMAKE_BINARY_DIR}/generated")
 target_link_libraries(abr PRIVATE abr_core)
 abr_link_statically(abr)
 

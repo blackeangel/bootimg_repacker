@@ -33,7 +33,7 @@
 //     untouched comes back byte for byte, whoever signed it);
 //   - made again, with the key the keyblock's data key belongs to, when something has: abr has the public
 //     developer data key of vboot_reference (tests/devkeys of the Chromium OS project; the same one Android
-//     Image Kitchen signs with), or the key of --chromeos-key;
+//     Image Kitchen signs with), or the key of keys/chromeos.vbprivk;
 //   - made with the developer key and a developer keyblock when the blob's keyblock is somebody else's and no
 //     key of it was given -- as Android Image Kitchen does, which replaces the keyblock every time. A device
 //     that is in developer mode boots such a blob; one that checks the keyblock against its own keys does not.
@@ -136,10 +136,10 @@ bool has_chromeos_header(const Bytes& data);
 // it (see above) is refused: FormatError, with the reason; nothing is ever read wrongly.
 std::optional<ChromeosInfo> strip_chromeos(const Bytes& data, Bytes& kernel_out);
 
-// What the command line can add to apply_chromeos: a signing key, and a keyblock for it.
+// What a folder can add to apply_chromeos (keys/chromeos.keyblock and keys/chromeos.vbprivk): a signing key, and a keyblock for it.
 struct ChromeosSigning {
-    std::optional<Bytes> keyblock;       // --chromeos-keyblock: replaces the blob's
-    std::optional<ChromeosKey> key;      // --chromeos-key: signs; its public half is the data key of the keyblock
+    std::optional<Bytes> keyblock;       // keys/chromeos.keyblock: replaces the blob's
+    std::optional<ChromeosKey> key;      // keys/chromeos.vbprivk: signs; its public half is the data key of the keyblock
 };
 
 // How apply_chromeos got to its signatures.

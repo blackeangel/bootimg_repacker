@@ -250,9 +250,9 @@ Signer make_signer(const Bytes& key_file, const Bytes& certificate_file) {
     }
     if (cert.empty())
         throw FormatError(
-            "a boot signature carries the signer's X.509 certificate, and none was found: pass it "
-            "with --avb1-cert <cert.pem|cert.der>, or name the key like Android Image Kitchen "
-            "does (--avb1-key <name> with <name>.pk8 and <name>.x509.pem next to each other)");
+            "a boot signature carries the signer's X.509 certificate, and none was found: put it beside the key "
+            "as keys/avb1.x509.pem (or keys/avb1.x509.der) -- the names Android Image Kitchen gives them, with keys/avb1.pk8 "
+            "for the key -- or in the PEM file of the key");
 
     RsaPublicKey pub;
     try {

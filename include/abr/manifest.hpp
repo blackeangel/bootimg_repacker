@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // abr::Manifest -- a small, human-editable key=value sidecar file that
-// `unpack` writes next to the extracted component files and `repack`
+// `unpack` writes next to the extracted component files and `pack`
 // reads back. One flat namespace, insertion order preserved (so a
 // human reading the file sees fields in a sensible order rather than
 // alphabetized), `#`-prefixed lines and blank lines ignored on read. A value that
@@ -35,7 +35,7 @@ public:
     bool has(const std::string& key) const;
     void set(const std::string& key, const std::string& value);
     std::string get(const std::string& key, const std::string& def = "") const;
-    // A value that names a file or a directory of the unpack (`kernel_file`, `ramdisk_tree`, ...): what repack opens. It
+    // A value that names a file or a directory of the unpack (`kernel_file`, `ramdisk_tree`, ...): what pack opens. It
     // must lie in the directory of the manifest -- a relative path, without '..', a drive, a colon or a backslash -- or
     // FormatError says so. (The directory may have come from anyone; a manifest that points at /etc/passwd or at
     // ../../.ssh/id_rsa must not get that file built into an image.)

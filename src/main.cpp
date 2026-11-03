@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// abr -- Android boot-family image unpacker/repacker CLI.
+// abr -- Android Boot Repacker: unpacks and packs the images of the Android boot family and the small firmware images of a phone's
+// partitions.
 //
-//   abr info    <image>
-//   abr unpack  <image> [-o <outdir>]
-//   abr repack  <dir>   -o <image> [--avb-key <private_key.pem>]
-//                       [--avb1-key <key[.pk8]> [--avb1-cert <cert.pem|der>]]
-//                       [--chromeos-key <.vbprivk> [--chromeos-keyblock <.keyblock>]]
+//   abr unpack -i <input.img>    [-o <output_folder>]
+//   abr pack   -i <input_folder> [-o <output_image>]
+//   abr info   -i <input.img>
+//   abr help
+//   abr version
 //
-// Format is auto-detected from magic bytes; see detect_format() below.
+// What an image is (its format, what it is wrapped in, how its parts are compressed, how it is signed) is found out from the image
+// itself; see detect_format() below.
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -57,6 +59,7 @@
 #include "abr/uimage.hpp"
 #include "abr/vbmeta.hpp"
 #include "abr/vendor_boot.hpp"
+#include "abr/version.hpp"
 
 namespace fs = std::filesystem;
 using namespace abr;
@@ -314,21 +317,15 @@ const Bytes& peel_wrappers(const Bytes& data, Wrappers& w) {
     return w.amonet ? w.unpatched : *inner;
 }
 
-// What the command line can add to a repack: keys for the signatures abr
-// regenerates when the content changed.
+// What a folder can add to a pack: keys of its own for the signatures abr makes again when the content changed (the files of
+// keys/ in the folder; without them abr signs with the public test keys it has, see load_folder_keys()).
 struct RepackOptions {
-    std::string avb_key_pem;               // --avb-key: AVB 2.0 signing key (file contents)
-    std::optional<Signer> avb1_signer;     // --avb1-key/--avb1-cert: AVBv1 boot signature
-    legacy::ChromeosSigning chromeos;      // --chromeos-key/--chromeos-keyblock: a ChromeOS kernel blob's signature
-    std::string ramdisk_from;              // --ramdisk-from: "tree" or "cpio" when both could be meant
+    std::string avb_key_pem;               // keys/avb_key.pem: AVB 2.0 signing key (file contents)
+    std::optional<Signer> avb1_signer;     // keys/avb1.pk8 + keys/avb1.x509.pem: AVBv1 boot signature
+    legacy::ChromeosSigning chromeos;      // keys/chromeos.vbprivk + keys/chromeos.keyblock: a ChromeOS kernel blob's signature
     // The second try of build_image(): what had to be compressed again is compressed as densely as the
     // decoders allow (dense_level()), because the first try made an image too big for its partition.
     bool dense = false;
-};
-
-struct UnpackOptions {
-    bool tree = true;       // write the ramdisk as a directory tree as well (see ramdisk_tree.hpp)
-    bool keep_cpio = true;  // ... and keep ramdisk.cpio (--tree-only drops it)
 };
 
 // Messages for the user. Components are loaded on several threads, so these are serialised.
@@ -496,8 +493,7 @@ size_t recorded_volumes(const Manifest& m, const std::string& prefix) {
     return static_cast<size_t>(m.get_int(prefix + "_tree_volumes", 1, 1, 256));
 }
 
-void save_ramdisk_trees(Manifest& m, const fs::path& dir, const std::vector<TreeJob>& jobs,
-                        const UnpackOptions& uo) {
+void save_ramdisk_trees(Manifest& m, const fs::path& dir, const std::vector<TreeJob>& jobs) {
     // What an earlier unpack into this directory left is replaced; a directory of the same name
     // that is anything else is somebody's, and is never touched (the library refuses to write over it).
     std::map<std::string, size_t> earlier;  // the ramdisks an earlier unpack made, and how many archives each had
@@ -513,19 +509,13 @@ void save_ramdisk_trees(Manifest& m, const fs::path& dir, const std::vector<Tree
         if (!j.decoded->present) continue;
         if (const auto owned = earlier.find(j.prefix); owned != earlier.end()) {
             std::error_code ec;
-            bool removed = false;
             for (size_t i = 0; i < owned->second; ++i) {
                 const fs::path tree = dir / ramdisk_volume_name(j.prefix, i);
-                if (fs::exists(fs::symlink_status(tree, ec))) {
-                    fs::remove_all(tree, ec);
-                    removed = true;
-                }
+                if (fs::exists(fs::symlink_status(tree, ec))) fs::remove_all(tree, ec);
                 fs::remove(dir / ramdisk_volume_meta(j.prefix, i), ec);
             }
-            if (removed && !uo.tree)
-                note("the directory " + (dir / j.prefix).generic_string() + " of an earlier unpack was removed");
         }
-        if (uo.tree) todo.push_back(&j);
+        todo.push_back(&j);
     }
 
     std::vector<RamdiskTree> results(todo.size());
@@ -542,7 +532,6 @@ void save_ramdisk_trees(Manifest& m, const fs::path& dir, const std::vector<Tree
     for (size_t k = 0; k < todo.size(); ++k) {
         const TreeJob& j = *todo[k];
         const RamdiskTree& t = results[k];
-        std::error_code ec;
         if (!failures[k].empty()) {
             note(j.filename + " stays a file only, the directory could not be written: " + failures[k]);
             continue;
@@ -567,10 +556,6 @@ void save_ramdisk_trees(Manifest& m, const fs::path& dir, const std::vector<Tree
         if (!t.exact)
             warn("the directory " + j.prefix + "/ does not give " + j.filename + " back exactly (" +
                  t.difference + "); the file is exact. An edit of the directory rebuilds the archive from it.");
-        if (!uo.keep_cpio) {
-            if (t.exact) fs::remove(dir / j.filename, ec);
-            else note(j.filename + " is kept: the directory alone would not give it back exactly");
-        }
     }
 }
 
@@ -611,9 +596,9 @@ void check_unpacks_as_is(const Bytes& stored, const std::string& prefix, const s
 // ramdisk_tree.hpp) there are two places it may have been edited, and which one counts is decided
 // by what changed since unpacking, not by file times: the file by the hash of its contents, the
 // directory by the hash of the archive that is built from it. Nothing changed: the bytes the image
-// had are replayed. One changed: that one wins. Both: abr cannot merge them and says so, unless
-// --ramdisk-from names the one to use. `replayed`, when given, says which of the two it was: true
-// for the bytes the image had, false for a component that was made (compressed) again.
+// had are replayed. One changed: that one wins. Both: abr cannot merge them, the directory wins and abr
+// says so. `replayed`, when given, says which of the two it was: true for the bytes the image had,
+// false for a component that was made (compressed) again.
 Bytes load_component(const Manifest& m, const fs::path& dir, const std::string& prefix,
                      const RepackOptions& opt, bool* replayed = nullptr) {
     if (replayed) *replayed = false;
@@ -624,9 +609,6 @@ Bytes load_component(const Manifest& m, const fs::path& dir, const std::string& 
     const fs::path raw_path = dir / ".abr_raw" / (filename + ".raw");
     const Bytes stored_hash = m.get_hex(prefix + "_orig_hash");
     const bool has_tree_entry = m.has(prefix + "_tree");
-    if (opt.ramdisk_from == "tree" && !has_tree_entry && prefix.rfind("ramdisk", 0) == 0)
-        warn("--ramdisk-from tree: " + shown(filename) + " has no directory in this unpack, the file is used");
-
     std::optional<Bytes> from_file;
     Bytes file_hash;
     if (fs::exists(file)) {
@@ -640,7 +622,7 @@ Bytes load_component(const Manifest& m, const fs::path& dir, const std::string& 
     bool tree_changed = false;
     std::string tree_name;
     PackReport report;  // what building from the directories had to say (notes are said only if it is used)
-    if (has_tree_entry && opt.ramdisk_from != "cpio") {
+    if (has_tree_entry) {
         tree_name = m.get_path(prefix + "_tree");
         // The directories of all the archives (see ramdisk_tree.hpp): one that is gone leaves its archive
         // out, and only when every one is gone is the directory as good as not there.
@@ -652,17 +634,15 @@ Bytes load_component(const Manifest& m, const fs::path& dir, const std::string& 
             for (const std::string& w : report.warnings) warn(w);
             tree_hash = hash::sha256(rebuilt);
             tree_changed = tree_hash != m.get_hex(prefix + "_tree_hash");
-            if (tree_changed || opt.ramdisk_from == "tree" || !from_file) from_tree = std::move(rebuilt);
-        } else if (opt.ramdisk_from == "tree") {
-            throw FormatError("--ramdisk-from tree: the directory " + textquote::quote_shown((dir / tree_name).generic_string()) + " is missing");
+            if (tree_changed || !from_file) from_tree = std::move(rebuilt);
         }
     }
-    if (tree_changed && file_changed && opt.ramdisk_from.empty())
-        throw FormatError("both " + textquote::quote_shown(filename) + " and the directory " + textquote::quote_shown(tree_name + "/") +
-                          " have been changed since unpacking, and abr cannot merge the two. Undo one "
-                          "of them, or say which one to use: --ramdisk-from tree  or  --ramdisk-from cpio");
+    if (tree_changed && file_changed)
+        warn("both " + textquote::quote_shown(filename) + " and the directory " + textquote::quote_shown(tree_name + "/") +
+             " have been changed since unpacking, and abr cannot merge the two: the image is made from the directory, and what was changed in " +
+             textquote::quote_shown(filename) + " is not in it. Delete the directory to have the file used");
 
-    const bool use_tree = from_tree && (opt.ramdisk_from == "tree" || tree_changed || !from_file);
+    const bool use_tree = from_tree.has_value();
     if (!use_tree && !from_file) from_file = read_file(file);  // neither is there: the usual error
     const Bytes& plain = use_tree ? *from_tree : *from_file;
     const bool original = !stored_hash.empty() && (use_tree ? tree_hash : file_hash) == stored_hash;
@@ -1003,8 +983,8 @@ Bytes reattach_avb_footer(const Manifest& m, const fs::path& dir, Bytes host,
             throw FormatError(
                 "the image content changed, so its AVB hash descriptor (and the vbmeta signature, "
                 "algorithm " + avb_algorithm_name(v.algorithm_type) +
-                ") must be regenerated: pass --avb-key <private_key.pem>. Without the original "
-                "vendor key the result will not verify on a locked device");
+                ") must be regenerated: put the private key in " + shown((dir / "keys" / "avb_key.pem").generic_string()) +
+                ". Without the original vendor key the result will not verify on a locked device");
     }
     v.host_prefix = std::move(host);
     std::vector<std::string> notes;
@@ -1032,7 +1012,7 @@ std::string verdict_text(const Verification& v) {
 
 // Re-creates the signature for `core` (the rebuilt image, from its magic) when
 // the manifest has `avb1_signature=true` -- unpack writes it when the source
-// carried a signature -- or --avb1-key was given. Returns how many leading
+// carried a signature -- or the folder has a key for it (keys/avb1.pk8). Returns how many leading
 // bytes of e.tail are the new signature (0: the tail was left alone).
 size_t refresh_avb1_signature(const Manifest& m, Envelope& e, Bytes& core, uint32_t page_size,
                               bool image_changed, const RepackOptions& opt) {
@@ -1057,8 +1037,8 @@ size_t refresh_avb1_signature(const Manifest& m, Envelope& e, Bytes& core, uint3
                  dquoted(certificate_subject(existing->certificate)) +
                  ", whose private key abr does not have. The new signature uses the public "
                  "AOSP test key (what Android Image Kitchen does); a bootloader that trusts only "
-                 "the original key will reject the image. Use --avb1-key/--avb1-cert to sign with "
-                 "your own key.");
+                 "the original key will reject the image. Put your key in keys/avb1.pk8 and its "
+                 "certificate in keys/avb1.x509.pem to sign with it.");
     }
     Bytes der = build_boot_signature(core, target, signer);
     std::cout << (existing ? "re-created" : "added") << " the AVBv1 boot signature (target "
@@ -1168,7 +1148,7 @@ void unpack_qcdt(const Bytes& data, const fs::path& dir) {
     m.set("type", "qcdt");
     save_qcdt(m, dir, "", "", t);
     save_envelope(m, dir, Envelope::capture(data, 0, t.consumed), data, 0, t.consumed);
-    m.save(dir / "manifest.txt", "abr qcdt manifest -- edit then `abr repack " + dir.string() + " -o dt.img`");
+    m.save(dir / "manifest.txt", "abr qcdt manifest -- edit then `abr pack -i " + dir.string() + " -o dt.img`");
 }
 
 Bytes repack_qcdt(const Manifest& m, const fs::path& dir, const RepackOptions& opt) {
@@ -1186,7 +1166,7 @@ std::string hex_words(const std::array<uint32_t, 4>& w) {
     return tmp.get("x");
 }
 
-void unpack_boot(const Bytes& whole, const fs::path& dir, const UnpackOptions& uo) {
+void unpack_boot(const Bytes& whole, const fs::path& dir) {
     AvbFooter footer = detect_avb_footer(whole);
     Bytes host(whole.begin(), whole.begin() + static_cast<long>(footer.host_size));
 
@@ -1255,7 +1235,7 @@ void unpack_boot(const Bytes& whole, const fs::path& dir, const UnpackOptions& u
         record_component(m, "kernel", "kernel", parts[0]);
         record_component(m, "ramdisk", "ramdisk.cpio", parts[1]);
         record_component(m, "second", "second", parts[2]);
-        save_ramdisk_trees(m, dir, {{"ramdisk", "ramdisk.cpio", &parts[1]}}, uo);
+        save_ramdisk_trees(m, dir, {{"ramdisk", "ramdisk.cpio", &parts[1]}});
     }
     {
         // A Qualcomm device tree table that abr can write again byte for byte is unpacked into its trees and its entries; any other dt is a file.
@@ -1306,7 +1286,7 @@ void unpack_boot(const Bytes& whole, const fs::path& dir, const UnpackOptions& u
     }
     save_avb_footer(m, dir, footer, host);
 
-    m.save(dir / "manifest.txt", "abr boot manifest -- edit then `abr repack " + dir.string() +
+    m.save(dir / "manifest.txt", "abr boot manifest -- edit then `abr pack -i " + dir.string() +
                                       " -o out.img`");
 }
 
@@ -1384,7 +1364,7 @@ Bytes repack_boot(const Manifest& m, const fs::path& dir, const RepackOptions& o
 
 // ------------------------------------------------------- vendor_boot.img --
 
-void unpack_vendor_boot(const Bytes& whole, const fs::path& dir, const UnpackOptions& uo) {
+void unpack_vendor_boot(const Bytes& whole, const fs::path& dir) {
     AvbFooter footer = detect_avb_footer(whole);
     Bytes host(whole.begin(), whole.begin() + static_cast<long>(footer.host_size));
     size_t off = find_magic(host, "VNDRBOOT", 8);
@@ -1460,11 +1440,11 @@ void unpack_vendor_boot(const Bytes& whole, const fs::path& dir, const UnpackOpt
         const std::string p = "ramdisk" + std::to_string(i);
         tree_jobs.push_back({p, p + ".cpio", &fragment_parts[i]});
     }
-    save_ramdisk_trees(m, dir, tree_jobs, uo);
+    save_ramdisk_trees(m, dir, tree_jobs);
     Envelope env = Envelope::capture(host, off, img.consumed);
     save_envelope(m, dir, env, host, off, img.consumed);
     save_avb_footer(m, dir, footer, host);
-    m.save(dir / "manifest.txt", "abr vendor_boot manifest -- edit then `abr repack " +
+    m.save(dir / "manifest.txt", "abr vendor_boot manifest -- edit then `abr pack -i " +
                                       dir.string() + " -o out.img`");
 }
 
@@ -1540,7 +1520,7 @@ void unpack_dtbo(const Bytes& whole, const fs::path& dir) {
     save_envelope(m, dir, Envelope::capture(data, 0, img.consumed), data, 0, img.consumed);
     save_avb_footer(m, dir, footer, data);
     m.save(dir / "manifest.txt",
-           "abr dtbo manifest -- edit then `abr repack " + dir.string() + " -o out.img`");
+           "abr dtbo manifest -- edit then `abr pack -i " + dir.string() + " -o out.img`");
 }
 
 Bytes repack_dtbo(const Manifest& m, const fs::path& dir, const RepackOptions& opt) {
@@ -1583,7 +1563,7 @@ void unpack_dtb(const Bytes& data, const fs::path& dir) {
     }
     save_envelope(m, dir, Envelope::capture(data, 0, split.consumed), data, 0, split.consumed);
     m.save(dir / "manifest.txt",
-           "abr dtb manifest -- edit then `abr repack " + dir.string() + " -o out.dtb`");
+           "abr dtb manifest -- edit then `abr pack -i " + dir.string() + " -o out.dtb`");
 }
 
 Bytes repack_dtb(const Manifest& m, const fs::path& dir, const RepackOptions& opt) {
@@ -1640,8 +1620,8 @@ void unpack_vbmeta(const Bytes& data, const fs::path& dir) {
         m.set(p + "_info", v.descriptors[i].describe());  // informational comment, ignored on read
     }
     m.save(dir / "manifest.txt",
-           "abr vbmeta manifest -- edit then `abr repack " + dir.string() +
-               " -o out.img` (pass --avb-key key.pem to re-sign)");
+           "abr vbmeta manifest -- edit then `abr pack -i " + dir.string() +
+               " -o out.img` (keys/avb_key.pem in the folder re-signs with a key of your own)");
 }
 
 Bytes repack_vbmeta(const Manifest& m, const fs::path& dir, const RepackOptions& opt) {
@@ -1703,7 +1683,7 @@ void unpack_uimage(const Bytes& data, const fs::path& dir) {
     if (!env.tail.empty())
         note(std::to_string(env.tail.size()) + " bytes after the uImage are kept verbatim (tail.bin)");
     m.save(dir / "manifest.txt",
-           "abr uimage manifest -- edit then `abr repack " + dir.string() + " -o out.img`\n"
+           "abr uimage manifest -- edit then `abr pack -i " + dir.string() + " -o out.img`\n"
            "# NOTE: 'data' is stored exactly as found in the source image -- if 'compression'\n"
            "# is not 'none', it is still compressed with that codec, this tool does not\n"
            "# transcode uImage payload compression.");
@@ -1803,7 +1783,7 @@ bool fit_compression_agrees(const std::string& said, const std::string& stored) 
     return known.count(said) == 0;
 }
 
-bool unpack_fit(const Bytes& data, const fs::path& dir, const UnpackOptions& uo, std::string& why) {
+bool unpack_fit(const Bytes& data, const fs::path& dir, std::string& why) {
     std::optional<fit::Opened> opened = fit::open(data, why);
     if (!opened) return false;
     fit::Opened& o = *opened;
@@ -1842,7 +1822,7 @@ bool unpack_fit(const Bytes& data, const fs::path& dir, const UnpackOptions& uo,
     std::vector<TreeJob> jobs;
     for (size_t i = 0; i < o.images.size(); ++i)
         if (o.images[i].type == "ramdisk" && parts[i].present) jobs.push_back({names[i].prefix, names[i].filename, &parts[i]});
-    save_ramdisk_trees(m, dir, jobs, uo);
+    save_ramdisk_trees(m, dir, jobs);
 
     const std::string text =
         "// A U-Boot FIT image, as abr unpacked it. `data = /incbin/(\"file\")` is the data of an image: the file is in this directory\n"
@@ -1860,7 +1840,7 @@ bool unpack_fit(const Bytes& data, const fs::path& dir, const UnpackOptions& uo,
                   : o.layout.place == fit::Place::OFFSET ? "the data is behind the tree (data-offset)"
                                                           : "the data is behind the tree (data-position)")
               << " -> " << (dir / "fit.its").generic_string() << "\n";
-    m.save(dir / "manifest.txt", "abr fit manifest -- edit fit.its or the files of the images, then `abr repack " + dir.string() + " -o out.itb`");
+    m.save(dir / "manifest.txt", "abr fit manifest -- edit fit.its or the files of the images, then `abr pack -i " + dir.string() + " -o out.itb`");
     return true;
 }
 
@@ -2048,7 +2028,7 @@ std::vector<uint64_t> split_numbers(const std::string& key, const std::string& s
     return out;
 }
 
-void unpack_elf_boot(const Bytes& data, const fs::path& dir, const UnpackOptions& uo) {
+void unpack_elf_boot(const Bytes& data, const fs::path& dir) {
     legacy::ElfBootImage img = legacy::ElfBootImage::parse(data);
     Manifest m;
     m.set("type", "elf_boot");
@@ -2072,7 +2052,7 @@ void unpack_elf_boot(const Bytes& data, const fs::path& dir, const UnpackOptions
     std::vector<TreeJob> tree_jobs;
     for (size_t i = 0; i < img.segments.size(); ++i)
         if (names.prefix[i] == "ramdisk") tree_jobs.push_back({"ramdisk", names.filename[i], &segment_parts[i]});
-    save_ramdisk_trees(m, dir, tree_jobs, uo);
+    save_ramdisk_trees(m, dir, tree_jobs);
     if (img.layout) {
         const legacy::ElfLayout& L = *img.layout;
         std::vector<uint64_t> order(L.order.begin(), L.order.end());
@@ -2098,7 +2078,7 @@ void unpack_elf_boot(const Bytes& data, const fs::path& dir, const UnpackOptions
              "): the bytes around the segments are kept in .abr_raw/elf_layout.bin, the image is built in that layout");
     }
     m.save(dir / "manifest.txt",
-           "abr elf_boot manifest -- edit then `abr repack " + dir.string() + " -o out.img`");
+           "abr elf_boot manifest -- edit then `abr pack -i " + dir.string() + " -o out.img`");
 }
 
 Bytes repack_elf_boot(const Manifest& m, const fs::path& dir, const RepackOptions& opt) {
@@ -2165,7 +2145,7 @@ Bytes repack_elf_boot(const Manifest& m, const fs::path& dir, const RepackOption
 // ramdisk: a cpio archive -- compressed, as Rockchip's boot.img has it -- becomes `ramdisk.cpio` and the
 // directory `ramdisk/`; a payload that is anything else (kernel.img holds a kernel) stays `kernel`.
 
-void unpack_krnl(const Bytes& host, const fs::path& dir, const UnpackOptions& uo) {
+void unpack_krnl(const Bytes& host, const fs::path& dir) {
     legacy::KrnlImage img = legacy::KrnlImage::parse(host);
     Manifest m;
     m.set("type", "krnl");
@@ -2178,7 +2158,7 @@ void unpack_krnl(const Bytes& host, const fs::path& dir, const UnpackOptions& uo
         write_file(dir / filename, part.plain);
         write_file(dir / ".abr_raw" / (filename + ".raw"), part.stored(img.payload));
         record_component(m, prefix, filename, part);
-        if (ramdisk) save_ramdisk_trees(m, dir, {{"ramdisk", "ramdisk.cpio", &part}}, uo);
+        if (ramdisk) save_ramdisk_trees(m, dir, {{"ramdisk", "ramdisk.cpio", &part}});
     }
     if (!img.crc_ok) {
         // Put back as it was while the payload is untouched, so that the round trip stays exact.
@@ -2192,7 +2172,7 @@ void unpack_krnl(const Bytes& host, const fs::path& dir, const UnpackOptions& uo
     }
     const Envelope env = Envelope::capture(host, 0, img.file_size());
     save_envelope(m, dir, env, host, 0, img.file_size());
-    m.save(dir / "manifest.txt", "abr krnl manifest -- edit then `abr repack " + dir.string() + " -o out.img`");
+    m.save(dir / "manifest.txt", "abr krnl manifest -- edit then `abr pack -i " + dir.string() + " -o out.img`");
 }
 
 Bytes repack_krnl(const Manifest& m, const fs::path& dir, const RepackOptions& opt) {
@@ -2341,7 +2321,7 @@ void unpack_blob(const Bytes& host, const fs::path& dir) {
         write_file(dir / file, b.parts[i].data);
         m.set("blob_part" + std::to_string(i) + "_file", file);
     }
-    m.save(dir / "manifest.txt", "abr blob manifest -- edit then `abr repack " + dir.string() + " -o out.img`");
+    m.save(dir / "manifest.txt", "abr blob manifest -- edit then `abr pack -i " + dir.string() + " -o out.img`");
 }
 
 Bytes repack_blob(const Manifest& m, const fs::path& dir) {
@@ -2457,7 +2437,7 @@ Bytes apply_loki_wrapper(const Manifest& m, const fs::path& dir, const Bytes& pl
 // the fields of the preamble, the config (the kernel's command line), the params and the bootloader of the body, the
 // signatures, what follows the blob -- and repack makes the blob again around the kernel the directory builds. The
 // signatures are the original's while nothing they cover has changed, and made again when it has (with the developer
-// key of vboot_reference, or the key of --chromeos-key). `has_chromeos=false` leaves the blob out (a plain image comes
+// key of vboot_reference, or the key of keys/chromeos.vbprivk). `has_chromeos=false` leaves the blob out (a plain image comes
 // out); `has_chromeos=true` on its own (a manifest with no keyblock) makes the blob Android Image Kitchen's command
 // line makes.
 
@@ -2536,7 +2516,7 @@ Bytes apply_chromeos_wrapper(const Manifest& m, const fs::path& dir, const Bytes
         case legacy::ChromeosSigned::KEPT:
             break;
         case legacy::ChromeosSigned::SIGNED: {
-            const std::string with = opt.chromeos.key ? "the key given (--chromeos-key)" : "the developer key of vboot_reference";
+            const std::string with = opt.chromeos.key ? "the key given (keys/chromeos.vbprivk)" : "the developer key of vboot_reference";
             // (no signatures came with the directory: a plain image with has_chromeos=true, nothing was "changed")
             note(c.signed_sha256.empty()
                      ? "the ChromeOS kernel blob is signed with " + with
@@ -2545,14 +2525,14 @@ Bytes apply_chromeos_wrapper(const Manifest& m, const fs::path& dir, const Bytes
             break;
         }
         case legacy::ChromeosSigned::NEW_KEYBLOCK:
-            note("the ChromeOS kernel blob is signed under the keyblock given (--chromeos-keyblock)");
+            note("the ChromeOS kernel blob is signed under the keyblock given (keys/chromeos.keyblock)");
             break;
         case legacy::ChromeosSigned::DEVELOPER_KEYBLOCK:
             warn("what the signatures of the ChromeOS kernel blob cover has changed, and its keyblock is somebody else's: "
                  "abr has no key for it. The blob is signed with the developer key under the developer keyblock of "
                  "vboot_reference instead, as Android Image Kitchen does; a Chromebook in developer mode boots it, one "
-                 "that checks the keyblock against its own keys does not. --chromeos-key and --chromeos-keyblock sign "
-                 "with keys of your own");
+                 "that checks the keyblock against its own keys does not. keys/chromeos.vbprivk and keys/chromeos.keyblock "
+                 "sign with keys of your own");
             break;
     }
     return assemble_envelope(m, c.tail, core, false, 0, opt);
@@ -2566,7 +2546,7 @@ void unpack_chromeos(const Bytes& host, const fs::path& dir) {
     m.set("type", "chromeos");
     save_chromeos_fields(m, dir, *c);
     save_raw(m, dir, "chromeos_kernel", kernel, "chromeos_kernel.bin");
-    m.save(dir / "manifest.txt", "abr ChromeOS kernel blob manifest -- edit then `abr repack " + dir.string() + " -o out.img`");
+    m.save(dir / "manifest.txt", "abr ChromeOS kernel blob manifest -- edit then `abr pack -i " + dir.string() + " -o out.img`");
 }
 
 Bytes repack_chromeos(const Manifest& m, const fs::path& dir, const RepackOptions& opt) {
@@ -2687,7 +2667,7 @@ Bytes osip_cmdline_block(const Manifest& m, const fs::path& dir) {
     return block;
 }
 
-void unpack_osip(const Bytes& host, const fs::path& dir, const UnpackOptions& uo) {
+void unpack_osip(const Bytes& host, const fs::path& dir) {
     OsipImage img = OsipImage::parse(host);
     Manifest m;
     m.set("type", "osip");
@@ -2722,7 +2702,7 @@ void unpack_osip(const Bytes& host, const fs::path& dir, const UnpackOptions& uo
         write_file(dir / "ramdisk.cpio", ramdisk.plain);
         write_file(dir / ".abr_raw" / "ramdisk.cpio.raw", ramdisk.stored(img.ramdisk));
         record_component(m, "ramdisk", "ramdisk.cpio", ramdisk);
-        save_ramdisk_trees(m, dir, {{"ramdisk", "ramdisk.cpio", &ramdisk}}, uo);
+        save_ramdisk_trees(m, dir, {{"ramdisk", "ramdisk.cpio", &ramdisk}});
     }
 
     m.set_u64("osip_body_size", img.body_size());
@@ -2732,7 +2712,7 @@ void unpack_osip(const Bytes& host, const fs::path& dir, const UnpackOptions& uo
     else m.set("osip_sector_pad", "none");
     const Envelope env = Envelope::capture(host, 0, pad.core_size);
     save_envelope(m, dir, env, host, 0, pad.core_size);
-    m.save(dir / "manifest.txt", "abr osip manifest -- edit then `abr repack " + dir.string() + " -o out.img`");
+    m.save(dir / "manifest.txt", "abr osip manifest -- edit then `abr pack -i " + dir.string() + " -o out.img`");
 }
 
 Bytes repack_osip(const Manifest& m, const fs::path& dir, const RepackOptions& opt) {
@@ -3250,9 +3230,9 @@ Bytes build_image_once(const fs::path& dir, const RepackOptions& opt) {
     }
 
     if (opt.avb1_signer && f != Fmt::BOOT)
-        warn("--avb1-key/--avb1-cert only apply to boot and recovery images; ignored here");
+        warn("keys/avb1.pk8 only applies to boot and recovery images; ignored here");
     if ((opt.chromeos.key || opt.chromeos.keyblock) && f != Fmt::CHROMEOS && !m.get_bool("has_chromeos", false))
-        warn("--chromeos-key/--chromeos-keyblock only apply to a ChromeOS kernel blob; ignored here");
+        warn("keys/chromeos.vbprivk and keys/chromeos.keyblock only apply to a ChromeOS kernel blob; ignored here");
 
     // The wrappers go on in the opposite order to the one they came off in: the amonet patch, the loki patch, the
     // blob, DHTB, then the ChromeOS kernel blob.
@@ -3352,7 +3332,7 @@ void self_check(const fs::path& outdir, const Bytes& original, const char* what 
     }
 }
 
-void do_unpack(const fs::path& in, const fs::path& outdir, const UnpackOptions& uo) {
+void do_unpack(const fs::path& in, const fs::path& outdir) {
     Bytes data = read_file(in);
 
     Wrappers wrap;
@@ -3366,14 +3346,14 @@ void do_unpack(const fs::path& in, const fs::path& outdir, const UnpackOptions& 
     fs::create_directories(outdir);
     try {
         switch (f) {
-            case Fmt::BOOT: unpack_boot(payload, outdir, uo); break;
-            case Fmt::VENDOR_BOOT: unpack_vendor_boot(payload, outdir, uo); break;
+            case Fmt::BOOT: unpack_boot(payload, outdir); break;
+            case Fmt::VENDOR_BOOT: unpack_vendor_boot(payload, outdir); break;
             case Fmt::DTBO: unpack_dtbo(payload, outdir); break;
             case Fmt::DTB: unpack_dtb(payload, outdir); break;
             case Fmt::QCDT: unpack_qcdt(payload, outdir); break;
             case Fmt::FIT: {
                 std::string why;
-                if (!unpack_fit(payload, outdir, uo, why)) {
+                if (!unpack_fit(payload, outdir, why)) {
                     note("this is a U-Boot FIT image, but abr cannot put it back as one (" + why + "): it is unpacked as a plain device tree");
                     f = Fmt::DTB;
                     unpack_dtb(payload, outdir);
@@ -3382,10 +3362,10 @@ void do_unpack(const fs::path& in, const fs::path& outdir, const UnpackOptions& 
             }
             case Fmt::VBMETA: unpack_vbmeta(payload, outdir); break;
             case Fmt::UIMAGE: unpack_uimage(payload, outdir); break;
-            case Fmt::ELF_BOOT: unpack_elf_boot(payload, outdir, uo); break;
-            case Fmt::KRNL: unpack_krnl(payload, outdir, uo); break;
+            case Fmt::ELF_BOOT: unpack_elf_boot(payload, outdir); break;
+            case Fmt::KRNL: unpack_krnl(payload, outdir); break;
             case Fmt::BLOB: unpack_blob(payload, outdir); break;
-            case Fmt::OSIP: unpack_osip(payload, outdir, uo); break;
+            case Fmt::OSIP: unpack_osip(payload, outdir); break;
             case Fmt::CHROMEOS: unpack_chromeos(payload, outdir); break;
             case Fmt::UNKNOWN:
                 throw FormatError(in.string() + ": " + describe_unknown(payload));
@@ -3422,7 +3402,7 @@ void do_unpack(const fs::path& in, const fs::path& outdir, const UnpackOptions& 
                 what += std::string(what.empty() ? "" : ", ") + "LOKI-patched";
             }
             m.save(outdir / "manifest.txt",
-                   "abr manifest (" + what + ") -- edit then `abr repack " + outdir.string() + " -o out.img`");
+                   "abr manifest (" + what + ") -- edit then `abr pack -i " + outdir.string() + " -o out.img`");
         }
     } catch (...) {
         if (made_outdir) {
@@ -3444,28 +3424,24 @@ void do_unpack(const fs::path& in, const fs::path& outdir, const UnpackOptions& 
     }
 }
 
-// `abr qcdt`: what dtbTool does. The trees are the files of the directories (the ones whose names end in .dtb, in the subdirectories as well but
-// not in those whose names start with a dot) and the files named, in the order of their paths (dtbTool takes them in the order the file system
-// lists them, and the order is in the table where two trees are for the same board).
-void do_qcdt(const std::vector<fs::path>& inputs, const fs::path& out, const qcdt::MakeOptions& opt) {
+// A folder of device trees packed as a Qualcomm device tree table: what dtbTool does. The trees are the files of the folder whose names
+// end in .dtb, in the subfolders as well but not in those whose names start with a dot, in the order of their paths (dtbTool takes them
+// in the order the file system lists them, and the order is in the table where two trees are for the same board).
+void pack_device_trees(const fs::path& dir, const fs::path& out, const qcdt::MakeOptions& opt) {
     std::vector<fs::path> files;
-    for (const fs::path& in : inputs) {
-        if (!fs::is_directory(in)) {
-            files.push_back(in);  // a file that is named is taken, whatever its name
-            continue;
-        }
-        for (fs::recursive_directory_iterator it(in, fs::directory_options::skip_permission_denied), end; it != end; ++it) {
-            const std::string name = it->path().filename().string();
-            if (it->is_directory()) {
-                if (!name.empty() && name[0] == '.') it.disable_recursion_pending();
-            } else if (it->is_regular_file() && name.size() > 4 && name.compare(name.size() - 4, 4, ".dtb") == 0) {
-                files.push_back(it->path());
-            }
+    for (fs::recursive_directory_iterator it(dir, fs::directory_options::skip_permission_denied), end; it != end; ++it) {
+        const std::string name = it->path().filename().string();
+        if (it->is_directory()) {
+            if (!name.empty() && name[0] == '.') it.disable_recursion_pending();
+        } else if (it->is_regular_file() && name.size() > 4 && name.compare(name.size() - 4, 4, ".dtb") == 0) {
+            files.push_back(it->path());
         }
     }
     std::sort(files.begin(), files.end(), [](const fs::path& a, const fs::path& b) { return a.generic_string() < b.generic_string(); });
     files.erase(std::unique(files.begin(), files.end()), files.end());
-    if (files.empty()) throw FormatError("there is no device tree to make a table of: no file whose name ends in .dtb in " + shown(inputs.front().string()));
+    if (files.empty())
+        throw FormatError(shown(dir.string()) + " has no manifest.txt (it is not a folder that `abr unpack` made) and no file whose name ends in .dtb "
+                          "(the device trees to make a Qualcomm device tree table of)");
     std::vector<qcdt::Source> sources;
     sources.reserve(files.size());
     for (const fs::path& f : files) sources.push_back({f.string(), read_file(f)});
@@ -3475,78 +3451,132 @@ void do_qcdt(const std::vector<fs::path>& inputs, const fs::path& out, const qcd
     if (const fs::path read = find_read_file(out); !read.empty())
         throw FormatError("-o " + shown(out.string()) + " is a file this run has read (" + shown(read.string()) + "); the table would be written over it. Name another file");
     write_file(out, table);
-    std::cout << "wrote " << out.string() << ": a QCDT table (" << qcdt_summary(made.table) << "), " << table.size() << " bytes\n";
+    std::cout << "packed qcdt -> " << out.string() << " (" << table.size() << " bytes): " << qcdt_summary(made.table) << "\n";
 }
 
-void do_repack(const fs::path& dir, const fs::path& out, const RepackOptions& opt) {
-    Manifest m = Manifest::load(dir / "manifest.txt");
-    Fmt f = fmt_from_name(m.get("type"));
-    Bytes result = build_image(dir, opt);
-    // The image is not written over a file this repack has read: the manifest, a component, a key, a file of the ramdisk
-    // directory, or what a symbolic link among them leads to.
-    if (const fs::path read = find_read_file(out); !read.empty())
-        throw FormatError("-o " + shown(out.string()) + " is a file this repack has read (" + shown(read.string()) +
-                          "); the image would be written over it. Name another file");
-    write_file(out, result);
-    std::cout << "repacked " << fmt_name(f) << " -> " << out.string() << " (" << result.size()
-              << " bytes)\n";
-}
-
-// --avb1-key is a key file, or -- as in Android Image Kitchen -- a base name N
-// with N.pk8 and N.x509.pem (or .der) beside each other.
-Signer load_avb1_signer(const std::string& key_arg, const std::string& cert_arg) {
-    if (key_arg.empty()) throw FormatError("--avb1-cert needs --avb1-key");
-    fs::path key_path = key_arg;
-    fs::path cert_path = cert_arg;
-    if (!fs::exists(key_path)) {
-        fs::path pk8 = key_arg + ".pk8";
-        if (!fs::exists(pk8))
-            throw FormatError("cannot find the AVBv1 signing key '" + key_arg + "' (nor '" +
-                              key_arg + ".pk8')");
-        key_path = pk8;
-        if (cert_arg.empty())
-            for (const char* ext : {".x509.pem", ".x509.der", ".x509.crt"})
-                if (fs::exists(key_arg + ext)) {
-                    cert_path = key_arg + ext;
-                    break;
-                }
-    }
-    Bytes key = read_file(key_path);
-    Bytes cert = cert_path.empty() ? Bytes() : read_file(cert_path);
+// The keys a folder brings (keys/): keys of its own for what abr signs again when the content has changed. None is needed: abr has the
+// public test keys of the projects the formats come from, and signs with them.
+//   keys/avb_key.pem                                the key of AVB 2.0 (vbmeta, hash footers): PEM or DER
+//   keys/avb1.pk8 and keys/avb1.x509.pem            the key and the certificate of the old boot signature of a boot image (AIK's names;
+//                                                   keys/avb1.x509.der is as good, and so is one PEM that holds both)
+//   keys/chromeos.vbprivk and keys/chromeos.keyblock  the key of the signature of a ChromeOS kernel blob, and the keyblock made for it
+Signer load_avb1_signer(const fs::path& base) {
+    const fs::path key_path = base.string() + ".pk8";
+    if (!fs::is_regular_file(key_path))
+        throw FormatError("keys/ has the certificate of an AVBv1 boot signature but not its key: " + shown(key_path.generic_string()) +
+                          " is not there");
+    fs::path cert_path;
+    for (const char* ext : {".x509.pem", ".x509.der", ".x509.crt"})
+        if (fs::is_regular_file(base.string() + ext)) {
+            cert_path = base.string() + ext;
+            break;
+        }
+    const Bytes key = read_file(key_path);
+    const Bytes cert = cert_path.empty() ? Bytes() : read_file(cert_path);
     return make_signer(key, cert);
 }
 
-void usage() {
-    std::cout <<
-        "abr -- Android boot-family image unpacker/repacker\n\n"
-        "  abr [-j N] info   <image>\n"
-        "  abr [-j N] unpack <image> [-o <outdir>] [--no-tree | --tree-only]\n"
-        "  abr [-j N] repack <dir> -o <image> [--avb-key <private_key.pem>]\n"
-        "                              [--avb1-key <key> [--avb1-cert <cert.pem|cert.der>]]\n"
-        "                              [--ramdisk-from tree|cpio]\n"
-        "                              [--chromeos-key <.vbprivk> [--chromeos-keyblock <.keyblock>]]\n"
-        "  abr qcdt <directory|file.dtb>... -o <dt.img> [--page-size N] [--version 1|2|3]\n"
-        "                                 make a Qualcomm device tree table of the device trees (what\n"
-        "                                 dtbTool makes: an entry for every board a tree is for, by its\n"
-        "                                 qcom,msm-id, qcom,board-id and qcom,pmic-id)\n"
-        "  abr identify [-b] <file>...    what it is, worded like Android Image Kitchen's\n"
-        "                                 `file -m androidbootimg.magic` (-b: the label only)\n\n"
-        "  -j N         threads to use (default: the number of cores, at most 16; 1 = one\n"
-        "               thread; also ABR_THREADS=N). The result never depends on it.\n"
-        "  --avb-key    signing key for AVB 2.0 (vbmeta / footers): PEM or DER (.pk8)\n"
-        "  --avb1-key   key for the old boot_signer signature of a boot image (the public AOSP\n"
-        "               test key is used when omitted); <key> may be a PEM/DER file or, as in\n"
-        "               Android Image Kitchen, a base name N with N.pk8 and N.x509.pem\n"
-        "  --chromeos-key  key (.vbprivk) to sign a ChromeOS kernel blob with, and\n"
-        "  --chromeos-keyblock  the keyblock (.keyblock) made for it; without them the signatures\n"
-        "               of the original are kept while the content is unchanged, and made with the\n"
-        "               public developer key of vboot_reference (as Android Image Kitchen does) when not\n"
-        "  A ramdisk is unpacked twice: ramdisk.cpio (exactly what the image held) and, when it\n"
-        "  can be one, the directory ramdisk/ with ramdisk.meta (owners, modes, order). Edit\n"
-        "  either; repack takes the one that changed (--ramdisk-from decides if both did).\n"
-        "  --no-tree    unpack: write ramdisk.cpio only\n"
-        "  --tree-only  unpack: write the directory only (ramdisk.cpio is dropped when the\n"
-        "               directory gives it back exactly)\n\n"
+void load_folder_keys(const fs::path& dir, RepackOptions& opt) {
+    const fs::path keys = dir / "keys";
+    if (!fs::is_directory(keys)) return;
+    const auto there = [&](const char* name) { return fs::is_regular_file(keys / name); };
+    if (there("avb_key.pem")) {
+        const Bytes key = read_file(keys / "avb_key.pem");
+        opt.avb_key_pem.assign(reinterpret_cast<const char*>(key.data()), key.size());
+    }
+    if (there("avb1.pk8") || there("avb1.x509.pem") || there("avb1.x509.der") || there("avb1.x509.crt")) opt.avb1_signer = load_avb1_signer(keys / "avb1");
+    if (there("chromeos.vbprivk")) {
+        try {
+            opt.chromeos.key = parse_vbprivk(read_file(keys / "chromeos.vbprivk"));
+        } catch (const FormatError& e) {
+            throw FormatError("keys/chromeos.vbprivk: " + std::string(e.what()));
+        }
+    }
+    if (there("chromeos.keyblock")) {
+        Bytes keyblock = read_file(keys / "chromeos.keyblock");
+        if (!has_chromeos_header(keyblock))
+            throw FormatError("keys/chromeos.keyblock is not a keyblock (it does not start with \"CHROMEOS\")");
+        try {
+            keyblock_data_key(keyblock);  // is it one?
+        } catch (const FormatError& e) {
+            throw FormatError("keys/chromeos.keyblock: " + std::string(e.what()));
+        }
+        opt.chromeos.keyblock = std::move(keyblock);
+    }
+}
+
+// The options of a table that is made of the device trees of a folder whose manifest.txt says `type=qcdt` and has no table of its own
+// (an `abr unpack` has one): `page_size` (default 2048: the page size of the boot image the table goes into) and `table_version`
+// (1, 2 or 3; default: what the trees need).
+qcdt::MakeOptions qcdt_make_options(const Manifest& m) {
+    qcdt::MakeOptions o;
+    o.page_size = static_cast<uint32_t>(m.get_int("page_size", qcdt::kDefaultPageSize, 1, qcdt::kMaxPageSize));
+    o.version = static_cast<uint32_t>(m.get_int("table_version", 0, 0, 3));
+    return o;
+}
+
+// What the folder is when it is packed: made by `abr unpack` (it has a manifest.txt), or just device trees.
+bool is_device_tree_table_recipe(const Manifest& m) { return m.get("type") == "qcdt" && !m.has("version"); }
+
+void do_pack(const fs::path& dir, const fs::path& out) {
+    if (!fs::is_directory(dir))
+        throw FormatError(shown(dir.string()) +
+                          (fs::exists(dir) ? " is a file, not a folder: `abr pack -i` takes the folder that `abr unpack -i` made of an image"
+                                           : " does not exist"));
+    if (fs::is_directory(out)) throw FormatError("-o " + shown(out.string()) + " is a folder: name the image file to make");
+    const fs::path manifest_file = dir / "manifest.txt";
+    if (!fs::exists(manifest_file)) {
+        pack_device_trees(dir, out, {});
+        return;
+    }
+    Manifest m = Manifest::load(manifest_file);
+    if (is_device_tree_table_recipe(m)) {
+        pack_device_trees(dir, out, qcdt_make_options(m));
+        return;
+    }
+    RepackOptions opt;
+    load_folder_keys(dir, opt);
+    const Fmt f = fmt_from_name(m.get("type"));
+    const Bytes result = build_image(dir, opt);
+    // The image is not written over a file this pack has read: the manifest, a component, a key, a file of the ramdisk
+    // folder, or what a symbolic link among them leads to.
+    if (const fs::path read = find_read_file(out); !read.empty())
+        throw FormatError("-o " + shown(out.string()) + " is a file this pack has read (" + shown(read.string()) +
+                          "); the image would be written over it. Name another file");
+    write_file(out, result);
+    std::cout << "packed " << fmt_name(f) << " -> " << out.string() << " (" << result.size() << " bytes)\n";
+}
+
+// ----------------------------------------------------------- command line --
+
+// A mistake in the command line (as against one in an image or a folder): main() points to the help after it.
+struct UsageError : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
+void usage(std::ostream& os) {
+    os <<
+        "abr " << kVersion << " -- Android Boot Repacker\n"
+        "\n"
+        "  abr unpack -i <input.img>    [-o <output_folder>]   take an image apart into a folder\n"
+        "  abr pack   -i <input_folder> [-o <output_image>]    build the image again of a folder that unpack made\n"
+        "  abr info   -i <input.img>                           show all there is to know about an image, without unpacking it\n"
+        "  abr help                                            show this help\n"
+        "  abr version                                         show the version (1.YYYYMMDD.NumberBuild)\n"
+        "\n"
+        "Without -o the output is made beside the input and named after it: `unpack -i dir/boot.img` makes the folder dir/boot,\n"
+        "`pack -i dir/boot` makes the image dir/boot.img (dir/boot_new.img when that file is there already: the image a folder came\n"
+        "from is not written over unless -o names it). A folder that `unpack` made is not unpacked into again unless -o names it.\n"
+        "\n"
+        "What an image is -- its format, what it is wrapped in -- abr finds out from the image itself. A ramdisk is unpacked twice:\n"
+        "ramdisk.cpio (exactly what the image held) and, when it can be one, the folder ramdisk/ with ramdisk.meta (owners, modes,\n"
+        "order). Edit either; pack takes the one that changed (the folder, when both did).\n"
+        "A folder of device trees (files that end in .dtb) and no manifest.txt is packed as a Qualcomm device tree table (QCDT, what\n"
+        "dtbTool makes); a manifest.txt of `type=qcdt` with `page_size=` and `table_version=` (1, 2 or 3) says how.\n"
+        "Keys of your own for what pack signs again go in the folder keys/ of the unpacked folder: avb_key.pem (AVB 2.0), avb1.pk8 and\n"
+        "avb1.x509.pem (the boot signature of old boot images), chromeos.vbprivk and chromeos.keyblock (a ChromeOS kernel blob).\n"
+        "ABR_THREADS=N limits the number of threads (the result never depends on it).\n"
+        "\n"
         "Supported: boot.img/init_boot.img/boot-debug.img/boot-test-harness.img,\n"
         "recovery.img/recovery-two-step.img (header v0-v4), vendor_boot.img/\n"
         "vendor_boot-debug.img/vendor_kernel_boot.img (header v3-v4), dtbo.img,\n"
@@ -3562,34 +3592,92 @@ void usage() {
         "(MTK) sub-header on the kernel and/or ramdisk.\n";
 }
 
-// -j N, -jN, --threads N and --threads=N, wherever they stand on the command
-// line: the most threads abr may use (0 = automatic, 1 = none besides the main
-// thread). Removes them from `v`; returns an error text, empty when fine.
-std::string take_threads_option(std::vector<std::string>& v) {
-    for (size_t i = 0; i < v.size();) {
-        const std::string a = v[i];
+struct IoArgs {
+    std::optional<std::string> input;
+    std::optional<std::string> output;
+};
+
+bool is_io_option(const std::string& a) { return a == "-i" || a == "--input" || a == "-o" || a == "--output"; }
+
+// The arguments of `unpack`, `pack` and `info`: -i <input> and -o <output> (also --input, --output, and --input=<input>,
+// --output=<output>); an input that no -i gave may be the one argument that is not an option. `info` has no output.
+IoArgs parse_io(const std::string& command, const std::vector<std::string>& args, bool takes_output) {
+    IoArgs io;
+    std::vector<std::string> bare;
+    for (size_t i = 0; i < args.size(); ++i) {
+        std::string option = args[i];
         std::string value;
-        size_t used = 1;
-        if (a == "-j" || a == "--threads") {
-            if (i + 1 >= v.size()) return a + " needs a number";
-            value = v[i + 1];
-            used = 2;
-        } else if (a.rfind("--threads=", 0) == 0) {
-            value = a.substr(10);
-        } else if (a.size() > 2 && a.compare(0, 2, "-j") == 0 && std::isdigit(static_cast<unsigned char>(a[2]))) {
-            value = a.substr(2);
-        } else {
-            ++i;
+        bool has_value = false;
+        if (option.rfind("--", 0) == 0) {
+            if (const size_t eq = option.find('='); eq != std::string::npos) {
+                value = option.substr(eq + 1);
+                option.resize(eq);
+                has_value = true;
+            }
+        }
+        const bool is_in = option == "-i" || option == "--input";
+        const bool is_out = option == "-o" || option == "--output";
+        if (!is_in && !is_out) {
+            if (args[i].size() > 1 && args[i][0] == '-') throw UsageError("unknown option " + shown(args[i]));
+            bare.push_back(args[i]);
             continue;
         }
-        if (value.empty() || value.size() > 4 ||
-            !std::all_of(value.begin(), value.end(), [](char c) { return c >= '0' && c <= '9'; }))
-            return "the number of threads must be a whole number (0 = automatic), not '" + value + "'";
-        par::set_max_threads(static_cast<unsigned>(std::stoul(value)));
-        v.erase(v.begin() + static_cast<long>(i), v.begin() + static_cast<long>(i + used));
+        if (is_out && !takes_output) throw UsageError(command + " has no output: it takes -i only");
+        if (!has_value) {
+            if (i + 1 >= args.size() || is_io_option(args[i + 1]))
+                throw UsageError(option + " needs " + (is_in ? "the " + std::string(command == "pack" ? "folder" : "image") + " to read" : std::string("the name of what to make")));
+            value = args[++i];
+        }
+        if (value.empty()) throw UsageError(option + " is empty");
+        std::optional<std::string>& slot = is_in ? io.input : io.output;
+        if (slot) throw UsageError(std::string(is_in ? "-i" : "-o") + " is given twice (" + shown(*slot) + " and " + shown(value) + ")");
+        slot = std::move(value);
     }
-    return "";
+    if (!io.input && bare.size() == 1) io.input = bare.front();
+    else if (!io.input && bare.size() > 1) throw UsageError("two inputs, " + shown(bare[0]) + " and " + shown(bare[1]) + ": the input goes after -i");
+    else if (!bare.empty()) throw UsageError("unexpected argument " + shown(bare.front()) + ": the input goes after -i, the output after -o");
+    if (!io.input) throw UsageError(command + " needs -i <" + (command == "pack" ? "input_folder" : "input.img") + ">");
+    return io;
 }
+
+// The name of the last part of a path, whatever way it was written (boot/, ./boot, boot/., ..).
+fs::path named_path(const fs::path& given) {
+    const auto name_of = [](const fs::path& p) { return p.has_filename() && p.filename() != "." && p.filename() != ".."; };
+    fs::path p = given.lexically_normal();
+    if (!name_of(p) && !p.empty()) p = p.parent_path();  // a path that ends in a separator
+    if (!name_of(p)) {
+        p = fs::absolute(given).lexically_normal();
+        if (!p.has_filename()) p = p.parent_path();
+    }
+    if (!name_of(p)) throw UsageError("there is no name in " + shown(given.string()) + " to name the output after: use -o");
+    return p;
+}
+
+// Without -o, an unpack goes beside the image, named after it, without its extension: dir/boot.img -> dir/boot. A name with no
+// extension to take off would be the name of the image itself: dir/boot -> dir/boot_unpacked.
+fs::path default_unpack_dir(const fs::path& image) {
+    const fs::path p = named_path(image);
+    std::string name = p.stem().string();
+    if (name.empty() || name == p.filename().string()) name = p.filename().string() + "_unpacked";
+    return p.parent_path() / name;
+}
+
+// Without -o, a pack goes beside the folder, named after it, with the extension of what it makes: dir/boot -> dir/boot.img. The image
+// the folder came from is likely to be there; it is not written over (dir/boot_new.img instead, which a later pack replaces).
+fs::path default_pack_file(const fs::path& folder) {
+    const fs::path p = named_path(folder);
+    std::string extension = ".img";
+    if (fs::exists(p / "manifest.txt")) {
+        const Fmt f = fmt_from_name(Manifest::load(p / "manifest.txt").get("type"));
+        if (f == Fmt::DTB) extension = ".dtb";
+        else if (f == Fmt::FIT) extension = ".itb";
+    }
+    const std::string name = p.filename().string();
+    fs::path out = p.parent_path() / (name + extension);
+    if (fs::exists(out)) out = p.parent_path() / (name + "_new" + extension);
+    return out;
+}
+
 
 }  // namespace
 
@@ -3639,53 +3727,52 @@ int main(int argc, char** argv) {
         // (UTF-8 on Windows, too: the C runtime's argv would hold '?' for every character outside the ANSI code page)
         std::vector<std::string> args = command_line_utf8(argc, argv);
         if (args.empty()) {
-            usage();
-            return 1;
-        }
-        if (std::string err = take_threads_option(args); !err.empty()) {
-            std::cerr << "error: " << err << "\n";
-            return 1;
-        }
-        if (args.empty()) {
-            usage();
+            usage(std::cerr);
             return 1;
         }
         const std::string cmd = args.front();
         args.erase(args.begin());
 
+        if (cmd == "help" || cmd == "-h" || cmd == "--help") {
+            usage(std::cout);
+            return 0;
+        }
+        if (cmd == "version" || cmd == "-V" || cmd == "--version") {
+            std::cout << kVersion << "\n";
+            return 0;
+        }
+        if (std::find_if(args.begin(), args.end(), [](const std::string& a) { return a == "-h" || a == "--help"; }) != args.end()) {
+            usage(std::cout);
+            return 0;
+        }
+
         if (cmd == "info") {
-            if (args.empty()) { usage(); return 1; }
-            print_info(args[0]);
+            const IoArgs io = parse_io(cmd, args, false);
+            print_info(*io.input);
         } else if (cmd == "unpack") {
-            if (args.empty()) { usage(); return 1; }
-            fs::path in = args[0];
-            fs::path outdir = in.stem();
-            UnpackOptions uo;
-            for (size_t i = 1; i < args.size(); ++i) {
-                if ((args[i] == "-o" || args[i] == "--output") && i + 1 < args.size())
-                    outdir = args[++i];
-                else if (args[i] == "--no-tree")
-                    uo.tree = false;
-                else if (args[i] == "--tree-only")
-                    uo.keep_cpio = false;
-                else {
-                    std::cerr << "unpack: unknown option " << args[i] << "\n";
-                    return 1;
-                }
-            }
-            if (!uo.tree && !uo.keep_cpio) {
-                std::cerr << "unpack: --no-tree and --tree-only contradict each other\n";
-                return 1;
-            }
-            do_unpack(in, outdir, uo);
+            const IoArgs io = parse_io(cmd, args, true);
+            const fs::path in = *io.input;
+            const fs::path outdir = io.output ? fs::path(*io.output) : default_unpack_dir(in);
+            if (fs::is_directory(in))
+                throw FormatError(shown(in.string()) + " is a folder, not an image: `abr unpack -i` takes an image (`abr pack -i` takes a folder)");
+            if (!io.output && fs::exists(outdir) && !(fs::is_directory(outdir) && fs::is_empty(outdir)))
+                throw FormatError(shown(outdir.string()) + " is there already: unpack does not write into a folder it chose itself when it is not empty. "
+                                  "Take another with -o, or -o " + shown(outdir.string()) + " to unpack into this one");
+            do_unpack(in, outdir);
+        } else if (cmd == "pack") {
+            const IoArgs io = parse_io(cmd, args, true);
+            const fs::path dir = *io.input;
+            const fs::path out = io.output ? fs::path(*io.output) : default_pack_file(dir);
+            do_pack(dir, out);
         } else if (cmd == "identify") {
+            // (not in the help: what the tests of the formats ask, worded like Android Image Kitchen's `file -m androidbootimg.magic`)
             bool brief = false;
             std::vector<std::string> files;
             for (const std::string& a : args) {
                 if (a == "-b" || a == "--brief") brief = true;
                 else files.push_back(a);
             }
-            if (files.empty()) { usage(); return 1; }
+            if (files.empty()) throw UsageError("identify needs a file");
             int status = 0;
             for (const std::string& f : files) {
                 try {
@@ -3698,93 +3785,12 @@ int main(int argc, char** argv) {
                 }
             }
             return status;
-        } else if (cmd == "qcdt") {
-            std::vector<fs::path> inputs;
-            fs::path out;
-            qcdt::MakeOptions opt;
-            const auto whole = [](const std::string& option, const std::string& text, uint64_t lo, uint64_t hi) {
-                bool digits = !text.empty() && text.size() <= 10;
-                for (const char c : text) digits = digits && c >= '0' && c <= '9';
-                const uint64_t v = digits ? std::stoull(text) : 0;
-                if (!digits || v < lo || v > hi)
-                    throw FormatError("qcdt: " + option + " takes a whole number from " + std::to_string(lo) + " to " + std::to_string(hi) + ", not " +
-                                      shown(text));
-                return v;
-            };
-            for (size_t i = 0; i < args.size(); ++i) {
-                const std::string& a = args[i];
-                if ((a == "-o" || a == "--output") && i + 1 < args.size()) out = args[++i];
-                else if ((a == "-s" || a == "--page-size") && i + 1 < args.size())
-                    opt.page_size = static_cast<uint32_t>(whole(a, args[++i], 1, qcdt::kMaxPageSize));
-                else if (a == "--version" && i + 1 < args.size()) opt.version = static_cast<uint32_t>(whole(a, args[++i], 1, 3));
-                else if (a.rfind("-", 0) == 0 && a.size() > 1) {
-                    std::cerr << "qcdt: unknown option " << shown(a) << " (or it needs a value)\n";
-                    return 1;
-                } else inputs.push_back(a);
-            }
-            if (inputs.empty()) { usage(); return 1; }
-            if (out.empty()) { std::cerr << "qcdt: -o <output file> is required\n"; return 1; }
-            do_qcdt(inputs, out, opt);
-        } else if (cmd == "repack") {
-            if (args.empty()) { usage(); return 1; }
-            fs::path dir = args[0];
-            fs::path out;
-            RepackOptions opt;
-            std::string avb1_key, avb1_cert, chromeos_key, chromeos_keyblock;
-            for (size_t i = 1; i < args.size(); ++i) {
-                if ((args[i] == "-o" || args[i] == "--output") && i + 1 < args.size())
-                    out = args[++i];
-                else if (args[i] == "--avb-key" && i + 1 < args.size()) {
-                    Bytes key_bytes = read_file(args[++i]);
-                    opt.avb_key_pem.assign(reinterpret_cast<const char*>(key_bytes.data()),
-                                           key_bytes.size());
-                } else if (args[i] == "--avb1-key" && i + 1 < args.size())
-                    avb1_key = args[++i];
-                else if (args[i] == "--avb1-cert" && i + 1 < args.size())
-                    avb1_cert = args[++i];
-                else if (args[i] == "--chromeos-key" && i + 1 < args.size())
-                    chromeos_key = args[++i];
-                else if (args[i] == "--chromeos-keyblock" && i + 1 < args.size())
-                    chromeos_keyblock = args[++i];
-                else if (args[i] == "--ramdisk-from" && i + 1 < args.size()) {
-                    opt.ramdisk_from = args[++i];
-                    if (opt.ramdisk_from != "tree" && opt.ramdisk_from != "cpio") {
-                        std::cerr << "repack: --ramdisk-from takes 'tree' or 'cpio', not '" << opt.ramdisk_from
-                                  << "'\n";
-                        return 1;
-                    }
-                }
-                else if (args[i].rfind("-", 0) == 0) {
-                    std::cerr << "repack: unknown option " << args[i] << "\n";
-                    return 1;
-                }
-            }
-            if (out.empty()) { std::cerr << "repack: -o <output image> is required\n"; return 1; }
-            if (!avb1_key.empty() || !avb1_cert.empty())
-                opt.avb1_signer = load_avb1_signer(avb1_key, avb1_cert);
-            if (!chromeos_key.empty()) {
-                try {
-                    opt.chromeos.key = parse_vbprivk(read_file(chromeos_key));
-                } catch (const FormatError& e) {
-                    throw FormatError("--chromeos-key " + chromeos_key + ": " + e.what());
-                }
-            }
-            if (!chromeos_keyblock.empty()) {
-                Bytes keyblock = read_file(chromeos_keyblock);
-                if (!has_chromeos_header(keyblock))
-                    throw FormatError("--chromeos-keyblock " + chromeos_keyblock + " is not a keyblock (it does not start with \"CHROMEOS\")");
-                try {
-                    keyblock_data_key(keyblock);  // is it one?
-                } catch (const FormatError& e) {
-                    throw FormatError("--chromeos-keyblock " + chromeos_keyblock + ": " + e.what());
-                }
-                opt.chromeos.keyblock = std::move(keyblock);
-            }
-            do_repack(dir, out, opt);
         } else {
-            usage();
-            return 1;
+            throw UsageError("there is no command " + shown(cmd));
         }
+    } catch (const UsageError& e) {
+        std::cerr << "error: " << e.what() << "\nsee 'abr help'\n";
+        return 1;
     } catch (const std::exception& e) {
         std::cerr << "error: " << e.what() << "\n";
         return 1;
