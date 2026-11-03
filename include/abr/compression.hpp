@@ -12,6 +12,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -60,7 +61,11 @@ Bytes decompress(Codec codec, const Bytes& data, size_t max_size = kMaxDecompres
 // May use several threads (abr/parallel.hpp): the independent 8 MiB blocks of
 // an lz4_legacy stream, the workers of a zstd frame. The output is the same for
 // any number of threads.
-Bytes compress(Codec codec, const Bytes& data, int level = -1);
+//
+// `on_progress`, when there is one, is told how many more bytes of `data` have been compressed -- the work as it is done, for a bar --
+// by whichever thread did it; what it is told adds up to data.size() when compress() returns (gzip and lz4_legacy say it as they go, the
+// other codecs when they are done).
+Bytes compress(Codec codec, const Bytes& data, int level = -1, const std::function<void(size_t)>& on_progress = {});
 
 // The densest setting of a codec that the decoders in the wild still take (gzip 9, zstd 19 -- an 8 MiB
 // window, what `zstd -19` writes --, xz 9, lz4 frame 12); -1 where the usual setting (-1 above) already

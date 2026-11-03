@@ -32,6 +32,7 @@
 #include "abr/boot_image.hpp"
 #include "abr/byte_io.hpp"
 #include "abr/compression.hpp"
+#include "abr/console.hpp"
 #include "abr/dtb.hpp"
 #include "abr/dtbo.hpp"
 #include "abr/dts.hpp"
@@ -52,6 +53,7 @@
 #include "abr/legacy/sin.hpp"
 #include "abr/manifest.hpp"
 #include "abr/parallel.hpp"
+#include "abr/progress.hpp"
 #include "abr/qcdt.hpp"
 #include "abr/ramdisk_tree.hpp"
 #include "abr/sha.hpp"
@@ -458,13 +460,20 @@ std::vector<DecodedComponent> save_components(const fs::path& dir,
     const bool any = !order.empty() && !sources[order[0]].raw->empty();
     if (any) fs::create_directories(dir / ".abr_raw");
 
+    uint64_t work = 0;
+    for (const ComponentSource& s : sources) work += s.raw->size();
+    progress::enter("decode", work);
+
     std::vector<DecodedComponent> out(sources.size());
     par::for_each(sources.size(), [&](size_t k) {
         const size_t i = order[k];
+        const progress::Activity doing(sources[i].filename);
         out[i] = decode_component(*sources[i].raw, sources[i].filename);
-        if (!out[i].present) return;
-        write_file(dir / sources[i].filename, out[i].plain);
-        write_file(dir / ".abr_raw" / (sources[i].filename + ".raw"), out[i].stored(*sources[i].raw));
+        if (out[i].present) {
+            write_file(dir / sources[i].filename, out[i].plain);
+            write_file(dir / ".abr_raw" / (sources[i].filename + ".raw"), out[i].stored(*sources[i].raw));
+        }
+        progress::advance(sources[i].raw->size());
     });
     return out;
 }
@@ -520,13 +529,18 @@ void save_ramdisk_trees(Manifest& m, const fs::path& dir, const std::vector<Tree
 
     std::vector<RamdiskTree> results(todo.size());
     std::vector<std::string> failures(todo.size());
+    uint64_t work = 0;
+    for (const TreeJob* j : todo) work += j->decoded->plain.size();
+    progress::enter("tree", work);
     par::for_each(todo.size(), [&](size_t k) {
         const TreeJob& j = *todo[k];
+        const progress::Activity doing(j.prefix + "/");
         try {
             results[k] = extract_ramdisk_tree(j.decoded->plain, dir, j.prefix);
         } catch (const std::exception& e) {
             failures[k] = e.what();
         }
+        progress::advance(j.decoded->plain.size());
     });
 
     for (size_t k = 0; k < todo.size(); ++k) {
@@ -605,6 +619,7 @@ Bytes load_component(const Manifest& m, const fs::path& dir, const std::string& 
     const std::string key = prefix + "_file";
     if (!m.has(key)) return {};
     const std::string filename = m.get_path(key);
+    const progress::Activity doing(filename);
     const fs::path file = dir / filename;
     const fs::path raw_path = dir / ".abr_raw" / (filename + ".raw");
     const Bytes stored_hash = m.get_hex(prefix + "_orig_hash");
@@ -652,6 +667,7 @@ Bytes load_component(const Manifest& m, const fs::path& dir, const std::string& 
         result = read_file(raw_path);  // untouched: the very bytes the image had
         check_raw_copy(raw_path, result, stored_hash, filename);
         if (replayed) *replayed = true;
+        progress::advance(plain.size());
     } else {
         if (use_tree) {
             for (const std::string& n : report.notes) note(n);
@@ -677,7 +693,7 @@ Bytes load_component(const Manifest& m, const fs::path& dir, const std::string& 
         int level = static_cast<int>(m.get_int(prefix + "_level", -1, -1, 22));
         if (level < 0 && opt.dense) level = dense_level(codec);
         else if (level < 0 && dense_level(codec) >= 0) g_denser_would_help = true;
-        result = compress(codec, plain, level);
+        result = compress(codec, plain, level, [](size_t n) { progress::advance(n); });
         if (codec == Codec::NONE) check_unpacks_as_is(result, prefix, filename);
     }
     if (m.has(prefix + "_mtk_name")) result = add_mtk_header(result, m.get(prefix + "_mtk_name"));
@@ -3315,6 +3331,7 @@ size_t first_difference(const Bytes& a, const Bytes& b) {
 // here, so a repack of an untouched image is either provably identical or
 // the user is told, at once, where it is not.
 void self_check(const fs::path& outdir, const Bytes& original, const char* what = "this image") {
+    progress::enter("verify", original.size() + original.size() / 8);  // (an eighth more than the components: the rest is putting them together)
     try {
         Bytes rebuilt = build_image(outdir, RepackOptions{});
         if (rebuilt == original) {
@@ -3333,7 +3350,10 @@ void self_check(const fs::path& outdir, const Bytes& original, const char* what 
 }
 
 void do_unpack(const fs::path& in, const fs::path& outdir) {
+    const progress::Scope progress_scope("unpack", {{"read", 1}, {"decode", 6}, {"tree", 2}, {"verify", 5}});
+    progress::enter("read", 1);
     Bytes data = read_file(in);
+    progress::advance(1);
 
     Wrappers wrap;
     const Bytes& payload = peel_wrappers(data, wrap);
@@ -3518,7 +3538,20 @@ qcdt::MakeOptions qcdt_make_options(const Manifest& m) {
 // What the folder is when it is packed: made by `abr unpack` (it has a manifest.txt), or just device trees.
 bool is_device_tree_table_recipe(const Manifest& m) { return m.get("type") == "qcdt" && !m.has("version"); }
 
+// The work of a pack, for the bar: the size of the files of the folder that go into the image (what the manifest names with `*_file`).
+uint64_t folder_work(const Manifest& m, const fs::path& dir) {
+    uint64_t total = 0;
+    for (const auto& [key, value] : m.entries()) {
+        if (key.size() < 5 || key.compare(key.size() - 5, 5, "_file") != 0 || *path_problem(value) != '\0') continue;
+        std::error_code ec;
+        const auto size = fs::file_size(dir / value, ec);
+        if (!ec) total += size;
+    }
+    return total;
+}
+
 void do_pack(const fs::path& dir, const fs::path& out) {
+    const progress::Scope progress_scope("pack", {{"build", 9}, {"write", 1}});
     if (!fs::is_directory(dir))
         throw FormatError(shown(dir.string()) +
                           (fs::exists(dir) ? " is a file, not a folder: `abr pack -i` takes the folder that `abr unpack -i` made of an image"
@@ -3537,7 +3570,10 @@ void do_pack(const fs::path& dir, const fs::path& out) {
     RepackOptions opt;
     load_folder_keys(dir, opt);
     const Fmt f = fmt_from_name(m.get("type"));
+    const uint64_t work = folder_work(m, dir);
+    progress::enter("build", work + work / 8);  // (an eighth more than the files: the rest is putting the image together)
     const Bytes result = build_image(dir, opt);
+    progress::enter("write");
     // The image is not written over a file this pack has read: the manifest, a component, a key, a file of the ramdisk
     // folder, or what a symbolic link among them leads to.
     if (const fs::path read = find_read_file(out); !read.empty())
@@ -3681,43 +3717,10 @@ fs::path default_pack_file(const fs::path& folder) {
 
 }  // namespace
 
-namespace {
-
-// Everything abr prints passes a filter that writes what a terminal would act on -- control characters, the C1 controls, what is
-// not UTF-8 -- as escapes (textquote.hpp): the last line of defence for text that an image holds and a message forgot to escape.
-// ABR_UNFILTERED_OUTPUT=1 turns it off; tests/tools/fuzz_images.py does that to find such a message.
-class OutputFilter {
-public:
-    OutputFilter() {
-        const char* off = std::getenv("ABR_UNFILTERED_OUTPUT");
-        if (off != nullptr && *off != '\0' && std::string_view(off) != "0") return;
-        out_.emplace(std::cout.rdbuf());
-        err_.emplace(std::cerr.rdbuf());
-        out_before_ = std::cout.rdbuf(&*out_);
-        err_before_ = std::cerr.rdbuf(&*err_);
-    }
-    ~OutputFilter() {
-        if (!out_) return;
-        std::cout.flush();
-        std::cerr.flush();
-        std::cout.rdbuf(out_before_);
-        std::cerr.rdbuf(err_before_);
-    }
-    OutputFilter(const OutputFilter&) = delete;
-    OutputFilter& operator=(const OutputFilter&) = delete;
-
-private:
-    std::optional<textquote::TerminalSafeBuf> out_, err_;
-    std::streambuf* out_before_ = nullptr;
-    std::streambuf* err_before_ = nullptr;
-};
-
-}  // namespace
-
 int main(int argc, char** argv) {
     set_binary_stdio();
     const Utf8Console utf8_console;  // (Windows: the console shows the paths in the messages as they are)
-    const OutputFilter output_filter;
+    const console::Printer printer;  // (the one thread that writes: abr/console.hpp; it is also what makes the text safe for a terminal)
     if (!hash::sha_selftest()) {
         std::cerr << "internal error: bundled SHA implementation failed its self-test; "
                      "refusing to run since boot ids and AVB hashes would be silently wrong\n";

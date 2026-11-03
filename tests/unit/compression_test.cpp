@@ -14,7 +14,11 @@
 //     terabyte: believing it would end the test with an out-of-memory), a frame that declares less than it holds is refused
 //     as the damaged one it is, and a frame that declares nothing is cut off at the limit like any stream;
 //   * a stream that is a thousand times its own size (a gzip of zeros, a zstd frame of run-length blocks) stops at the
-//     limit, where the plain data the decoder had made so far is a few megabytes, not the gigabytes it asks for.
+//     limit, where the plain data the decoder had made so far is a few megabytes, not the gigabytes it asks for;
+//   * the progress that compress() reports (`on_progress`) adds up to the size of the data for every codec, at every size around
+//     the slices gzip is fed in and the blocks lz4_legacy is cut into, from any number of threads, and the stream is the same as
+//     the one made without anybody listening and decompresses to the data.
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <optional>
@@ -249,7 +253,49 @@ void test_bombs() {
 
 }  // namespace
 
+// What compress() tells of how far it has got.
+void test_progress_reports() {
+    std::mt19937_64 rng(20261103);
+    const size_t mib = size_t(1) << 20;
+    // sizes on both sides of the 1 MiB slices of gzip and the 8 MiB blocks of lz4_legacy, and the empty and the tiny; the codecs that say it
+    // only at the end (and are slow) get the sizes that are small
+    const std::vector<size_t> sizes = {0, 1, 4095, mib - 1, mib, mib + 1, 3 * mib + 7, 8 * mib, 8 * mib + 1};
+    for (const Codec codec : {Codec::NONE, Codec::GZIP, Codec::LZ4_LEGACY, Codec::LZ4, Codec::ZSTD, Codec::XZ, Codec::LZMA, Codec::BZIP2, Codec::LZO}) {
+        for (const size_t size : sizes) {
+            const bool says_as_it_goes = codec == Codec::GZIP || codec == Codec::LZ4_LEGACY;
+            if (!says_as_it_goes && size > mib + 1) continue;
+            if (codec == Codec::LZ4_LEGACY && (size == mib - 1 || size == mib || size == 3 * mib + 7)) continue;  // (one block, as 1 MiB + 1 is)
+            // data that compresses (text-like runs) and some that does not
+            Bytes data(size);
+            for (size_t i = 0; i < size; ++i) data[i] = (i / 3000) % 2 ? static_cast<uint8_t>(rng()) : static_cast<uint8_t>("abcdefgh"[i % 8]);
+            std::atomic<size_t> total{0};
+            std::atomic<int> calls{0};
+            const Bytes with = compress(codec, data, -1, [&](size_t n) {
+                total += n;
+                ++calls;
+            });
+            EXPECT(total == size);
+            if (size > 0) EXPECT(calls > 0);
+            // gzip says it as it goes: more than once for data of more than a slice
+            if (codec == Codec::GZIP && size > 2 * mib) EXPECT(calls >= 2);
+            if (codec == Codec::LZ4_LEGACY && size > 8 * mib) EXPECT(calls >= 2);
+            EXPECT(with == compress(codec, data));
+            EXPECT(decompress(codec, with) == data);
+        }
+    }
+    // gzip at level 0 (stored blocks as long as what is at hand) is fed all at once, and every level gives a stream that reads back
+    Bytes data(5 * mib + 11);
+    for (size_t i = 0; i < data.size(); ++i) data[i] = static_cast<uint8_t>(i * 7 + (i >> 9));
+    for (const int level : {-1, 0, 1, 6, 9}) {
+        std::atomic<size_t> total{0};
+        const Bytes stream = compress(Codec::GZIP, data, level, [&](size_t n) { total += n; });
+        EXPECT(total == data.size());
+        EXPECT(decompress(Codec::GZIP, stream) == data);
+    }
+}
+
 int run_compression_tests() {
+    test_progress_reports();
     test_none_is_not_limited();
     test_default_limit();
     test_damaged_streams();

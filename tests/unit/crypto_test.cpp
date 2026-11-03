@@ -209,6 +209,7 @@ int run_fdt_tests();  // fdt_test.cpp
 int run_fdt_files(int argc, char** argv);  // fdt_test.cpp
 int run_fit_tests();  // fit_test.cpp
 int run_fit_files(int argc, char** argv);  // fit_test.cpp
+int run_console_tests();  // console_test.cpp
 
 int main(int argc, char** argv) {
     set_binary_stdio();
@@ -223,6 +224,7 @@ int main(int argc, char** argv) {
         if (cmd == "compression") return run_compression_tests();
         if (cmd == "fdt") return run_fdt_tests();
         if (cmd == "fdt-files") return run_fdt_files(argc, argv);
+        if (cmd == "console") return run_console_tests();
         if (cmd == "fit") return run_fit_tests();
         if (cmd == "fit-files") return run_fit_files(argc, argv);
         if (cmd == "sha-impl") {

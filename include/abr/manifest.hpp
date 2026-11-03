@@ -34,6 +34,8 @@ public:
 
     bool has(const std::string& key) const;
     void set(const std::string& key, const std::string& value);
+    // Every key and its value, in the order of the file.
+    const std::vector<std::pair<std::string, std::string>>& entries() const { return entries_; }
     std::string get(const std::string& key, const std::string& def = "") const;
     // A value that names a file or a directory of the unpack (`kernel_file`, `ramdisk_tree`, ...): what pack opens. It
     // must lie in the directory of the manifest -- a relative path, without '..', a drive, a colon or a backslash -- or

@@ -128,6 +128,8 @@ add_library(abr_core STATIC
   src/byte_io.cpp
   src/compression.cpp
   src/parallel.cpp
+  src/progress.cpp
+  src/console.cpp
   src/sha.cpp
   src/boot_image.cpp
   src/vendor_boot.cpp
@@ -223,7 +225,7 @@ abr_link_statically(abr)
 
 if(ABR_BUILD_TESTS)
   add_executable(abr_unit_tests tests/unit/crypto_test.cpp tests/unit/par_test.cpp tests/unit/cpio_test.cpp
-               tests/unit/legacy_test.cpp tests/unit/manifest_test.cpp tests/unit/compression_test.cpp tests/unit/fdt_test.cpp tests/unit/fit_test.cpp)
+               tests/unit/legacy_test.cpp tests/unit/manifest_test.cpp tests/unit/compression_test.cpp tests/unit/fdt_test.cpp tests/unit/fit_test.cpp tests/unit/console_test.cpp)
   target_link_libraries(abr_unit_tests PRIVATE abr_core)
   abr_link_statically(abr_unit_tests)
 endif()

@@ -12,6 +12,7 @@
 #include "minilzo.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <vector>
 
@@ -89,40 +90,89 @@ void append_up_to(Bytes& out, const uint8_t* p, size_t n, size_t max) {
     out.insert(out.end(), p, p + n);
 }
 
+// What a compressor tells of how far it has got, in bytes of its input; compress() tops it up to the whole input at the end, so that what
+// a caller adds up is exact whichever codecs report on the way. Any thread may report.
+class Reporter {
+public:
+    explicit Reporter(const std::function<void(size_t)>& fn) : fn_(fn) {}
+    void operator()(size_t n) {
+        sent_.fetch_add(n, std::memory_order_relaxed);
+        if (fn_) fn_(n);
+    }
+    size_t sent() const { return sent_.load(std::memory_order_relaxed); }
+
+private:
+    const std::function<void(size_t)>& fn_;
+    std::atomic<size_t> sent_{0};
+};
+
 // ---------------------------------------------------------------- gzip --
 
-// `max_out` is the most a decoder may produce; an encoder (`encode`) is not limited.
-Bytes zlib_run(const Bytes& in, bool encode, int level, int window_bits, size_t max_out = 0) {
+// The encoder: the input goes in in slices, so that there is something to say of how far it has got. What deflate writes does not
+// depend on the slices as long as no flush is asked for (it waits for more input rather than go on with what it has) -- except at level 0,
+// where the stored blocks are as long as what is at hand: that level is given all at once.
+Bytes zlib_encode(const Bytes& in, int level, int window_bits, Reporter& report) {
     z_stream strm{};
-    int rc = encode ? deflateInit2(&strm, level, Z_DEFLATED, window_bits, 8, Z_DEFAULT_STRATEGY)
-                     : inflateInit2(&strm, window_bits);
-    if (rc != Z_OK) fail("zlib init failed");
+    if (deflateInit2(&strm, level, Z_DEFLATED, window_bits, 8, Z_DEFAULT_STRATEGY) != Z_OK) fail("zlib init failed");
+    Bytes out(std::max<size_t>(64, in.size() + 4096));
+    size_t produced = 0, fed = 0;
+    const size_t slice = level == 0 ? std::max<size_t>(in.size(), 1) : (size_t{1} << 20);
+    for (;;) {
+        const size_t take = std::min(slice, in.size() - fed);
+        const bool last = fed + take == in.size();
+        strm.next_in = const_cast<Bytef*>(in.data()) + fed;
+        strm.avail_in = static_cast<uInt>(take);
+        for (;;) {
+            if (produced == out.size()) out.resize(out.size() * 2);
+            strm.next_out = out.data() + produced;
+            strm.avail_out = static_cast<uInt>(std::min<size_t>(out.size() - produced, 0x40000000));  // (a uInt is 32 bits)
+            const int rc = deflate(&strm, last ? Z_FINISH : Z_NO_FLUSH);
+            produced = static_cast<size_t>(strm.next_out - out.data());
+            if (rc == Z_STREAM_END) {
+                deflateEnd(&strm);
+                out.resize(produced);
+                report(take);
+                return out;
+            }
+            if (rc != Z_OK && rc != Z_BUF_ERROR) {
+                deflateEnd(&strm);
+                fail(std::string("zlib deflate failed: ") + (strm.msg ? strm.msg : std::to_string(rc)));
+            }
+            if (!last && strm.avail_in == 0 && strm.avail_out != 0) break;  // the slice is taken
+        }
+        fed += take;
+        report(take);
+    }
+}
 
-    const size_t room = encode ? 0 : room_for(max_out);
+// The decoder. `max_out` is the most it may produce.
+Bytes zlib_decode(const Bytes& in, int window_bits, size_t max_out) {
+    z_stream strm{};
+    if (inflateInit2(&strm, window_bits) != Z_OK) fail("zlib init failed");
+
+    const size_t room = room_for(max_out);
     Bytes out;
-    out.resize(encode ? std::max<size_t>(64, in.size() + 4096) : first_buffer(in.size() * 3 + 4096, room));
+    out.resize(first_buffer(in.size() * 3 + 4096, room));
     strm.next_in = const_cast<Bytef*>(in.data());
     strm.avail_in = static_cast<uInt>(in.size());
     size_t produced = 0;
 
-    int action = encode ? Z_FINISH : Z_FINISH;
     for (;;) {
         if (produced == out.size()) {
-            if (!encode && out.size() >= room) {  // the room is filled: more than max_out
+            if (out.size() >= room) {  // the room is filled: more than max_out
                 inflateEnd(&strm);
                 too_big(max_out);
             }
-            out.resize(encode ? out.size() * 2 : next_buffer(out.size(), room));
+            out.resize(next_buffer(out.size(), room));
         }
         strm.next_out = out.data() + produced;
         strm.avail_out = static_cast<uInt>(std::min<size_t>(out.size() - produced, 0x40000000));  // (a uInt is 32 bits)
-        rc = encode ? deflate(&strm, action) : inflate(&strm, action);
+        const int rc = inflate(&strm, Z_FINISH);
         produced = static_cast<size_t>(strm.next_out - out.data());
         if (rc == Z_STREAM_END) break;
         if (rc != Z_OK && rc != Z_BUF_ERROR) {
-            (encode ? deflateEnd : inflateEnd)(&strm);
-            fail(std::string("zlib ") + (encode ? "deflate" : "inflate") + " failed: " +
-                 (strm.msg ? strm.msg : std::to_string(rc)));
+            inflateEnd(&strm);
+            fail(std::string("zlib inflate failed: ") + (strm.msg ? strm.msg : std::to_string(rc)));
         }
         if (rc == Z_BUF_ERROR && strm.avail_out != 0 && strm.avail_in == 0) {
             // No forward progress possible and no more input: for a
@@ -130,18 +180,18 @@ Bytes zlib_run(const Bytes& in, bool encode, int level, int window_bits, size_t 
             break;
         }
     }
-    (encode ? deflateEnd : inflateEnd)(&strm);
-    if (!encode && produced > max_out) too_big(max_out);  // (a stream that ends with the room filled up to its last byte)
+    inflateEnd(&strm);
+    if (produced > max_out) too_big(max_out);  // (a stream that ends with the room filled up to its last byte)
     out.resize(produced);
     return out;
 }
 
-Bytes gzip_compress(const Bytes& in, int level) {
+Bytes gzip_compress(const Bytes& in, int level, Reporter& report) {
     if (level < 0) level = Z_DEFAULT_COMPRESSION;
-    return zlib_run(in, /*encode=*/true, level, /*windowBits=*/15 + 16);
+    return zlib_encode(in, level, /*windowBits=*/15 + 16, report);
 }
 Bytes gzip_decompress(const Bytes& in, size_t max_out) {
-    return zlib_run(in, /*encode=*/false, 0, /*windowBits=*/15 + 32 /* auto zlib/gzip */, max_out);
+    return zlib_decode(in, /*windowBits=*/15 + 32 /* auto zlib/gzip */, max_out);
 }
 
 // ------------------------------------------------------------ lz4 frame --
@@ -195,7 +245,7 @@ Bytes lz4_frame_decompress(const Bytes& in, size_t max_out) {
 // sized vendor_boot partition from fitting.
 constexpr int kLz4LegacyDefaultLevel = 12;
 
-Bytes lz4_legacy_compress(const Bytes& in, int level) {
+Bytes lz4_legacy_compress(const Bytes& in, int level, Reporter& report) {
     if (level < 0) level = kLz4LegacyDefaultLevel;
     level = std::min(level, static_cast<int>(LZ4HC_CLEVEL_MAX));
 
@@ -213,6 +263,7 @@ Bytes lz4_legacy_compress(const Bytes& in, int level) {
         if (csize <= 0) fail("LZ4 compression failed");
         cbuf.resize(static_cast<size_t>(csize));
         parts[i] = std::move(cbuf);
+        report(static_cast<size_t>(chunk));
     });
 
     BinaryWriter w;
@@ -626,19 +677,23 @@ Bytes decompress(Codec codec, const Bytes& data, size_t max_size) {
     fail("unknown codec");
 }
 
-Bytes compress(Codec codec, const Bytes& data, int level) {
+Bytes compress(Codec codec, const Bytes& data, int level, const std::function<void(size_t)>& on_progress) {
+    Reporter report(on_progress);
+    Bytes out;
     switch (codec) {
-        case Codec::NONE: return data;
-        case Codec::GZIP: return gzip_compress(data, level);
-        case Codec::LZ4_LEGACY: return lz4_legacy_compress(data, level);
-        case Codec::LZ4: return lz4_frame_compress(data, level);
-        case Codec::ZSTD: return zstd_compress(data, level);
-        case Codec::XZ: return xz_compress(data, level);
-        case Codec::LZMA: return lzma_stream_run(data, /*encode=*/true);
-        case Codec::BZIP2: return bzip2_compress(data, level);
-        case Codec::LZO: return lzo_compress(data);
+        case Codec::NONE: out = data; break;
+        case Codec::GZIP: out = gzip_compress(data, level, report); break;
+        case Codec::LZ4_LEGACY: out = lz4_legacy_compress(data, level, report); break;
+        case Codec::LZ4: out = lz4_frame_compress(data, level); break;
+        case Codec::ZSTD: out = zstd_compress(data, level); break;
+        case Codec::XZ: out = xz_compress(data, level); break;
+        case Codec::LZMA: out = lzma_stream_run(data, /*encode=*/true); break;
+        case Codec::BZIP2: out = bzip2_compress(data, level); break;
+        case Codec::LZO: out = lzo_compress(data); break;
+        default: fail("unknown codec");
     }
-    fail("unknown codec");
+    if (report.sent() < data.size()) report(data.size() - report.sent());
+    return out;
 }
 
 int dense_level(Codec codec) {
