@@ -29,6 +29,7 @@
 #include <tuple>
 #include <vector>
 
+#include "abr/avb_keys.hpp"
 #include "abr/boot_image.hpp"
 #include "abr/byte_io.hpp"
 #include "abr/compression.hpp"
@@ -962,6 +963,30 @@ void save_avb_footer(Manifest& m, const fs::path& dir, const AvbFooter& f, const
              "(already modified without re-signing?)");
 }
 
+// The key an AVB 2.0 vbmeta is signed with when it is built (the choice is described in abr/avb_keys.hpp): the key of the folder
+// (keys/avb_key.pem) when there is one; else none while the signature the image has still covers it; else a public test key of the AVB
+// project -- the image's own when that is what it was signed with, and then the new signature is as good as the old one. When the
+// image's key is none of them the signature is the test key's, which only a bootloader that does not check the key accepts: that is
+// said (`warned`: it was, and build() need not say that the public key was replaced).
+std::string avb_signing_key(const VbmetaImage& v, const std::string& folder_key_pem, bool& warned) {
+    warned = false;
+    if (v.algorithm_type == 0 || !folder_key_pem.empty()) return folder_key_pem;
+    if (v.can_keep_signature()) return {};
+    const AvbKeyChoice choice = choose_avb_test_key(v.algorithm_type, v.public_key);
+    if (!choice.key) return {};  // (ML-DSA: build() says why abr cannot)
+    const std::string name = choice.key->name;
+    if (choice.the_images_key) {
+        note("the AVB 2.0 signature is made again with the public AVB test key " + name + ", which is the key this image was signed with");
+        return choice.key->pem;
+    }
+    warned = true;
+    warn(std::string(v.public_key.empty() ? "this vbmeta has no public key" : "this vbmeta was signed with a key abr does not have the private half of (" +
+                                                                                    describe_avb_public_key(v.public_key) + ")") +
+         "; it is signed with the public AVB test key " + name + " instead, and that key's public key replaces the one in the image. A bootloader that "
+         "checks the image against the key it trusts will reject it. A key of your own goes in keys/avb_key.pem");
+    return choice.key->pem;
+}
+
 // `host` is the freshly-built (possibly edited) protected image. Returns it
 // unchanged when the source had no footer, else the full
 // [host][padding][vbmeta][padding][footer] partition image.
@@ -994,18 +1019,14 @@ Bytes reattach_avb_footer(const Manifest& m, const fs::path& dir, Bytes host,
     // Only touch the digests if the protected image really changed: an
     // untouched repack must reproduce the source byte-for-byte, even if the
     // source's own digest was already stale.
-    if (hash::sha256(host) != m.get_hex("avb_host_sha256") && v.refresh_hash_descriptors(host)) {
-        if (v.algorithm_type != 0 && avb_key_pem.empty())
-            throw FormatError(
-                "the image content changed, so its AVB hash descriptor (and the vbmeta signature, "
-                "algorithm " + avb_algorithm_name(v.algorithm_type) +
-                ") must be regenerated: put the private key in " + shown((dir / "keys" / "avb_key.pem").generic_string()) +
-                ". Without the original vendor key the result will not verify on a locked device");
-    }
+    if (hash::sha256(host) != m.get_hex("avb_host_sha256")) v.refresh_hash_descriptors(host);
     v.host_prefix = std::move(host);
     std::vector<std::string> notes;
-    Bytes built = v.build(avb_key_pem, &notes);
-    for (auto& n : notes) warn(n);
+    bool warned = false;
+    const std::string signing_key = avb_signing_key(v, avb_key_pem, warned);
+    Bytes built = v.build(signing_key, &notes);
+    if (!warned)
+        for (auto& n : notes) warn(n);
     return built;
 }
 
@@ -1670,8 +1691,11 @@ Bytes repack_vbmeta(const Manifest& m, const fs::path& dir, const RepackOptions&
         v.descriptors.push_back(std::move(d));
     }
     std::vector<std::string> notes;
-    Bytes built = v.build(opt.avb_key_pem, &notes);
-    for (auto& n : notes) warn(n);
+    bool warned = false;
+    const std::string signing_key = avb_signing_key(v, opt.avb_key_pem, warned);
+    Bytes built = v.build(signing_key, &notes);
+    if (!warned)
+        for (auto& n : notes) warn(n);
     return built;
 }
 
@@ -2820,12 +2844,21 @@ void print_avb1_info(const Envelope& env, const Bytes& host, size_t image_off, s
               << verdict_text(v) << "\n";
 }
 
+// What `info` says about the public key of an AVB 2.0 vbmeta: its size and id, and whether it is one of the public test keys that abr
+// has the private half of (then it signs the image again itself when the content has changed).
+std::string avb_key_text(const Bytes& public_key) {
+    std::string text = describe_avb_public_key(public_key);
+    if (find_avb_test_key(public_key)) text += " -- abr signs with it itself when the content changes";
+    return text;
+}
+
 void print_avb_footer_info(const AvbFooter& f, const Bytes& host) {
     if (!f.present) return;
     const VbmetaImage& v = f.v;
     std::cout << "avb footer:     partition " << v.source_total_size << " bytes, protects the first "
               << f.host_size << ", algorithm " << avb_algorithm_name(v.algorithm_type)
               << (v.algorithm_type ? " (signed)" : " (unsigned)") << "\n";
+    if (!v.public_key.empty()) std::cout << "  public key:   " << avb_key_text(v.public_key) << "\n";
     for (auto& d : v.descriptors) std::cout << "  - " << d.describe() << "\n";
     size_t bad = 0;
     size_t checked = v.verify_hash_descriptors(host, &bad);
@@ -3054,6 +3087,7 @@ void print_info(const fs::path& path) {
         case Fmt::VBMETA: {
             VbmetaImage v = VbmetaImage::parse(data);
             std::cout << "algorithm:  " << avb_algorithm_name(v.algorithm_type) << "\n";
+            if (!v.public_key.empty()) std::cout << "public key: " << avb_key_text(v.public_key) << "\n";
             std::cout << "flags:      " << v.flags << "\n";
             std::cout << "rollback:   " << v.rollback_index << " @location "
                        << v.rollback_index_location << "\n";
@@ -3609,8 +3643,11 @@ void usage(std::ostream& os) {
         "order). Edit either; pack takes the one that changed (the folder, when both did).\n"
         "A folder of device trees (files that end in .dtb) and no manifest.txt is packed as a Qualcomm device tree table (QCDT, what\n"
         "dtbTool makes); a manifest.txt of `type=qcdt` with `page_size=` and `table_version=` (1, 2 or 3) says how.\n"
-        "Keys of your own for what pack signs again go in the folder keys/ of the unpacked folder: avb_key.pem (AVB 2.0), avb1.pk8 and\n"
-        "avb1.x509.pem (the boot signature of old boot images), chromeos.vbprivk and chromeos.keyblock (a ChromeOS kernel blob).\n"
+        "What pack has to sign again (an AVB 2.0 hash footer or vbmeta, the boot signature of old boot images, a ChromeOS kernel blob)\n"
+        "it signs with the public test keys that are built into abr (the AVB project's, AOSP's verity key, vboot's developer keys): with\n"
+        "the one the image was signed with when it was one of them, else with the one of the right size, and says so. Keys of your own\n"
+        "go in the folder keys/ of the unpacked folder and win: avb_key.pem (AVB 2.0), avb1.pk8 and avb1.x509.pem (the boot signature\n"
+        "of old boot images), chromeos.vbprivk and chromeos.keyblock (a ChromeOS kernel blob). A signature that is untouched is kept.\n"
         "ABR_THREADS=N limits the number of threads (the result never depends on it).\n"
         "\n"
         "Supported: boot.img/init_boot.img/boot-debug.img/boot-test-harness.img,\n"

@@ -7,14 +7,16 @@
 // platform/external/avb libavb/{avb_vbmeta_image.h,avb_footer.h,
 // avb_*_descriptor.h}.
 //
-// Signing note: re-signing (build() with a supplied PEM private key) uses
-// OpenSSL to produce a standard RSASSA-PKCS1-v1.5 signature over the
-// SHA-256/SHA-512 digest, which is the scheme AVB documents. This path is
-// not validated against `avbtool verify_image` from this sandbox (no real
-// device/avbtool available here) -- treat it as best-effort and verify
-// before relying on it for a locked or verity-enforcing device. Passthrough
-// repacking (no key supplied, nothing that affects the hash changed) does
-// not depend on this at all: it just keeps the original signature bytes.
+// Signing note: re-signing (build() with a supplied private key) makes the
+// RSASSA-PKCS1-v1.5 signature over the SHA-256/SHA-512 digest that AVB
+// documents, with abr's own RSA (abr/rsa.hpp); tests/run_tests.sh checks the
+// images it makes against avbtool's verify_image. Passthrough repacking (no
+// key supplied, nothing that affects the hash changed) does not depend on any
+// of it: it just keeps the original signature bytes. Which key signs an image
+// whose content changed is decided by the caller (abr/avb_keys.hpp).
+//
+// ML-DSA (algorithm types 7 and 8, MLDSA65 and MLDSA87): read, listed and
+// passed through when nothing changed; abr cannot make such a signature.
 #pragma once
 
 #include <cstdint>
@@ -34,9 +36,14 @@ enum class AvbAlgorithm : uint32_t {
     SHA512_RSA2048 = 4,
     SHA512_RSA4096 = 5,
     SHA512_RSA8192 = 6,
+    MLDSA65 = 7,  // (libavb 1.4: the signature is ML-DSA over the header and the auxiliary block; no digest is stored)
+    MLDSA87 = 8,
 };
 
 std::string avb_algorithm_name(uint32_t algorithm_type);
+
+// The size of the RSA key an algorithm signs with: 2048, 4096 or 8192; 0 for NONE, for ML-DSA and for a number that is none of them.
+unsigned avb_algorithm_key_bits(uint32_t algorithm_type);
 
 enum class AvbDescriptorTag : uint64_t {
     PROPERTY = 0,
@@ -76,6 +83,9 @@ struct VbmetaImage {
 
     // As read from the source image; used for passthrough when rebuilding
     // without a private key and nothing that affects the hash has changed.
+    // (ML-DSA has no digest in the image: there `hash` is the SHA-256 of what
+    // is signed, as parse() worked it out -- abr's own record, so that it can
+    // tell that the signature still covers it.)
     Bytes hash;
     Bytes signature;
 
@@ -100,6 +110,11 @@ struct VbmetaImage {
     // `avbtool add_hash_footer` would. Returns true if anything changed.
     // HASHTREE descriptors (filesystem images) cannot be refreshed here.
     bool refresh_hash_descriptors(const Bytes& host_image);
+
+    // True when the signature this object has (read from an image) still covers what build() assembles from it, so that build() without a
+    // key gives the image's own signature back; also true when the algorithm is NONE (there is nothing to sign). Throws FormatError for
+    // an algorithm_type that is none of the known ones.
+    bool can_keep_signature() const;
 
     // Rebuilds the AVB blob. If this instance has_footer, the return
     // value is the *whole* host image (host_prefix + new blob + footer,

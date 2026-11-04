@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "abr/vbmeta.hpp"
 
+#include "abr/avb_keys.hpp"
 #include "abr/rsa.hpp"
 #include "abr/sha.hpp"
 #include "abr/textquote.hpp"
@@ -19,9 +20,10 @@ constexpr uint32_t kAvbMagic4 = 0x41564230;   // "AVB0" read as a big-endian u32
 constexpr uint32_t kAvbFooterMagic4 = 0x41564266;  // "AVBf"
 
 struct AlgoParams {
-    size_t hash_size;
-    size_t sig_size;  // == RSA key size in bytes
+    size_t hash_size;  // the digest in the authentication block (0: none, ML-DSA signs the bytes themselves)
+    size_t sig_size;   // RSA: the key size in bytes
     bool sha512;
+    bool mldsa = false;
 };
 
 AlgoParams algo_params(uint32_t algorithm_type) {
@@ -33,6 +35,8 @@ AlgoParams algo_params(uint32_t algorithm_type) {
         case 4: return {64, 256, true};     // SHA512_RSA2048
         case 5: return {64, 512, true};     // SHA512_RSA4096
         case 6: return {64, 1024, true};    // SHA512_RSA8192
+        case 7: return {0, 3309, false, true};  // MLDSA65 (FIPS 204: the signature of ML-DSA-65 is 3309 bytes)
+        case 8: return {0, 4627, false, true};  // MLDSA87 (4627)
         default:
             throw FormatError("unknown AVB algorithm_type: " + std::to_string(algorithm_type));
     }
@@ -73,7 +77,21 @@ std::string avb_algorithm_name(uint32_t algorithm_type) {
         case 4: return "SHA512_RSA2048";
         case 5: return "SHA512_RSA4096";
         case 6: return "SHA512_RSA8192";
+        case 7: return "MLDSA65";
+        case 8: return "MLDSA87";
         default: return "UNKNOWN(" + std::to_string(algorithm_type) + ")";
+    }
+}
+
+unsigned avb_algorithm_key_bits(uint32_t algorithm_type) {
+    switch (algorithm_type) {
+        case 1:
+        case 4: return 2048;
+        case 2:
+        case 5: return 4096;
+        case 3:
+        case 6: return 8192;
+        default: return 0;
     }
 }
 
@@ -151,13 +169,21 @@ std::string AvbDescriptor::describe() const {
                 return "kernel_cmdline: " + shown(cmd);
             }
             case AvbDescriptorTag::CHAIN_PARTITION: {
-                r.be32();  // rollback_index_location
+                uint32_t location = r.be32();  // rollback_index_location
                 uint32_t pn_len = r.be32();
                 uint32_t pk_len = r.be32();
                 r.be32();  // flags
                 r.skip(60);
                 std::string pname = text_at(content, r.pos(), pn_len);
-                return "chain_partition: " + shown(pname) + " (pubkey " + std::to_string(pk_len) + "B)";
+                std::string out = "chain_partition: " + shown(pname) + " (rollback index location " + std::to_string(location) + ", pubkey " +
+                                  std::to_string(pk_len) + "B";
+                // The key of the chained partition: which of the AVB project's public test keys it is, if it is one of them.
+                const size_t key_at = r.pos() + pn_len;
+                if (pk_len > 0 && key_at <= content.size() && pk_len <= content.size() - key_at) {
+                    const Bytes blob(content.begin() + static_cast<long>(key_at), content.begin() + static_cast<long>(key_at + pk_len));
+                    if (const AvbTestKey* known = find_avb_test_key(blob)) out += ", the AVB test key " + std::string(known->name);
+                }
+                return out + ")";
             }
         }
     } catch (const FormatError&) {
@@ -310,6 +336,13 @@ VbmetaImage parse_header_at(const Bytes& image, size_t header_start) {
         sr.seek(auth_start + static_cast<size_t>(sig_offset));
         v.signature = sr.bytes(static_cast<size_t>(sig_size));
     }
+    if (v.algorithm_type == 7 || v.algorithm_type == 8) {
+        // ML-DSA signs the bytes themselves, so the image has no digest: what is kept instead is the digest of what the signature covers,
+        // for build() to tell that nothing has changed (see VbmetaImage::hash).
+        Bytes covered(image.begin() + static_cast<long>(header_start), image.begin() + static_cast<long>(header_start + kVbmetaHeaderSize));
+        covered.insert(covered.end(), image.begin() + static_cast<long>(aux_start), image.begin() + static_cast<long>(aux_start + aux_size));
+        v.hash = hash::sha256(covered);
+    }
     if (pubkey_size > 0) {
         BinaryReader pr(image);
         pr.seek(aux_start + static_cast<size_t>(pubkey_offset));
@@ -337,31 +370,14 @@ VbmetaImage parse_header_at(const Bytes& image, size_t header_start) {
     return v;
 }
 
-Bytes build_blob(const VbmetaImage& v, const std::string& private_key_file,
-                 std::vector<std::string>* notes) {
-    AlgoParams ap = algo_params(v.algorithm_type);
+// The header and the auxiliary block as they are for `public_key` (the key blob the auxiliary block holds).
+struct Assembled {
+    Bytes header;
+    Bytes aux;
+    uint64_t auth_size = 0;  // the size of the authentication block
+};
 
-    // Signing with a key also means publishing it: libavb verifies the
-    // signature with the public key stored in the auxiliary block, so that
-    // blob has to describe the key that signed, exactly as avbtool does.
-    std::optional<RsaPrivateKey> key;
-    Bytes public_key = v.public_key;
-    if (v.algorithm_type != 0 && !private_key_file.empty()) {
-        key = load_signing_key(private_key_file);
-        if (key->size_bytes() != ap.sig_size)
-            throw FormatError("signing key size does not match algorithm_type " +
-                               avb_algorithm_name(v.algorithm_type) + " (expected a " +
-                               std::to_string(ap.sig_size * 8) + "-bit RSA key, got " +
-                               std::to_string(key->n.bit_length()) + ")");
-        Bytes derived = avb_encode_public_key(key->public_key());
-        if (!public_key.empty() && public_key != derived && notes)
-            notes->push_back(
-                "the public key stored in this vbmeta was replaced by the one belonging to the "
-                "signing key you supplied; a bootloader that trusts only the original key will "
-                "reject the image");
-        public_key = std::move(derived);
-    }
-
+Assembled assemble(const VbmetaImage& v, const AlgoParams& ap, const Bytes& public_key) {
     BinaryWriter aux;
     for (auto& d : v.descriptors) {
         aux.be64(d.tag);
@@ -407,23 +423,64 @@ Bytes build_blob(const VbmetaImage& v, const std::string& private_key_file,
         reserved.resize(80, 0);  // (a manifest that was edited by hand may hold more or fewer)
         hdr.bytes(reserved);
     }
-    Bytes header_bytes = hdr.take();
+    return {hdr.take(), std::move(aux_bytes), auth_size};
+}
 
-    Bytes result = header_bytes;
+// What the signature is made over: the digest of the header and the auxiliary block (for ML-DSA, which signs the bytes themselves, abr's
+// record of them: see VbmetaImage::hash).
+Bytes signed_digest(const Assembled& a, const AlgoParams& ap) {
+    Bytes to_hash = a.header;
+    to_hash.insert(to_hash.end(), a.aux.begin(), a.aux.end());
+    return digest(to_hash, ap.sha512);
+}
+
+Bytes build_blob(const VbmetaImage& v, const std::string& private_key_file,
+                 std::vector<std::string>* notes) {
+    AlgoParams ap = algo_params(v.algorithm_type);
+
+    // Signing with a key also means publishing it: libavb verifies the
+    // signature with the public key stored in the auxiliary block, so that
+    // blob has to describe the key that signed, exactly as avbtool does.
+    std::optional<RsaPrivateKey> key;
+    Bytes public_key = v.public_key;
+    if (v.algorithm_type != 0 && !private_key_file.empty()) {
+        if (ap.mldsa)
+            throw FormatError("the vbmeta is signed with " + avb_algorithm_name(v.algorithm_type) +
+                              " (ML-DSA), and abr cannot make such a signature; the RSA key that was supplied is of no use");
+        key = load_signing_key(private_key_file);
+        if (key->size_bytes() != ap.sig_size)
+            throw FormatError("signing key size does not match algorithm_type " +
+                               avb_algorithm_name(v.algorithm_type) + " (expected a " +
+                               std::to_string(ap.sig_size * 8) + "-bit RSA key, got " +
+                               std::to_string(key->n.bit_length()) + ")");
+        Bytes derived = avb_encode_public_key(key->public_key());
+        if (!public_key.empty() && public_key != derived && notes)
+            notes->push_back(
+                "the public key stored in this vbmeta was replaced by the one belonging to the "
+                "signing key; a bootloader that trusts only the original key will "
+                "reject the image");
+        public_key = std::move(derived);
+    }
+
+    const Assembled a = assemble(v, ap, public_key);
+
+    Bytes result = a.header;
     if (v.algorithm_type == 0) {
-        result.insert(result.end(), aux_bytes.begin(), aux_bytes.end());
+        result.insert(result.end(), a.aux.begin(), a.aux.end());
         return result;
     }
 
-    Bytes to_hash = header_bytes;
-    to_hash.insert(to_hash.end(), aux_bytes.begin(), aux_bytes.end());
-    Bytes h = digest(to_hash, ap.sha512);
+    const Bytes h = signed_digest(a, ap);
 
     Bytes sig;
     if (key) {
         sig = rsa_pkcs1_sign(*key, ap.sha512 ? HashAlg::SHA512 : HashAlg::SHA256, h);
     } else if (h == v.hash && v.signature.size() == ap.sig_size) {
         sig = v.signature;  // untouched passthrough
+    } else if (ap.mldsa) {
+        throw FormatError("what the " + avb_algorithm_name(v.algorithm_type) +
+                          " signature of this vbmeta covers has changed, and abr cannot make an ML-DSA signature; "
+                          "set algorithm_type to 0 for an unsigned image");
     } else {
         throw FormatError(
             "vbmeta content changed (or was never signed with a key we have) and no "
@@ -431,14 +488,20 @@ Bytes build_blob(const VbmetaImage& v, const std::string& private_key_file,
             "algorithm_type=NONE for an unsigned image");
     }
 
-    Bytes auth_block(static_cast<size_t>(auth_size), 0);
-    std::copy(h.begin(), h.end(), auth_block.begin());
+    Bytes auth_block(static_cast<size_t>(a.auth_size), 0);
+    std::copy_n(h.begin(), ap.hash_size, auth_block.begin());
     std::copy(sig.begin(), sig.end(), auth_block.begin() + static_cast<long>(ap.hash_size));
     result.insert(result.end(), auth_block.begin(), auth_block.end());
-    result.insert(result.end(), aux_bytes.begin(), aux_bytes.end());
+    result.insert(result.end(), a.aux.begin(), a.aux.end());
     return result;
 }
 }  // namespace
+
+bool VbmetaImage::can_keep_signature() const {
+    const AlgoParams ap = algo_params(algorithm_type);
+    if (algorithm_type == 0) return true;
+    return signed_digest(assemble(*this, ap, public_key), ap) == hash && signature.size() == ap.sig_size;
+}
 
 VbmetaImage VbmetaImage::parse(const Bytes& image) {
     if (image.size() >= 4 && std::memcmp(image.data(), "AVB0", 4) == 0) {

@@ -203,10 +203,22 @@ RsaPrivateKey rsa_parse_private_key(const Bytes& file) {
     } catch (const FormatError& e) {
         rethrow_key_error(e, "an RSA private key (PEM, or PKCS#8/PKCS#1 DER such as Android's .pk8)");
     }
-    // Reject a key whose own numbers do not agree, instead of signing garbage.
-    BigInt probe(0x1234567);
-    if (public_op(BigInt::mod_exp(probe, k.d, k.n), k.public_key()) != probe)
-        throw FormatError("RSA key is inconsistent (e*d != 1 mod phi(n))");
+    // Reject a key whose own numbers do not agree, instead of signing garbage. A key is used through its CRT numbers when it has them
+    // (private_op), so those are what is checked: that p and q make n, that dp and dq are the remainders of d, that qinv is the inverse
+    // of q mod p, and that a probe goes through the private operation and comes back through the public one. (A check through d
+    // alone is a full-size exponentiation: almost a second for a key of 8192 bits, where this takes a fifth of that.) A key that has
+    // no CRT numbers is checked through d.
+    const BigInt probe(0x1234567);
+    bool consistent;
+    if (k.has_crt()) {
+        const BigInt one(1);
+        consistent = BigInt::compare(k.p, one) > 0 && BigInt::compare(k.q, one) > 0 && BigInt::mul(k.p, k.q) == k.n &&
+                     k.d.mod(BigInt::sub(k.p, one)) == k.dp && k.d.mod(BigInt::sub(k.q, one)) == k.dq &&
+                     BigInt::mul(k.q, k.qinv).mod(k.p) == one && public_op(private_op(probe, k), k.public_key()) == probe;
+    } else {
+        consistent = public_op(BigInt::mod_exp(probe, k.d, k.n), k.public_key()) == probe;
+    }
+    if (!consistent) throw FormatError("RSA key is inconsistent (e*d != 1 mod phi(n))");
     return k;
 }
 
