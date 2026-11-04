@@ -316,6 +316,12 @@ std::string stream_text(const Region& r) {
         }
     } else if (!r.codec.empty()) {
         s = r.codec;
+        if (r.unpacked || r.level >= 0) {  // (what `info` found out by looking into the stream)
+            s += " (";
+            if (r.unpacked) s += std::to_string(r.unpacked) + " bytes unpacked";
+            if (r.level >= 0) s += (r.unpacked ? ", level " : "level ") + std::to_string(r.level);
+            s += ")";
+        }
     }
     return s;
 }

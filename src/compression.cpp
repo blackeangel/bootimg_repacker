@@ -245,6 +245,19 @@ Bytes lz4_frame_decompress(const Bytes& in, size_t max_out) {
 // sized vendor_boot partition from fitting.
 constexpr int kLz4LegacyDefaultLevel = 12;
 
+// One block of the legacy format: what LZ4 makes of `len` bytes at `src` (HC from level 3, the fast mode below).
+Bytes lz4_block(const uint8_t* src_bytes, size_t len, int level) {
+    const int chunk = static_cast<int>(len);
+    Bytes cbuf(static_cast<size_t>(LZ4_compressBound(chunk)));
+    const char* src = reinterpret_cast<const char*>(src_bytes);
+    char* dst = reinterpret_cast<char*>(cbuf.data());
+    const int cap = static_cast<int>(cbuf.size());
+    const int csize = level >= LZ4HC_CLEVEL_MIN ? LZ4_compress_HC(src, dst, chunk, cap, level) : LZ4_compress_default(src, dst, chunk, cap);
+    if (csize <= 0) fail("LZ4 compression failed");
+    cbuf.resize(static_cast<size_t>(csize));
+    return cbuf;
+}
+
 Bytes lz4_legacy_compress(const Bytes& in, int level, Reporter& report) {
     if (level < 0) level = kLz4LegacyDefaultLevel;
     level = std::min(level, static_cast<int>(LZ4HC_CLEVEL_MAX));
@@ -253,17 +266,9 @@ Bytes lz4_legacy_compress(const Bytes& in, int level, Reporter& report) {
     std::vector<Bytes> parts(blocks);
     par::for_each(blocks, [&](size_t i) {
         const size_t pos = i * kLz4LegacyBlockSize;
-        const int chunk = static_cast<int>(std::min(kLz4LegacyBlockSize, in.size() - pos));
-        Bytes cbuf(static_cast<size_t>(LZ4_compressBound(chunk)));
-        const char* src = reinterpret_cast<const char*>(in.data() + pos);
-        char* dst = reinterpret_cast<char*>(cbuf.data());
-        const int cap = static_cast<int>(cbuf.size());
-        const int csize = level >= LZ4HC_CLEVEL_MIN ? LZ4_compress_HC(src, dst, chunk, cap, level)
-                                                       : LZ4_compress_default(src, dst, chunk, cap);
-        if (csize <= 0) fail("LZ4 compression failed");
-        cbuf.resize(static_cast<size_t>(csize));
-        parts[i] = std::move(cbuf);
-        report(static_cast<size_t>(chunk));
+        const size_t chunk = std::min(kLz4LegacyBlockSize, in.size() - pos);
+        parts[i] = lz4_block(in.data() + pos, chunk, level);
+        report(chunk);
     });
 
     BinaryWriter w;
@@ -696,13 +701,162 @@ Bytes compress(Codec codec, const Bytes& data, int level, const std::function<vo
     return out;
 }
 
+int default_level(Codec codec) {
+    switch (codec) {
+        case Codec::GZIP: return 6;  // zlib's Z_DEFAULT_COMPRESSION
+        case Codec::LZ4_LEGACY: return kLz4LegacyDefaultLevel;
+        case Codec::LZ4: return 0;   // the fast mode
+        case Codec::ZSTD: return ZSTD_CLEVEL_DEFAULT;
+        case Codec::XZ: return 6;
+        case Codec::BZIP2: return 9;
+        default: return -1;          // lzma, lzo and none have no setting
+    }
+}
+
 int dense_level(Codec codec) {
     switch (codec) {
         case Codec::GZIP: return 9;
-        case Codec::LZ4: return 12;   // LZ4HC_CLEVEL_MAX; the usual 0 is the fast mode
-        case Codec::ZSTD: return 19;  // windowLog 23 (8 MiB): anything that reads zstd reads it
+        case Codec::LZ4_LEGACY: return LZ4HC_CLEVEL_MAX;  // 12: also the usual one
+        case Codec::LZ4: return 12;                       // LZ4HC_CLEVEL_MAX; the usual 0 is the fast mode
+        case Codec::ZSTD: return 19;                      // windowLog 23 (8 MiB): anything that reads zstd reads it
         case Codec::XZ: return 9;
-        default: return -1;           // lz4_legacy (HC 12) and bzip2 (9) are dense already; the others have no setting
+        case Codec::BZIP2: return 9;                      // also the usual one
+        default: return -1;                               // the others have no setting
+    }
+}
+
+// ------------------------------------------------------------------------------------------------ the level of a stream --
+
+namespace {
+
+constexpr size_t kTrialLimit = size_t{16} << 20;  // the most plain data that is compressed whole to see what level made a stream
+
+bool same_prefix(const Bytes& stream, const uint8_t* made, size_t n) { return stream.size() >= n && std::memcmp(stream.data(), made, n) == 0; }
+
+// Where the deflate data of a gzip stream begins (behind the header and its optional fields); 0 when the header is cut short.
+size_t gzip_data_start(const Bytes& s) {
+    if (s.size() < 18 || s[0] != 0x1f || s[1] != 0x8b || s[2] != 8) return 0;
+    const uint8_t flags = s[3];
+    size_t pos = 10;
+    if (flags & 0x04) {  // FEXTRA
+        if (pos + 2 > s.size()) return 0;
+        pos += 2 + (size_t{s[pos]} | (size_t{s[pos + 1]} << 8));
+    }
+    for (uint8_t bit : {uint8_t{0x08}, uint8_t{0x10}}) {  // FNAME, FCOMMENT: zero-terminated text
+        if (!(flags & bit)) continue;
+        while (pos < s.size() && s[pos] != 0) ++pos;
+        ++pos;
+    }
+    if (flags & 0x02) pos += 2;  // FHCRC
+    return pos < s.size() ? pos : 0;
+}
+
+LevelGuess gzip_level(const Bytes& stored, const Bytes& plain) {
+    const size_t start = gzip_data_start(stored);
+    if (!start) return {};
+    const uint8_t xfl = stored[8];  // the extra flags: 2 for the densest setting, 4 for the fastest, 0 for the ones in between
+    if (xfl == 2) return {9, "the gzip header says it is the densest setting"};
+    if (xfl == 4) return {1, "the gzip header says it is the fastest setting"};
+    if (plain.empty() || plain.size() > kTrialLimit) return {};
+    // Nothing in the header: the usual level, and only if abr's deflate makes the very data of this stream at it.
+    const std::function<void(size_t)> nobody;
+    Reporter report(nobody);
+    const Bytes again = gzip_compress(plain, 6, report);
+    if (again.size() <= 10 || stored.size() - start < again.size() - 10) return {};
+    if (std::memcmp(again.data() + 10, stored.data() + start, again.size() - 10) != 0) return {};
+    return {6, "compress() at level 6 makes the same deflate data"};
+}
+
+LevelGuess lz4_legacy_level(const Bytes& stored, const Bytes& plain) {
+    if (stored.size() < 12 || plain.empty()) return {};
+    const uint32_t first = uint32_t{stored[4]} | (uint32_t{stored[5]} << 8) | (uint32_t{stored[6]} << 16) | (uint32_t{stored[7]} << 24);
+    if (first == 0 || first > stored.size() - 8) return {};
+    const size_t length = std::min(kLz4LegacyBlockSize, plain.size());  // the first block holds this much of the plain data
+    // (LZ4's fast mode uses other tables for an input of less than 64 KiB, so the sample is more than that: it has to be made the way the
+    // whole block is.)
+    constexpr size_t kSample = size_t{128} << 10;
+    static const int order[] = {12, 9, 11, 10, 8, 7, 6, 5, 4, 3, 1};
+    for (const int level : order) {
+        if (length > 2 * kSample) {
+            // Cheap test first: what a block makes of its first 128 KiB does not depend on what comes after, up to the last bytes.
+            const Bytes head = lz4_block(plain.data(), kSample, level);
+            const size_t n = head.size() * 6 / 10;
+            if (n >= 64 && (n > first || std::memcmp(head.data(), stored.data() + 8, n) != 0)) continue;
+        }
+        const Bytes block = lz4_block(plain.data(), length, level);
+        if (block.size() != first || std::memcmp(block.data(), stored.data() + 8, first) != 0) continue;
+        return {level, plain.size() > length ? "compress() at this level makes the same first block" : "compress() at this level makes the same block"};
+    }
+    return {};
+}
+
+// The first `sample` bytes of `plain` as a zstd encoder makes them: `workers` 0 is the encoder on one thread (what the zstd command line does
+// without -T), 1 is what abr makes. Everything but the last block of the sample is what the whole stream has there: the encoder is told how
+// long the stream is going to be (that decides the window and the tables), and the data is flushed, not ended.
+bool zstd_start(const Bytes& plain, size_t sample, int level, int workers, bool checksum, bool content_size, Bytes& out) {
+    ZSTD_CCtx* cctx = ZSTD_createCCtx();
+    if (!cctx) return false;
+    struct Guard {
+        ZSTD_CCtx* c;
+        ~Guard() { ZSTD_freeCCtx(c); }
+    } guard{cctx};
+    if (ZSTD_isError(ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, level))) return false;
+    ZSTD_CCtx_setParameter(cctx, ZSTD_c_checksumFlag, checksum ? 1 : 0);
+    ZSTD_CCtx_setParameter(cctx, ZSTD_c_contentSizeFlag, content_size ? 1 : 0);
+    if (workers && ZSTD_isError(ZSTD_CCtx_setParameter(cctx, ZSTD_c_nbWorkers, workers))) return false;
+    if (ZSTD_isError(ZSTD_CCtx_setPledgedSrcSize(cctx, plain.size()))) return false;
+    out.assign(ZSTD_compressBound(sample) + 64, 0);
+    ZSTD_inBuffer in{plain.data(), sample, 0};
+    ZSTD_outBuffer o{out.data(), out.size(), 0};
+    const ZSTD_EndDirective mode = sample == plain.size() ? ZSTD_e_end : ZSTD_e_flush;
+    for (;;) {
+        const size_t rc = ZSTD_compressStream2(cctx, &o, &in, mode);
+        if (ZSTD_isError(rc)) return false;
+        if (rc == 0 && in.pos == in.size) break;
+        if (o.pos == o.size) return false;
+    }
+    out.resize(o.pos);
+    return true;
+}
+
+LevelGuess zstd_level(const Bytes& stored, const Bytes& plain) {
+    if (stored.size() < 6 || plain.empty()) return {};
+    const uint8_t descriptor = stored[4];  // the frame header descriptor: content checksum (bit 2), single segment (5), content size (6-7)
+    const bool checksum = (descriptor & 0x04) != 0;
+    const bool content_size = (descriptor >> 6) != 0 || (descriptor & 0x20) != 0;
+    constexpr size_t kSample = size_t{256} << 10;  // two blocks
+    const size_t sample = std::min(plain.size(), kSample);
+    static const int order[] = {3, 19, 22, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 21};
+    Bytes made;
+    for (const int level : order) {
+        for (const int workers : {0, 1}) {
+            if (workers == 1 && level != 3 && level != 19) continue;  // (what abr makes is made at the levels it picks itself, or the one it is told)
+            if (!zstd_start(plain, sample, level, workers, checksum, content_size, made)) continue;
+            if (!same_prefix(stored, made.data(), made.size())) continue;
+            if (sample == plain.size()) return {level, "compress() at this level makes the same frame"};
+            if (plain.size() <= (size_t{2} << 20)) {  // small enough to see the rest of it
+                Bytes whole;
+                if (zstd_start(plain, plain.size(), level, workers, checksum, content_size, whole) && same_prefix(stored, whole.data(), whole.size()))
+                    return {level, "compress() at this level makes the same frame"};
+            }
+            return {level, "compress() at this level makes the same start of the frame (the first 256 KiB)"};
+        }
+    }
+    return {};
+}
+
+}  // namespace
+
+LevelGuess detect_level(Codec codec, const Bytes& stored, const Bytes& plain) {
+    switch (codec) {
+        case Codec::BZIP2:
+            if (stored.size() >= 4 && stored[0] == 'B' && stored[1] == 'Z' && stored[2] == 'h' && stored[3] >= '1' && stored[3] <= '9')
+                return {stored[3] - '0', "the bzip2 header says it (the block size, in hundreds of kilobytes)"};
+            return {};
+        case Codec::GZIP: return gzip_level(stored, plain);
+        case Codec::LZ4_LEGACY: return lz4_legacy_level(stored, plain);
+        case Codec::ZSTD: return zstd_level(stored, plain);
+        default: return {};  // xz, lzma, lz4 frame, lzo: abr cannot tell
     }
 }
 

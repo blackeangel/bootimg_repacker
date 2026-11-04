@@ -414,6 +414,8 @@ struct DecodedComponent {
     std::optional<std::string> mtk_name;
     std::optional<Bytes> stripped;       // the stored bytes without their MTK sub-header, when it had one
     Codec codec = Codec::NONE;
+    int level = -1;                      // the level the stream was made with, when abr could tell (detect_level()); else -1
+    std::string level_basis;             // how it told
     Bytes plain;                         // decompressed
     Bytes plain_hash;                    // SHA-256 of `plain`
 
@@ -441,6 +443,11 @@ DecodedComponent decode_component(const Bytes& raw, std::string_view what = {}) 
                           " stream cannot be decompressed: " + e.what());
     }
     d.plain_hash = hash::sha256(d.plain);
+    if (d.codec != Codec::NONE) {
+        const LevelGuess guess = detect_level(d.codec, working, d.plain);
+        d.level = guess.level;
+        d.level_basis = guess.basis;
+    }
     return d;
 }
 
@@ -486,6 +493,12 @@ void record_component(Manifest& m, const std::string& prefix, const std::string&
     if (d.mtk_name) m.set(prefix + "_mtk_name", *d.mtk_name);
     m.set(prefix + "_file", filename);
     m.set(prefix + "_compression", std::string(codec_name(d.codec)));
+    // The level of the stream, when abr could tell: pack compresses the component again at it when the file was changed. Without the
+    // key (xz, lzma, lz4 frame, lzo, or a stream made in a way abr does not make) pack uses the usual level of the compression.
+    if (d.level >= 0) {
+        m.set(prefix + "_level", std::to_string(d.level));
+        m.set(prefix + "_level_basis", d.level_basis);  // for a person: pack does not read it
+    }
     m.set_hex(prefix + "_orig_hash", d.plain_hash);
 }
 
@@ -689,12 +702,15 @@ Bytes load_component(const Manifest& m, const fs::path& dir, const std::string& 
             throw FormatError("manifest.txt: " + shown(prefix + "_compression=" + codec_text) +
                               " is none of the compressions abr knows (none, gzip, lz4_legacy, lz4, zstd, xz, lzma, bzip2, lzo)");
         const Codec codec = *named;
-        // Optional `<prefix>_level=N` in the manifest picks the compression level
-        // (codec-specific; absent or -1: the codec's default -- or, on the second try of a build
-        // that did not fit its partition, the densest the decoders allow).
+        // `<prefix>_level=N` in the manifest is the compression level (codec-specific): the one the stream of the image was made with, when
+        // unpack could tell, or the one a person wrote. Absent or -1: the codec's usual level. On the second try of a build that did not fit
+        // its partition it is the densest the decoders allow, when that is denser than the level above.
         int level = static_cast<int>(m.get_int(prefix + "_level", -1, -1, 22));
-        if (level < 0 && opt.dense) level = dense_level(codec);
-        else if (level < 0 && dense_level(codec) >= 0) g_denser_would_help = true;
+        const int dense = dense_level(codec);
+        if (dense >= 0 && (level >= 0 ? level : default_level(codec)) < dense) {
+            if (opt.dense) level = dense;
+            else g_denser_would_help = true;
+        }
         result = compress(codec, plain, level, [](size_t n) { progress::advance(n); });
         if (codec == Codec::NONE) check_unpacks_as_is(result, prefix, filename);
     }
@@ -3001,6 +3017,25 @@ void report_layout(Fmt f, const Bytes& image, const Wrappers& wrap, const fs::pa
     }
 }
 
+// `info` has no folder to ask: what a look into each stream of the layout adds is how big its plain data is and the level it was made with
+// (decode_component(), as `unpack` does it, on all the threads there are). A stream that cannot be decompressed stays as it was.
+void annotate_streams(layout::Layout& l, const Bytes& image) {
+    std::vector<layout::Region*> streams;
+    for (layout::Region& r : l.regions)
+        if (!r.codec.empty() && r.file.empty() && r.size && r.offset + r.size <= image.size()) streams.push_back(&r);
+    par::for_each(streams.size(), [&](size_t i) {
+        layout::Region& r = *streams[i];
+        try {
+            const auto first = image.begin() + static_cast<std::ptrdiff_t>(r.offset);
+            const DecodedComponent d = decode_component(Bytes(first, first + static_cast<std::ptrdiff_t>(r.size)));
+            if (d.codec == Codec::NONE) return;
+            r.unpacked = d.plain.size();
+            r.level = d.level;
+        } catch (const std::exception&) {
+        }
+    });
+}
+
 void print_info(const fs::path& path) {
     Bytes raw = read_file(path);
     Wrappers wrap;
@@ -3342,10 +3377,12 @@ void print_info(const fs::path& path) {
         }
     }
     if (f != Fmt::UNKNOWN)
-        if (const std::optional<layout::Layout> l = describe_layout(f, data))
+        if (std::optional<layout::Layout> l = describe_layout(f, data)) {
+            annotate_streams(*l, data);
             std::cout << "layout (" << l->format << ", " << l->size << " bytes"
                       << (wrap.recorded() || wrap.sin ? "; offsets are those of the plain image inside its wrapper" : "") << "):\n"
                       << layout::render(*l);
+        }
 }
 
 // ------------------------------------------------------------- dispatch --

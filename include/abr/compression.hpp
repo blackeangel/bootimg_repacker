@@ -67,10 +67,30 @@ Bytes decompress(Codec codec, const Bytes& data, size_t max_size = kMaxDecompres
 // other codecs when they are done).
 Bytes compress(Codec codec, const Bytes& data, int level = -1, const std::function<void(size_t)>& on_progress = {});
 
+// The level compress() uses when it is given none (-1): gzip 6, lz4_legacy 12 (HC, the densest), lz4 frame 0, zstd 3, xz 6, bzip2 9; -1 for the
+// codecs that have no setting (lzma, lzo, none).
+int default_level(Codec codec);
+
 // The densest setting of a codec that the decoders in the wild still take (gzip 9, zstd 19 -- an 8 MiB
-// window, what `zstd -19` writes --, xz 9, lz4 frame 12); -1 where the usual setting (-1 above) already
-// is the densest, or the codec has no setting. For when the usual one makes an edited image too big for
-// its partition: the images of builds that care about size were compressed this way in the first place.
+// window, what `zstd -19` writes --, xz 9, lz4 frame 12, lz4_legacy 12, bzip2 9); -1 where the codec has
+// no setting. For when the usual one makes an edited image too big for its partition: the images of
+// builds that care about size were compressed this way in the first place. A codec whose default_level()
+// is already this one has nothing denser to try.
 int dense_level(Codec codec);
+
+// What is known of the setting a stream was made with, so that a component that is edited is compressed again the same way (the
+// `<part>_level` of the manifest).
+struct LevelGuess {
+    int level = -1;     // the `level` of compress() that makes this stream (or its start): -1 when nothing is known
+    std::string basis;  // how it is known, for a person: "the header says ...", "compress() at this level makes the same bytes"
+};
+
+// `stored` is a stream of `codec` (what detect_codec() said it is) and `plain` what it holds. bzip2 tells its level in its header; gzip
+// tells whether it is the densest (9) or the fastest (1) setting; for the others, and for a gzip with no mark, the stream is made again
+// at the levels in use -- all of it when it is small, the first blocks of it when the codec has blocks that stand on their own (lz4_legacy,
+// zstd) -- and the first level that makes the bytes of the stream is the one. A stream that another program made in another way (GNU gzip's
+// own deflate, an xz stream with its own check, an lz4 frame with its own block size) is not made again by abr: -1, and the manifest
+// says no level (compress() then uses its usual one). Slow only where it has to be: a few seconds at most, on the thread that calls it.
+LevelGuess detect_level(Codec codec, const Bytes& stored, const Bytes& plain);
 
 }  // namespace abr

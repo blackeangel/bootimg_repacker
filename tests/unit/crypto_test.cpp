@@ -212,6 +212,7 @@ int run_fit_files(int argc, char** argv);  // fit_test.cpp
 int run_console_tests();  // console_test.cpp
 int run_avb_keys_tests();  // avb_keys_test.cpp
 int run_layout_tests();  // layout_test.cpp
+int run_levels_tests();  // level_test.cpp
 
 int main(int argc, char** argv) {
     set_binary_stdio();
@@ -229,6 +230,7 @@ int main(int argc, char** argv) {
         if (cmd == "console") return run_console_tests();
         if (cmd == "avbkeys") return run_avb_keys_tests();
         if (cmd == "layout") return run_layout_tests();
+        if (cmd == "levels") return run_levels_tests();
         if (cmd == "fit") return run_fit_tests();
         if (cmd == "fit-files") return run_fit_files(argc, argv);
         if (cmd == "sha-impl") {
