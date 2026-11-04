@@ -1,0 +1,408 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#include "abr/layout.hpp"
+
+#include <algorithm>
+#include <cctype>
+#include <cinttypes>
+#include <cstdio>
+#include <cstring>
+#include <map>
+
+#include "abr/boot_image.hpp"
+#include "abr/compression.hpp"
+#include "abr/dtbo.hpp"
+#include "abr/envelope.hpp"
+#include "abr/qcdt.hpp"
+#include "abr/uimage.hpp"
+#include "abr/vbmeta.hpp"
+#include "abr/vendor_boot.hpp"
+
+namespace abr::layout {
+
+namespace {
+
+bool within(const Bytes& d, uint64_t off, uint64_t n) { return off <= d.size() && n <= d.size() - off; }
+
+uint32_t be32(const Bytes& d, uint64_t o) {
+    return (uint32_t{d[o]} << 24) | (uint32_t{d[o + 1]} << 16) | (uint32_t{d[o + 2]} << 8) | uint32_t{d[o + 3]};
+}
+uint64_t be64(const Bytes& d, uint64_t o) { return (uint64_t{be32(d, o)} << 32) | be32(d, o + 4); }
+uint32_t le32(const Bytes& d, uint64_t o) {
+    return uint32_t{d[o]} | (uint32_t{d[o + 1]} << 8) | (uint32_t{d[o + 2]} << 16) | (uint32_t{d[o + 3]} << 24);
+}
+
+std::string hex(uint64_t v) {
+    char b[24];
+    std::snprintf(b, sizeof b, "0x%" PRIx64, v);
+    return b;
+}
+
+// The stream a part is, by its first bytes ("" for plain data).
+std::string codec_of(const Bytes& b) {
+    const Codec c = detect_codec(b);
+    return c == Codec::NONE ? std::string() : std::string(codec_name(c));
+}
+
+}  // namespace
+
+Region& Layout::add(std::string name, std::string key, uint64_t offset, uint64_t size, unsigned depth, std::string note) {
+    Region r;
+    r.name = std::move(name);
+    r.key = std::move(key);
+    r.offset = offset;
+    r.size = size;
+    r.depth = depth;
+    r.note = std::move(note);
+    regions.push_back(std::move(r));
+    return regions.back();
+}
+
+void Layout::shift(uint64_t by) {
+    for (Region& r : regions) r.offset += by;
+}
+
+// ------------------------------------------------------------------------------------------------ the containers --
+
+Layout boot(const BootImage& img) {
+    Layout l;
+    const uint32_t page = (img.header_version <= 2 || img.pxa) ? (img.page_size ? img.page_size : 2048) : 4096;
+    l.format = "boot image, header version " + std::to_string(img.header_version) + (img.pxa ? " (Marvell PXA)" : "");
+    // The header takes the pages it needs: one, unless the page is smaller than the header (512 or 1024 bytes).
+    static constexpr uint32_t kHeaderBytes[] = {1632, 1648, 1660, 1580, 1584};  // version 0 to 4 (the PXA header: 1640)
+    const uint64_t header_bytes = img.pxa ? 1640 : kHeaderBytes[std::min<uint32_t>(img.header_version, 4)];
+    const uint64_t header = align_up(header_bytes, page);
+    l.add("header", "", 0, header, 0,
+          "header version " + std::to_string(img.header_version) + ", " + std::to_string(header_bytes) + " bytes, page size " + std::to_string(page));
+    uint64_t pos = header;
+    auto part = [&](const char* name, const char* key, const Bytes& b, const std::string& note = {}) {
+        if (b.empty()) return;
+        Region& r = l.add(name, key, pos, b.size(), 0, note);
+        r.codec = codec_of(b);
+        pos = align_up(pos + b.size(), page);
+    };
+    part("kernel", "kernel", img.kernel);
+    part("ramdisk", "ramdisk", img.ramdisk);
+    part("second", "second", img.second, "second stage");
+    part("dt", "dt", img.dt, qcdt::looks_like(img.dt) ? "Qualcomm device tree table (QCDT)" : "device tree");
+    part("recovery dtbo", "recovery_dtbo", img.recovery_dtbo);
+    part("dtb", "dtb", img.dtb, "device tree");
+    part("boot signature", "boot_signature", img.boot_signature, "GKI boot signature");
+    l.size = img.consumed;
+    return l;
+}
+
+Layout vendor_boot(const VendorBootImage& img) {
+    Layout l;
+    const uint32_t page = img.page_size ? img.page_size : 4096;
+    l.format = "vendor_boot image, header version " + std::to_string(img.header_version);
+    const uint64_t header_bytes = img.header_version >= 4 ? 2128 : 2112;
+    const uint64_t header = align_up(header_bytes, page);  // (two pages when the page is 2048 bytes: the header is a little larger)
+    l.add("header", "", 0, header, 0,
+          "header version " + std::to_string(img.header_version) + ", " + std::to_string(header_bytes) + " bytes, page size " + std::to_string(page));
+    uint64_t pos = header;
+    uint64_t total = 0;
+    for (const VendorRamdiskEntry& e : img.ramdisk_fragments) total += e.data.size();
+    if (total) {
+        const bool single = img.ramdisk_fragments.size() == 1;
+        Region& sec = l.add("vendor ramdisk", single ? "ramdisk0" : "", pos, total);
+        if (single) sec.codec = codec_of(img.ramdisk_fragments[0].data);
+        if (!single) {
+            uint64_t at = pos;
+            for (size_t i = 0; i < img.ramdisk_fragments.size(); ++i) {
+                const VendorRamdiskEntry& e = img.ramdisk_fragments[i];
+                std::string note = std::string(vendor_ramdisk_type_name(e.type));
+                if (!e.name.empty()) note += ", " + e.name;
+                Region& f = l.add("ramdisk fragment " + std::to_string(i), "ramdisk" + std::to_string(i), at, e.data.size(), 1, note);
+                f.codec = codec_of(e.data);
+                at += e.data.size();
+            }
+        }
+    }
+    pos = align_up(pos + total, page);
+    if (!img.dtb.empty()) {
+        l.add("dtb", "dtb", pos, img.dtb.size(), 0, "device trees");
+        pos = align_up(pos + img.dtb.size(), page);
+    }
+    if (img.header_version >= 4 && img.has_ramdisk_table && !img.ramdisk_fragments.empty()) {
+        const uint64_t n = img.ramdisk_fragments.size() * kVendorRamdiskTableEntrySize;
+        l.add("vendor ramdisk table", "", pos, n, 0, std::to_string(img.ramdisk_fragments.size()) + " entries");
+        pos = align_up(pos + n, page);
+    }
+    if (!img.bootconfig.empty()) {
+        l.add("bootconfig", "bootconfig", pos, img.bootconfig.size());
+        pos = align_up(pos + img.bootconfig.size(), page);
+    }
+    l.size = img.consumed;
+    return l;
+}
+
+Layout dtbo(const Bytes& t) {
+    Layout l;
+    l.format = "dtbo image";
+    l.size = t.size();
+    if (t.size() < 32) return l;
+    const uint32_t magic = be32(t, 0);
+    const bool acpio = magic == kAcpioTableMagic;
+    const uint32_t total = be32(t, 4), header_size = be32(t, 8), entry_size = be32(t, 12), count = be32(t, 16), entries_off = be32(t, 20),
+                   page = be32(t, 24), version = be32(t, 28);
+    l.format = std::string(acpio ? "ACPIO table" : "dtbo image") + ", version " + std::to_string(version);
+    l.size = std::min<uint64_t>(total, t.size());
+    if (within(t, 0, header_size))
+        l.add("header", "", 0, header_size, 0, "version " + std::to_string(version) + ", page size " + std::to_string(page));
+    if (count && entry_size && within(t, entries_off, uint64_t{count} * entry_size))
+        l.add("entry table", "", entries_off, uint64_t{count} * entry_size, 0, std::to_string(count) + (count == 1 ? " entry" : " entries"));
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint64_t er = entries_off + uint64_t{i} * entry_size;
+        if (entry_size < 20 || !within(t, er, entry_size)) break;
+        const uint32_t size = be32(t, er), off = be32(t, er + 4), id = be32(t, er + 8), rev = be32(t, er + 12);
+        Region& r = l.add("entry " + std::to_string(i), "entry" + std::to_string(i), off, size, 0, "id " + hex(id) + ", rev " + hex(rev));
+        if (version == 1) {
+            const uint32_t comp = be32(t, er + 16) & 0x0f;  // the low nibble of flags: 1 zlib, 2 gzip
+            if (comp == 1) r.codec = "zlib";
+            if (comp == 2) r.codec = "gzip";
+        }
+    }
+    return l;
+}
+
+Layout uimage(const UImage& img) {
+    Layout l;
+    l.format = "U-Boot legacy image (uImage)";
+    l.add("header", "", 0, kUimageHeaderSize, 0, "os " + uboot_os_name(img.os) + ", arch " + uboot_arch_name(img.arch) + ", " + uboot_type_name(img.type));
+    if (!img.data.empty()) {
+        Region& r = l.add("data", "data", kUimageHeaderSize, img.data.size(), 0, "");
+        r.codec = codec_of(img.data);
+        if (r.codec.empty() && img.comp != 0) r.note = "compression " + uboot_comp_name(img.comp) + " says the header";
+    }
+    l.size = img.consumed;
+    return l;
+}
+
+Layout qcdt(const Bytes& d, const std::string& kp) {
+    Layout l;
+    l.format = "Qualcomm device tree table (QCDT)";
+    l.size = d.size();
+    if (d.size() < qcdt::kHeaderSize || !qcdt::looks_like(d)) return l;
+    const uint32_t version = le32(d, 4), count = le32(d, 8);
+    const size_t es = qcdt::entry_size(version);
+    if (!es) return l;
+    const uint64_t fits = (d.size() - qcdt::kHeaderSize) / es;
+    const uint64_t n = std::min<uint64_t>(count, fits);
+    l.add("QCDT table", "", 0, qcdt::kHeaderSize + n * es + 4, 0,
+          "version " + std::to_string(version) + ", " + std::to_string(count) + (count == 1 ? " entry" : " entries"));
+    std::map<uint64_t, uint64_t> trees;  // offset -> size, in the order of the file
+    for (uint64_t k = 0; k < n; ++k) {
+        const uint64_t er = qcdt::kHeaderSize + k * es;
+        const uint32_t off = le32(d, er + es - 8), size = le32(d, er + es - 4);
+        if (within(d, off, 1)) trees.emplace(off, size);
+    }
+    size_t j = 0;
+    for (const auto& [off, size] : trees) {
+        std::string note = "device tree";
+        if (within(d, off, 8) && be32(d, off) == 0xd00dfeed) note += " of " + std::to_string(be32(d, off + 4)) + " bytes, zeros up to the page";
+        l.add("device tree " + std::to_string(j), kp + "dtb" + std::to_string(j), off, std::min<uint64_t>(size, d.size() - off), 0, note);
+        ++j;
+    }
+    return l;
+}
+
+void vbmeta(Layout& l, const Bytes& d, uint64_t at, unsigned depth, const std::string& key_prefix) {
+    if (!within(d, at, 256) || std::memcmp(d.data() + at, "AVB0", 4) != 0) return;
+    const uint64_t auth_size = be64(d, at + 12), aux_size = be64(d, at + 20);
+    const uint32_t algorithm = be32(d, at + 28);
+    const uint64_t hash_off = be64(d, at + 32), hash_size = be64(d, at + 40), sig_off = be64(d, at + 48), sig_size = be64(d, at + 56),
+                   key_off = be64(d, at + 64), key_size = be64(d, at + 72), meta_off = be64(d, at + 80), meta_size = be64(d, at + 88),
+                   desc_off = be64(d, at + 96), desc_size = be64(d, at + 104);
+    const uint64_t auth_at = at + 256;
+    if (auth_size > d.size() || aux_size > d.size() || !within(d, auth_at, auth_size + aux_size)) return;
+    const uint64_t aux_at = auth_at + auth_size;
+    l.add("vbmeta header", "", at, 256, depth, "algorithm " + avb_algorithm_name(algorithm));
+    if (auth_size) {
+        l.add("authentication block", "", auth_at, auth_size, depth);
+        if (hash_size && hash_off <= auth_size && hash_size <= auth_size - hash_off) l.add("hash", "", auth_at + hash_off, hash_size, depth + 1);
+        if (sig_size && sig_off <= auth_size && sig_size <= auth_size - sig_off) l.add("signature", "", auth_at + sig_off, sig_size, depth + 1);
+    }
+    if (aux_size) {
+        l.add("auxiliary block", "", aux_at, aux_size, depth);
+        auto inside = [&](uint64_t off, uint64_t size) { return size && off <= aux_size && size <= aux_size - off; };
+        if (inside(desc_off, desc_size)) {
+            l.add("descriptors", "", aux_at + desc_off, desc_size, depth + 1, "");
+            uint64_t p = aux_at + desc_off;
+            const uint64_t end = p + desc_size;
+            for (size_t i = 0; p + 16 <= end; ++i) {
+                const uint64_t tag = be64(d, p), following = be64(d, p + 8);
+                if (following > end - p - 16) break;
+                AvbDescriptor desc;
+                desc.tag = tag;
+                desc.content.assign(d.begin() + static_cast<long>(p + 16), d.begin() + static_cast<long>(p + 16 + following));
+                l.add("descriptor " + std::to_string(i), key_prefix + "descriptor" + std::to_string(i), p, 16 + following, depth + 2, desc.describe());
+                p += 16 + following;
+            }
+        }
+        if (inside(key_off, key_size)) l.add("public key", key_prefix + "public_key", aux_at + key_off, key_size, depth + 1);
+        if (inside(meta_off, meta_size)) l.add("public key metadata", key_prefix + "public_key_metadata", aux_at + meta_off, meta_size, depth + 1);
+    }
+}
+
+Layout vbmeta_image(const Bytes& d) {
+    Layout l;
+    l.format = "vbmeta image";
+    l.size = d.size();
+    vbmeta(l, d, 0, 0, "");
+    return l;
+}
+
+Layout dtb_blobs(const std::vector<size_t>& sizes) {
+    Layout l;
+    l.format = "flattened device trees";
+    uint64_t at = 0;
+    for (size_t i = 0; i < sizes.size(); ++i) {
+        l.add("device tree " + std::to_string(i), "blob" + std::to_string(i), at, sizes[i]);
+        at += sizes[i];
+    }
+    l.size = at;
+    return l;
+}
+
+// ----------------------------------------------------------------------------------------------------- around --
+
+void around(Layout& l, const Bytes& whole, size_t host_size, size_t core_off, size_t core_len) {
+    l.size = whole.size();
+    host_size = std::min(host_size, whole.size());
+    core_off = std::min(core_off, host_size);
+    core_len = std::min(core_len, host_size - core_off);
+    l.shift(core_off);
+    const Bytes host(whole.begin(), whole.begin() + static_cast<long>(host_size));
+    const Envelope env = Envelope::capture(host, core_off, core_len);
+    if (core_off) l.regions.insert(l.regions.begin(), Region{"prefix", "prefix", 0, core_off, 0, "kept as it is (prefix.bin)", "", "", 0, -1});
+    const uint64_t core_end = core_off + core_len;
+    if (!env.tail.empty()) l.add("tail", "tail", core_end, env.tail.size(), 0, "kept as it is (tail.bin)");
+    if (env.pad_to) {
+        const uint64_t from = core_end + env.tail.size();
+        if (env.pad_to > from) {
+            char b[40];
+            std::snprintf(b, sizeof b, "fill, all bytes 0x%02x", env.pad_byte);
+            l.add("fill", "", from, env.pad_to - from, 0, b);
+        }
+    }
+    if (host_size < whole.size() && whole.size() >= 64 && std::memcmp(whole.data() + whole.size() - 64, "AVBf", 4) == 0) {
+        const uint64_t footer_at = whole.size() - 64;
+        const uint64_t vb_off = be64(whole, footer_at + 20), vb_size = be64(whole, footer_at + 28);
+        if (vb_off >= host_size && vb_off <= footer_at && vb_size <= footer_at - vb_off) {
+            if (vb_off > host_size) l.add("padding", "", host_size, vb_off - host_size);
+            l.add("AVB vbmeta", "", vb_off, vb_size, 0, "the AVB footer's signed block");
+            vbmeta(l, whole, vb_off, 1, "avb_");
+            if (vb_off + vb_size < footer_at) l.add("padding", "", vb_off + vb_size, footer_at - (vb_off + vb_size));
+        }
+        l.add("AVB footer", "", footer_at, 64, 0, "protects the first " + std::to_string(host_size) + " bytes");
+    }
+    std::stable_sort(l.regions.begin(), l.regions.end(), [](const Region& a, const Region& b) {
+        return a.offset != b.offset ? a.offset < b.offset : a.depth < b.depth;
+    });
+}
+
+// ----------------------------------------------------------------------------------------------------- the text --
+
+namespace {
+
+std::string stream_text(const Region& r) {
+    std::string s;
+    if (!r.file.empty()) {
+        s = r.codec.empty() ? "file " + r.file : r.codec + " -> " + r.file;
+        if (!r.codec.empty()) {
+            s += " (" + std::to_string(r.unpacked) + " bytes";
+            if (r.level >= 0) s += ", level " + std::to_string(r.level);
+            s += ")";
+        }
+    } else if (!r.codec.empty()) {
+        s = r.codec;
+    }
+    return s;
+}
+
+std::string slug(const std::string& name) {
+    std::string s;
+    for (char c : name) {
+        const unsigned char u = static_cast<unsigned char>(c);
+        if (std::isalnum(u))
+            s += static_cast<char>(std::tolower(u));
+        else if (!s.empty() && s.back() != '_')
+            s += '_';
+    }
+    while (!s.empty() && s.back() == '_') s.pop_back();
+    return s.empty() ? "region" : s;
+}
+
+}  // namespace
+
+std::string render(const Layout& l, const std::string& indent) {
+    uint64_t top = 0;
+    size_t name_w = 4, size_w = 4;
+    for (const Region& r : l.regions) {
+        top = std::max(top, r.offset + r.size);
+        name_w = std::max(name_w, r.depth * 2 + r.name.size());
+        size_w = std::max(size_w, std::to_string(r.size).size());
+    }
+    name_w = std::min<size_t>(name_w, 36);
+    int hex_w = 8;
+    for (uint64_t v = top >> 32; v; v >>= 4) ++hex_w;
+
+    std::string out;
+    char buf[64];
+    std::snprintf(buf, sizeof buf, "%-*s", hex_w + 2, "offset");
+    out += indent + buf + "  " + std::string(size_w > 4 ? size_w - 4 : 0, ' ') + "size  part\n";
+    for (const Region& r : l.regions) {
+        std::snprintf(buf, sizeof buf, "0x%0*" PRIx64, hex_w, r.offset);
+        std::string name = std::string(r.depth * 2, ' ') + r.name;
+        if (name.size() > name_w) name = name.substr(0, name_w - 1) + "~";
+        std::string what = r.note;
+        if (const std::string s = stream_text(r); !s.empty()) what += (what.empty() ? "" : "; ") + s;
+        char size[32];
+        std::snprintf(size, sizeof size, "%*" PRIu64, static_cast<int>(size_w), r.size);
+        std::string line = indent + buf + "  " + size + "  " + name;
+        if (!what.empty()) line += std::string(name_w - name.size(), ' ') + "  " + what;
+        out += line + "\n";
+    }
+    return out;
+}
+
+std::vector<std::pair<std::string, std::string>> manifest_lines(const Layout& l) {
+    std::vector<std::pair<std::string, std::string>> out;
+    std::map<std::string, int> seen;
+    for (const Region& r : l.regions) {
+        std::string name = r.key.empty() ? slug(r.name) : r.key;
+        if (const int n = seen[name]++; n) name += "_" + std::to_string(n + 1);
+        out.emplace_back("layout_" + name + "_offset", hex(r.offset));
+        out.emplace_back("layout_" + name + "_size", std::to_string(r.size));
+        if (!r.codec.empty() && r.unpacked) out.emplace_back("layout_" + name + "_unpacked_size", std::to_string(r.unpacked));
+    }
+    return out;
+}
+
+bool write_manifest_block(const std::filesystem::path& path, const Layout& l, const std::string& what) {
+    try {
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(path, ec)) return false;
+        const Bytes raw = read_file(path);
+        const std::string text(raw.begin(), raw.end());
+        std::string out;
+        for (size_t pos = 0; pos < text.size();) {
+            size_t nl = text.find('\n', pos);
+            const size_t end = nl == std::string::npos ? text.size() : nl + 1;
+            const std::string line = text.substr(pos, end - pos);
+            pos = end;
+            if (line.rfind("layout_", 0) == 0 || line.rfind("# layout", 0) == 0) continue;  // an earlier block
+            out += line;
+        }
+        while (out.size() >= 2 && out[out.size() - 1] == '\n' && out[out.size() - 2] == '\n') out.pop_back();
+        if (!out.empty() && out.back() != '\n') out += '\n';
+        out += "\n# layout of " + what + " -- information only, pack does not read these lines\n";
+        for (const auto& [k, v] : manifest_lines(l)) out += k + "=" + v + "\n";
+        write_file(path, reinterpret_cast<const uint8_t*>(out.data()), out.size());
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
+}  // namespace abr::layout

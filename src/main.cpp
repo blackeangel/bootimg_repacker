@@ -41,6 +41,7 @@
 #include "abr/fdt.hpp"
 #include "abr/fit.hpp"
 #include "abr/identify.hpp"
+#include "abr/layout.hpp"
 #include "abr/legacy/amonet.hpp"
 #include "abr/legacy/avb1.hpp"
 #include "abr/legacy/blob.hpp"
@@ -2870,6 +2871,136 @@ void print_avb_footer_info(const AvbFooter& f, const Bytes& host) {
                   << "\n";
 }
 
+// ------------------------------------------------------------------ layout --
+//
+// Where the parts of an image are (abr/layout.hpp). `unpack` says it of the image it took apart, `pack` of the image it built and `info`
+// of the image it is asked about -- always from the bytes of that image, read again, so that the three tell the same numbers; `unpack`
+// and `pack` also keep it in the layout block at the end of manifest.txt.
+
+// data[off, off + len) -- `data` itself when that is all of it, so that a plain image is not copied again.
+const Bytes& part_of(const Bytes& data, size_t off, size_t len, Bytes& storage) {
+    if (off == 0 && len == data.size()) return data;
+    storage.assign(data.begin() + static_cast<long>(off), data.begin() + static_cast<long>(off + len));
+    return storage;
+}
+
+// `whole` (an image with its wrappers taken off) read as a `f`. nullopt for a format whose layout abr does not tell, and for bytes that are
+// not one after all.
+std::optional<layout::Layout> describe_layout(Fmt f, const Bytes& whole) {
+    try {
+        Bytes storage;
+        switch (f) {
+            case Fmt::BOOT: {
+                const AvbFooter footer = detect_avb_footer(whole);
+                const size_t off = find_container(whole, "ANDROID!");
+                if (off == std::string::npos || off >= footer.host_size) return std::nullopt;
+                const BootImage img = BootImage::parse(part_of(whole, off, footer.host_size - off, storage));
+                layout::Layout l = layout::boot(img);
+                layout::around(l, whole, footer.host_size, off, img.consumed);
+                return l;
+            }
+            case Fmt::VENDOR_BOOT: {
+                const AvbFooter footer = detect_avb_footer(whole);
+                const size_t off = find_magic(whole, "VNDRBOOT", 8);
+                if (off == std::string::npos || off >= footer.host_size) return std::nullopt;
+                const VendorBootImage img = VendorBootImage::parse(part_of(whole, off, footer.host_size - off, storage));
+                layout::Layout l = layout::vendor_boot(img);
+                layout::around(l, whole, footer.host_size, off, img.consumed);
+                return l;
+            }
+            case Fmt::DTBO: {
+                const AvbFooter footer = detect_avb_footer(whole);
+                const Bytes& host = part_of(whole, 0, footer.host_size, storage);
+                const DtboImage img = DtboImage::parse(host);
+                layout::Layout l = layout::dtbo(host);
+                layout::around(l, whole, footer.host_size, 0, img.consumed);
+                return l;
+            }
+            case Fmt::DTB: {
+                const FdtBlobs split = split_fdt_blobs(whole);
+                std::vector<size_t> sizes;
+                for (const Bytes& b : split.blobs) sizes.push_back(b.size());
+                layout::Layout l = layout::dtb_blobs(sizes);
+                layout::around(l, whole, whole.size(), 0, split.consumed);
+                return l;
+            }
+            case Fmt::QCDT: {
+                const qcdt::Table t = qcdt::parse(whole);
+                layout::Layout l = layout::qcdt(whole);
+                layout::around(l, whole, whole.size(), 0, t.consumed);
+                return l;
+            }
+            case Fmt::VBMETA: {
+                const VbmetaImage v = VbmetaImage::parse(whole);
+                if (v.has_footer) {  // an AVB footer behind something abr has no reader for: the image it protects is one lump
+                    layout::Layout l;
+                    l.format = "AVB hash footer behind another image";
+                    l.add("protected image", "", 0, v.footer_original_image_size);
+                    layout::around(l, whole, v.footer_original_image_size, 0, v.footer_original_image_size);
+                    return l;
+                }
+                layout::Layout l = layout::vbmeta_image(whole);
+                uint64_t end = 0;
+                for (const layout::Region& r : l.regions) end = std::max(end, r.offset + r.size);
+                layout::around(l, whole, whole.size(), 0, end);
+                return l;
+            }
+            case Fmt::UIMAGE: {
+                const UImage img = UImage::parse(whole);
+                layout::Layout l = layout::uimage(img);
+                layout::around(l, whole, whole.size(), 0, img.consumed);
+                return l;
+            }
+            default:
+                return std::nullopt;
+        }
+    } catch (const FormatError&) {
+        return std::nullopt;
+    }
+}
+
+// What the manifest of an unpacked folder says about the parts the layout names by their keys: the file each became, and the compression it
+// was in (and at what level, where that is known). A manifest that cannot be read leaves the layout as it is.
+void annotate_layout(layout::Layout& l, const Manifest& m, const fs::path& dir) {
+    for (layout::Region& r : l.regions) {
+        if (r.key.empty() || !m.has(r.key + "_file")) continue;
+        try {
+            const std::string codec = m.get(r.key + "_compression", "none");
+            r.file = m.get(r.key + "_file");
+            r.codec = codec == "none" ? std::string() : codec;
+            std::error_code ec;
+            const uintmax_t size = fs::file_size(dir / r.file, ec);
+            r.unpacked = ec ? 0 : size;
+            r.level = static_cast<int>(m.get_int(r.key + "_level", -1, -1, 22));
+            if (m.has(r.key + "_tree")) r.file += " + " + m.get(r.key + "_tree") + "/";
+        } catch (const std::exception&) {
+        }
+    }
+}
+
+// Tells where the parts of `image` (read as a `f`, wrappers off) are -- the table on the console -- and keeps it in the layout block of the
+// manifest of `dir`. `what` goes into the comment of that block, `name` into the line before the table. Never an error: a layout that
+// cannot be worked out is a warning.
+void report_layout(Fmt f, const Bytes& image, const Wrappers& wrap, const fs::path& dir, const std::string& what, const std::string& name) {
+    try {
+        std::optional<layout::Layout> l = describe_layout(f, image);
+        if (!l) return;
+        const fs::path manifest_file = dir / "manifest.txt";
+        Manifest m;
+        try {
+            m = Manifest::load(manifest_file);
+        } catch (const std::exception&) {
+        }
+        annotate_layout(*l, m, dir);
+        std::cout << "layout of " << name << " (" << l->format << ", " << l->size << " bytes"
+                  << (wrap.recorded() || wrap.sin ? "; offsets are those of the plain image inside its wrapper" : "") << "):\n"
+                  << layout::render(*l);
+        layout::write_manifest_block(manifest_file, *l, what);
+    } catch (const std::exception& e) {
+        warn(std::string("could not work out where the parts of the image are: ") + e.what());
+    }
+}
+
 void print_info(const fs::path& path) {
     Bytes raw = read_file(path);
     Wrappers wrap;
@@ -3210,6 +3341,11 @@ void print_info(const fs::path& path) {
             break;
         }
     }
+    if (f != Fmt::UNKNOWN)
+        if (const std::optional<layout::Layout> l = describe_layout(f, data))
+            std::cout << "layout (" << l->format << ", " << l->size << " bytes"
+                      << (wrap.recorded() || wrap.sin ? "; offsets are those of the plain image inside its wrapper" : "") << "):\n"
+                      << layout::render(*l);
 }
 
 // ------------------------------------------------------------- dispatch --
@@ -3468,6 +3604,7 @@ void do_unpack(const fs::path& in, const fs::path& outdir) {
 
     std::cout << "unpacked " << wrap.adjectives() << fmt_name(f)
               << " -> " << outdir.string() << "/\n";
+    report_layout(f, payload, wrap, outdir, "the image this folder was unpacked from", in.filename().string());
     if (wrap.sin) {
         for (const std::string& n : wrap.sin->notes) warn(n);
         note(legacy::describe_sin(*wrap.sin) + ": the container is not kept, a repack writes the plain " + fmt_name(f) +
@@ -3615,6 +3752,11 @@ void do_pack(const fs::path& dir, const fs::path& out) {
                           "); the image would be written over it. Name another file");
     write_file(out, result);
     std::cout << "packed " << fmt_name(f) << " -> " << out.string() << " (" << result.size() << " bytes)\n";
+    {
+        Wrappers wrap;
+        const Bytes& payload = peel_wrappers(result, wrap);
+        report_layout(f, payload, wrap, dir, "the image built from this folder (" + out.filename().string() + ")", out.filename().string());
+    }
 }
 
 // ----------------------------------------------------------- command line --
