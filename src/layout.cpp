@@ -12,6 +12,11 @@
 #include "abr/compression.hpp"
 #include "abr/dtbo.hpp"
 #include "abr/envelope.hpp"
+#include "abr/legacy/blob.hpp"
+#include "abr/legacy/chromeos.hpp"
+#include "abr/legacy/elf_boot.hpp"
+#include "abr/legacy/krnl.hpp"
+#include "abr/legacy/osip.hpp"
 #include "abr/qcdt.hpp"
 #include "abr/uimage.hpp"
 #include "abr/vbmeta.hpp"
@@ -31,6 +36,9 @@ uint32_t le32(const Bytes& d, uint64_t o) {
     return uint32_t{d[o]} | (uint32_t{d[o + 1]} << 8) | (uint32_t{d[o + 2]} << 16) | (uint32_t{d[o + 3]} << 24);
 }
 
+uint16_t le16(const Bytes& d, uint64_t o) { return static_cast<uint16_t>(uint32_t{d[o]} | (uint32_t{d[o + 1]} << 8)); }
+uint64_t le64(const Bytes& d, uint64_t o) { return uint64_t{le32(d, o)} | (uint64_t{le32(d, o + 4)} << 32); }
+
 std::string hex(uint64_t v) {
     char b[24];
     std::snprintf(b, sizeof b, "0x%" PRIx64, v);
@@ -41,6 +49,13 @@ std::string hex(uint64_t v) {
 std::string codec_of(const Bytes& b) {
     const Codec c = detect_codec(b);
     return c == Codec::NONE ? std::string() : std::string(codec_name(c));
+}
+
+// The stream the `n` bytes at `off` are, by their first bytes (the magic of a codec is all there is to look at).
+std::string codec_at(const Bytes& d, uint64_t off, uint64_t n) {
+    if (!within(d, off, n) || n == 0) return {};
+    const auto first = d.begin() + static_cast<std::ptrdiff_t>(off);
+    return codec_of(Bytes(first, first + static_cast<std::ptrdiff_t>(std::min<uint64_t>(n, 64))));
 }
 
 }  // namespace
@@ -175,6 +190,245 @@ Layout uimage(const UImage& img) {
         if (r.codec.empty() && img.comp != 0) r.note = "compression " + uboot_comp_name(img.comp) + " says the header";
     }
     l.size = img.consumed;
+    return l;
+}
+
+// A FIT image. The flattened tree is walked here (the bytes of the file, not what abr made of them), so that the numbers are the ones the
+// file has: a `data` property is where the data of an image is when it is in the tree, data-size and data-offset or data-position say it when
+// it is behind the tree (the offset counts from the end of the tree, a multiple of 4; the position from the start of the file).
+Layout fit(const Bytes& d, const std::vector<std::string>& keys) {
+    Layout l;
+    l.format = "FIT image (U-Boot flattened image tree)";
+    l.size = d.size();
+    if (d.size() < 28 || be32(d, 0) != 0xd00dfeed) return l;
+    const uint64_t total = be32(d, 4), off_struct = be32(d, 8), off_strings = be32(d, 12), off_rsv = be32(d, 16);
+    const uint32_t version = be32(d, 20);
+    const uint64_t size_strings = version >= 3 && d.size() >= 36 ? be32(d, 32) : 0;
+    const uint64_t size_struct = version >= 17 && d.size() >= 40 ? be32(d, 36) : 0;
+    if (total > d.size() || off_rsv > total || off_struct > total || off_strings > total || size_struct > total - off_struct ||
+        size_strings > total - off_strings)
+        return l;
+    l.add("FDT header", "", 0, std::min<uint64_t>(off_rsv, version >= 17 ? 40 : 36), 0, "version " + std::to_string(version) + ", total size " + std::to_string(total));
+    if (off_struct > off_rsv) l.add("memory reservation map", "", off_rsv, off_struct - off_rsv, 0, "");
+    l.add("structure block", "", off_struct, size_struct, 0, "the nodes and properties of the tree");
+
+    struct Img {
+        std::string name, type;
+        uint64_t data_at = 0, data_len = 0;
+        bool inline_data = false;
+        std::optional<uint32_t> size, offset, position;
+    };
+    std::vector<Img> images;
+    std::vector<std::string> path;  // the names of the open nodes: ["", "images", "kernel-1"]
+    auto text_at = [&](uint64_t at, uint64_t end) {
+        std::string s;
+        while (at < end && d[at]) s.push_back(static_cast<char>(d[at++]));
+        return s;
+    };
+    uint64_t p = off_struct;
+    const uint64_t end = off_struct + size_struct;
+    bool walking = true;
+    while (walking && p + 4 <= end) {
+        const uint32_t token = be32(d, p);
+        p += 4;
+        switch (token) {
+            case 1: {  // FDT_BEGIN_NODE, the name, padded to 4
+                const uint64_t from = p;
+                while (p < end && d[p]) ++p;
+                if (p >= end) { walking = false; break; }
+                path.push_back(std::string(d.begin() + static_cast<std::ptrdiff_t>(from), d.begin() + static_cast<std::ptrdiff_t>(p)));
+                p = align_up(p + 1, 4);
+                if (path.size() == 3 && path[1] == "images") {
+                    images.emplace_back();
+                    images.back().name = path[2];
+                }
+                break;
+            }
+            case 2:  // FDT_END_NODE
+                if (!path.empty()) path.pop_back();
+                break;
+            case 3: {  // FDT_PROP: length, offset of the name in the strings block, the value, padded to 4
+                if (p + 8 > end) { walking = false; break; }
+                const uint64_t len = be32(d, p), name_off = be32(d, p + 4);
+                p += 8;
+                if (len > end - p) { walking = false; break; }
+                if (path.size() == 3 && path[1] == "images" && !images.empty() && name_off < size_strings) {
+                    Img& im = images.back();
+                    const std::string name = text_at(off_strings + name_off, off_strings + size_strings);
+                    if (name == "data") {
+                        im.data_at = p;
+                        im.data_len = len;
+                        im.inline_data = true;
+                    } else if ((name == "data-size" || name == "data-offset" || name == "data-position") && len == 4) {
+                        (name == "data-size" ? im.size : name == "data-offset" ? im.offset : im.position) = be32(d, p);
+                    } else if (name == "type") {
+                        im.type = text_at(p, p + len);
+                    }
+                }
+                p = align_up(p + len, 4);
+                break;
+            }
+            case 4:  // FDT_NOP
+                break;
+            default:  // FDT_END, or a token that is none
+                walking = false;
+                break;
+        }
+    }
+    for (size_t i = 0; i < images.size(); ++i) {
+        const Img& im = images[i];
+        const std::string key = i < keys.size() ? keys[i] : std::string();
+        const std::string what = im.type.empty() ? std::string() : im.type;
+        if (im.inline_data) {
+            if (im.data_len && within(d, im.data_at, im.data_len)) {
+                Region& r = l.add("image " + im.name, key, im.data_at, im.data_len, 1, what.empty() ? "in the tree" : what + ", in the tree");
+                r.codec = codec_at(d, r.offset, r.size);
+            }
+        } else if (im.size && (im.offset || im.position)) {
+            const uint64_t at = im.position ? *im.position : align_up(total, 4) + *im.offset;
+            if (*im.size && within(d, at, *im.size)) {
+                Region& r = l.add("image " + im.name, key, at, *im.size, 0, what.empty() ? "behind the tree" : what + ", behind the tree");
+                r.codec = codec_at(d, r.offset, r.size);
+            }
+        }
+    }
+    if (size_strings) l.add("strings block", "", off_strings, size_strings, 0, "the names of the properties");
+    std::stable_sort(l.regions.begin(), l.regions.end(), [](const Region& a, const Region& b) {
+        return a.offset != b.offset ? a.offset < b.offset : a.depth < b.depth;
+    });
+    return l;
+}
+
+Layout elf_boot(const legacy::ElfBootImage& img, const Bytes& d, const std::vector<std::string>& keys) {
+    Layout l;
+    l.size = d.size();
+    l.format = std::string("ELF boot image (") + (img.is_64bit ? "ELF64, " : "ELF32, ") + std::to_string(img.segments.size()) +
+               (img.segments.size() == 1 ? " segment)" : " segments)");
+    const bool is64 = img.is_64bit;
+    const uint64_t aw = is64 ? 8 : 4;
+    const uint64_t after = 24 + 3 * aw + 4;  // e_ehsize, e_phentsize, e_phnum come behind e_entry, e_phoff, e_shoff, e_flags
+    if (!within(d, 0, after + 6)) return l;
+    const uint64_t phoff = is64 ? le64(d, 32) : le32(d, 28);
+    const uint64_t ehsize = le16(d, after), phentsize = le16(d, after + 2), phnum = le16(d, after + 4);
+    const uint64_t ehdr = ehsize ? ehsize : (is64 ? 64 : 52);
+    if (within(d, 0, ehdr)) l.add("ELF header", "", 0, ehdr, 0, "machine " + std::to_string(img.machine));
+    if (phnum && phentsize && phentsize <= d.size() && phnum <= d.size() && within(d, phoff, phnum * phentsize))
+        l.add("program headers", "", phoff, phnum * phentsize, 0, std::to_string(phnum) + (phnum == 1 ? " header" : " headers"));
+    const uint64_t phdr_min = is64 ? 56 : 32;
+    for (uint64_t i = 0; i < phnum && i < img.segments.size(); ++i) {
+        const uint64_t at = phoff + i * phentsize;
+        if (phentsize < phdr_min || !within(d, at, phdr_min)) break;
+        const uint64_t off = is64 ? le64(d, at + 8) : le32(d, at + 4);
+        const uint64_t filesz = is64 ? le64(d, at + 32) : le32(d, at + 16);
+        if (!filesz || !within(d, off, filesz)) continue;
+        const legacy::ElfSegment& s = img.segments[i];
+        Region& r = l.add("segment " + std::to_string(i) + " (" + s.role + ")", i < keys.size() ? keys[i] : std::string(), off, filesz, 0,
+                          "address " + hex(s.addr) + (s.flags ? ", flags " + hex(s.flags) : std::string()));
+        r.codec = codec_at(d, off, filesz);
+    }
+    return l;
+}
+
+Layout krnl(const legacy::KrnlImage& img, const std::string& key) {
+    Layout l;
+    l.format = "Rockchip KRNL image";
+    l.add("header", "", 0, legacy::kKrnlHeaderSize, 0, "KRNL, payload of " + std::to_string(img.payload.size()) + " bytes");
+    if (!img.payload.empty()) {
+        Region& r = l.add("payload", key, legacy::kKrnlHeaderSize, img.payload.size());
+        r.codec = codec_of(img.payload);
+    }
+    l.add("CRC", "", legacy::kKrnlHeaderSize + img.payload.size(), legacy::kKrnlTrailerSize, 0,
+          img.crc_ok ? "Rockchip CRC-32 " + hex(img.crc) + ", the payload's" : "Rockchip CRC-32 " + hex(img.crc) + ", NOT the payload's");
+    l.size = img.file_size();
+    return l;
+}
+
+Layout blob(const legacy::BlobImage& img) {
+    using namespace legacy;
+    Layout l;
+    l.format = img.secure ? "ASUS blob, signed (-SIGNED-BY-SIGNBLOB-)" : "ASUS blob (MSM-RADIO-UPDATE)";
+    uint64_t at = 0;
+    if (img.secure) {
+        l.add("secure header", "", 0, kBlobSecureHeaderSize, 0,
+              "datalen " + std::to_string(img.secure_datalen) + ", siglen " + std::to_string(img.secure_siglen));
+        at = kBlobSecureHeaderSize;
+    }
+    l.add("blob header", "", at, kBlobHeaderSize, 0,
+          "version " + hex(img.version) + ", " + std::to_string(img.parts.size()) + (img.parts.size() == 1 ? " partition" : " partitions"));
+    at += kBlobHeaderSize;
+    if (!img.parts.empty()) l.add("partition table", "", at, img.parts.size() * kBlobPartEntrySize, 0, "");
+    at += img.parts.size() * kBlobPartEntrySize;
+    for (size_t i = 0; i < img.parts.size(); ++i) {
+        const BlobPart& part = img.parts[i];
+        std::string name;
+        for (uint8_t c : part.name)
+            if (c) name.push_back(c >= 0x20 && c < 0x7f ? static_cast<char>(c) : '?');
+        if (!part.data.empty()) {
+            Region& r = l.add("partition " + (name.empty() ? std::to_string(i) : name), "blob_part" + std::to_string(i), at, part.data.size(), 0,
+                              "version " + std::to_string(part.version));
+            r.codec = codec_of(part.data);
+        }
+        at += part.data.size();
+    }
+    if (!img.tail.empty()) {
+        l.add(img.secure ? "signature" : "after the partitions", "blob_tail", at, img.tail.size());
+        at += img.tail.size();
+    }
+    l.size = at;
+    return l;
+}
+
+Layout osip(const legacy::OsipImage& img) {
+    using namespace legacy;
+    Layout l;
+    l.format = img.header.empty() ? "Intel OSIP boot image (no OSIP header)" : "Intel OSIP boot image";
+    uint64_t at = 0;
+    auto put = [&](const std::string& name, const std::string& key, uint64_t size, std::string note = {}) -> Region* {
+        if (!size) return nullptr;
+        Region& r = l.add(name, key, at, size, 0, std::move(note));
+        at += size;
+        return &r;
+    };
+    put("OSIP header", "osip_header", img.header.size(), "the $OS$ header and its OSII entry");
+    put("signature", "osip_signature", img.signature.size(), "Intel's signature");
+    std::string cmd = img.cmdline_text();
+    if (cmd.size() > 60) cmd = cmd.substr(0, 57) + "...";
+    put("cmdline", "osip_cmdline", img.cmdline.size(), cmd.empty() ? std::string() : "\"" + cmd + "\"");
+    put("image info", "osip_info", kOsipInfoFixedSize + img.info_rest.size(),
+        std::to_string(img.kernel.size()) + " bytes of kernel, " + std::to_string(img.ramdisk.size()) + " of ramdisk");
+    put("bootstub", "bootstub", img.bootstub.size());
+    put("kernel", "kernel", img.kernel.size());
+    if (Region* r = put("ramdisk", "ramdisk", img.ramdisk.size())) r->codec = codec_of(img.ramdisk);
+    l.size = at;
+    return l;
+}
+
+Layout chromeos(const legacy::ChromeosInfo& c, const Bytes& d) {
+    using namespace legacy;
+    Layout l;
+    l.format = "ChromeOS kernel blob (vboot preamble " + std::to_string(c.preamble_major) + "." + std::to_string(c.preamble_minor) + ")";
+    const uint64_t core = std::min<uint64_t>(c.core_size, d.size());
+    const uint64_t pad = std::min<uint64_t>(c.pad, core);
+    const uint64_t keyblock = std::min<uint64_t>(c.keyblock.size(), pad);
+    l.size = core;
+    l.add("verification block", "", 0, pad, 0, "the keyblock and the preamble, zeros up to the " + std::to_string(pad) + " bytes");
+    if (keyblock) l.add("keyblock", "", 0, keyblock, 1, "the data key and the signature of the keyblock");
+    const uint64_t preamble = within(d, keyblock, 4) ? le32(d, keyblock) : 0;  // preamble_size: its first field
+    if (preamble && preamble <= pad - keyblock)
+        l.add("preamble", "", keyblock, preamble, 1, "kernel version " + std::to_string(c.kernel_version) + ", loaded at " + hex(c.body_load_address));
+    if (core > pad) {
+        l.add("body", "", pad, core - pad, 0, "signed as one: the kernel, the config, the params, the bootloader");
+        uint64_t at = pad;
+        auto part = [&](const std::string& name, const std::string& key, uint64_t size, const std::string& note) {
+            size = std::min<uint64_t>(size, core - at);
+            if (size) l.add(name, key, at, size, 1, note);
+            at += size;
+        };
+        part("kernel", "chromeos_kernel", c.kernel_size, "the plain image, zeros up to " + std::to_string(kChromeosAlign));
+        part("config", "", kChromeosConfigSize, "the command line");
+        part("params", "", kChromeosParamsSize, "the x86 boot parameters (zeros on ARM)");
+        part("bootloader", "", align_up(c.bootloader_size, kChromeosAlign), "");
+    }
     return l;
 }
 

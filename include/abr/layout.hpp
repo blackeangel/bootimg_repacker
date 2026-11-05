@@ -26,6 +26,13 @@ namespace abr {
 struct BootImage;
 struct VendorBootImage;
 struct UImage;
+namespace legacy {
+struct KrnlImage;
+struct ElfBootImage;
+struct BlobImage;
+struct OsipImage;
+struct ChromeosInfo;
+}  // namespace legacy
 }  // namespace abr
 
 namespace abr::layout {
@@ -74,6 +81,22 @@ void vbmeta(Layout& l, const Bytes& data, uint64_t at, unsigned depth, const std
 Layout vbmeta_image(const Bytes& data);
 // Flattened device trees one after the other (a dtb file): the size of each.
 Layout dtb_blobs(const std::vector<size_t>& sizes);
+// A U-Boot FIT image, read from `file` (the flattened tree is walked): the header, the reservation map, the structure block and the strings
+// block, and the data of every image, where it is -- inside the structure block (`data`), or behind the tree (data-offset, data-position).
+// `keys[i]` is the key of the manifest for the i-th child of /images (empty: none).
+Layout fit(const Bytes& file, const std::vector<std::string>& keys);
+// A Sony ELF boot image, read from the program headers of `file` (the bytes `img` was parsed from): the ELF header, the table of program
+// headers, the data of every segment. `keys[i]` is the key of the manifest for the component of segment i.
+Layout elf_boot(const legacy::ElfBootImage& img, const Bytes& file, const std::vector<std::string>& keys);
+// A Rockchip KRNL image: "KRNL" and the size, the payload (`key`: "kernel" or "ramdisk", the component it became), the CRC.
+Layout krnl(const legacy::KrnlImage& img, const std::string& key);
+// An ASUS blob: the secure header of a signed one, the blob header, the table, the partitions (`blob_part<N>`), what follows (the signature).
+Layout blob(const legacy::BlobImage& img);
+// An Intel OSIP image: the OSIP header, the signature, the cmdline, the image info, the bootstub, the kernel, the ramdisk.
+Layout osip(const legacy::OsipImage& img);
+// A ChromeOS kernel blob, read from `file`: the verification block (the keyblock and the preamble in it) and the body (the kernel, the
+// config, the params, the bootloader in it).
+Layout chromeos(const legacy::ChromeosInfo& info, const Bytes& file);
 
 // What is around the container that lies at [core_off, core_off + core_len) of `whole`: the bytes in front of it, the bytes after
 // it, the fill up to the size of the partition (Envelope), and the AVB hash footer at the end (vbmeta block and footer). The regions of

@@ -8,6 +8,8 @@
 //   * vendor_boot v3 and v4 (one fragment, three fragments, a v4 header with no table), with a dtb and a bootconfig;
 //   * dtbo v0 and v1, with entries stored as zlib and as gzip;
 //   * a uImage; a Qualcomm device tree table made by qcdt::build; flattened device trees one after the other;
+//   * a FIT image with its data in the tree, behind it by data-offset and by data-position; a Sony ELF boot image (ELF32 and ELF64); a
+//     Rockchip KRNL image; an ASUS blob, signed and not; an Intel OSIP image with and without its header; a ChromeOS kernel blob;
 //   * a vbmeta image (header, hash, signature, descriptors, public key) and the vbmeta block and footer of an AVB hash footer;
 //   * the bytes around a container: a prefix, a tail, the fill up to the partition size;
 //   * the text (render) and the lines of a manifest (manifest_lines, write_manifest_block: an earlier block is replaced, the rest stays).
@@ -16,6 +18,7 @@
 #include <cstring>
 #include <filesystem>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -25,7 +28,14 @@
 #include "abr/byte_io.hpp"
 #include "abr/compression.hpp"
 #include "abr/dtbo.hpp"
+#include "abr/fdt.hpp"
+#include "abr/fit.hpp"
 #include "abr/layout.hpp"
+#include "abr/legacy/blob.hpp"
+#include "abr/legacy/chromeos.hpp"
+#include "abr/legacy/elf_boot.hpp"
+#include "abr/legacy/krnl.hpp"
+#include "abr/legacy/osip.hpp"
 #include "abr/qcdt.hpp"
 #include "abr/uimage.hpp"
 #include "abr/vbmeta.hpp"
@@ -588,6 +598,279 @@ void test_manifest_block() {
     fs::remove_all(dir, ec);
 }
 
+
+// ----------------------------------------------------------------------------------------------------- the legacy ones --
+
+void test_krnl() {
+    legacy::KrnlImage img;
+    img.payload = pattern(1000, 8);
+    const Bytes built = img.build();
+    const legacy::KrnlImage p = legacy::KrnlImage::parse(built);
+    layout::Layout l = layout::krnl(p, "kernel");
+    layout::around(l, built, built.size(), 0, p.file_size());
+    check_layout(l, built, {{"kernel", img.payload}});
+    EXPECT(find_name(l, "header")->offset == 0 && find_name(l, "header")->size == 8);
+    EXPECT(find_key(l, "kernel")->offset == 8 && find_key(l, "kernel")->size == 1000);
+    const layout::Region* crc = find_name(l, "CRC");
+    EXPECT(crc && crc->offset == 1008 && crc->size == 4 && crc->note.find("the payload's") != std::string::npos);
+    EXPECT(l.size == built.size());
+    // a ramdisk that is a gzip stream says so; the fill behind it is told
+    legacy::KrnlImage gz;
+    gz.payload = compress(Codec::GZIP, pattern(3000, 9));
+    Bytes padded = gz.build();
+    const size_t image_size = padded.size();
+    padded.resize(image_size + 4096, 0);
+    layout::Layout g = layout::krnl(legacy::KrnlImage::parse(padded), "ramdisk");
+    layout::around(g, padded, padded.size(), 0, image_size);
+    EXPECT(find_key(g, "ramdisk")->codec == "gzip");
+    EXPECT(g.regions.back().offset == image_size && g.regions.back().size == 4096);
+    // a CRC that is not the payload's
+    Bytes bad = built;
+    bad[bad.size() - 1] ^= 0x55;
+    EXPECT(find_name(layout::krnl(legacy::KrnlImage::parse(bad), "kernel"), "CRC")->note.find("NOT") != std::string::npos);
+}
+
+void test_elf_boot() {
+    using legacy::ElfSegment;
+    for (bool is64 : {false, true}) {
+        ElfSegment k, r, c;
+        k.role = "kernel";
+        k.addr = 0x8000;
+        k.data = pattern(5000, 10);
+        r.role = "ramdisk";
+        r.flags = legacy::kElfFlagsRamdisk;
+        r.addr = 0x2000000;
+        r.data = pattern(777, 11);
+        c.role = "cmdline";
+        c.flags = legacy::kElfFlagsCmdline;
+        c.data = pattern(43, 12);
+        legacy::ElfBootImage img;
+        img.is_64bit = is64;
+        img.segments = {k, r, c};
+        const Bytes built = img.build_elftool();
+        const legacy::ElfBootImage p = legacy::ElfBootImage::parse(built);
+        layout::Layout l = layout::elf_boot(p, built, {"kernel", "ramdisk", "cmdline"});
+        layout::around(l, built, built.size(), 0, built.size());
+        check_layout(l, built, {{"kernel", k.data}, {"ramdisk", r.data}, {"cmdline", c.data}});
+        EXPECT(find_name(l, "ELF header")->offset == 0 && find_name(l, "ELF header")->size == (is64 ? 64u : 52u));
+        EXPECT(find_name(l, "program headers")->size == 3 * (is64 ? 56u : 32u));
+        EXPECT(find_key(l, "kernel")->offset == 4096 && find_key(l, "ramdisk")->offset == 4096 + 5000);
+        EXPECT(find_key(l, "ramdisk")->note.find("0x2000000") != std::string::npos);
+        EXPECT(l.format.find(is64 ? "ELF64" : "ELF32") != std::string::npos && l.size == built.size());
+        // a segment that has no data has no region; one that is a gzip stream says so
+        ElfSegment empty = k;
+        empty.role = "extra0";
+        empty.data.clear();
+        ElfSegment zipped = r;
+        zipped.data = compress(Codec::GZIP, pattern(2000, 13));
+        legacy::ElfBootImage two;
+        two.is_64bit = is64;
+        two.segments = {k, empty, zipped};
+        const Bytes b2 = two.build_elftool();
+        const legacy::ElfBootImage p2 = legacy::ElfBootImage::parse(b2);
+        const layout::Layout l2 = layout::elf_boot(p2, b2, {"kernel", "", "ramdisk"});
+        EXPECT(find_key(l2, "kernel") && find_key(l2, "ramdisk") && find_key(l2, "ramdisk")->codec == "gzip");
+        size_t segments = 0;
+        for (const auto& region : l2.regions) segments += region.name.rfind("segment ", 0) == 0;
+        EXPECT(segments == 2);
+    }
+}
+
+void test_blob() {
+    for (bool secure : {false, true}) {
+        legacy::BlobPart lnx, sos;
+        lnx.name = {'L', 'N', 'X', 0};
+        lnx.data = pattern(3000, 14);
+        sos.name = {'S', 'O', 'S', 0};
+        sos.data = pattern(1500, 15);
+        legacy::BlobImage b;
+        b.secure = secure;
+        b.parts = {lnx, sos};
+        if (secure) {
+            b.secure_datalen = 7000;
+            b.secure_siglen = 256;
+            b.tail = pattern(256, 16);
+        }
+        Bytes built = b.build();
+        built.insert(built.end(), b.tail.begin(), b.tail.end());
+        const legacy::BlobImage p = legacy::BlobImage::parse(built);
+        layout::Layout l = layout::blob(p);
+        layout::around(l, built, built.size(), 0, built.size());
+        check_layout(l, built, {{"blob_part0", lnx.data}, {"blob_part1", sos.data}, {"blob_tail", b.tail}});
+        EXPECT(l.size == built.size());
+        EXPECT(find_name(l, "blob header")->offset == (secure ? 28u : 0u) && find_name(l, "blob header")->size == 60);
+        EXPECT(find_name(l, "partition table")->size == 32);
+        EXPECT(find_name(l, "partition LNX") && find_name(l, "partition SOS"));
+        EXPECT((find_name(l, "secure header") != nullptr) == secure);
+        EXPECT(find_key(l, "blob_part0")->offset == (secure ? 28u : 0u) + 60 + 32);
+    }
+}
+
+void test_osip() {
+    legacy::OsipImage img;
+    img.cmdline.assign(legacy::kOsipCmdlineSize, 0);
+    const std::string cmd = "console=ttyS0 androidboot.hardware=unit";
+    std::copy(cmd.begin(), cmd.end(), img.cmdline.begin());
+    img.info_rest.assign(legacy::kOsipInfoSize - legacy::kOsipInfoFixedSize, 0);
+    img.bootstub = pattern(4096, 17);
+    const uint8_t stub_magic[4] = {0xFC, 0xFA, 0xBC, 0x00};
+    std::copy(stub_magic, stub_magic + 4, img.bootstub.begin());
+    img.kernel = pattern(700, 18);
+    img.kernel[0] = 0xEB;
+    img.kernel[1] = 0x3C;
+    img.ramdisk = Bytes(300, 0);
+    std::copy_n("070701", 6, img.ramdisk.begin());
+    for (bool with_header : {false, true}) {
+        legacy::OsipImage x = img;
+        if (with_header) {
+            x.header.assign(legacy::kOsipHeaderSize, 0);
+            std::copy_n("$OS$\0\0\1", 7, x.header.begin());
+        }
+        const Bytes built = x.build();
+        const legacy::OsipImage p = legacy::OsipImage::parse(built);
+        layout::Layout l = layout::osip(p);
+        layout::around(l, built, built.size(), 0, p.consumed);
+        check_layout(l, built, {{"kernel", x.kernel}, {"ramdisk", x.ramdisk}, {"bootstub", x.bootstub}, {"osip_header", x.header}});
+        const uint64_t front = with_header ? legacy::kOsipHeaderSize : 0;
+        EXPECT(find_name(l, "cmdline")->offset == front && find_name(l, "cmdline")->size == legacy::kOsipCmdlineSize);
+        EXPECT(find_name(l, "cmdline")->note.find("console=ttyS0") != std::string::npos);
+        EXPECT(find_name(l, "image info")->offset == front + 1024 && find_name(l, "image info")->size == legacy::kOsipInfoSize);
+        EXPECT(find_key(l, "bootstub")->offset == front + 4096 && find_key(l, "kernel")->offset == front + 4096 + 4096);
+        EXPECT((find_name(l, "OSIP header") != nullptr) == with_header);
+        EXPECT(l.size == built.size());
+    }
+}
+
+void test_chromeos() {
+    legacy::ChromeosInfo info;
+    info.keyblock = legacy::chromeos_dev_keyblock();
+    const std::string cmdline = "console=ttyS0 root=/dev/mmcblk0p3";
+    info.config.assign(cmdline.begin(), cmdline.end());
+    const Bytes kernel = pattern(5000, 19);
+    const Bytes blob = legacy::apply_chromeos(kernel, info);
+    Bytes k;
+    const std::optional<legacy::ChromeosInfo> c = legacy::strip_chromeos(blob, k);
+    EXPECT(c.has_value());
+    if (!c) return;
+    layout::Layout l = layout::chromeos(*c, blob);
+    layout::around(l, blob, blob.size(), 0, c->core_size);
+    check_layout(l, blob, {{"chromeos_kernel", k}});
+    EXPECT(find_name(l, "verification block")->offset == 0 && find_name(l, "verification block")->size == c->pad);
+    EXPECT(find_name(l, "keyblock")->size == info.keyblock.size() && find_name(l, "keyblock")->depth == 1);
+    EXPECT(find_name(l, "preamble") && find_name(l, "preamble")->offset == info.keyblock.size());
+    EXPECT(find_name(l, "body")->offset == c->pad && find_name(l, "body")->size == c->core_size - c->pad);
+    EXPECT(find_key(l, "chromeos_kernel")->offset == c->pad);
+    EXPECT(find_name(l, "config")->size == 4096 && find_name(l, "params")->size == 4096);
+    EXPECT(find_name(l, "config")->offset == c->pad + c->kernel_size);
+    EXPECT(l.size == c->core_size);
+    // the fill of a partition behind it
+    Bytes dump = blob;
+    dump.resize(dump.size() + 8192, 0xFF);
+    const std::optional<legacy::ChromeosInfo> c2 = legacy::strip_chromeos(dump, k);
+    EXPECT(c2.has_value());
+    if (c2) {
+        layout::Layout l2 = layout::chromeos(*c2, dump);
+        layout::around(l2, dump, dump.size(), 0, c2->core_size);
+        EXPECT(l2.regions.back().offset == blob.size() && l2.regions.back().size == 8192);
+    }
+}
+
+fdt::Property fit_text(const std::string& name, const std::string& text) {
+    fdt::Property p;
+    p.name = name;
+    p.value.assign(text.begin(), text.end());
+    p.value.push_back(0);
+    return p;
+}
+
+fdt::Node fit_image(const std::string& name, const std::string& type, const Bytes* data, bool with_hash) {
+    fdt::Node n;
+    n.name = name;
+    n.props.push_back(fit_text("description", name));
+    n.props.push_back(fit_text("type", type));
+    n.props.push_back(fit_text("compression", "none"));
+    if (data) {
+        fdt::Property p;
+        p.name = "data";
+        p.value = *data;
+        n.props.push_back(std::move(p));
+    }
+    if (with_hash) {  // (a node inside an image node: its properties are not the image's)
+        fdt::Node h;
+        h.name = "hash-1";
+        h.props.push_back(fit_text("algo", "crc32"));
+        fdt::Property v;
+        v.name = "value";
+        v.value = {1, 2, 3, 4};
+        h.props.push_back(std::move(v));
+        n.children.push_back(std::move(h));
+    }
+    return n;
+}
+
+void fit_case(fit::Place place) {
+    const Bytes d0 = pattern(1000, 20), d1 = pattern(300, 21), d2 = pattern(4097, 22);
+    const Bytes gz = compress(Codec::GZIP, pattern(2000, 23));
+    fdt::Tree t;
+    t.root.props.push_back(fit_text("description", "layout test"));
+    fdt::Node images;
+    images.name = "images";
+    images.children.push_back(fit_image("kernel-1", "kernel", &d0, true));
+    images.children.push_back(fit_image("script-1", "script", nullptr, false));  // no data
+    images.children.push_back(fit_image("fdt-1", "flat_dt", &d1, false));
+    images.children.push_back(fit_image("ramdisk-1", "ramdisk", &gz, true));
+    images.children.push_back(fit_image("firmware-1", "firmware", &d2, false));
+    t.root.children.push_back(std::move(images));
+    fdt::Node configs;
+    configs.name = "configurations";
+    configs.props.push_back(fit_text("default", "conf-1"));
+    t.root.children.push_back(std::move(configs));
+
+    fit::Layout lay;
+    lay.place = place;
+    const Bytes file = fit::build(t, lay);
+    const std::vector<std::string> keys = {"kernel_1", "", "fdt_1", "ramdisk_1", "firmware_1"};
+    layout::Layout l = layout::fit(file, keys);
+    layout::around(l, file, file.size(), 0, file.size());
+    check_layout(l, file, {{"kernel_1", d0}, {"fdt_1", d1}, {"ramdisk_1", gz}, {"firmware_1", d2}});
+    EXPECT(find_name(l, "FDT header") && find_name(l, "FDT header")->offset == 0);
+    const layout::Region* structure = find_name(l, "structure block");
+    const layout::Region* strings = find_name(l, "strings block");
+    EXPECT(structure && strings && strings->offset >= structure->offset + structure->size);
+    EXPECT(find_key(l, "ramdisk_1")->codec == "gzip");
+    EXPECT(find_name(l, "image script-1") == nullptr);  // (it has no data)
+    EXPECT(find_name(l, "image kernel-1")->note.find("kernel") == 0);
+    for (const char* key : {"kernel_1", "fdt_1", "ramdisk_1", "firmware_1"}) {
+        const layout::Region* r = find_key(l, key);
+        if (!r || !structure) continue;
+        if (place == fit::Place::INLINE) {
+            EXPECT(r->depth == 1 && r->offset >= structure->offset && r->offset + r->size <= structure->offset + structure->size);
+        } else {
+            EXPECT(r->depth == 0 && r->offset >= strings->offset + strings->size);
+        }
+    }
+    EXPECT(l.size == file.size());
+}
+
+void test_fit() {
+    fit_case(fit::Place::INLINE);
+    fit_case(fit::Place::OFFSET);
+    fit_case(fit::Place::POSITION);
+    // not a tree: nothing breaks, nothing is made up
+    EXPECT(layout::fit(Bytes(), {}).regions.empty());
+    EXPECT(layout::fit(Bytes(100, 7), {}).regions.empty());
+    Bytes cut = tiny_fdt(1);
+    cut.resize(30);
+    EXPECT(layout::fit(cut, {}).regions.empty());
+    // a tree that is damaged anywhere never throws
+    const Bytes good = tiny_fdt(2);
+    for (size_t at = 0; at < good.size(); ++at) {
+        Bytes bad = good;
+        bad[at] ^= 0xff;
+        (void)layout::fit(bad, {});
+    }
+}
+
 }  // namespace
 
 int run_layout_tests() {
@@ -596,6 +879,12 @@ int run_layout_tests() {
     test_dtbo();
     test_uimage_and_dtb();
     test_qcdt();
+    test_krnl();
+    test_elf_boot();
+    test_blob();
+    test_osip();
+    test_chromeos();
+    test_fit();
     test_vbmeta();
     test_around();
     test_text();

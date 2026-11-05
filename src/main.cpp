@@ -1733,7 +1733,13 @@ void unpack_uimage(const Bytes& data, const fs::path& dir) {
     m.set_tail("name_tail", img.name_tail);
     if (const std::string t = tails_text({{"name", &img.name_tail}}); !t.empty())
         note("bytes behind the NUL that ends the text of a header field (" + t + ") are kept in manifest.txt (*_tail)");
-    save_raw(m, dir, "data", img.data, "data.bin");
+    // The payload, the way the parts of a boot image are: a stream is decompressed (data.bin holds the plain data), and what it was is
+    // in the manifest (data_compression, data_level) for pack to make it again. `compression` above is the field of the header, which U-Boot
+    // reads: pack writes it as it is here, and says when the stream it makes is not the one it names.
+    {
+        const std::vector<DecodedComponent> parts = save_components(dir, {{&img.data, "data.bin"}});
+        record_component(m, "data", "data.bin", parts[0]);
+    }
     // What lies behind the image (fill up to the size of a partition, a trailer): kept like the bytes around a boot image.
     const Envelope env = Envelope::capture(data, 0, img.consumed);
     save_envelope(m, dir, env, data, 0, img.consumed);
@@ -1741,9 +1747,24 @@ void unpack_uimage(const Bytes& data, const fs::path& dir) {
         note(std::to_string(env.tail.size()) + " bytes after the uImage are kept verbatim (tail.bin)");
     m.save(dir / "manifest.txt",
            "abr uimage manifest -- edit then `abr pack -i " + dir.string() + " -o out.img`\n"
-           "# NOTE: 'data' is stored exactly as found in the source image -- if 'compression'\n"
-           "# is not 'none', it is still compressed with that codec, this tool does not\n"
-           "# transcode uImage payload compression.");
+           "# NOTE: data.bin is the payload with its compression taken off (data_compression, data_level say what it\n"
+           "# was; pack makes the stream again). `compression` is the field of the uImage header, which U-Boot reads.");
+}
+
+// The `compression` field of a uImage header that goes with a stream of `codec`, as the table of mkimage names it; nullopt for the codecs
+// that have no name there.
+std::optional<uint8_t> uboot_comp_for(Codec codec) {
+    switch (codec) {
+        case Codec::NONE: return uboot_value(UbootField::COMP, "none");
+        case Codec::GZIP: return uboot_value(UbootField::COMP, "gzip");
+        case Codec::BZIP2: return uboot_value(UbootField::COMP, "bzip2");
+        case Codec::LZMA: return uboot_value(UbootField::COMP, "lzma");
+        case Codec::LZO: return uboot_value(UbootField::COMP, "lzo");
+        case Codec::LZ4:
+        case Codec::LZ4_LEGACY: return uboot_value(UbootField::COMP, "lz4");
+        case Codec::ZSTD: return uboot_value(UbootField::COMP, "zstd");
+        default: return std::nullopt;
+    }
 }
 
 Bytes repack_uimage(const Manifest& m, const fs::path& dir, const RepackOptions& opt) {
@@ -1766,7 +1787,18 @@ Bytes repack_uimage(const Manifest& m, const fs::path& dir, const RepackOptions&
     img.comp = field(UbootField::COMP, "none");
     img.name = m.get("name");
     img.name_tail = m.get_tail("name_tail");
-    img.data = load_raw(m, dir, "data");
+    bool replayed = false;
+    img.data = load_component(m, dir, "data", opt, &replayed);
+    // U-Boot unpacks the payload by what the header says. A stream that abr made (the file was changed) and that is not the one the header
+    // names -- the header says gzip and `data_compression` was changed to xz, or the other way round -- would not boot: said. A payload that
+    // was put back as it was is not looked at (an image that was odd to begin with stays what it was), nor one with a sub-header in front.
+    if (!replayed && img.comp != 0 && !m.has("data_mtk_name")) {
+        const Codec stream = detect_codec(img.data);
+        if (uboot_comp_for(stream) != std::optional<uint8_t>(img.comp))
+            warn("the header says " + shown(std::string(uboot_field_key(UbootField::COMP)) + "=" + uboot_comp_name(img.comp)) +
+                 ", but what goes into the image is " + (stream == Codec::NONE ? std::string("not a compressed stream") : std::string(codec_name(stream)) + " data") +
+                 ": U-Boot unpacks the payload by the header. Make `compression` and `data_compression` of manifest.txt agree");
+    }
     return assemble_envelope(m, dir, img.build(), opt);
 }
 
@@ -2893,6 +2925,16 @@ void print_avb_footer_info(const AvbFooter& f, const Bytes& host) {
 // of the image it is asked about -- always from the bytes of that image, read again, so that the three tell the same numbers; `unpack`
 // and `pack` also keep it in the layout block at the end of manifest.txt.
 
+// The component a KRNL payload becomes at unpack: a ramdisk when it is a cpio archive (an empty one is a ramdisk too), else a kernel.
+std::string krnl_prefix(const Bytes& payload) {
+    try {
+        const DecodedComponent part = decode_component(payload);
+        return part.plain.size() < 5 || std::memcmp(part.plain.data(), "07070", 5) == 0 ? "ramdisk" : "kernel";
+    } catch (const std::exception&) {
+        return "kernel";
+    }
+}
+
 // data[off, off + len) -- `data` itself when that is all of it, so that a plain image is not copied again.
 const Bytes& part_of(const Bytes& data, size_t off, size_t len, Bytes& storage) {
     if (off == 0 && len == data.size()) return data;
@@ -2965,6 +3007,53 @@ std::optional<layout::Layout> describe_layout(Fmt f, const Bytes& whole) {
                 const UImage img = UImage::parse(whole);
                 layout::Layout l = layout::uimage(img);
                 layout::around(l, whole, whole.size(), 0, img.consumed);
+                return l;
+            }
+            case Fmt::FIT: {
+                std::string why;
+                const std::optional<fit::Opened> o = fit::open(whole, why);
+                if (!o) return std::nullopt;  // (it is a plain device tree then)
+                const std::vector<FitName> names = fit_names(o->images);
+                std::vector<std::string> keys;  // by the child of /images
+                for (size_t i = 0; i < o->images.size(); ++i) {
+                    if (o->images[i].data.empty()) continue;
+                    if (keys.size() <= o->images[i].index) keys.resize(o->images[i].index + 1);
+                    keys[o->images[i].index] = names[i].prefix;
+                }
+                layout::Layout l = layout::fit(whole, keys);
+                layout::around(l, whole, whole.size(), 0, o->consumed);
+                return l;
+            }
+            case Fmt::ELF_BOOT: {
+                const legacy::ElfBootImage img = legacy::ElfBootImage::parse(whole);
+                layout::Layout l = layout::elf_boot(img, whole, elf_names(img.segments).prefix);
+                layout::around(l, whole, whole.size(), 0, whole.size());
+                return l;
+            }
+            case Fmt::KRNL: {
+                const legacy::KrnlImage img = legacy::KrnlImage::parse(whole);
+                layout::Layout l = layout::krnl(img, krnl_prefix(img.payload));
+                layout::around(l, whole, whole.size(), 0, img.file_size());
+                return l;
+            }
+            case Fmt::BLOB: {
+                const legacy::BlobImage img = legacy::BlobImage::parse(whole);
+                layout::Layout l = layout::blob(img);
+                layout::around(l, whole, whole.size(), 0, whole.size());
+                return l;
+            }
+            case Fmt::OSIP: {
+                const OsipImage img = OsipImage::parse(whole);
+                layout::Layout l = layout::osip(img);
+                layout::around(l, whole, whole.size(), 0, img.consumed);
+                return l;
+            }
+            case Fmt::CHROMEOS: {
+                Bytes kernel;
+                const std::optional<legacy::ChromeosInfo> c = legacy::strip_chromeos(whole, kernel);
+                if (!c) return std::nullopt;
+                layout::Layout l = layout::chromeos(*c, whole);
+                layout::around(l, whole, whole.size(), 0, c->core_size);
                 return l;
             }
             default:
