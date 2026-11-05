@@ -1,7 +1,11 @@
-# bootimg_repacker (`abr`)
+# Android Boot Repacker (`abr`)
 
-A C++26 unpacker/repacker for the Android boot-family image formats,
-statically linked, for Linux, Windows, and Android (arm64-v8a).
+**abr** -- *Android Boot Repacker*, in the repository `bootimg_repacker` -- is one static, dependency-free **C++26**
+program that takes the images of the Android boot family apart and puts them together again: boot, init_boot,
+vendor_boot, recovery, dtbo, dtb, QCDT, vbmeta (AVB), U-Boot uImage and FIT, and the older and vendor formats listed
+below. It is built for Linux, Windows and Android (arm64-v8a), and it runs nothing else -- no `cpio`, `gzip`, `mkbootimg`,
+`avbtool`, `dtc`, no shell: every codec, hash, signature scheme and archive format is inside the one file, and so are the
+public test keys it signs with, so a single file is all there is to copy.
 
 ## Supported formats
 
@@ -15,6 +19,7 @@ build-time contents:
 | vendor_boot (header v3-v4) | `vendor_boot.img`, `vendor_boot-debug.img`, `vendor_kernel_boot.img` |
 | dtbo | `dtbo.img` (and the ACPIO variant) |
 | dtb | raw or concatenated Flattened Device Tree blobs |
+| QCDT (v1-v3) | Qualcomm's device tree table (`QCDT`, what `dtbTool` makes): `dt.img`, or the table of a boot image; a folder of `.dtb` files is packed into one |
 | vbmeta (AVB) | `vbmeta.img`, `vbmeta_system.img`, and AVB footers appended to other partitions |
 | uboot | U-Boot's legacy `mkimage`/uImage container |
 | U-Boot FIT image | what `mkimage -f` makes (`.itb`, `.fit`): a flattened device tree whose `/images` hold the kernel, ramdisks and device trees, the data in the tree or behind it (`-E`, `-E -B n`, `-E -p n`); see below |
@@ -30,7 +35,7 @@ MediaTek (MTK) sub-header on the kernel and/or ramdisk, a DHTB wrapper
 (`has_blob=true` in the manifest; see below), the *amonet* patch of Amazon's
 MediaTek Fire tablets (a 1024-byte microloader in front, the boot header
 moved behind it: `unpack` keeps it as `microloader.bin` and `has_amonet=true`
-in the manifest, reads the boot image under it, and `repack` puts it back;
+in the manifest, reads the boot image under it, and `pack` puts it back;
 the same two manifest lines put it on an ordinary v0 image), the *loki*
 patch of `loki_tool` on a boot or recovery image (a block of the bootloader's
 code behind the ramdisk: `has_loki=true`; see below), a ChromeOS (vboot) kernel
@@ -55,19 +60,32 @@ of a bare "unknown format".
 ## Usage
 
 ```sh
-abr info   <image>
-abr unpack <image> [-o <outdir>] [--no-tree | --tree-only]
-abr repack <dir> -o <image> [--ramdisk-from tree|cpio] [--avb-key <private_key.pem>] [--avb1-key <key> [--avb1-cert <cert>]]
-                            [--chromeos-key <.vbprivk> [--chromeos-keyblock <.keyblock>]]
-abr identify [-b] <file>...   # what is it? worded like Android Image Kitchen's `file -m androidbootimg.magic`
-# with any of them: -j N (or -jN, --threads N) = the most threads to use, 0 = automatic, 1 = none
+abr unpack -i ./input.img    -o ./output_folder    # take an image apart
+abr pack   -i ./input_folder -o ./output_image.img # build the image again
+abr info   -i ./input.img                          # everything there is to know about an image, without unpacking it
+abr help                                           # this summary
+abr version                                        # the version, 1.YYYYMMDD.NumberBuild (1.20261102.5)
 ```
+
+`-o` is optional. Without it the output is made beside the input and named after it: `abr unpack -i dir/boot.img` makes the
+folder `dir/boot`, `abr pack -i dir/boot` makes the image `dir/boot.img` -- or `dir/boot_new.img` when that file is there
+already (the image a folder came from is not written over unless `-o` names it), and a folder that `unpack` made is not unpacked
+into again unless `-o` names it.
+
+**Nothing has to be said about what the image is.** The format (boot, vendor_boot, vbmeta, FIT, ...), the wrappers around
+it (DHTB, ChromeOS, ASUS blob, SIN, LOKI, AMONET, ...), the compression of every part and the signatures are worked out from the
+image itself; `pack` finds them again in the folder's `manifest.txt`. A folder of device trees (files that end in `.dtb`) and no
+`manifest.txt` is packed into a Qualcomm device tree table; `type=qcdt`, `page_size=` and `table_version=` (1, 2 or 3) in a
+`manifest.txt` say how.
 
 `unpack` writes a human-readable, human-editable `manifest.txt` plus
 one file per component (kernel, ramdisk, dtb, ...) into the output
-directory. Edit whatever you need to, then `repack`.
+directory. Edit whatever you need to, then `pack`.
 
-`repack` reads what you edited strictly, and says which key and which value it will not take (it writes nothing then).
+The environment variable `ABR_THREADS=N` limits the number of threads (the result never depends on it); `NO_COLOR` and
+`ABR_PROGRESS=0` turn the colours and the progress bar off, see *Threads, console and progress* below.
+
+`pack` reads what you edited strictly, and says which key and which value it will not take (it writes nothing then).
 A number is decimal digits, or `0x` and hexadecimal digits (`010` is ten, not eight): no sign, no unit, no text behind it,
 and no more than the field it is for holds (a 32-bit field of a header takes up to 4294967295, not "the first 32 bits of
 something bigger"). A flag is `true` or `false` (`yes`, `no`, `1`, `0` in any case do too), hexadecimal digits come
@@ -90,7 +108,7 @@ cannot be decompressed: it would be more than 1024 MiB decompressed ..."). The n
 (`ramdisk_compression=`) is one of `none`, `gzip`, `lz4_legacy`, `lz4`, `zstd`, `xz`, `lzma`, `bzip2`, `lzo`; any other
 name is refused, not taken for `none`. A component that goes into the image as it is (`..._compression=none`) and begins like a
 stream of one of those codecs is checked once: `unpack` would take it for that stream, so a stream that is damaged (or a bomb)
-is refused by `repack`, with the way out (the plain data in the file and the name of the compression in the manifest, or a
+is refused by `pack`, with the way out (the plain data in the file and the name of the compression in the manifest, or a
 whole stream), instead of being written into an image that `unpack` then refuses.
 The prefix and the role of a segment of an ELF boot image (`segmentN_prefix`, `segmentN_role`) are names -- letters, digits
 and underscores, 1 to 64 of them -- because they start other keys of the manifest; any other text is refused with the key and
@@ -114,18 +132,96 @@ extracted file comes back unchanged -- only an actual edit triggers
 recompression. See `tests/run_tests.sh` for this being checked against
 real images built with AOSP's own `mkbootimg.py`, `dtc`, and `mkimage`.
 
+### Where everything is: offsets and sizes
+
+`unpack`, `pack` and `info` print where the parts of the image lie, in the order they lie in the file: the offset (hexadecimal),
+the size, the name of the part, and what is known of it -- the file it was unpacked to, how big the plain data of a compressed part is,
+and what it was compressed with. The table is made of the bytes of the image (the one that was read, or the one that was just built),
+never of what `abr` meant to write, so the three commands say the same numbers:
+
+```
+layout (boot image, header version 0, 15581184 bytes):
+  offset          size  part
+  0x00000000      4096  header   header version 0, 1632 bytes, page size 4096
+  0x00001000  14193400  kernel   gzip (33719296 bytes unpacked, level 9)
+  0x00d8b000   1380274  ramdisk  gzip (3325952 bytes unpacked, level 6)
+```
+
+(`abr info` of a boot image of a device; `unpack` and `pack` say the same, and name the file each part was unpacked to:
+`gzip -> kernel (33719296 bytes, level 9)`.)
+
+`unpack` and `pack` add the same numbers to `manifest.txt` as a block of lines (`layout_kernel_offset=0x00001000`,
+`layout_kernel_size=14193400`, `layout_kernel_unpacked_size=33719296`, ...) under a comment that says they are information
+only -- `pack` does not read them, and writes the block again for the image it built. The parts of a container lie inside it and are
+indented (the fragments of a vendor ramdisk in the ramdisk section, the descriptors in the auxiliary block of a vbmeta, the
+images of a FIT in its tree); what lies between the parts is padding. The table covers boot, vendor_boot, dtbo, dtb, QCDT, vbmeta, uImage,
+FIT, Sony ELF, Rockchip KRNL, ASUS blob, Intel OSIP and ChromeOS images, with whatever lies around them (bytes in front, a tail, the
+fill up to the size of the partition, an AVB footer and its vbmeta). The offsets of an image that has a wrapper (DHTB, ChromeOS around
+a boot image, ...) are those of the plain image inside it, and the line that heads the table says so.
+
+### Compressed parts, and the level they were compressed with
+
+A part that is compressed in the image -- the kernel (`gzip`, `lz4`, ...), the ramdisk, the fragments of a vendor ramdisk, the
+images of a FIT, the payload of a uImage, the segments of an ELF boot image -- is **unpacked from its compression**: the file that
+`unpack` writes holds the plain data. The manifest says what became of it, so that `pack` can put it back the same way:
+
+```
+kernel_file=kernel
+kernel_compression=gzip
+kernel_level=9
+kernel_level_basis=the gzip header says it is the densest setting
+kernel_orig_hash=ec62948845857fd63b7661a5f453254cdb5856817615db953f43f5a0413dd802
+ramdisk_file=ramdisk.cpio
+ramdisk_compression=gzip
+ramdisk_level=6
+ramdisk_level_basis=compress() at level 6 makes the same deflate data
+```
+
+`<part>_file` is the name of the file, `<part>_compression` the codec (`none`, `gzip`, `lz4_legacy`, `lz4`, `zstd`, `xz`, `lzma`,
+`bzip2`, `lzo`), `<part>_level` the level the stream was made with, and `<part>_level_basis` how `abr` knows. It is worked out from
+the stream: bzip2 says it in its header; gzip says the densest (9) and the fastest (1) setting in its header, and a gzip without such a
+mark is level 6 when the deflate of `abr` makes the very same stream from the plain data; LZ4 legacy and zstd are made again at the
+levels that are in use (the first 8 MiB block, or the first 256 KiB of the frame) and the first level that makes the same bytes is the
+one. xz, lzma, LZ4 frame, LZO, and streams that another program made in another way have no `_level`: `pack` then uses the usual level
+of the codec. When the file is not touched `pack` puts the very bytes of the image back, and the level does not matter; when it is, the
+part is compressed again at `<part>_level`, and the image has the same kind of stream as before. You may write another level (or
+another `<part>_compression`) in the manifest.
+
+### Keys
+
+Everything `pack` has to sign again -- an AVB 2.0 hash footer or vbmeta, the boot signature of old boot images (AVBv1), a ChromeOS kernel
+blob -- is signed with keys that are **built into `abr`**: the public test keys of the projects the formats come from (AVB's
+`testkey_rsa2048/4096/8192`, AOSP's verity key, vboot's developer keys). They protect nothing; a device that checks the key it trusts
+will not take such an image. `abr` takes, in this order: the key of the folder, else the signature that the image has when it still
+covers what is in the image, else the test key that the image was signed with (the new signature is then as good as the old one),
+else the test key of the size the image's algorithm needs, and says so. Keys of your own go in the folder `keys/` of the unpacked folder:
+
+| file | what it is for |
+|---|---|
+| `keys/avb_key.pem` | AVB 2.0: a vbmeta image, the vbmeta of an AVB footer (RSA-2048/4096/8192; PEM or DER; no passphrase) |
+| `keys/avb1.pk8` and `keys/avb1.x509.pem` | the boot signature of old boot images (`avb1.x509.der` or one PEM that holds both do too) |
+| `keys/chromeos.vbprivk` and `keys/chromeos.keyblock` | a ChromeOS kernel blob: the key must be the data key of the keyblock |
+
+A signature that is untouched is kept as it is. ML-DSA vbmeta images (AVB's post-quantum algorithms) are read and checked, not made.
+
+### Version
+
+`abr version` prints `1.YYYYMMDD.NumberBuild`: the date of the commit it was built from and the number of commits of that day
+(`1.20261102.5`).
+
 ### The ramdisk as a directory
 
 Like Android Image Kitchen's `ramdisk/`, `unpack` also lays the ramdisk out as
 files you can edit: `ramdisk/` next to `ramdisk.cpio` (a vendor_boot has
 `ramdisk0/`, `ramdisk1/`, ... one per fragment). Add, change or delete files,
-then `repack`: the archive is built again from the directory. Nothing is run
+then `pack`: the archive is built again from the directory. Nothing is run
 (no `cpio`, no `find`, no shell), so it works the same on Android, Linux and
 Windows. An untouched directory is not rebuilt at all -- the image's own
-compressed bytes are replayed, which keeps the round trip exact. If both
-`ramdisk.cpio` and the directory were edited, `abr` stops and asks which one
-counts (`--ramdisk-from tree` or `--ramdisk-from cpio`); `--no-tree` writes
-only `ramdisk.cpio`, `--tree-only` only the directory.
+compressed bytes are replayed, which keeps the round trip exact. `pack` takes the
+one that changed since the unpack; if both `ramdisk.cpio` and the directory were
+edited it builds the image from the directory and says so (`abr` cannot merge the two):
+delete the directory to have the file used, or delete `ramdisk.cpio` to have only the
+directory.
 
 What a directory cannot hold -- owners, modes, device nodes, the order of the
 records, inode numbers, link counts -- is written beside it to `ramdisk.meta`,
@@ -142,7 +238,7 @@ lose them if they were read from the files.
   `0755` for a directory, `0777` for a link, and `0755` for an executable
   file -- one that starts with `#!`, an ELF program (not a `.so` or `.ko`), or,
   where the system has such a bit, one with the owner's executable bit. A line
-  of its own in `ramdisk.meta` gives a path any mode and owner. `repack` lists
+  of its own in `ramdisk.meta` gives a path any mode and owner. `pack` lists
   the new and the deleted entries, so a mode that is not what you meant shows.
 - **Symbolic links** are real links on Linux and Android. Windows cannot make
   them without administrator rights, so there a link is the small file that
@@ -157,7 +253,7 @@ lose them if they were read from the files.
   `ramdisk.vol2/`, `ramdisk.vol3/`, ..., with `ramdisk.meta`,
   `ramdisk.vol2.meta`, ... Every archive keeps its own magic, digit case and
   padding, and an edit rebuilds only the archive it is in. A directory that is
-  deleted leaves its archive out of the image (`repack` says so); a directory
+  deleted leaves its archive out of the image (`pack` says so); a directory
   the unpack did not make is ignored with a warning.
 - The digits of a cpio header are upper case in GNU cpio and `gen_init_cpio`
   and lower case in Android's `mkbootfs`, Magisk and libarchive; the metadata
@@ -229,7 +325,7 @@ bytes in front of `blobpack`'s output (`datalen` and `siglen` 0).
 an image `abr` reads (a boot image in the partition `LNX`, say) is a wrapper,
 like DHTB: `unpack` writes the directory of that image and
 `has_blob=true`, `blob_part0_name=LNX` and the other fields of the blob into the
-manifest, and `repack` puts the blob back around the repacked image (under the
+manifest, and `pack` puts the blob back around the repacked image (under the
 blob there may be the amonet patch; the three wrappers come off and go on in
 order). Any other blob -- several partitions, or one that holds no image -- is
 a directory of its own: `type=blob`, a file `part<i>_<NAME>.bin` for every
@@ -241,7 +337,7 @@ What the signature is worth after an edit is not something `abr` can know. It
 is kept where it was, behind the data (`blob_tail.bin`); `datalen` follows the
 blob when it was the length of the blob in the original (a blob made by AIK has
 `datalen` 0, and keeps it); and when the blob has changed and a signature is
-kept, `repack` says that the signature no longer fits. Only the layout
+kept, `pack` says that the signature no longer fits. Only the layout
 `blobpack` writes is read (a header of 60 bytes, the table right behind it, the
 partitions one after the other with no gap): a blob laid out differently, a cut
 one, and a SIGNBLOB header with no blob behind it are refused with the reason,
@@ -264,7 +360,7 @@ gzip-compressed ramdisk, and padding up to a whole 512-byte sector.
 `unpack` writes `kernel`, `bootstub.bin`, the ramdisk as `ramdisk.cpio` and as
 the directory `ramdisk/` (as for a boot image), `osip_header.bin` and
 `osip_sig.bin` where the image has them, and the cmdline and the parameter into
-`manifest.txt`. `repack` does what `mboot` does when it packs: the size of the
+`manifest.txt`. `pack` does what `mboot` does when it packs: the size of the
 image in sectors (offset 48 of the header), the "unsigned" bit of the image type
 (offset 52, set when there is no signature: 0 is a signed boot image, 1 an
 unsigned one, 0x0C and 0x0D the same for a recovery) and the checksum of the
@@ -279,8 +375,8 @@ To take the signature off an image, delete the line `osip_signature_file=` from
 `manifest.txt`; to put one in, name a file of 480, 728 or 1024 bytes there. The
 header is kept as `mboot` keeps it, so where the type should change (a signed
 image that was unsigned) put the header of a signed image in `osip_header.bin`;
-`repack` says so. A signature that is kept after the image changed describes the
-original contents, and `repack` says that too.
+`pack` says so. A signature that is kept after the image changed describes the
+original contents, and `pack` says that too.
 
 `mboot` guesses the layout: four letters or digits where the cmdline starts mark
 the end of the signature (so it is 0, 480, 728 or 1024 bytes), and letters
@@ -326,7 +422,7 @@ with `loki_recovery`, `loki_build`, `loki_patched_ramdisk_addr`,
 `loki_block.bin` in the manifest. What follows the image (other data, or a fill
 up to the size of the partition) is kept, as for the other wrappers; so are
 fields that are not what `loki_tool` writes (another type, a build that is no
-text, another load address in the LOKI header). `repack` builds the plain image
+text, another load address in the LOKI header). `pack` builds the plain image
 and puts the patch back on it. The block is the one that was in the image, so
 an image that was not touched comes back as it was, and an edited one is what
 `loki_tool patch` makes of the repacked plain image with the `aboot.img` the
@@ -339,7 +435,7 @@ of: finding the signature check in an `aboot.img` and the table of targets are
 `loki_tool` makes (a second stage, a header of another version, sizes that do
 not add up, no patch code in the first 16 bytes of the block, a cut-short
 image) is refused with the reason and nothing is left behind. A command line of
-more than 928 characters has no room beside the LOKI header: `repack` says so
+more than 928 characters has no room beside the LOKI header: `pack` says so
 and names `has_loki=false`.
 
 The 56 bytes of the patch code are the one thing of loki that is in `abr`
@@ -366,20 +462,20 @@ signatures and what follows the blob (other data, or the fill up to the size of 
 the files beside it. `info` says which key the keyblock holds (the algorithm: 0 to 17 of vboot, RSA of 1024 to 8192 bits,
 the public exponent 65537 or 3, SHA-1, SHA-256 or SHA-512) and whether both signatures are good.
 
-`repack` makes the blob again: the kernel is the image the directory builds, padded with zeros to 4096, and the fields are
+`pack` makes the blob again: the kernel is the image the directory builds, padded with zeros to 4096, and the fields are
 what the manifest says. The signatures are **kept** while nothing they cover has changed -- a blob that was not touched
 comes back byte for byte, whoever signed it, a bad signature included -- and **made again** when something has. `abr`
 has the public developer key of vboot_reference (the one AIK signs with; it protects nothing) and signs with it when the
 blob's keyblock holds the developer data key. When the keyblock is somebody else's, `abr` says so and does what AIK does:
 it signs with the developer key under the developer keyblock (a Chromebook in developer mode boots that; one that checks the
-keyblock against its own keys does not). `--chromeos-key <.vbprivk>` signs with a key of your own, which has to be the data
-key of the keyblock (`abr` refuses one that is not), and `--chromeos-keyblock <.keyblock>` puts another keyblock in: `abr`
+keyblock against its own keys does not). `keys/chromeos.vbprivk` in the folder signs with a key of your own, which has to be the data
+key of the keyblock (`abr` refuses one that is not), and `keys/chromeos.keyblock` puts another keyblock in: `abr`
 never signs under a keyblock it has no key for. A plain image whose manifest gets `has_chromeos=true` is made into the blob
 that AIK's `futility vbutil_kernel --pack` line makes (version 1, flags 0x1, the developer keys; `futility` makes the
 same bytes). `has_chromeos=false` leaves the blob out.
 
 What `abr` does not do: it keeps the keyblock as it is and neither checks nor makes its own signature (a keyblock is signed
-by the key of whoever vouches for it: `futility vbutil_keyblock` makes one, and `--chromeos-keyblock` takes it); a blob for x86
+by the key of whoever vouches for it: `futility vbutil_keyblock` makes one, and `keys/chromeos.keyblock` takes it); a blob for x86
 (its preamble carries a vmlinuz header: a bzImage that no Android tool opens) is refused, and so is a blob that is not laid
 out the way `futility` writes it (signatures anywhere but behind the preamble header, data behind them, a bootloader or kernel
 that is not a whole number of 4096 bytes, ...), with the reason and nothing left behind. The public developer keyblock and key
@@ -392,7 +488,7 @@ Android Image Kitchen opens one with `sony_dump` (munjeni's anyxperia_dumper), w
 forgets that there was a container: `repackimg.sh` writes the plain image. A SIN is Sony's -- header, hash tables and signature
 are theirs, and nothing here could make one for an edited image. `abr` does the same without the program: `unpack` takes the
 container off, unpacks what is inside as it would unpack that image on its own (the line that says what was unpacked calls it
-`sin-wrapped`, and the self-check is about the image inside) and says that the container is not kept; `repack` writes the plain
+`sin-wrapped`, and the self-check is about the image inside) and says that the container is not kept; `pack` writes the plain
 image. Under the container the other wrappers (a DHTB header, ...) are what they are anywhere else, and are put back.
 
 The three versions Android Image Kitchen's signature file knows are read: v1 and v2 (`01 00 00 00`, `02 00 00 00`, a header of
@@ -400,7 +496,7 @@ its own size plus 16 bytes) and v3 (`"\x03SIN"`, with the size of the header and
 the image itself, a loader (an ELF; the image is behind it) or an MMCF block: parts that are an LZ4 block (`LZ4A`) or bytes as
 they are (`ADDR`), put one behind the other with 0xFF where the image has a gap, as `sony_dump` does; a part that starts before
 the end of what there is goes to the end, and the unpack says so. The LZ4 parts of a large container are decoded on as many
-threads as there are (`-j`), and the result is the same for one. `abr info` describes the container.
+threads as there are, and the result is the same for one. `abr info` describes the container.
 
 A container is refused, with the reason and nothing left behind, when it is damaged -- a size that does not fit the file, an entry
 shorter than its own fields, a part outside the file, a tag that is not `ADDR` or `LZ4A`, an LZ4 block that does not decode to
@@ -445,8 +541,11 @@ OS/ABI byte is not `0x61` is no boot image to the signature file of Android Imag
 The `os`, `arch`, `image_type` and `compression` of the 64-byte header are the names that `mkimage -O help`, `-A help`, `-T help` and
 `-C help` list for them (`linux`, `arm64`, `kernel`, `gzip`, ...; a name in any case is read, as `mkimage` reads it). A value that no
 name stands for is its number (`os=99`), and comes back as it was. A name that is none of the table's, or a number above 255, is
-refused by `repack` with the names that are known. The payload is kept as it was found: it is not decompressed, whatever
-`compression` says. The tests make an image with `mkimage` for every name of the four lists (69 images: the types that go into a
+refused by `pack` with the names that are known. The payload is **decompressed** when it is a stream (gzip, bzip2, lzma, lz4, zstd,
+...): `data.bin` holds the plain data, `data_compression` and `data_level` in the manifest say what it was, and `pack` makes the
+stream again (the plain data is put back as the very bytes it was when nothing changed). `compression` stays the field of the
+header, which is what U-Boot reads to unpack the payload: `pack` says when the stream it makes is not the one the header names (the
+file was changed and `data_compression` too, but `compression` not). A payload that is no stream stays as it is. The tests make an image with `mkimage` for every name of the four lists (69 images: the types that go into a
 legacy header) and compare the repack with it byte for byte.
 
 ### U-Boot FIT images
@@ -460,7 +559,7 @@ writes `data-size` and `data-position` (counted from the start of the file), and
 `abr unpack` writes `fit.its`, the tree as device tree source, and a file for every image: `data = /incbin/("kernel_1");` in
 `fit.its` names the file of `kernel-1`, a `flat_dt` image is `fdt_1.dtb`, a ramdisk is `ramdisk_1.cpio` and, as in a boot image, a
 directory `ramdisk_1/` with `ramdisk_1.meta` (an image that is a compressed stream, a kernel or a ramdisk, is decompressed for
-editing, and compressed again with the codec it had; the tests do that with gzip). `abr repack` puts it together again: an untouched directory is the file byte for byte -- the places of the images, how
+editing, and compressed again with the codec it had; the tests do that with gzip). `abr pack` puts it together again: an untouched directory is the file byte for byte -- the places of the images, how
 the end of the tree is padded (to the `-B` it was made with, or by the number of bytes it had), the free space behind the strings, the
 strings block as it was, the bytes that mkimage leaves behind the `hashed-nodes` of a signature (they are in `fit.its` as a comment
 `/* abr: padding 98 3e b2 */` right behind the property), a trailer or zero fill behind the FIT.
@@ -489,21 +588,31 @@ The tests make FIT images with `mkimage` in six layouts (the data in the tree, `
 images of what `abr` wrote) and by `tests/tools/fit_tool.py`, a reader of FIT images of its own that checks every hash with `hashlib`.
 No FIT image of a device has been tried.
 
-### Threads and compression levels
+### Threads, console and progress
 
-`abr` uses several cores where that pays: the components of an image (kernel,
+`abr` runs at least two threads: one **writes to the terminal** and the others do the work. While a command runs, everything
+that is written to the standard output and the standard error goes to a thread of its own, the only one that touches the terminal
+(or file, or pipe): the threads that work never wait for it, a line is never torn by another one's, and the lines come out in the
+order they were written. On a terminal that thread also draws a coloured **progress bar** on the last line -- a gradient, the share
+that is done, the stage and the jobs in progress, the time -- and takes it away for every line that is written and at the end, so that
+what is written is what a pipe would have got. Where the output is not a terminal there is no bar, only the lines.
+`NO_COLOR=1` turns the colours off (the bar is drawn in plain characters), `ABR_PROGRESS=0` (also `never`, `off`, `no`, `false`) turns
+the bar off, `ABR_PROGRESS=always` draws it where the output is no terminal (the tests of the bar do that; `ABR_COLUMNS=N` is the
+width then), and `ABR_UNFILTERED_OUTPUT=1` turns off the filter that writes what a terminal would act on -- a control character in a
+name that an image holds -- as an escape.
+
+The work uses several cores where that pays: the components of an image (kernel,
 ramdisk, each vendor ramdisk fragment, ...) are decoded, hashed and written
 side by side; when an edited component has to be compressed again, the
 independent 8 MiB blocks of an LZ4 "legacy" ramdisk and the jobs of a zstd
-frame are compressed side by side. `-j N` (or `-jN`, `--threads N`, or the
-environment variable `ABR_THREADS`) sets the most threads it may use. The
-default is the number of hardware threads, at most 16; `-j1` runs everything
-on the main thread.
+frame are compressed side by side. The environment variable `ABR_THREADS=N` sets the most threads
+the work may use. The default is the number of hardware threads, at most 16; `ABR_THREADS=1` runs the work on the main thread (the
+thread that writes to the terminal runs beside it all the same).
 
 **The result never depends on the number of threads.** The work is split by
 the data (fixed block sizes, a fixed number of components), never by the
-thread count, and results are joined in order; the test suite repacks with
-`-j1` and with several threads and demands identical bytes, for every codec.
+thread count, and results are joined in order; the test suite packs with
+one thread and with several threads and demands identical bytes, for every codec.
 The same program on a 2-core and on a 32-core machine writes the same image.
 
 What it buys is honest and modest, because most of the time is not
@@ -511,19 +620,19 @@ parallel: an unmodified image is never recompressed (the original compressed
 bytes are replayed), and hashing -- the bulk of an unpack -- already runs on
 the CPU's SHA instructions. Recompression is where threads help: on a 2-core
 machine, repacking OrangeFox's `vendor_boot` after editing its 63 MB LZ4
-ramdisk takes 10.0 s with `-j1` and 5.4 s with `-j2`. gzip, xz, lzma and bzip2
+ramdisk takes 10.0 s on one thread and 5.4 s on two. gzip, xz, lzma and bzip2
 are written by a single stream each, so they gain nothing from more threads
 (the other components of the image still run beside them).
 
-When a component has to be compressed again, `abr` uses the codec's usual
-setting. `<component>_level=N` in the manifest (`ramdisk_level=9`,
-`ramdisk1_level=6`, ...) overrides it, with the codec's own meaning of the
-number. For LZ4 legacy the default is the densest level (HC 12), which is what
+When a component has to be compressed again, `abr` uses the level that `<component>_level=N` in the manifest gives
+(`ramdisk_level=9`, `ramdisk1_level=6`, ...), with the codec's own meaning of the number: `unpack` writes it when it could tell what
+the stream was made with (see *Compressed parts, and the level they were compressed with*), and you may write another. Without
+one it uses the codec's usual setting: gzip 6, zstd 3, xz 6, bzip2 9, and for LZ4 legacy the densest level (HC 12), which is what
 Android's build uses (`lz4 -l -12`): a faster setting makes an edited ramdisk
 enough larger to overflow a tightly sized `vendor_boot` partition.
 
-**An edit that no longer fits its partition.** Other codecs are written at
-their usual setting too (gzip 6, zstd 3, xz 6), and a build that cares about
+**An edit that no longer fits its partition.** A stream whose level `abr` could not tell is written at the usual
+setting of its codec (gzip 6, zstd 3, xz 6), and a build that cares about
 size may have used a denser one: OrangeFox's `vendor_boot` has its `ramdisk0`
 at `zstd -19` (22.6 MB; level 3 makes the same content 28.2 MB), and with one
 file added at level 3 the image plus its AVB metadata is 9 KB bigger than the
@@ -531,19 +640,20 @@ file added at level 3 the image plus its AVB metadata is 9 KB bigger than the
 came out of -- more than the AVB footer's partition size allows, or more than
 the fill it was padded to -- and something was compressed again at a setting
 that has a denser one, `abr` says so and builds the image once more with
-everything it compresses again at the densest setting the decoders still read:
-gzip 9, zstd 19 (an 8 MiB window, what `zstd -19` writes), xz 9, lz4 frame 12.
+everything it compresses again at the densest setting the decoders still read
+(when the level in the manifest is not that already): gzip 9, zstd 19 (an 8 MiB window, what `zstd -19` writes), xz 9, lz4 frame 12,
+lz4 legacy 12.
 ```
 note: image plus AVB metadata (67117760 bytes) no longer fits the original partition size (67108864 bytes); compressing what was edited again, as densely as the codecs allow
 ```
 What the first try said is dropped, so every message appears once; the result
-does not depend on `-j`; components that were not edited keep their original
-bytes; a `<component>_level=N` in the manifest is never overridden. The second
+does not depend on the number of threads; components that were not edited keep their original
+bytes; a level in the manifest that is higher than the densest setting is left as it is. The second
 try costs time -- level 19 is slow (24 s against 1 s for `zstd` on that
 ramdisk, two threads) -- and only runs when the first one did not fit. If even
 the densest setting is too big the error says so ("... -- not even with what
 was edited compressed as densely as the codecs allow"). Where nothing has a
-denser setting (LZ4 legacy and bzip2 are at their densest, lzma and lzo have no
+denser setting (an LZ4 legacy stream at level 12 and bzip2 are at their densest, lzma and lzo have no
 setting) there is no second try: an AVB footer that no longer fits is refused,
 a padded image is written bigger with a warning, as it always was.
 
@@ -566,8 +676,8 @@ this in the manifest / as side files and writes it back:
 - vendor_boot v4 images that declare no ramdisk table;
 - an AVB footer: laid out the way `avbtool` does, with the digest checked
   at unpack time and **refreshed after you edit the image** (a signed
-  footer needs `--avb-key`; without it `abr` refuses rather than emit an
-  image that fails verification);
+  footer is signed with `keys/avb_key.pem`, else with the test key
+  that fits, and `abr` says which, see *Keys*);
 - an AVBv1 boot signature (the `boot_signer` blob after the image):
   checked at unpack time and **re-created after you edit the image**
   (see below);
@@ -608,7 +718,7 @@ this in the manifest / as side files and writes it back:
   `\"`, `\\`, `\x1b`), the way `ramdisk.meta` writes a path. Everything else stays as it was, and a manifest written by
   hand or by an earlier `abr` (no quotes, white space around the value, CRLF line ends, `#` comments) reads as before.
   A line break in a command line used to turn what followed it into more keys of the manifest -- among them the names of
-  the files `repack` reads. Those names have to lie in the directory of the manifest now: a name with `..`, an
+  the files `pack` reads. Those names have to lie in the directory of the manifest now: a name with `..`, an
   absolute path, a drive, a backslash or an empty part is refused with the key it came from, and nothing is written;
   `info` and the messages show the text an image has in a name or a command line the same way (also escaping the C1
   controls and bytes that are not UTF-8), and everything abr prints passes a last filter that writes such bytes as `\xNN`:
@@ -625,7 +735,9 @@ header in front of the image.
 ### Re-signing a vbmeta
 
 ```sh
-abr repack <dir> -o vbmeta.img --avb-key my_signing_key.pem
+abr unpack -i vbmeta.img -o vbmeta
+mkdir vbmeta/keys && cp my_signing_key.pem vbmeta/keys/avb_key.pem
+abr pack -i vbmeta -o vbmeta_new.img
 ```
 
 The key may be a PEM file (`BEGIN PRIVATE KEY` or `BEGIN RSA PRIVATE KEY`)
@@ -634,14 +746,17 @@ the image's `algorithm_type`. A key protected by a passphrase is refused
 with the one-line `openssl` command that removes the passphrase. The
 signature is computed inside `abr` (see below), the public key stored in
 the vbmeta is regenerated from the key you pass, and `abr` says so when
-that differs from the key the image had before.
+that differs from the key the image had before. The same `keys/avb_key.pem`
+signs the vbmeta that an AVB footer on boot, vendor_boot or dtbo carries.
 
-Without `--avb-key`, a signed vbmeta repacks by passthrough as long as
+Without a key in `keys/`, a signed vbmeta is packed as it is as long as
 nothing that affects its hash changed. If you *do* change something
-(a descriptor, flags, rollback index) on a signed vbmeta, you must
-supply a key -- `abr` will refuse to emit a self-inconsistent signed
-blob rather than silently producing one that fails verification. Or
-set `algorithm_type=0` in the manifest for an unsigned rebuild instead.
+(a descriptor, flags, rollback index) on a signed vbmeta, `abr` signs
+it with a public test key that is built in: the one the image was signed with when it
+was one of them (the signature is then as good as the old one), else the test key of the size the
+algorithm needs, with a warning that a bootloader which checks the key it trusts will not take
+it -- `abr` does not emit a signed blob that fails its own check, but the key is the test
+key's. Or set `algorithm_type=0` in the manifest for an unsigned rebuild instead.
 
 ### Re-signing a boot image (AVBv1 boot signature)
 
@@ -657,20 +772,23 @@ exact:
 - an image you do not touch round-trips byte for byte -- even one whose
   signature is already invalid, which `abr` reports at unpack;
 - once you edit something, the old signature cannot match any more, so
-  `abr` **re-creates it** over the new image and says so. Without options
+  `abr` **re-creates it** over the new image and says so. Without keys of your own
   it signs with AOSP's public test key (the Android Image Kitchen default)
   and **warns** when the original was signed by somebody else, because the
-  device will not trust a test-key signature. To sign with your own key:
+  device will not trust a test-key signature. To sign with your own key, put it
+  in the folder before `pack`:
 
 ```sh
-abr repack <dir> -o boot.img --avb1-key my.pk8 --avb1-cert my.x509.pem
-abr repack <dir> -o boot.img --avb1-key my          # my.pk8 + my.x509.pem, as AIK names them
+mkdir boot/keys
+cp my.pk8 boot/keys/avb1.pk8
+cp my.x509.pem boot/keys/avb1.x509.pem      # the names AIK uses
+abr pack -i boot -o boot_new.img
 ```
 
 The key is an RSA private key (PEM, or DER such as `.pk8`); the certificate
-(PEM or DER) goes into the signature and must belong to the key, which
+(PEM or DER: `keys/avb1.x509.der` is as good) goes into the signature and must belong to the key, which
 `abr` checks. A PEM file holding both works too. An unsigned image stays
-unsigned; give `--avb1-key` (or put `avb1_signature=true` in the manifest)
+unsigned; give it a key in `keys/` (or put `avb1_signature=true` in the manifest)
 to add a signature.
 
 The signature is what `boot_signer` would write byte for byte: the same
@@ -751,7 +869,7 @@ UBSAN_OPTIONS=log_path=$PWD/asan-logs/ubsan:print_stacktrace=1:halt_on_error=1 \
 
 `tests/tools/fuzz_images.py` damages images the ways images are damaged (a size field that is too big, a cut-off
 file, a flipped bit, a block taken out or doubled, a piece of another image spliced in; the fields of a cpio header)
-and runs `identify`, `info`, `unpack` and `repack` on every damaged copy. It does not ask what abr says: an image may be
+and runs `identify`, `info`, `unpack` and `pack` on every damaged copy. It does not ask what abr says: an image may be
 refused or taken, but abr must not crash, hang, run out of memory, stop with an exception nobody meant to reach, print
 a control character (a mutator puts escape sequences into the text an image holds), say nothing and then write another
 image from what it unpacked, or give the sanitizers something to report:
@@ -764,17 +882,17 @@ tests/tools/fuzz_images.py --abr build-asan/abr --seeds <that directory> --itera
 A run is determined by `--rng-seed`, the seed and the iteration, so a finding is rebuilt by the same command; the
 damaged file is kept with the command and abr's output, and `--repro FILE` runs the commands on a file again.
 
-`tests/tools/fuzz_repack.py` does the same for `repack`, which reads something else: the directory `unpack` wrote, and
+`tests/tools/fuzz_repack.py` does the same for `pack`, which reads something else: the directory `unpack` wrote, and
 that can come from someone else (a downloaded directory, a script, an archive). It unpacks every seed once and damages
 the directory the ways a hand edit or a hostile archive would: a value of `manifest.txt` (not a number, a number that does
 not fit its field, a count of four billion, a flag that is neither `true` nor `false`, a key twice, a name that leaves the
 directory), a component file (cut, grown, a directory, a fifo or a link to `/dev/zero` in its place), the ramdisk
 directory and `ramdisk.meta`, the raw copies in `.abr_raw`, a stream of one of the eight codecs (whole, damaged, a bomb) in
 the place of a component with the name of its compression kept, changed or made up, the key that signs, the `-o` argument. A directory may be
-refused or taken, but `repack` must not crash, hang, run out of memory, stop with an exception of the standard library,
+refused or taken, but `pack` must not crash, hang, run out of memory, stop with an exception of the standard library,
 print a control character or a byte that is not UTF-8 (the filter that makes output safe is turned off for the run, to see
 the messages that forget to escape), say nothing when it refuses, leave something behind, change the directory it reads or
-write an image that depends on `-j` or `-o`, that `unpack` cannot read again, or that does not come back byte for byte:
+write an image that depends on the number of threads or on the name of the output, that `unpack` cannot read again, or that does not come back byte for byte:
 
 ```sh
 tests/tools/fuzz_repack.py --abr build-asan/abr --seeds <that directory> --iterations 10 --rng-seed 1 --jobs 2
@@ -837,7 +955,7 @@ beyond what every Android system already provides.
 big-integer arithmetic,
 RSA PKCS#1 v1.5 signing and verification, and the small DER/PEM/X.509
 reader that key files need are all part of the binary (`src/bigint.cpp`,
-`src/rsa.cpp`, `src/asn1.cpp`, `src/sha.cpp`), so `--avb-key` works the
+`src/rsa.cpp`, `src/asn1.cpp`, `src/sha.cpp`), so signing with `keys/avb_key.pem` works the
 same on Linux, Windows and Android and the binary stays a single file.
 PKCS#1 v1.5 is deterministic, so for a given key and image the signature
 is bit-for-bit what `openssl dgst -sign` or `avbtool` produce -- which
@@ -1006,10 +1124,9 @@ Two smaller gaps:
 
 - Hard links in a ramdisk's cpio archive (the ramdisk then stays one
   `ramdisk.cpio`); a directory tree is made for `newc`/`crc` archives only.
-- The rest of the Android Image Kitchen format list: QCDT tooling.
-  `abr identify` already names it; what is missing is unpacking and packing
-  it. See `PROGRESS.md` for the plan. (Sony SIN is read, and never written:
-  the container is Sony's. SIN v4 and v5 are not read.)
+- Sony SIN is read, and never written (the container is Sony's); SIN v4 and v5 are not read. See `PROGRESS.md` for the plan.
+- The small firmware images of MediaTek and Qualcomm chips (preloader, logo, modem, splash, lk, tee, MBN and the like) are
+  not unpacked yet.
 - Signatures of a FIT image (checking them, making them): the signature nodes are kept, and the repack says which an edit makes
   wrong.
 - Filesystems (ext4, F2FS, EROFS, SquashFS) and sparse images: out of
