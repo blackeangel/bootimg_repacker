@@ -39,18 +39,10 @@ bool starts_with(const Bytes& d, const uint8_t* magic, size_t len) {
     return d.size() >= len && std::memcmp(d.data(), magic, len) == 0;
 }
 
-// Heuristic used by magiskboot/AIK to spot a headerless "LZMA alone"
-// stream: byte 0 is the packed (pb*5+lp)*9+lc properties byte (0x5D for
-// the default lc=3,lp=0,pb=2), bytes 1..4 are a power-of-two dictionary
-// size, and bytes 5..12 are the (usually unknown-length) 0xFF marker.
-bool looks_like_lzma_alone(const Bytes& d) {
-    if (d.size() <= 13 || d[0] != 0x5d) return false;
-    uint32_t dict = d[1] | (d[2] << 8) | (d[3] << 16) | (uint32_t(d[4]) << 24);
-    if (dict == 0 || (dict & (dict - 1)) != 0) return false;
-    for (int i = 5; i < 13; ++i)
-        if (d[i] != 0xff) return false;
-    return true;
-}
+// A "LZMA alone" stream is spotted by its first fourteen bytes (lzma_alone_params(), compression.cpp below): the properties byte, the
+// dictionary, the size of the plain data, and the zero byte of the range coder. magiskboot and AIK look at the first bytes only; the rest is
+// what keeps data that merely begins with 0x5d from being taken for a stream.
+bool looks_like_lzma_alone(const Bytes& d) { return lzma_alone_params(d).has_value(); }
 
 [[noreturn]] void fail(const std::string& what) { throw FormatError(what); }
 
@@ -415,17 +407,26 @@ Bytes xz_decompress(const Bytes& in, size_t max_out) {
 // -------------------------------------------------- lzma "alone" stream --
 
 // `max_out` is the most a decoder may produce; an encoder (`encode`) is not limited.
-Bytes lzma_stream_run(const Bytes& in, bool encode, size_t max_out = 0) {
+Bytes lzma_stream_run(const Bytes& in, bool encode, size_t max_out = 0, const LzmaAloneParams* params = nullptr) {
     lzma_stream strm = LZMA_STREAM_INIT;
     lzma_ret rc;
     if (encode) {
         lzma_options_lzma opt;
         if (lzma_lzma_preset(&opt, 6)) fail("lzma_lzma_preset failed");
+        if (params) {
+            opt.lc = params->lc;
+            opt.lp = params->lp;
+            opt.pb = params->pb;
+            opt.dict_size = params->dict_size;
+        }
         rc = lzma_alone_encoder(&strm, &opt);
     } else {
         rc = lzma_alone_decoder(&strm, UINT64_MAX);
     }
-    if (rc != LZMA_OK) fail("lzma alone (en|de)coder init failed: rc=" + std::to_string(rc));
+    if (rc != LZMA_OK) {
+        lzma_end(&strm);
+        fail("lzma alone (en|de)coder init failed: rc=" + std::to_string(rc) + (params ? " (these settings are not ones liblzma writes)" : ""));
+    }
 
     const size_t room = encode ? 0 : room_for(max_out);
     Bytes out;
@@ -456,6 +457,33 @@ Bytes lzma_stream_run(const Bytes& in, bool encode, size_t max_out = 0) {
     out.resize(produced);
     return out;
 }
+
+}  // namespace
+
+std::optional<LzmaAloneParams> lzma_alone_params(const Bytes& d) {
+    if (d.size() <= 13) return std::nullopt;
+    const unsigned props = d[0];
+    if (props >= 9 * 5 * 5) return std::nullopt;  // (pb * 5 + lp) * 9 + lc, with lc up to 8 and lp and pb up to 4
+    LzmaAloneParams p;
+    p.lc = static_cast<uint8_t>(props % 9);
+    p.lp = static_cast<uint8_t>(props / 9 % 5);
+    p.pb = static_cast<uint8_t>(props / 45);
+    p.dict_size = uint32_t{d[1]} | (uint32_t{d[2]} << 8) | (uint32_t{d[3]} << 16) | (uint32_t{d[4]} << 24);
+    if (p.dict_size < 4096 || p.dict_size > 0x60000000u) return std::nullopt;
+    uint32_t top = p.dict_size;
+    while (top & (top - 1)) top &= top - 1;  // the highest bit
+    if (p.dict_size != top && p.dict_size != top + top / 2) return std::nullopt;
+    uint64_t size = 0;
+    for (int i = 12; i >= 5; --i) size = (size << 8) | d[i];
+    p.size_known = size != UINT64_MAX;
+    if (p.size_known && size >= (uint64_t{1} << 38)) return std::nullopt;
+    if (d[13] != 0) return std::nullopt;  // a range coder begins with a zero byte
+    return p;
+}
+
+Bytes lzma_alone_compress(const Bytes& data, const LzmaAloneParams& params) { return lzma_stream_run(data, /*encode=*/true, 0, &params); }
+
+namespace {
 
 // -------------------------------------------------------------- bzip2 --
 
@@ -638,6 +666,7 @@ std::string_view codec_name(Codec c) {
         case Codec::LZMA: return "lzma";
         case Codec::BZIP2: return "bzip2";
         case Codec::LZO: return "lzo";
+        case Codec::ZLIB: return "zlib";
     }
     return "none";
 }
@@ -652,6 +681,7 @@ std::optional<Codec> codec_from_name(std::string_view name) {
     if (name == "lzma") return Codec::LZMA;
     if (name == "bzip2") return Codec::BZIP2;
     if (name == "lzo") return Codec::LZO;
+    if (name == "zlib") return Codec::ZLIB;
     return std::nullopt;
 }
 
@@ -678,6 +708,7 @@ Bytes decompress(Codec codec, const Bytes& data, size_t max_size) {
         case Codec::LZMA: return lzma_stream_run(data, /*encode=*/false, max_size);
         case Codec::BZIP2: return bzip2_decompress(data, max_size);
         case Codec::LZO: return lzo_decompress(data, max_size);
+        case Codec::ZLIB: return zlib_decode(data, /*windowBits=*/15, max_size);
     }
     fail("unknown codec");
 }
@@ -695,6 +726,7 @@ Bytes compress(Codec codec, const Bytes& data, int level, const std::function<vo
         case Codec::LZMA: out = lzma_stream_run(data, /*encode=*/true); break;
         case Codec::BZIP2: out = bzip2_compress(data, level); break;
         case Codec::LZO: out = lzo_compress(data); break;
+        case Codec::ZLIB: out = zlib_encode(data, level < 0 ? Z_DEFAULT_COMPRESSION : std::min(level, 9), /*windowBits=*/15, report); break;
         default: fail("unknown codec");
     }
     if (report.sent() < data.size()) report(data.size() - report.sent());
@@ -704,6 +736,7 @@ Bytes compress(Codec codec, const Bytes& data, int level, const std::function<vo
 int default_level(Codec codec) {
     switch (codec) {
         case Codec::GZIP: return 6;  // zlib's Z_DEFAULT_COMPRESSION
+        case Codec::ZLIB: return 6;
         case Codec::LZ4_LEGACY: return kLz4LegacyDefaultLevel;
         case Codec::LZ4: return 0;   // the fast mode
         case Codec::ZSTD: return ZSTD_CLEVEL_DEFAULT;
@@ -716,6 +749,7 @@ int default_level(Codec codec) {
 int dense_level(Codec codec) {
     switch (codec) {
         case Codec::GZIP: return 9;
+        case Codec::ZLIB: return 9;
         case Codec::LZ4_LEGACY: return LZ4HC_CLEVEL_MAX;  // 12: also the usual one
         case Codec::LZ4: return 12;                       // LZ4HC_CLEVEL_MAX; the usual 0 is the fast mode
         case Codec::ZSTD: return 19;                      // windowLog 23 (8 MiB): anything that reads zstd reads it
@@ -845,6 +879,92 @@ LevelGuess zstd_level(const Bytes& stored, const Bytes& plain) {
     return {};
 }
 
+
+// A zlib stream: two header bytes (the method, and FLEVEL in the top two bits of the second: 0 for the fastest settings, 1 for 2 to 5, 2 for the
+// default 6, 3 for 7 to 9), the deflate data, the Adler-32. The group is in the header; the level in it is the one at which abr's deflate makes the
+// very bytes of the stream.
+LevelGuess zlib_level(const Bytes& stored, const Bytes& plain) {
+    if (stored.size() < 6) return {};
+    const unsigned cmf = stored[0], flg = stored[1];
+    if ((cmf & 0x0f) != 8 || ((cmf << 8) | flg) % 31 != 0 || (flg & 0x20)) return {};  // no zlib header, or one with a preset dictionary
+    const unsigned group = flg >> 6;
+    static const int levels[4][4] = {{1, 0, -1, -1}, {5, 4, 3, 2}, {6, -1, -1, -1}, {9, 8, 7, -1}};
+    if (!plain.empty() && plain.size() <= kTrialLimit) {
+        const std::function<void(size_t)> nobody;
+        Reporter report(nobody);
+        for (const int level : levels[group]) {
+            if (level < 0) continue;
+            const Bytes again = zlib_encode(plain, level, 15, report);
+            if (stored.size() >= again.size() && std::memcmp(again.data(), stored.data(), again.size()) == 0)
+                return {level, "compress() at this level makes the same zlib stream"};
+        }
+    }
+    switch (group) {
+        case 0: return {1, "the zlib header says it is one of the fastest settings (level 1 is the usual of them)"};
+        case 1: return {5, "the zlib header says it is one of the settings 2 to 5 (level 5 is the densest of them)"};
+        case 2: return {6, "the zlib header says it is the default setting"};
+        default: return {9, "the zlib header says it is one of the densest settings (7 to 9; level 9 is the usual of them)"};
+    }
+}
+
+// The dictionary that the first block of an xz stream asks of its decoder (the LZMA2 filter's property byte, in the block header); 0 when the
+// header does not say.
+uint64_t xz_dict_size(const Bytes& s) {
+    if (s.size() < 24 || std::memcmp(s.data(), kXzMagic, sizeof(kXzMagic)) != 0) return 0;
+    const size_t pos = 12;  // the block header: its size byte, its flags, the sizes it may hold, the filters, the CRC
+    if (s[pos] == 0) return 0;  // the index: no blocks
+    const size_t end = pos + (size_t{s[pos]} + 1) * 4 - 4;
+    if (end > s.size()) return 0;
+    size_t q = pos + 2;
+    const auto vli = [&](uint64_t& v) {
+        v = 0;
+        for (int i = 0; i < 9 && q < end; ++i) {
+            const uint8_t b = s[q++];
+            v |= uint64_t{b & 0x7f} << (7 * i);
+            if (!(b & 0x80)) return true;
+        }
+        return false;
+    };
+    uint64_t skip = 0;
+    if ((s[pos + 1] & 0x40) && !vli(skip)) return 0;  // the compressed size
+    if ((s[pos + 1] & 0x80) && !vli(skip)) return 0;  // the uncompressed size
+    for (unsigned n = (s[pos + 1] & 3) + 1; n > 0; --n) {
+        uint64_t id = 0, props = 0;
+        if (!vli(id) || !vli(props) || props > end - q) return 0;
+        if (id == 0x21 && props == 1) {  // LZMA2
+            const unsigned d = s[q];
+            if (d > 40) return 0;
+            return d == 40 ? 0xFFFFFFFFull : uint64_t{2 | (d & 1)} << (d / 2 + 11);
+        }
+        q += props;
+    }
+    return 0;
+}
+
+// An xz stream: the dictionary of its block says which presets could have made it (0: 256 KiB, 1: 1 MiB, 2: 2 MiB, 3 and 4: 4 MiB, 5 and 6: 8 MiB,
+// 7: 16 MiB, 8: 32 MiB, 9: 64 MiB), and the one of them at which abr's encoder makes the very stream is the level. When none does (another encoder,
+// another check, threads), the dictionary still names a level -- the densest of the pair -- and says so.
+LevelGuess xz_level(const Bytes& stored, const Bytes& plain) {
+    const uint64_t dict = xz_dict_size(stored);
+    if (dict == 0) return {};
+    static const struct {
+        uint64_t dict;
+        int levels[2];
+    } presets[] = {{uint64_t{256} << 10, {0, -1}}, {uint64_t{1} << 20, {1, -1}}, {uint64_t{2} << 20, {2, -1}}, {uint64_t{4} << 20, {4, 3}},
+                   {uint64_t{8} << 20, {6, 5}},    {uint64_t{16} << 20, {7, -1}}, {uint64_t{32} << 20, {8, -1}}, {uint64_t{64} << 20, {9, -1}}};
+    for (const auto& p : presets) {
+        if (dict != p.dict) continue;
+        if (!plain.empty() && plain.size() <= kTrialLimit)
+            for (const int level : p.levels) {
+                if (level < 0) continue;
+                const Bytes again = xz_compress(plain, level);
+                if (stored.size() >= again.size() && std::memcmp(again.data(), stored.data(), again.size()) == 0)
+                    return {level, "compress() at this level makes the same xz stream"};
+            }
+        return {p.levels[0], "the dictionary of the xz stream (" + std::to_string(dict >> 10) + " KiB) is that of this preset"};
+    }
+    return {};  // a dictionary that no preset has
+}
 }  // namespace
 
 LevelGuess detect_level(Codec codec, const Bytes& stored, const Bytes& plain) {
@@ -854,9 +974,11 @@ LevelGuess detect_level(Codec codec, const Bytes& stored, const Bytes& plain) {
                 return {stored[3] - '0', "the bzip2 header says it (the block size, in hundreds of kilobytes)"};
             return {};
         case Codec::GZIP: return gzip_level(stored, plain);
+        case Codec::ZLIB: return zlib_level(stored, plain);
+        case Codec::XZ: return xz_level(stored, plain);
         case Codec::LZ4_LEGACY: return lz4_legacy_level(stored, plain);
         case Codec::ZSTD: return zstd_level(stored, plain);
-        default: return {};  // xz, lzma, lz4 frame, lzo: abr cannot tell
+        default: return {};  // lzma (its settings are lzma_alone_params()), lz4 frame, lzo: abr cannot tell
     }
 }
 

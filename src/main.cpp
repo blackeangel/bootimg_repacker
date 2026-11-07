@@ -416,6 +416,7 @@ struct DecodedComponent {
     Codec codec = Codec::NONE;
     int level = -1;                      // the level the stream was made with, when abr could tell (detect_level()); else -1
     std::string level_basis;             // how it told
+    std::optional<LzmaAloneParams> lzma; // a "LZMA alone" stream: the settings its header names (lc, lp, pb, the dictionary)
     Bytes plain;                         // decompressed
     Bytes plain_hash;                    // SHA-256 of `plain`
 
@@ -447,6 +448,7 @@ DecodedComponent decode_component(const Bytes& raw, std::string_view what = {}) 
         const LevelGuess guess = detect_level(d.codec, working, d.plain);
         d.level = guess.level;
         d.level_basis = guess.basis;
+        if (d.codec == Codec::LZMA) d.lzma = lzma_alone_params(working);
     }
     return d;
 }
@@ -498,6 +500,13 @@ void record_component(Manifest& m, const std::string& prefix, const std::string&
     if (d.level >= 0) {
         m.set(prefix + "_level", std::to_string(d.level));
         m.set(prefix + "_level_basis", d.level_basis);  // for a person: pack does not read it
+    }
+    // A "LZMA alone" stream has no level, it has the four settings of its header: pack makes an edited component again with them.
+    if (d.lzma) {
+        m.set(prefix + "_lzma_lc", std::to_string(d.lzma->lc));
+        m.set(prefix + "_lzma_lp", std::to_string(d.lzma->lp));
+        m.set(prefix + "_lzma_pb", std::to_string(d.lzma->pb));
+        m.set(prefix + "_lzma_dict", std::to_string(d.lzma->dict_size));
     }
     m.set_hex(prefix + "_orig_hash", d.plain_hash);
 }
@@ -700,7 +709,7 @@ Bytes load_component(const Manifest& m, const fs::path& dir, const std::string& 
         const std::optional<Codec> named = codec_from_name(codec_text);
         if (!named)
             throw FormatError("manifest.txt: " + shown(prefix + "_compression=" + codec_text) +
-                              " is none of the compressions abr knows (none, gzip, lz4_legacy, lz4, zstd, xz, lzma, bzip2, lzo)");
+                              " is none of the compressions abr knows (none, gzip, lz4_legacy, lz4, zstd, xz, lzma, bzip2, lzo, zlib)");
         const Codec codec = *named;
         // `<prefix>_level=N` in the manifest is the compression level (codec-specific): the one the stream of the image was made with, when
         // unpack could tell, or the one a person wrote. Absent or -1: the codec's usual level. On the second try of a build that did not fit
@@ -711,7 +720,18 @@ Bytes load_component(const Manifest& m, const fs::path& dir, const std::string& 
             if (opt.dense) level = dense;
             else g_denser_would_help = true;
         }
-        result = compress(codec, plain, level, [](size_t n) { progress::advance(n); });
+        if (codec == Codec::LZMA && m.has(prefix + "_lzma_dict")) {
+            // the settings of the stream of the image (lc, lp, pb, the dictionary), or the ones a person wrote
+            LzmaAloneParams params;
+            params.lc = static_cast<uint8_t>(m.get_int(prefix + "_lzma_lc", 3, 0, 8));
+            params.lp = static_cast<uint8_t>(m.get_int(prefix + "_lzma_lp", 0, 0, 4));
+            params.pb = static_cast<uint8_t>(m.get_int(prefix + "_lzma_pb", 2, 0, 4));
+            params.dict_size = static_cast<uint32_t>(m.get_int(prefix + "_lzma_dict", 8 << 20, 4096, 0x60000000));
+            result = lzma_alone_compress(plain, params);
+            progress::advance(plain.size());
+        } else {
+            result = compress(codec, plain, level, [](size_t n) { progress::advance(n); });
+        }
         if (codec == Codec::NONE) check_unpacks_as_is(result, prefix, filename);
     }
     if (m.has(prefix + "_mtk_name")) result = add_mtk_header(result, m.get(prefix + "_mtk_name"));

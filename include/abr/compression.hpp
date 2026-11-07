@@ -31,6 +31,10 @@ enum class Codec {
     LZMA,   // legacy "LZMA alone" stream (no container), as used by 7-Zip's .lzma
     BZIP2,
     LZO,    // LZO1X wrapped in the lzop container framing (see compression.cpp for why)
+    // A zlib stream (RFC 1950: two header bytes, deflate, Adler-32) -- what MediaTek's logo.bin holds for each picture. It starts with
+    // two bytes that any data may start with, so detect_codec() never says it is one: only a format that knows it is there (and a
+    // manifest that says `<part>_compression=zlib`) uses it.
+    ZLIB,
 };
 
 std::string_view codec_name(Codec c);
@@ -54,6 +58,23 @@ inline constexpr size_t kMaxDecompressedSize = 0x40000000;
 // Exactly `max_size` bytes is taken.
 Bytes decompress(Codec codec, const Bytes& data, size_t max_size = kMaxDecompressedSize);
 
+// The settings of a "LZMA alone" stream that its first thirteen bytes tell (the properties byte, the dictionary size, the size of the plain data),
+// and that a stream that is made again has to have for the decoder that reads it to be the same as the one that read the first.
+struct LzmaAloneParams {
+    uint8_t lc = 3, lp = 0, pb = 2;     // the literal context bits, the literal position bits, the position bits (the byte is (pb*5+lp)*9+lc)
+    uint32_t dict_size = 8u << 20;      // the dictionary
+    bool size_known = false;            // the header holds the size of the plain data, not "unknown" (all ones) with an end marker
+};
+
+// The settings of `stored`, when it is a "LZMA alone" stream (detect_codec() says Codec::LZMA): a valid properties byte, a dictionary size
+// of 2^n or 2^n + 2^(n-1) from 4 KiB to 1.5 GiB, the size of the plain data unknown (all ones) or below 2^38, and the zero byte that a range
+// coder begins with. These streams come from the LZMA SDK, 7-Zip and `lzma`, and from the modem and boot images of phones.
+std::optional<LzmaAloneParams> lzma_alone_params(const Bytes& stored);
+
+// A "LZMA alone" stream of `data` with these settings (the size of the plain data is written as unknown and the stream ends with the end
+// marker, whatever `size_known` says: liblzma does not write the other kind, and every decoder reads this one).
+Bytes lzma_alone_compress(const Bytes& data, const LzmaAloneParams& params);
+
 // Compresses `data` with `codec`. `level` is codec-specific; -1 selects
 // a sensible per-codec default (lz4_legacy: HC level 12, what Android's
 // `lz4 -l -12` uses). Codec::NONE returns `data` unchanged.
@@ -67,8 +88,8 @@ Bytes decompress(Codec codec, const Bytes& data, size_t max_size = kMaxDecompres
 // other codecs when they are done).
 Bytes compress(Codec codec, const Bytes& data, int level = -1, const std::function<void(size_t)>& on_progress = {});
 
-// The level compress() uses when it is given none (-1): gzip 6, lz4_legacy 12 (HC, the densest), lz4 frame 0, zstd 3, xz 6, bzip2 9; -1 for the
-// codecs that have no setting (lzma, lzo, none).
+// The level compress() uses when it is given none (-1): gzip 6, zlib 6, lz4_legacy 12 (HC, the densest), lz4 frame 0, zstd 3, xz 6, bzip2 9;
+// -1 for the codecs that have no setting (lzma, lzo, none).
 int default_level(Codec codec);
 
 // The densest setting of a codec that the decoders in the wild still take (gzip 9, zstd 19 -- an 8 MiB
@@ -86,7 +107,8 @@ struct LevelGuess {
 };
 
 // `stored` is a stream of `codec` (what detect_codec() said it is) and `plain` what it holds. bzip2 tells its level in its header; gzip
-// tells whether it is the densest (9) or the fastest (1) setting; for the others, and for a gzip with no mark, the stream is made again
+// tells whether it is the densest (9) or the fastest (1) setting; a zlib stream and an xz stream tell a group of levels (the xz one by the size
+// of its dictionary), and the level in the group that makes the very bytes is the one; for the others, and for a gzip with no mark, the stream is made again
 // at the levels in use -- all of it when it is small, the first blocks of it when the codec has blocks that stand on their own (lz4_legacy,
 // zstd) -- and the first level that makes the bytes of the stream is the one. A stream that another program made in another way (GNU gzip's
 // own deflate, an xz stream with its own check, an lz4 frame with its own block size) is not made again by abr: -1, and the manifest
