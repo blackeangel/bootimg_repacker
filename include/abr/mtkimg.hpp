@@ -89,8 +89,18 @@ bool looks_like(const Bytes& d, size_t at = 0);
 Header parse_header(const Bytes& d, size_t at);
 Bytes serialize_header(const Header& h);
 
+// Where the sections are, without their bytes (what a table of the layout needs; parse() is this and a copy of the bytes).
+struct Span {
+    Header header;
+    size_t header_at = 0;  // offset of the header
+    size_t data_at = 0;    // header_at + 512
+    uint64_t data_size = 0;
+    size_t pad_size = 0;   // the bytes between the data and the next header; 0 in the last section
+    uint32_t align = 16;   // the alignment that placed the next header
+};
 // The sections from offset 0: a FormatError when the first one is no section or is cut short; a header behind a section that is not one
-// ends the chain (what is left is the padding of the file).
+// ends the chain (what is left is the padding of the file). `consumed`, when given, is the end of the data of the last section.
+std::vector<Span> scan(const Bytes& d, size_t* consumed = nullptr);
 Chain parse(const Bytes& d);
 
 // The file: every header (with the size of its data as it is now), data and pad, one after the other.
@@ -108,6 +118,8 @@ struct Logo {
 // The data of a section that is a table of pictures, or nullopt when it is not one: the number of pictures (1 to 4096), the size of the whole that is
 // the size of the data, the first offset right behind the table, the offsets rising and inside the data.
 std::optional<Logo> parse_logo(const Bytes& data);
+// The same checks on bytes that are not copied: where each picture begins (the table's offsets), or nullopt when it is no table of pictures.
+std::optional<std::vector<uint32_t>> logo_offsets(const uint8_t* data, size_t size);
 Bytes build_logo(const std::vector<Bytes>& pictures);
 
 // -------------------------------------------------------------------------------------------------------------------------- pixels --
@@ -125,6 +137,9 @@ struct Resolution {
 // The resolution that a picture of `pixels` pixels has, from a table of the sizes that the logos of MediaTek phones have (the pictures of a
 // logo.bin do not say how wide they are): the first of the table, which lists the portrait one before the landscape one of the same area.
 std::optional<Resolution> guess_resolution(uint64_t pixels);
+// The same, and where the table has nothing: a picture as wide as `like` (the size of another picture of the same logo) that is as many
+// rows high as the pixels make, when they make whole rows. nullopt when neither says.
+std::optional<Resolution> guess_resolution(uint64_t pixels, const std::optional<Resolution>& like);
 
 // The format that explains most of the sizes (the numbers of bytes of the pictures): 4 bytes per pixel (BGRA), 2 (RGB565) or 3 (BGR), the one
 // whose pixel counts are most often in the table of resolutions; BGRA when none is.

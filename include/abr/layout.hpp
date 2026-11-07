@@ -98,6 +98,11 @@ Layout osip(const legacy::OsipImage& img);
 // config, the params, the bootloader in it).
 Layout chromeos(const legacy::ChromeosInfo& info, const Bytes& file);
 
+// A MediaTek partition image (abr/mtkimg.hpp), read from `file`: for every section its header (512 bytes), its data and the padding behind
+// it. `section<i>` is the key of the data of the section i (and of its file in the manifest) when it is a file of its own; the pictures of
+// a logo table are regions of depth 1 inside the data of their section, `section<i>_p<k>` their keys. Empty for a file that is no such image.
+Layout mtk_image(const Bytes& file);
+
 // What is around the container that lies at [core_off, core_off + core_len) of `whole`: the bytes in front of it, the bytes after
 // it, the fill up to the size of the partition (Envelope), and the AVB hash footer at the end (vbmeta block and footer). The regions of
 // the container are moved by core_off; the size and the regions of the layout are those of `whole`. `host_size` is the number of bytes

@@ -17,6 +17,7 @@
 #include "abr/legacy/elf_boot.hpp"
 #include "abr/legacy/krnl.hpp"
 #include "abr/legacy/osip.hpp"
+#include "abr/mtkimg.hpp"
 #include "abr/qcdt.hpp"
 #include "abr/uimage.hpp"
 #include "abr/vbmeta.hpp"
@@ -519,6 +520,55 @@ Layout dtb_blobs(const std::vector<size_t>& sizes) {
 }
 
 // ----------------------------------------------------------------------------------------------------- around --
+
+namespace {
+
+// A zlib stream by its first two bytes: the method (deflate, a window of at most 32 KiB), the check of the pair, no preset dictionary.
+bool starts_like_zlib(const Bytes& d, uint64_t off, uint64_t n) {
+    if (n < 6 || !within(d, off, n)) return false;
+    const unsigned cmf = d[off], flg = d[off + 1];
+    return (cmf & 0x0f) == 8 && (cmf >> 4) <= 7 && ((cmf << 8) | flg) % 31 == 0 && !(flg & 0x20);
+}
+
+}  // namespace
+
+Layout mtk_image(const Bytes& d) {
+    Layout l;
+    l.format = "MediaTek partition image";
+    l.size = d.size();
+    std::vector<mtkimg::Span> spans;
+    try {
+        spans = mtkimg::scan(d);
+    } catch (const FormatError&) {
+        return l;
+    }
+    for (size_t i = 0; i < spans.size(); ++i) {
+        const mtkimg::Span& s = spans[i];
+        const std::string name = s.header.name_text();
+        const std::string head = "section " + std::to_string(i);
+        std::string note = "load address " + hex(s.header.maddr) + (s.header.extended() ? ", type " + hex(s.header.img_type) : ", older header");
+        l.add(head + " header", "", s.header_at, mtkimg::kHeaderSize, 0, name + "; " + note);
+        const std::string key = "section" + std::to_string(i);
+        const uint64_t size = s.data_size;
+        if (size != 0) {
+            const std::optional<std::vector<uint32_t>> offsets = mtkimg::logo_offsets(d.data() + s.data_at, static_cast<size_t>(size));
+            if (offsets) {
+                l.add(head + " data (" + name + ")", "", s.data_at, size, 0, "table of " + std::to_string(offsets->size()) + " pictures");
+                for (size_t k = 0; k < offsets->size(); ++k) {
+                    const uint64_t at = s.data_at + (*offsets)[k];
+                    const uint64_t n = (k + 1 < offsets->size() ? uint64_t{(*offsets)[k + 1]} : size) - (*offsets)[k];
+                    Region& r = l.add("picture " + std::to_string(k), key + "_p" + std::to_string(k), at, n, 1, "");
+                    if (starts_like_zlib(d, at, n)) r.codec = "zlib";
+                }
+            } else {
+                Region& r = l.add(head + " data (" + name + ")", key, s.data_at, size, 0, "");
+                r.codec = codec_at(d, s.data_at, size);
+            }
+        }
+        if (s.pad_size) l.add("padding", "", s.data_at + size, s.pad_size, 0, "alignment " + std::to_string(s.align));
+    }
+    return l;
+}
 
 void around(Layout& l, const Bytes& whole, size_t host_size, size_t core_off, size_t core_len) {
     l.size = whole.size();

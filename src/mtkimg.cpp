@@ -143,7 +143,7 @@ size_t pad_length(uint64_t end, uint32_t align) {
 
 // ------------------------------------------------------------------------------------------------------------------------- chain --
 
-Chain parse(const Bytes& d) {
+std::vector<Span> scan(const Bytes& d, size_t* consumed) {
     if (!looks_like(d, 0)) {
         if (d.size() >= 4 && le32(d, 0) == kMagic && d.size() >= kHeaderSize) {
             const Header h = parse_header(d, 0);
@@ -155,27 +155,42 @@ Chain parse(const Bytes& d) {
         }
         throw FormatError("mtk: the file does not begin with a section (the header of 512 bytes, its magic 0x58881688, a name)");
     }
-    Chain chain;
+    std::vector<Span> spans;
     size_t at = 0;
     for (;;) {
-        if (chain.sections.size() >= kMaxSections) throw FormatError("mtk: more than " + std::to_string(kMaxSections) + " sections");
-        Section s;
+        if (spans.size() >= kMaxSections) throw FormatError("mtk: more than " + std::to_string(kMaxSections) + " sections");
+        Span s;
         s.header = parse_header(d, at);
-        const uint64_t size = s.header.data_size();
-        const size_t data_at = at + kHeaderSize;
-        if (size > d.size() - data_at)
-            throw FormatError("mtk: the section " + s.header.name_text() + " says " + std::to_string(size) + " bytes of data and the file has " +
-                              std::to_string(d.size() - data_at) + " behind its header: the image is cut short");
-        s.data.assign(d.begin() + data_at, d.begin() + data_at + size);
-        const size_t end = data_at + size;
+        s.header_at = at;
+        s.data_at = at + kHeaderSize;
+        s.data_size = s.header.data_size();
+        if (s.data_size > d.size() - s.data_at)
+            throw FormatError("mtk: the section " + s.header.name_text() + " says " + std::to_string(s.data_size) + " bytes of data and the file has " +
+                              std::to_string(d.size() - s.data_at) + " behind its header: the image is cut short");
+        const size_t end = s.data_at + static_cast<size_t>(s.data_size);
         s.align = s.header.alignment();
-        chain.consumed = end;
+        if (consumed) *consumed = end;
         std::optional<size_t> next;
         if (!(s.header.extended() && s.header.img_list_end == 1)) next = find_next(d, end, s.align);
-        if (next) s.pad.assign(d.begin() + end, d.begin() + *next);
-        chain.sections.push_back(std::move(s));
+        if (next) s.pad_size = *next - end;
+        spans.push_back(std::move(s));
         if (!next) break;
         at = *next;
+    }
+    return spans;
+}
+
+Chain parse(const Bytes& d) {
+    Chain chain;
+    const std::vector<Span> spans = scan(d, &chain.consumed);
+    chain.sections.reserve(spans.size());
+    for (const Span& s : spans) {
+        Section sec;
+        sec.header = s.header;
+        sec.data.assign(d.begin() + s.data_at, d.begin() + s.data_at + s.data_size);
+        sec.pad.assign(d.begin() + s.data_at + s.data_size, d.begin() + s.data_at + s.data_size + s.pad_size);
+        sec.align = s.align;
+        chain.sections.push_back(std::move(sec));
     }
     return chain;
 }
@@ -205,24 +220,31 @@ Bytes build(const Chain& chain) {
 
 // ------------------------------------------------------------------------------------------------------------------ the logo table --
 
-std::optional<Logo> parse_logo(const Bytes& data) {
-    if (data.size() < 12) return std::nullopt;
-    const uint32_t count = le32(data, 0);
+std::optional<std::vector<uint32_t>> logo_offsets(const uint8_t* data, size_t size) {
+    const auto word = [&](size_t at) { return uint32_t{data[at]} | (uint32_t{data[at + 1]} << 8) | (uint32_t{data[at + 2]} << 16) | (uint32_t{data[at + 3]} << 24); };
+    if (size < 12) return std::nullopt;
+    const uint32_t count = word(0);
     if (count == 0 || count > kMaxPictures) return std::nullopt;
     const uint64_t table_end = 8 + uint64_t{count} * 4;
-    if (table_end > data.size() || le32(data, 4) != data.size()) return std::nullopt;
+    if (table_end > size || word(4) != size) return std::nullopt;
     std::vector<uint32_t> offsets(count);
-    for (uint32_t i = 0; i < count; ++i) offsets[i] = le32(data, 8 + size_t{i} * 4);
+    for (uint32_t i = 0; i < count; ++i) offsets[i] = word(8 + size_t{i} * 4);
     if (offsets[0] != table_end) return std::nullopt;
     for (uint32_t i = 0; i < count; ++i) {
-        const uint64_t next = i + 1 < count ? offsets[i + 1] : data.size();
-        if (offsets[i] > next || next > data.size()) return std::nullopt;
+        const uint64_t next = i + 1 < count ? offsets[i + 1] : size;
+        if (offsets[i] > next || next > size) return std::nullopt;
     }
+    return offsets;
+}
+
+std::optional<Logo> parse_logo(const Bytes& data) {
+    const auto offsets = logo_offsets(data.data(), data.size());
+    if (!offsets) return std::nullopt;
     Logo logo;
-    logo.pictures.reserve(count);
-    for (uint32_t i = 0; i < count; ++i) {
-        const size_t next = i + 1 < count ? offsets[i + 1] : data.size();
-        logo.pictures.emplace_back(data.begin() + offsets[i], data.begin() + next);
+    logo.pictures.reserve(offsets->size());
+    for (size_t i = 0; i < offsets->size(); ++i) {
+        const size_t next = i + 1 < offsets->size() ? (*offsets)[i + 1] : data.size();
+        logo.pictures.emplace_back(data.begin() + (*offsets)[i], data.begin() + next);
     }
     return logo;
 }
@@ -317,6 +339,13 @@ std::optional<Resolution> guess_resolution(uint64_t pixels) {
     const auto it = t.find(pixels);
     if (it == t.end()) return std::nullopt;
     return it->second;
+}
+
+std::optional<Resolution> guess_resolution(uint64_t pixels, const std::optional<Resolution>& like) {
+    if (const auto known = guess_resolution(pixels)) return known;
+    if (like && like->width != 0 && pixels != 0 && pixels % like->width == 0 && pixels / like->width <= 0xFFFFFFFFull)
+        return Resolution{like->width, static_cast<uint32_t>(pixels / like->width)};
+    return std::nullopt;
 }
 
 PixelFormat guess_format(const std::vector<size_t>& sizes) {

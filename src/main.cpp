@@ -54,7 +54,9 @@
 #include "abr/legacy/osip.hpp"
 #include "abr/legacy/sin.hpp"
 #include "abr/manifest.hpp"
+#include "abr/mtkimg.hpp"
 #include "abr/parallel.hpp"
+#include "abr/png.hpp"
 #include "abr/progress.hpp"
 #include "abr/qcdt.hpp"
 #include "abr/ramdisk_tree.hpp"
@@ -98,7 +100,7 @@ std::string tails_text(std::initializer_list<std::pair<const char*, const Bytes*
 
 // ------------------------------------------------------------ detection --
 
-enum class Fmt { BOOT, VENDOR_BOOT, DTBO, DTB, FIT, QCDT, VBMETA, UIMAGE, ELF_BOOT, KRNL, BLOB, OSIP, CHROMEOS, UNKNOWN };
+enum class Fmt { BOOT, VENDOR_BOOT, DTBO, DTB, FIT, QCDT, VBMETA, UIMAGE, ELF_BOOT, KRNL, BLOB, OSIP, CHROMEOS, MTK_IMAGE, UNKNOWN };
 
 // Where the "ANDROID!" container starts: within the first kMagicSearchLimit bytes (a vendor
 // wrapper in front of it), or -- Barnes & Noble Nook images -- right behind the fixed-size
@@ -118,6 +120,7 @@ Fmt detect_format(const Bytes& d) {
     if (d.size() >= 8 && std::memcmp(d.data(), "ANDROID!", 8) == 0) return Fmt::BOOT;
     if (d.size() >= 8 && std::memcmp(d.data(), "VNDRBOOT", 8) == 0) return Fmt::VENDOR_BOOT;
     if (d.size() >= 4 && std::memcmp(d.data(), "AVB0", 4) == 0) return Fmt::VBMETA;
+    if (mtkimg::looks_like(d, 0)) return Fmt::MTK_IMAGE;
     if (qcdt::looks_like(d)) return Fmt::QCDT;
     if (has_chromeos_header(d)) return Fmt::CHROMEOS;
     if (d.size() >= 4) {
@@ -175,6 +178,13 @@ std::string describe_unknown(const Bytes& d) {
         if (off + 2 > d.size()) return 0;
         return uint32_t(d[off]) | (uint32_t(d[off + 1]) << 8);
     };
+    if (u32le(0) == mtkimg::kMagic && d.size() >= 4) {
+        try {
+            (void)mtkimg::scan(d);
+        } catch (const FormatError& e) {
+            return std::string("this starts like a MediaTek partition image (the header of a section, magic 0x58881688), but abr cannot read it: ") + e.what();
+        }
+    }
     if (u16le(0x438) == 0xEF53)
         return "this is an ext2/3/4 filesystem image (system/vendor/product/... or a recovery "
                "dumped as a filesystem), not a boot-family container. Filesystems are out of "
@@ -215,6 +225,7 @@ const char* fmt_name(Fmt f) {
         case Fmt::BLOB: return "blob";
         case Fmt::OSIP: return "osip";
         case Fmt::CHROMEOS: return "chromeos";
+        case Fmt::MTK_IMAGE: return "mtk_image";
         case Fmt::UNKNOWN: return "unknown";
     }
     return "unknown";
@@ -234,6 +245,7 @@ Fmt fmt_from_name(const std::string& s) {
     if (s == "blob") return Fmt::BLOB;
     if (s == "osip") return Fmt::OSIP;
     if (s == "chromeos") return Fmt::CHROMEOS;
+    if (s == "mtk_image") return Fmt::MTK_IMAGE;
     return Fmt::UNKNOWN;
 }
 
@@ -426,12 +438,12 @@ struct DecodedComponent {
 
 // `what` names the component in the message of a stream that cannot be decompressed (a damaged image, or a bomb: a stream
 // that would be more than kMaxDecompressedSize); empty, the message does not name it.
-DecodedComponent decode_component(const Bytes& raw, std::string_view what = {}) {
+DecodedComponent decode_component(const Bytes& raw, std::string_view what = {}, bool strip_mtk = true) {
     DecodedComponent d;
     if (raw.empty()) return d;
     d.present = true;
     Bytes after_mtk;
-    if (auto mtk = strip_mtk_header(raw, after_mtk)) {
+    if (auto mtk = strip_mtk ? strip_mtk_header(raw, after_mtk) : std::nullopt) {
         d.mtk_name = mtk->name;
         d.stripped = std::move(after_mtk);
     }
@@ -2939,6 +2951,504 @@ void print_avb_footer_info(const AvbFooter& f, const Bytes& host) {
                   << "\n";
 }
 
+// ------------------------------------------------------------ mtk_image --
+//
+// The small images of a MediaTek phone (abr/mtkimg.hpp): md1img (the modem), lk, tee, scp, sspm, logo and the rest of that kind. `unpack` writes
+// the data of every section to a file of its own, `<NN>_<name>` (NN is the number of the section, so the same name twice is no trouble),
+// after taking its compression off -- a stream is known by what it holds, not by a name: gzip, xz, lzma, lz4, zstd, bzip2, lzo -- and the
+// manifest says what the header of the section says (`section<i>_*`), how the data was compressed (`section<i>_compression`, the level or the
+// settings of the stream), and how the sections follow one another (the alignment, the bytes of the padding). A section that is a table of
+// pictures -- the logo -- becomes a folder of PNG files, `<NN>_<name>/img-000.png` and so on; a picture whose pixels are not a size that is
+// known stays a file of its pixels as they are, so that nothing is lost. A picture, like any other component, is put back as the very bytes it
+// was when its file is unchanged.
+
+std::string mtk_section_prefix(size_t i) { return "section" + std::to_string(i); }
+std::string mtk_picture_prefix(size_t section, size_t k) { return mtk_section_prefix(section) + "_p" + std::to_string(k); }
+
+// `00_md1rom`: the number of the section (two digits at least), the name of the section made safe for a file name.
+std::string mtk_file_name(size_t index, size_t count, std::string_view name) {
+    const size_t width = std::max<size_t>(2, std::to_string(count > 0 ? count - 1 : 0).size());
+    std::string number = std::to_string(index);
+    if (number.size() < width) number.insert(0, width - number.size(), '0');
+    std::string clean;
+    for (const char c : name) {
+        const bool plain = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '.' || c == '_' || c == '-';
+        clean += plain ? c : '_';
+    }
+    while (!clean.empty() && clean.back() == '.') clean.pop_back();
+    return number + "_" + (clean.empty() ? "section" : clean);
+}
+
+std::string mtk_picture_file_name(const std::string& folder, size_t k, size_t count, bool png) {
+    const size_t width = std::max<size_t>(3, std::to_string(count > 0 ? count - 1 : 0).size());
+    std::string number = std::to_string(k);
+    if (number.size() < width) number.insert(0, width - number.size(), '0');
+    return folder + "/img-" + number + (png ? ".png" : ".bin");
+}
+
+// What the header of a section says, as the manifest has it. A field of an older header that says nothing (0xFFFFFFFF) is left out.
+void save_mtk_header(Manifest& m, const std::string& p, const mtkimg::Header& h) {
+    m.set(p + "_name", h.name_text());
+    m.set_tail(p + "_name_tail", h.name_tail());
+    m.set_addr(p + "_load_addr", h.maddr);
+    m.set_addr(p + "_mode", h.mode);
+    m.set_addr(p + "_ext_magic", h.ext_magic);
+    const auto field = [&](const char* key, uint32_t value) {
+        if (h.extended() || value != mtkimg::kAny) m.set_addr(p + "_" + key, value);
+    };
+    field("hdr_size", h.hdr_size);
+    field("hdr_version", h.hdr_version);
+    field("img_type", h.img_type);
+    field("list_end", h.img_list_end);
+    field("align", h.align_size);
+    field("size_high", h.dsize_extend);
+    field("load_addr_high", h.maddr_extend);
+    if (std::any_of(h.reserved.begin(), h.reserved.end(), [](uint8_t b) { return b != 0xFF; })) m.set_hex(p + "_reserved", h.reserved);
+}
+
+mtkimg::Header load_mtk_header(const Manifest& m, const std::string& p, bool last) {
+    using mtkimg::kAny;
+    if (!m.has(p + "_name")) throw FormatError("manifest.txt: " + shown(p + "_name") + " is missing (the name of the section)");
+    mtkimg::Header h = mtkimg::Header::fresh("x");
+    try {
+        h.set_name(m.get(p + "_name"), m.get_tail(p + "_name_tail"));
+    } catch (const FormatError& e) {
+        throw FormatError("manifest.txt: " + shown(p + "_name") + ": " + e.what());
+    }
+    h.maddr = m.get_addr32(p + "_load_addr", kAny);
+    h.mode = m.get_addr32(p + "_mode", kAny);
+    h.ext_magic = m.get_addr32(p + "_ext_magic", mtkimg::kExtMagic);
+    const bool ext = h.extended();
+    h.hdr_size = m.get_addr32(p + "_hdr_size", ext ? static_cast<uint32_t>(mtkimg::kHeaderSize) : kAny);
+    h.hdr_version = m.get_addr32(p + "_hdr_version", ext ? 0 : kAny);
+    h.img_type = m.get_addr32(p + "_img_type", ext ? 0 : kAny);
+    h.img_list_end = m.get_addr32(p + "_list_end", ext ? (last ? 1 : 0) : kAny);
+    h.align_size = m.get_addr32(p + "_align", ext ? 16 : kAny);
+    h.dsize_extend = m.get_addr32(p + "_size_high", ext ? 0 : kAny);
+    h.maddr_extend = m.get_addr32(p + "_load_addr_high", ext ? 0 : kAny);
+    if (m.has(p + "_reserved")) {
+        Bytes reserved = m.get_hex(p + "_reserved");
+        if (reserved.size() != h.reserved.size())
+            throw FormatError("manifest.txt: " + shown(p + "_reserved") + " is " + std::to_string(reserved.size()) + " bytes; the rest of a header is " +
+                              std::to_string(h.reserved.size()));
+        h.reserved = std::move(reserved);
+    }
+    return h;
+}
+
+// The bytes between the data of a section and the next header, as the manifest keeps them: the alignment that put the next header where it is,
+// and the byte that fills (when it is not zero) or all of the bytes (when they are not one byte over and over).
+void save_mtk_padding(Manifest& m, const std::string& p, const mtkimg::Span& s, const Bytes& data) {
+    if (s.pad_size == 0 && s.align == 0) return;
+    m.set(p + "_pad_align", std::to_string(s.align));
+    if (s.pad_size == 0) return;
+    const size_t at = s.data_at + static_cast<size_t>(s.data_size);
+    const uint8_t first = data[at];
+    if (std::all_of(data.begin() + static_cast<std::ptrdiff_t>(at), data.begin() + static_cast<std::ptrdiff_t>(at + s.pad_size), [&](uint8_t b) { return b == first; })) {
+        if (first != 0) m.set_addr(p + "_pad_byte", first);
+    } else {
+        m.set_hex(p + "_pad_hex", Bytes(data.begin() + static_cast<std::ptrdiff_t>(at), data.begin() + static_cast<std::ptrdiff_t>(at + s.pad_size)));
+    }
+}
+
+Bytes load_mtk_padding(const Manifest& m, const std::string& p, uint64_t at, uint32_t default_align) {
+    const uint32_t align = static_cast<uint32_t>(m.get_int(p + "_pad_align", default_align, 1, 65536));
+    const size_t n = mtkimg::pad_length(at, align);
+    if (m.has(p + "_pad_hex")) {
+        Bytes hex = m.get_hex(p + "_pad_hex");
+        if (hex.size() == n) return hex;  // (a section whose size changed has another length of padding: the byte that fills is used)
+    }
+    return Bytes(n, static_cast<uint8_t>(m.get_bounded(p + "_pad_byte", 0, 8)));
+}
+
+// ---- the pictures of a logo table
+
+struct MtkPicture {
+    std::string problem;                    // why a stream that starts like zlib's could not be unpacked
+    Bytes stored;                           // as it lies in the table: a zlib stream, and what follows it
+    Bytes plain;                            // the pixels
+    Codec codec = Codec::NONE;              // ZLIB, or NONE for bytes that are no zlib stream
+    int level = -1;
+    std::string level_basis;
+    Bytes plain_hash;
+    std::optional<mtkimg::Resolution> size;  // set when the pixels make a picture of a size abr knows
+    std::optional<uint8_t> alpha;            // every pixel has this alpha: the PNG has no alpha channel
+};
+
+struct MtkLogo {
+    mtkimg::PixelFormat format = mtkimg::PixelFormat::BGRA8888;
+    std::vector<MtkPicture> pictures;
+};
+
+// The pictures of a table: every one is decompressed (on several threads), the pixel format that explains the sizes is told, and for every
+// picture the size that its pixels have, where that is known: from the table of resolutions of abr/mtkimg.hpp, or as wide as the first
+// picture that the table knows.
+//
+// What a table may ask of the memory is limited: no picture is more than 64 MiB unpacked (a screen of 4K by 4K at four bytes a pixel), and all of
+// them together are not more than 512 MiB; a stream that would be more is kept as the bytes it is.
+constexpr size_t kMtkPictureLimit = size_t{64} << 20;
+constexpr uint64_t kMtkLogoLimit = uint64_t{512} << 20;
+
+MtkLogo analyse_mtk_logo(const std::vector<Bytes>& stored, bool with_hash) {
+    MtkLogo logo;
+    logo.pictures.resize(stored.size());
+    std::atomic<uint64_t> used{0};
+    par::for_each(stored.size(), [&](size_t i) {
+        MtkPicture& pic = logo.pictures[i];
+        pic.stored = stored[i];
+        try {
+            const uint64_t so_far = used.load();
+            const uint64_t room = so_far >= kMtkLogoLimit ? 0 : kMtkLogoLimit - so_far;
+            pic.plain = decompress(Codec::ZLIB, pic.stored, static_cast<size_t>(std::min<uint64_t>(kMtkPictureLimit, room)));
+            pic.codec = Codec::ZLIB;
+            used += pic.plain.size();
+        } catch (const FormatError& e) {
+            const bool zlib_header = pic.stored.size() >= 6 && (pic.stored[0] & 0x0f) == 8 && ((pic.stored[0] << 8) | pic.stored[1]) % 31 == 0;
+            if (zlib_header) pic.problem = e.what();
+            pic.plain = pic.stored;
+            pic.codec = Codec::NONE;
+        }
+        if (with_hash) pic.plain_hash = hash::sha256(pic.plain);
+        if (pic.codec == Codec::ZLIB && !pic.plain.empty()) {
+            const LevelGuess guess = detect_level(Codec::ZLIB, pic.stored, pic.plain);
+            pic.level = guess.level;
+            pic.level_basis = guess.basis;
+        }
+    });
+    std::vector<size_t> sizes;
+    for (const MtkPicture& pic : logo.pictures) sizes.push_back(pic.plain.size());
+    logo.format = mtkimg::guess_format(sizes);
+    const size_t bpp = mtkimg::bytes_per_pixel(logo.format);
+    std::optional<mtkimg::Resolution> like;
+    for (const MtkPicture& pic : logo.pictures)
+        if (!like && !pic.plain.empty() && pic.plain.size() % bpp == 0) like = mtkimg::guess_resolution(pic.plain.size() / bpp);
+    for (MtkPicture& pic : logo.pictures) {
+        if (pic.plain.empty() || pic.plain.size() % bpp != 0) continue;
+        const uint64_t pixels = pic.plain.size() / bpp;
+        if (pixels > png::kMaxPixels) continue;
+        pic.size = mtkimg::guess_resolution(pixels, like);
+        if (pic.size) pic.alpha = mtkimg::constant_alpha(logo.format, pic.plain);
+    }
+    return logo;
+}
+
+std::string mtk_picture_text(const MtkPicture& pic, mtkimg::PixelFormat format) {
+    std::string s;
+    if (pic.size) s = std::to_string(pic.size->width) + "x" + std::to_string(pic.size->height) + " " + std::string(mtkimg::format_name(format));
+    else s = std::to_string(pic.plain.size()) + " bytes of pixels, no size abr knows";
+    s += pic.codec == Codec::ZLIB ? ", zlib" : pic.problem.empty() ? ", stored as they are (no zlib stream)" : ", stored as they are (" + pic.problem + ")";
+    if (pic.level >= 0) s += " level " + std::to_string(pic.level);
+    return s;
+}
+
+// ---- unpack
+
+void unpack_mtk_image(const Bytes& data, const fs::path& dir) {
+    size_t consumed = 0;
+    const std::vector<mtkimg::Span> spans = mtkimg::scan(data, &consumed);
+    const size_t count = spans.size();
+    Manifest m;
+    m.set("type", "mtk_image");
+    m.set_u32("sections", static_cast<uint32_t>(count));
+
+    struct SectionWork {
+        std::string file;                       // the file of the data, or the folder of the pictures
+        std::optional<mtkimg::Logo> logo;
+        Bytes bytes;                            // the data of the section
+        DecodedComponent decoded;               // an ordinary section
+        MtkLogo pictures;                       // a table of pictures
+        std::vector<std::string> picture_files;
+    };
+    std::vector<SectionWork> work(count);
+    uint64_t total = 0;
+    for (size_t i = 0; i < count; ++i) {
+        SectionWork& w = work[i];
+        const mtkimg::Span& s = spans[i];
+        w.file = mtk_file_name(i, count, s.header.name_text());
+        w.bytes.assign(data.begin() + static_cast<std::ptrdiff_t>(s.data_at), data.begin() + static_cast<std::ptrdiff_t>(s.data_at + s.data_size));
+        w.logo = mtkimg::parse_logo(w.bytes);
+        total += w.bytes.size();
+    }
+    fs::create_directories(dir / ".abr_raw");
+    progress::enter("decode", total);
+
+    // The ordinary sections: decoded, written, on several threads (the biggest first).
+    std::vector<size_t> plain_sections;
+    for (size_t i = 0; i < count; ++i)
+        if (!work[i].logo && !work[i].bytes.empty()) plain_sections.push_back(i);
+    std::stable_sort(plain_sections.begin(), plain_sections.end(), [&](size_t a, size_t b) { return work[a].bytes.size() > work[b].bytes.size(); });
+    par::for_each(plain_sections.size(), [&](size_t k) {
+        SectionWork& w = work[plain_sections[k]];
+        const progress::Activity doing(w.file);
+        w.decoded = decode_component(w.bytes, w.file, /*strip_mtk=*/false);
+        write_file(dir / w.file, w.decoded.plain);
+        write_file(dir / ".abr_raw" / (w.file + ".raw"), w.bytes);
+        progress::advance(w.bytes.size());
+    });
+
+    // The logo tables: the pictures of each are decoded together (the pixel format is one for a table), then written.
+    for (size_t i = 0; i < count; ++i) {
+        SectionWork& w = work[i];
+        if (!w.logo) continue;
+        const progress::Activity doing(w.file + "/");
+        w.pictures = analyse_mtk_logo(w.logo->pictures, /*with_hash=*/true);
+        fs::create_directories(dir / w.file);
+        fs::create_directories(dir / ".abr_raw" / w.file);
+        const size_t n = w.pictures.pictures.size();
+        w.picture_files.resize(n);
+        par::for_each(n, [&](size_t k) {
+            MtkPicture& pic = w.pictures.pictures[k];
+            const bool is_png = pic.size.has_value();
+            w.picture_files[k] = mtk_picture_file_name(w.file, k, n, is_png);
+            if (is_png) {
+                png::Image img;
+                img.width = pic.size->width;
+                img.height = pic.size->height;
+                img.rgba = mtkimg::pixels_to_rgba(w.pictures.format, pic.plain, img.width, img.height);
+                write_file(dir / w.picture_files[k], png::encode(img, /*with_alpha=*/!pic.alpha.has_value() && mtkimg::bytes_per_pixel(w.pictures.format) == 4));
+            } else {
+                write_file(dir / w.picture_files[k], pic.plain);
+            }
+            write_file(dir / ".abr_raw" / (w.picture_files[k] + ".raw"), pic.stored);
+            progress::advance(pic.stored.size());
+        });
+    }
+
+    // The manifest, in the order of the sections.
+    size_t pictures = 0, opaque_pictures = 0;
+    for (size_t i = 0; i < count; ++i) {
+        const mtkimg::Span& s = spans[i];
+        SectionWork& w = work[i];
+        const std::string p = mtk_section_prefix(i);
+        save_mtk_header(m, p, s.header);
+        save_mtk_padding(m, p, s, data);
+        if (w.logo) {
+            const size_t n = w.pictures.pictures.size();
+            m.set_bool(p + "_logo", true);
+            m.set_u32(p + "_logo_count", static_cast<uint32_t>(n));
+            m.set(p + "_logo_format", std::string(mtkimg::format_name(w.pictures.format)));
+            for (size_t k = 0; k < n; ++k) {
+                const MtkPicture& pic = w.pictures.pictures[k];
+                DecodedComponent d;
+                d.present = true;
+                d.codec = pic.codec;
+                d.level = pic.level;
+                d.level_basis = pic.level_basis;
+                d.plain_hash = pic.plain_hash;
+                const std::string pp = mtk_picture_prefix(i, k);
+                record_component(m, pp, w.picture_files[k], d);
+                if (pic.size) {
+                    m.set_u32(pp + "_width", pic.size->width);
+                    m.set_u32(pp + "_height", pic.size->height);
+                    if (pic.alpha) m.set_u32(pp + "_alpha", *pic.alpha);
+                } else {
+                    ++opaque_pictures;
+                }
+                ++pictures;
+            }
+        } else if (w.decoded.present) {
+            record_component(m, p, w.file, w.decoded);
+        }
+    }
+
+    const Envelope env = Envelope::capture(data, 0, consumed);
+    save_envelope(m, dir, env, data, 0, consumed);
+    if (!env.tail.empty()) note(std::to_string(env.tail.size()) + " bytes after the last section are kept verbatim (tail.bin)");
+
+    std::cout << "sections: " << count << (pictures ? ", pictures: " + std::to_string(pictures) : std::string()) << "\n";
+    for (size_t i = 0; i < count; ++i) {
+        const SectionWork& w = work[i];
+        std::string what;
+        if (w.logo) what = "table of " + std::to_string(w.pictures.pictures.size()) + " pictures, " + std::string(mtkimg::format_name(w.pictures.format)) + " -> " + w.file + "/";
+        else if (w.decoded.present) what = (w.decoded.codec == Codec::NONE ? std::string("plain") : std::string(codec_name(w.decoded.codec)) + " stream taken off") + " -> " + w.file;
+        else what = "no data";
+        std::cout << "  [" << i << "] " << shown(spans[i].header.name_text()) << ": " << spans[i].data_size << " bytes at 0x" << std::hex << spans[i].data_at << std::dec
+                  << ", " << what << "\n";
+    }
+    for (size_t i = 0; i < count; ++i)
+        for (size_t k = 0; k < work[i].pictures.pictures.size(); ++k)
+            if (!work[i].pictures.pictures[k].problem.empty())
+                warn("picture " + std::to_string(k) + " of section " + std::to_string(i) + " starts like a zlib stream but cannot be unpacked (" +
+                     work[i].pictures.pictures[k].problem + "): it is kept as the bytes it is");
+    if (opaque_pictures)
+        note(std::to_string(opaque_pictures) + " picture(s) are no size that abr knows (or no pixels at all): they stay files of their bytes as they are (img-NNN.bin)");
+
+    m.save(dir / "manifest.txt",
+           "abr mtk_image manifest -- edit then `abr pack -i " + dir.string() + " -o out.img`\n"
+           "# NOTE: a section's file holds its data with the compression taken off (section<i>_compression, _level say what it was; pack makes the\n"
+           "# stream again). A table of pictures (the logo) is a folder of PNG files; section<i>_logo_format is how their pixels are stored, and the\n"
+           "# size of a picture is what abr guessed from its pixel count -- the PNG is as many pixels as the bootloader draws, keep its size.");
+}
+
+// ---- pack
+
+// One picture of a logo table, made from its file: the stream of the table. The pixels of a PNG are stored in `format`.
+Bytes load_mtk_picture(const Manifest& m, const fs::path& dir, const std::string& p, mtkimg::PixelFormat format, const RepackOptions& opt) {
+    if (!m.has(p + "_file")) throw FormatError("manifest.txt: " + shown(p + "_file") + " is missing (the file of the picture)");
+    const std::string filename = m.get_path(p + "_file");
+    const progress::Activity doing(filename);
+    const Bytes disk = read_file(dir / filename);
+    Bytes pixels;
+    if (m.has(p + "_width")) {
+        png::Image img;
+        try {
+            img = png::decode(disk);
+        } catch (const FormatError& e) {
+            throw FormatError(shown(filename) + ": " + e.what());
+        }
+        const uint32_t want_w = m.get_u32(p + "_width", 0), want_h = m.get_u32(p + "_height", 0);
+        if (img.width != want_w || img.height != want_h)
+            warn(shown(filename) + " is " + std::to_string(img.width) + "x" + std::to_string(img.height) + " pixels, it was " + std::to_string(want_w) + "x" +
+                 std::to_string(want_h) + ": the bootloader draws the pixels as the size it knows, a picture of another size comes out skewed or does not show");
+        pixels = mtkimg::rgba_to_pixels(format, img.rgba, img.width, img.height, img.has_alpha, static_cast<uint8_t>(m.get_bounded(p + "_alpha", 255, 8)));
+    } else {
+        pixels = disk;
+    }
+    const std::string codec_text = m.get(p + "_compression", "zlib");
+    const std::optional<Codec> named = codec_from_name(codec_text);
+    if (!named || (*named != Codec::ZLIB && *named != Codec::NONE))
+        throw FormatError("manifest.txt: " + shown(p + "_compression=" + codec_text) + " is none of the compressions of a picture of a logo table (zlib, none)");
+    const Bytes hash = hash::sha256(pixels);
+    const fs::path raw_path = dir / ".abr_raw" / (filename + ".raw");
+    const Bytes stored_hash = m.get_hex(p + "_orig_hash");
+    if (!stored_hash.empty() && hash == stored_hash && fs::exists(raw_path)) {
+        Bytes raw = read_file(raw_path);  // the pixels are what they were: the very bytes the table had
+        std::string why;
+        try {
+            const Bytes plain = *named == Codec::ZLIB ? decompress(Codec::ZLIB, raw) : raw;
+            if (hash::sha256(plain) == stored_hash) {
+                progress::advance(disk.size());
+                return raw;
+            }
+            why = "it does not decompress to the pixels of " + filename + " as it was unpacked";
+        } catch (const std::exception& e) {
+            why = std::string("it does not decompress (") + e.what() + ")";
+        }
+        throw FormatError(shown(raw_path.generic_string()) + " does not belong to " + shown(filename) + ": " + why + ". Delete it to have " + shown(filename) +
+                          " compressed again, or unpack the image again");
+    }
+    int level = static_cast<int>(m.get_int(p + "_level", -1, -1, 22));
+    const int dense = dense_level(*named);
+    if (dense >= 0 && (level >= 0 ? level : default_level(*named)) < dense) {
+        if (opt.dense) level = dense;
+        else g_denser_would_help = true;
+    }
+    Bytes out = compress(*named, pixels, level, [](size_t n) { progress::advance(n); });
+    return out;
+}
+
+Bytes repack_mtk_image(const Manifest& m, const fs::path& dir, const RepackOptions& opt) {
+    const size_t count = m.get_count("sections", 0);
+    if (count == 0) throw FormatError("manifest.txt: sections= is missing or 0 (the number of the sections of the image)");
+
+    struct Job {
+        size_t section;
+        long picture;  // -1: the whole section
+        uintmax_t size;
+    };
+    std::vector<Job> jobs;
+    std::vector<bool> is_logo(count, false);
+    std::vector<mtkimg::PixelFormat> formats(count, mtkimg::PixelFormat::BGRA8888);
+    std::vector<size_t> pictures(count, 0);
+    for (size_t i = 0; i < count; ++i) {
+        const std::string p = mtk_section_prefix(i);
+        const auto size_of = [&](const std::string& key) -> uintmax_t {
+            std::error_code ec;
+            if (!m.has(key)) return 0;
+            const auto n = fs::file_size(dir / m.get_path(key), ec);
+            return ec ? 0 : n;
+        };
+        if (m.get_bool(p + "_logo", false)) {
+            is_logo[i] = true;
+            const std::string format_name = m.get(p + "_logo_format", "bgra8888");
+            const std::optional<mtkimg::PixelFormat> format = mtkimg::format_from_name(format_name);
+            if (!format)
+                throw FormatError("manifest.txt: " + shown(p + "_logo_format=" + format_name) +
+                                  " is none of the pixel formats abr knows (bgra8888, rgba8888, rgb565, bgr888, rgb888)");
+            formats[i] = *format;
+            pictures[i] = m.get_count(p + "_logo_count", 0);
+            if (pictures[i] == 0 || pictures[i] > 4096) throw FormatError("manifest.txt: " + shown(p + "_logo_count") + " is the number of the pictures of the table, 1 to 4096");
+            for (size_t k = 0; k < pictures[i]; ++k) jobs.push_back({i, static_cast<long>(k), size_of(mtk_picture_prefix(i, k) + "_file")});
+        } else {
+            jobs.push_back({i, -1, size_of(p + "_file")});
+        }
+    }
+    std::stable_sort(jobs.begin(), jobs.end(), [](const Job& a, const Job& b) { return a.size > b.size; });
+
+    std::vector<Bytes> data(count);
+    std::vector<std::vector<Bytes>> streams(count);
+    for (size_t i = 0; i < count; ++i) streams[i].resize(pictures[i]);
+    par::for_each(jobs.size(), [&](size_t j) {
+        const Job& job = jobs[j];
+        if (job.picture < 0) data[job.section] = load_component(m, dir, mtk_section_prefix(job.section), opt);
+        else streams[job.section][static_cast<size_t>(job.picture)] = load_mtk_picture(m, dir, mtk_picture_prefix(job.section, static_cast<size_t>(job.picture)), formats[job.section], opt);
+    });
+
+    mtkimg::Chain chain;
+    uint64_t at = 0;
+    for (size_t i = 0; i < count; ++i) {
+        const std::string p = mtk_section_prefix(i);
+        mtkimg::Section s;
+        s.header = load_mtk_header(m, p, i + 1 == count);
+        s.data = is_logo[i] ? mtkimg::build_logo(streams[i]) : std::move(data[i]);
+        s.align = s.header.alignment();
+        at += mtkimg::kHeaderSize + s.data.size();
+        if (i + 1 < count) {
+            s.pad = load_mtk_padding(m, p, at, s.align);
+            at += s.pad.size();
+        }
+        chain.sections.push_back(std::move(s));
+    }
+    chain.consumed = static_cast<size_t>(at);
+    return assemble_envelope(m, dir, mtkimg::build(chain), opt);
+}
+
+// ---- info
+
+void print_mtk_image_info(const Bytes& data) {
+    size_t consumed = 0;
+    const std::vector<mtkimg::Span> spans = mtkimg::scan(data, &consumed);
+    std::cout << "sections:       " << spans.size() << "\n";
+    for (size_t i = 0; i < spans.size(); ++i) {
+        const mtkimg::Span& s = spans[i];
+        const mtkimg::Header& h = s.header;
+        char line[256];
+        std::snprintf(line, sizeof line, "load address 0x%x, mode 0x%x", h.maddr, h.mode);
+        std::cout << "  [" << i << "] " << shown(h.name_text()) << ": " << s.data_size << " bytes at 0x" << std::hex << s.data_at << std::dec << ", " << line;
+        if (h.extended()) {
+            std::cout << ", type " << h.img_type << ", header version " << h.hdr_version << ", " << (h.img_list_end == 1 ? "last of the list" : "list goes on");
+            std::cout << ", alignment " << h.align_size << (h.alignment() != h.align_size ? " (taken as " + std::to_string(h.alignment()) + ")" : std::string());
+        } else {
+            std::cout << ", the older kind of header (no extension)";
+        }
+        if (s.pad_size) std::cout << ", " << s.pad_size << " bytes of padding to the next (alignment " << s.align << ")";
+        if (!h.name_tail().empty()) std::cout << ", " << h.name_tail().size() << " bytes behind the name (kept)";
+        std::cout << "\n";
+        if (s.data_size == 0) continue;
+        const Bytes bytes(data.begin() + static_cast<std::ptrdiff_t>(s.data_at), data.begin() + static_cast<std::ptrdiff_t>(s.data_at + s.data_size));
+        if (const std::optional<mtkimg::Logo> logo = mtkimg::parse_logo(bytes)) {
+            const MtkLogo pictures = analyse_mtk_logo(logo->pictures, /*with_hash=*/false);
+            std::cout << "      table of " << pictures.pictures.size() << " pictures, pixel format " << mtkimg::format_name(pictures.format) << " (guessed from the sizes)\n";
+            for (size_t k = 0; k < pictures.pictures.size(); ++k)
+                std::cout << "        picture " << k << ": " << pictures.pictures[k].stored.size() << " bytes, " << mtk_picture_text(pictures.pictures[k], pictures.format) << "\n";
+        } else {
+            const Codec codec = detect_codec(bytes);
+            std::cout << "      data: " << (codec == Codec::NONE ? std::string("not compressed") : std::string(codec_name(codec)));
+            if (codec != Codec::NONE) {
+                try {
+                    const DecodedComponent d = decode_component(bytes, {}, /*strip_mtk=*/false);
+                    std::cout << ", " << d.plain.size() << " bytes unpacked";
+                    if (d.level >= 0) std::cout << ", level " << d.level;
+                } catch (const FormatError& e) {
+                    std::cout << " (cannot be decompressed: " << e.what() << ")";
+                }
+            }
+            std::cout << "\n";
+        }
+    }
+    print_envelope_info(Envelope::capture(data, 0, consumed));
+}
+
 // ------------------------------------------------------------------ layout --
 //
 // Where the parts of an image are (abr/layout.hpp). `unpack` says it of the image it took apart, `pack` of the image it built and `info`
@@ -3074,6 +3584,14 @@ std::optional<layout::Layout> describe_layout(Fmt f, const Bytes& whole) {
                 if (!c) return std::nullopt;
                 layout::Layout l = layout::chromeos(*c, whole);
                 layout::around(l, whole, whole.size(), 0, c->core_size);
+                return l;
+            }
+            case Fmt::MTK_IMAGE: {
+                layout::Layout l = layout::mtk_image(whole);
+                if (l.regions.empty()) return std::nullopt;
+                size_t consumed = 0;
+                (void)mtkimg::scan(whole, &consumed);
+                layout::around(l, whole, whole.size(), 0, consumed);
                 return l;
             }
             default:
@@ -3467,6 +3985,10 @@ void print_info(const fs::path& path) {
             }
             break;
         }
+        case Fmt::MTK_IMAGE: {
+            print_mtk_image_info(data);
+            break;
+        }
         case Fmt::CHROMEOS: {
             Bytes kernel;
             const std::optional<legacy::ChromeosInfo> c = legacy::strip_chromeos(data, kernel);
@@ -3557,6 +4079,7 @@ Bytes build_image_once(const fs::path& dir, const RepackOptions& opt) {
         case Fmt::BLOB: result = repack_blob(m, dir); break;
         case Fmt::OSIP: result = repack_osip(m, dir, opt); break;
         case Fmt::CHROMEOS: result = repack_chromeos(m, dir, opt); break;
+        case Fmt::MTK_IMAGE: result = repack_mtk_image(m, dir, opt); break;
         case Fmt::UNKNOWN:
             throw FormatError("manifest.txt has no (or an unrecognized) 'type=' field");
     }
@@ -3703,6 +4226,7 @@ void do_unpack(const fs::path& in, const fs::path& outdir) {
             case Fmt::BLOB: unpack_blob(payload, outdir); break;
             case Fmt::OSIP: unpack_osip(payload, outdir); break;
             case Fmt::CHROMEOS: unpack_chromeos(payload, outdir); break;
+            case Fmt::MTK_IMAGE: unpack_mtk_image(payload, outdir); break;
             case Fmt::UNKNOWN:
                 throw FormatError(in.string() + ": " + describe_unknown(payload));
         }

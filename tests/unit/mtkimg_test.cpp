@@ -227,6 +227,17 @@ void test_chain() {
     EXPECT(build(p) == img);
     EXPECT(p.sections[0].align == 16);
 
+    // scan() says where the sections are without copying them.
+    {
+        size_t consumed = 0;
+        const std::vector<Span> spans = scan(img, &consumed);
+        EXPECT(spans.size() == 3 && consumed == img.size());
+        EXPECT(spans[0].header_at == 0 && spans[0].data_at == kHeaderSize && spans[0].data_size == 1000);
+        EXPECT(spans[1].header_at == spans[0].data_at + 1000 + spans[0].pad_size && spans[1].data_size == 333);
+        EXPECT(spans[2].pad_size == 0 && spans[2].data_at + spans[2].data_size == img.size());
+        EXPECT(spans[0].header.name_text() == "md1rom" && spans[0].align == 16);
+    }
+
     // Bytes after the last section are not part of the chain.
     Bytes with_tail = img;
     with_tail.insert(with_tail.end(), 77, 0xFF);
@@ -439,6 +450,14 @@ void test_guess() {
     const auto land = guess_resolution(uint64_t{1920} * 1080);
     EXPECT(land && land->width == 1080 && land->height == 1920);
     EXPECT(!guess_resolution(0));
+    // A size that is not in the table: as wide as the picture it is like, when that makes whole rows.
+    const std::optional<Resolution> like = Resolution{1080, 1920};
+    const auto strip = guess_resolution(uint64_t{1080} * 123, like);
+    EXPECT(strip && strip->width == 1080 && strip->height == 123);
+    EXPECT(!guess_resolution(uint64_t{1080} * 123 + 1, like));
+    EXPECT(!guess_resolution(uint64_t{1080} * 123, std::nullopt));
+    const auto known_first = guess_resolution(uint64_t{720} * 1280, like);  // the table says first
+    EXPECT(known_first && known_first->width == 720);
     EXPECT(!guess_resolution(12345679));
     // An area that is in the table comes back as sizes that give that area.
     bool every = true;
