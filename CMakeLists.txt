@@ -147,6 +147,7 @@ add_library(abr_core STATIC
   src/layout.cpp
   src/png.cpp
   src/mtkimg.cpp
+  src/mtkgfh.cpp
   src/cpio.cpp
   src/ramdisk_tree.cpp
   src/identify.cpp
@@ -231,7 +232,7 @@ abr_link_statically(abr)
 if(ABR_BUILD_TESTS)
   add_executable(abr_unit_tests tests/unit/crypto_test.cpp tests/unit/par_test.cpp tests/unit/cpio_test.cpp
                tests/unit/legacy_test.cpp tests/unit/manifest_test.cpp tests/unit/compression_test.cpp tests/unit/fdt_test.cpp tests/unit/fit_test.cpp tests/unit/console_test.cpp
-               tests/unit/avb_keys_test.cpp tests/unit/layout_test.cpp tests/unit/level_test.cpp tests/unit/png_test.cpp tests/unit/mtkimg_test.cpp)
+               tests/unit/avb_keys_test.cpp tests/unit/layout_test.cpp tests/unit/level_test.cpp tests/unit/png_test.cpp tests/unit/mtkimg_test.cpp tests/unit/mtkgfh_test.cpp)
   target_link_libraries(abr_unit_tests PRIVATE abr_core)
   abr_link_statically(abr_unit_tests)
 endif()

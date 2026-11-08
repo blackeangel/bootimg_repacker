@@ -54,6 +54,7 @@
 #include "abr/legacy/osip.hpp"
 #include "abr/legacy/sin.hpp"
 #include "abr/manifest.hpp"
+#include "abr/mtkgfh.hpp"
 #include "abr/mtkimg.hpp"
 #include "abr/parallel.hpp"
 #include "abr/png.hpp"
@@ -100,7 +101,7 @@ std::string tails_text(std::initializer_list<std::pair<const char*, const Bytes*
 
 // ------------------------------------------------------------ detection --
 
-enum class Fmt { BOOT, VENDOR_BOOT, DTBO, DTB, FIT, QCDT, VBMETA, UIMAGE, ELF_BOOT, KRNL, BLOB, OSIP, CHROMEOS, MTK_IMAGE, UNKNOWN };
+enum class Fmt { BOOT, VENDOR_BOOT, DTBO, DTB, FIT, QCDT, VBMETA, UIMAGE, ELF_BOOT, KRNL, BLOB, OSIP, CHROMEOS, MTK_IMAGE, MTK_PRELOADER, UNKNOWN };
 
 // Where the "ANDROID!" container starts: within the first kMagicSearchLimit bytes (a vendor
 // wrapper in front of it), or -- Barnes & Noble Nook images -- right behind the fixed-size
@@ -121,6 +122,7 @@ Fmt detect_format(const Bytes& d) {
     if (d.size() >= 8 && std::memcmp(d.data(), "VNDRBOOT", 8) == 0) return Fmt::VENDOR_BOOT;
     if (d.size() >= 4 && std::memcmp(d.data(), "AVB0", 4) == 0) return Fmt::VBMETA;
     if (mtkimg::looks_like(d, 0)) return Fmt::MTK_IMAGE;
+    if (mtkgfh::looks_like(d)) return Fmt::MTK_PRELOADER;
     if (qcdt::looks_like(d)) return Fmt::QCDT;
     if (has_chromeos_header(d)) return Fmt::CHROMEOS;
     if (d.size() >= 4) {
@@ -185,6 +187,19 @@ std::string describe_unknown(const Bytes& d) {
             return std::string("this starts like a MediaTek partition image (the header of a section, magic 0x58881688), but abr cannot read it: ") + e.what();
         }
     }
+    if (mtkgfh::find_chain(d)) {
+        try {
+            (void)mtkgfh::parse(d);
+        } catch (const FormatError& e) {
+            return std::string("this starts like the loader of a MediaTek boot ROM (a chain of GFH headers that begins with FILE_INFO), but abr cannot read it: ") + e.what();
+        }
+    }
+    if (const std::optional<mtkgfh::Device> dev = mtkgfh::parse_device(d))
+        return "this starts with the device header and the BRLYT of a MediaTek boot partition image (" + dev->boot_name + "), but there is no FILE_INFO header at offset " +
+               std::to_string(dev->header_size) + ", where the BRLYT says the loader starts";
+    if (const std::optional<mtkgfh::Marker> mark = mtkgfh::find_bloader_marker(d); mark && mark->offset == 0)
+        return "this starts with " + mark->text + ", the text that stands near the end of the code of a MediaTek preloader: it is that record on its own, not a loader image "
+               "(a preloader has the GFH headers, FILE_INFO first, in front of its code), and abr cannot unpack it";
     if (u16le(0x438) == 0xEF53)
         return "this is an ext2/3/4 filesystem image (system/vendor/product/... or a recovery "
                "dumped as a filesystem), not a boot-family container. Filesystems are out of "
@@ -226,6 +241,7 @@ const char* fmt_name(Fmt f) {
         case Fmt::OSIP: return "osip";
         case Fmt::CHROMEOS: return "chromeos";
         case Fmt::MTK_IMAGE: return "mtk_image";
+        case Fmt::MTK_PRELOADER: return "mtk_preloader";
         case Fmt::UNKNOWN: return "unknown";
     }
     return "unknown";
@@ -246,6 +262,7 @@ Fmt fmt_from_name(const std::string& s) {
     if (s == "osip") return Fmt::OSIP;
     if (s == "chromeos") return Fmt::CHROMEOS;
     if (s == "mtk_image") return Fmt::MTK_IMAGE;
+    if (s == "mtk_preloader") return Fmt::MTK_PRELOADER;
     return Fmt::UNKNOWN;
 }
 
@@ -3449,6 +3466,256 @@ void print_mtk_image_info(const Bytes& data) {
     print_envelope_info(Envelope::capture(data, 0, consumed));
 }
 
+// ------------------------------------------------------- mtk_preloader --
+//
+// The loader that the boot ROM of a MediaTek chip runs from the boot partition (abr/mtkgfh.hpp): a chain of GFH headers, the loader's code and a
+// signature, and in an image of the partition a device header and a BRLYT in front of it. `unpack` writes
+//   device.bin     the device header and the BRLYT (what is in front of the chain; only when there is any),
+//   headers.bin    the GFH headers behind FILE_INFO (BL_INFO, BROM_CFG, ANTI_CLONE, ...) and the bytes of padding behind them, as they lie in the image,
+//   loader.bin     the loader's code, with a compression taken off if it has one,
+//   signature.bin  the signature, unless it is the SHA-256 that `pack` makes again,
+// and what FILE_INFO holds that is not a size goes into the manifest. `pack` works out the sizes (those of FILE_INFO and of the BRLYT) and the SHA-256
+// again from what is in the folder. A signature of another kind cannot be made again: it is kept as it is, and a warning says when what it was made
+// for has changed.
+
+constexpr size_t kPreloaderSector = 0x200;  // the images of a partition that were looked at are a multiple of it
+
+std::string mtk_hex(uint64_t v) {
+    char b[24];
+    std::snprintf(b, sizeof b, "0x%llx", static_cast<unsigned long long>(v));
+    return b;
+}
+
+// The byte that fills an image of a partition up to a multiple of kPreloaderSector behind the signature -- or nothing, when what is behind the loader is
+// not that (a file of another size, other bytes in it, a file that is not an image of a partition at all).
+std::optional<uint8_t> preloader_round_fill(const mtkgfh::Image& img, const Bytes& data) {
+    if (!img.device || data.size() % kPreloaderSector != 0 || data.size() - img.consumed >= kPreloaderSector) return std::nullopt;
+    const uint8_t fill = data.size() > img.consumed ? data[img.consumed] : 0xFF;
+    for (size_t i = img.consumed; i < data.size(); ++i)
+        if (data[i] != fill) return std::nullopt;
+    return fill;
+}
+
+std::string preloader_basis_text(const mtkgfh::Device& v, mtkgfh::SizeBasis basis) {
+    switch (basis) {
+        case mtkgfh::SizeBasis::File: return "the size of the file, " + mtk_hex(v.total_size);
+        case mtkgfh::SizeBasis::Chain: return "the end of the loader, " + mtk_hex(v.total_size);
+        default: return mtk_hex(v.total_size) + ", kept as it is";
+    }
+}
+
+// ---- unpack
+
+void unpack_mtk_preloader(const Bytes& data, const fs::path& dir) {
+    const mtkgfh::Image img = mtkgfh::parse(data);
+    const mtkgfh::FileInfo fi = mtkgfh::read_file_info(img.chain[0]);
+    Manifest m;
+    m.set("type", "mtk_preloader");
+    m.set_u32("file_info_version", fi.version);
+    m.set_tail("file_info_name_tail", fi.name_tail());
+    m.set_u32("file_ver", fi.file_ver);
+    m.set_u32("file_type", fi.file_type);
+    m.set_u32("flash_type", fi.flash_type);
+    m.set_u32("sig_type", fi.sig_type);
+    m.set_addr("load_addr", fi.load_addr);
+    m.set_addr("max_size", fi.max_size);
+    m.set_addr("jump_offset", fi.jump_offset);
+    m.set_addr("processed", fi.processed);
+    if (!fi.extra.empty()) m.set_hex("file_info_extra", fi.extra);
+
+    // What is in front of the chain, and what is behind FILE_INFO.
+    save_raw(m, dir, "device", img.prefix, "device.bin");
+    if (img.device) m.set("brlyt_basis", mtkgfh::size_basis_name(img.basis));
+    Bytes headers = mtkgfh::serialize_headers(img.chain, 1);
+    headers.insert(headers.end(), img.chain_pad.begin(), img.chain_pad.end());
+    save_raw(m, dir, "headers", headers, "headers.bin");
+
+    // The loader's code: a compression on it is taken off, like that of any component.
+    DecodedComponent loader;
+    if (!img.payload.empty()) {
+        progress::enter("decode", img.payload.size());
+        const progress::Activity doing("loader.bin");
+        fs::create_directories(dir / ".abr_raw");
+        loader = decode_component(img.payload, "loader.bin", /*strip_mtk=*/false);
+        write_file(dir / "loader.bin", loader.plain);
+        write_file(dir / ".abr_raw" / "loader.bin.raw", loader.stored(img.payload));
+        progress::advance(img.payload.size());
+        record_component(m, "loader", "loader.bin", loader);
+    }
+
+    // The signature: the SHA-256 is made again by pack; any other is kept, with a hash of what it follows, to tell a changed image from an unchanged one.
+    const size_t sig_at = img.consumed - img.signature.size();
+    if (img.sha256_trailer) {
+        m.set("signature", "sha256");
+    } else if (!img.signature.empty()) {
+        save_raw(m, dir, "signature", img.signature, "signature.bin");
+        m.set_hex("signed_sha256", hash::sha256(data.data() + img.at(), sig_at - img.at()));
+    }
+
+    // The fill behind the signature of an image of a partition (a multiple of 0x200) is made again when the loader changes its size: its byte and
+    // the multiple are in the manifest. Any other bytes behind the image are kept as the envelope keeps them.
+    Envelope env = Envelope::capture(data, 0, img.consumed);
+    if (const std::optional<uint8_t> fill = preloader_round_fill(img, data)) {
+        env.tail.clear();
+        env.pad_to = 0;
+        m.set_addr("file_align", static_cast<uint32_t>(kPreloaderSector));
+        m.set_addr("pad_byte", *fill);
+    }
+    save_envelope(m, dir, env, data, 0, img.consumed);
+    if (!env.tail.empty()) note(std::to_string(env.tail.size()) + " bytes after the signature are kept verbatim (tail.bin)");
+
+    // What was done, with the offsets and the sizes.
+    std::cout << "FILE_INFO: load address " << mtk_hex(fi.load_addr) << ", code at " << mtk_hex(uint64_t{fi.load_addr} + fi.jump_offset) << ", flash type "
+              << unsigned{fi.flash_type} << " (" << mtkgfh::flash_type_name(fi.flash_type) << "), signature " << mtkgfh::sig_type_name(fi.sig_type) << "\n";
+    if (img.device) {
+        const mtkgfh::Device& v = *img.device;
+        std::cout << "  [device header and BRLYT] " << img.prefix.size() << " bytes at 0x0, " << v.boot_name << ", BRLYT " << mtkgfh::brlyt_type_name(v.type)
+                  << " -> device.bin\n";
+    }
+    std::cout << "  [FILE_INFO] " << img.chain[0].size() << " bytes at " << mtk_hex(img.at()) << "\n";
+    if (img.chain.size() > 1 || !img.chain_pad.empty()) {
+        std::string names;
+        for (size_t i = 1; i < img.chain.size(); ++i) names += (names.empty() ? "" : ", ") + mtkgfh::type_name(img.chain[i].type);
+        std::cout << "  [headers] " << (img.chain.size() - 1) << " behind FILE_INFO (" << names << (img.chain_pad.empty() ? "" : "; " + std::to_string(img.chain_pad.size()) + " bytes of padding")
+                  << "), " << headers.size() << " bytes at " << mtk_hex(img.at() + img.chain[0].size()) << " -> headers.bin\n";
+    }
+    if (loader.present) {
+        std::cout << "  [loader] " << img.payload.size() << " bytes at " << mtk_hex(img.at() + fi.hdr_size) << ", "
+                  << (loader.codec == Codec::NONE ? std::string("not compressed") : std::string(codec_name(loader.codec)) + " stream taken off") << " -> loader.bin\n";
+        if (const std::optional<mtkgfh::Marker> mark = mtkgfh::find_bloader_marker(img.payload))
+            std::cout << "           " << mark->text << " at " << mtk_hex(img.at() + fi.hdr_size + mark->offset) << "\n";
+    }
+    if (!img.signature.empty())
+        std::cout << "  [signature] " << img.signature.size() << " bytes at " << mtk_hex(sig_at) << ", " << mtkgfh::sig_type_name(fi.sig_type)
+                  << (img.sha256_trailer ? ", the SHA-256 of the image from the first header (made again by pack)" : ", kept as it is (signature.bin)") << "\n";
+    if (!img.sha256_trailer && !img.signature.empty())
+        note(std::string("the signature is ") + (fi.sig_type == mtkgfh::kSigSha256 ? "not the SHA-256 of the image (it is kept as it is)" : "of a kind that abr cannot make again") +
+             ": a loader that is edited no longer matches it");
+    if (fi.max_size && fi.total_size > fi.max_size)
+        warn("the image is " + std::to_string(fi.total_size) + " bytes, more than the max_size that FILE_INFO gives (" + mtk_hex(fi.max_size) + ")");
+
+    m.save(dir / "manifest.txt",
+           "abr mtk_preloader manifest -- edit then `abr pack -i " + dir.string() + " -o out.img`\n"
+           "# NOTE: FILE_INFO's sizes (hdr_size, total_size, sig_size) and the sizes in the BRLYT are worked out by pack, from the files. The code that starts\n"
+           "# at load_addr + jump_offset is loader.bin. headers.bin holds the GFH headers behind FILE_INFO as they are in the image (each: \"MMM\" and its\n"
+           "# version, its size, its type, its body). signature=sha256 is made again by pack; signature.bin (any other signature) is kept as it is.");
+}
+
+// ---- pack
+
+Bytes repack_mtk_preloader(const Manifest& m, const fs::path& dir, const RepackOptions& opt) {
+    const auto need = [&](const char* key) -> uint32_t {
+        if (!m.has(key)) throw FormatError(std::string("manifest.txt: ") + shown(key) + " is missing (a number of FILE_INFO)");
+        return m.get_addr32(key, 0);
+    };
+
+    mtkgfh::Image img;
+    img.prefix = load_raw(m, dir, "device");
+    if (!img.prefix.empty()) {
+        img.device = mtkgfh::parse_device(img.prefix);
+        if (!img.device)
+            throw FormatError("device.bin is not the device header and the BRLYT of a boot medium (EMMC_BOOT, SF_BOOT or SDMMC_BOOT, 0x200 bytes, then \"BRLYT\")");
+        if (img.device->header_size != img.prefix.size())
+            throw FormatError("device.bin is " + std::to_string(img.prefix.size()) + " bytes, and its BRLYT says that the headers begin at " + mtk_hex(img.device->header_size) +
+                              " (the BRLYT is at 0x200: header_size, then total_size)");
+        const std::string basis = m.get("brlyt_basis", "literal");
+        const std::optional<mtkgfh::SizeBasis> b = mtkgfh::size_basis_from_name(basis);
+        if (!b) throw FormatError("manifest.txt: " + shown("brlyt_basis=" + basis) + " is none of file, chain, literal");
+        img.basis = *b;
+    }
+
+    mtkgfh::FileInfo fi;
+    fi.version = static_cast<uint8_t>(m.get_bounded("file_info_version", 1, 8));
+    const std::string name = "FILE_INFO";
+    const Bytes tail = m.get_tail("file_info_name_tail");
+    if (name.size() + 1 + tail.size() > fi.name.size())
+        throw FormatError("manifest.txt: " + shown("file_info_name_tail") + " is " + std::to_string(tail.size()) + " bytes; the name field holds 12, and FILE_INFO and its zero take 10");
+    std::copy(name.begin(), name.end(), fi.name.begin());
+    std::copy(tail.begin(), tail.end(), fi.name.begin() + static_cast<std::ptrdiff_t>(name.size() + 1));
+    fi.file_ver = m.get_u32("file_ver", 1);
+    fi.file_type = static_cast<uint16_t>(m.get_bounded("file_type", 1, 16));
+    fi.flash_type = static_cast<uint8_t>(m.get_bounded("flash_type", 5, 8));
+    fi.sig_type = static_cast<uint8_t>(m.get_bounded("sig_type", 0, 8));
+    fi.load_addr = need("load_addr");
+    fi.max_size = need("max_size");
+    fi.jump_offset = need("jump_offset");
+    fi.processed = m.get_addr32("processed", 0);
+    if (m.has("file_info_extra")) fi.extra = m.get_hex("file_info_extra");
+
+    const Bytes headers = load_raw(m, dir, "headers");
+    img.chain.push_back(mtkgfh::write_file_info(fi));
+    for (mtkgfh::Header& h : mtkgfh::split_headers(headers, 0, headers.size(), &img.chain_pad)) img.chain.push_back(std::move(h));
+
+    bool replayed = false;
+    img.payload = load_component(m, dir, "loader", opt, &replayed);
+
+    const std::string signature = m.get("signature", "");
+    if (signature == "sha256") {
+        if (fi.sig_type != mtkgfh::kSigSha256) throw FormatError("manifest.txt: signature=sha256 is the signature of sig_type=1, and sig_type is " + std::to_string(fi.sig_type));
+        img.sha256_trailer = true;
+    } else if (!signature.empty()) {
+        throw FormatError("manifest.txt: " + shown("signature=" + signature) + " is not sha256 (the one signature that abr makes; any other is the file signature.bin, signature_file=)");
+    } else {
+        img.signature = load_raw(m, dir, "signature");
+    }
+
+    Bytes core = mtkgfh::build(img);
+    const uint64_t total = core.size() - img.at();
+    if (!img.sha256_trailer && !img.signature.empty() && m.has("signed_sha256")) {
+        const size_t from = img.at(), to = core.size() - img.signature.size();
+        if (hash::sha256(core.data() + from, to - from) != m.get_hex("signed_sha256"))
+            warn("the image is not the one that the signature (" + mtkgfh::sig_type_name(fi.sig_type) + ", " + std::to_string(img.signature.size()) +
+                 " bytes, signature.bin) came with: it is kept as it is, abr cannot make it again, and a boot ROM that checks it will not accept this image");
+    }
+    if (fi.max_size && total > fi.max_size)
+        warn("the image is " + std::to_string(total) + " bytes, more than the max_size of FILE_INFO (" + mtk_hex(fi.max_size) + "); raise max_size in manifest.txt if that is meant");
+
+    Bytes out = assemble_envelope(m, dir, core, opt);
+    const uint64_t align = m.get_int("file_align", 1, 1, 1 << 20);
+    if (align > 1 && out.size() % align != 0) out.resize(static_cast<size_t>((out.size() + align - 1) / align * align), static_cast<uint8_t>(m.get_bounded("pad_byte", 0xFF, 8)));
+    mtkgfh::fix_device(out, img);
+    return out;
+}
+
+// ---- info
+
+void print_mtk_preloader_info(const Bytes& data) {
+    const mtkgfh::Image img = mtkgfh::parse(data);
+    const mtkgfh::FileInfo fi = mtkgfh::read_file_info(img.chain[0]);
+    if (img.device) {
+        const mtkgfh::Device& v = *img.device;
+        std::cout << "device header:  " << v.boot_name << ", version " << v.boot_version << ", " << v.boot_size << " bytes\n";
+        std::cout << "BRLYT:          " << mtkgfh::brlyt_type_name(v.type) << ", version " << v.version << ", the headers begin at " << mtk_hex(v.header_size) << ", size "
+                  << preloader_basis_text(v, img.basis) << "\n";
+    }
+    std::cout << "FILE_INFO:      " << shown(fi.name_text()) << ", header version " << unsigned{fi.version} << ", file version " << fi.file_ver << ", file type " << fi.file_type
+              << ", flash type " << unsigned{fi.flash_type} << " (" << mtkgfh::flash_type_name(fi.flash_type) << "), processed " << mtk_hex(fi.processed) << "\n";
+    std::cout << "load address:   " << mtk_hex(fi.load_addr) << ", jump offset " << mtk_hex(fi.jump_offset) << ": the code is at " << mtk_hex(uint64_t{fi.load_addr} + fi.jump_offset) << "\n";
+    std::cout << "sizes:          headers " << fi.hdr_size << ", loader " << img.payload.size() << ", signature " << fi.sig_size << ", total " << fi.total_size << " bytes (max_size "
+              << mtk_hex(fi.max_size) << (fi.max_size && fi.total_size > fi.max_size ? ": EXCEEDED" : "") << ")\n";
+    std::cout << "signature:      " << mtkgfh::sig_type_name(fi.sig_type);
+    if (img.sha256_trailer) std::cout << ", the SHA-256 of the image from the first header (pack makes it again)";
+    else if (fi.sig_size) std::cout << ", " << fi.sig_size << " bytes, kept as it is (abr cannot make it again)";
+    std::cout << "\n";
+    std::cout << "headers:        " << img.chain.size() << (img.chain_pad.empty() ? std::string() : " and " + std::to_string(img.chain_pad.size()) + " bytes of padding") << "\n";
+    uint64_t at = img.at();
+    for (size_t i = 0; i < img.chain.size(); ++i) {
+        const mtkgfh::Header& h = img.chain[i];
+        std::cout << "  [" << i << "] " << mtkgfh::type_name(h.type) << " at " << mtk_hex(at) << ", " << h.size() << " bytes, version " << unsigned{h.version};
+        if (const std::string what = i > 0 ? mtkgfh::describe(h) : std::string(); !what.empty()) std::cout << ": " << what;
+        std::cout << "\n";
+        at += h.size();
+    }
+    if (!img.payload.empty()) {
+        std::cout << "loader:         " << img.payload.size() << " bytes at " << mtk_hex(img.at() + fi.hdr_size);
+        const Codec codec = detect_codec(img.payload);
+        std::cout << ", " << (codec == Codec::NONE ? std::string("not compressed") : std::string(codec_name(codec))) << "\n";
+        if (const std::optional<mtkgfh::Marker> mark = mtkgfh::find_bloader_marker(img.payload))
+            std::cout << "                " << mark->text << " at " << mtk_hex(img.at() + fi.hdr_size + mark->offset) << "\n";
+    }
+    print_envelope_info(Envelope::capture(data, 0, img.consumed));
+}
+
 // ------------------------------------------------------------------ layout --
 //
 // Where the parts of an image are (abr/layout.hpp). `unpack` says it of the image it took apart, `pack` of the image it built and `info`
@@ -3592,6 +3859,12 @@ std::optional<layout::Layout> describe_layout(Fmt f, const Bytes& whole) {
                 size_t consumed = 0;
                 (void)mtkimg::scan(whole, &consumed);
                 layout::around(l, whole, whole.size(), 0, consumed);
+                return l;
+            }
+            case Fmt::MTK_PRELOADER: {
+                layout::Layout l = layout::mtk_preloader(whole);
+                if (l.regions.empty()) return std::nullopt;
+                layout::around(l, whole, whole.size(), 0, mtkgfh::parse(whole).consumed);
                 return l;
             }
             default:
@@ -3989,6 +4262,10 @@ void print_info(const fs::path& path) {
             print_mtk_image_info(data);
             break;
         }
+        case Fmt::MTK_PRELOADER: {
+            print_mtk_preloader_info(data);
+            break;
+        }
         case Fmt::CHROMEOS: {
             Bytes kernel;
             const std::optional<legacy::ChromeosInfo> c = legacy::strip_chromeos(data, kernel);
@@ -4002,8 +4279,11 @@ void print_info(const fs::path& path) {
             const Identity id = identify(data);
             std::cout << "(unrecognized format"
                       << (id.kind == Kind::UNKNOWN ? std::string() : ": " + id.label) << ")\n";
-            if (legacy::has_sin_header(data)) std::cout << describe_unknown(data) << "\n";
-            else if (std::string note = id.unsupported_note(); !note.empty()) std::cout << note << "\n";
+            if (legacy::has_sin_header(data)) {
+                std::cout << describe_unknown(data) << "\n";
+            } else if (const std::string why = describe_unknown(data); why.rfind("unrecognized image format", 0) != 0) {
+                std::cout << why << "\n";  // (what the file looks like and why abr cannot read it, unless it looks like nothing)
+            }
             break;
         }
     }
@@ -4080,6 +4360,7 @@ Bytes build_image_once(const fs::path& dir, const RepackOptions& opt) {
         case Fmt::OSIP: result = repack_osip(m, dir, opt); break;
         case Fmt::CHROMEOS: result = repack_chromeos(m, dir, opt); break;
         case Fmt::MTK_IMAGE: result = repack_mtk_image(m, dir, opt); break;
+        case Fmt::MTK_PRELOADER: result = repack_mtk_preloader(m, dir, opt); break;
         case Fmt::UNKNOWN:
             throw FormatError("manifest.txt has no (or an unrecognized) 'type=' field");
     }
@@ -4227,6 +4508,7 @@ void do_unpack(const fs::path& in, const fs::path& outdir) {
             case Fmt::OSIP: unpack_osip(payload, outdir); break;
             case Fmt::CHROMEOS: unpack_chromeos(payload, outdir); break;
             case Fmt::MTK_IMAGE: unpack_mtk_image(payload, outdir); break;
+            case Fmt::MTK_PRELOADER: unpack_mtk_preloader(payload, outdir); break;
             case Fmt::UNKNOWN:
                 throw FormatError(in.string() + ": " + describe_unknown(payload));
         }

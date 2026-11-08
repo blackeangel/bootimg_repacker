@@ -17,6 +17,7 @@
 #include "abr/legacy/elf_boot.hpp"
 #include "abr/legacy/krnl.hpp"
 #include "abr/legacy/osip.hpp"
+#include "abr/mtkgfh.hpp"
 #include "abr/mtkimg.hpp"
 #include "abr/qcdt.hpp"
 #include "abr/uimage.hpp"
@@ -566,6 +567,53 @@ Layout mtk_image(const Bytes& d) {
             }
         }
         if (s.pad_size) l.add("padding", "", s.data_at + size, s.pad_size, 0, "alignment " + std::to_string(s.align));
+    }
+    return l;
+}
+
+Layout mtk_preloader(const Bytes& d) {
+    Layout l;
+    l.format = "MediaTek preloader (GFH)";
+    l.size = d.size();
+    mtkgfh::Image img;
+    try {
+        img = mtkgfh::parse(d);
+    } catch (const FormatError&) {
+        return l;
+    }
+    const mtkgfh::FileInfo fi = mtkgfh::read_file_info(img.chain[0]);
+    const uint64_t at = img.at();
+    if (img.device) {
+        const mtkgfh::Device& v = *img.device;
+        l.add("device header and BRLYT", "device", 0, at, 0, "");
+        l.add("device header", "", 0, std::min<uint64_t>(v.boot_size, at), 1, v.boot_name + ", version " + std::to_string(v.boot_version));
+        if (at >= mtkgfh::kDeviceHeaderSize + mtkgfh::kBrlytSize)
+            l.add("BRLYT", "", mtkgfh::kDeviceHeaderSize, mtkgfh::kBrlytSize, 1,
+                  mtkgfh::brlyt_type_name(v.type) + ", headers at " + hex(v.header_size) + ", size " + hex(v.total_size));
+    }
+    const mtkgfh::Header& first = img.chain[0];
+    l.add("FILE_INFO", "", at, first.size(), 0,
+          "load address " + hex(fi.load_addr) + ", code at " + hex(uint64_t{fi.load_addr} + fi.jump_offset) + ", signature " + mtkgfh::sig_type_name(fi.sig_type));
+    uint64_t o = at + first.size();
+    const uint64_t headers_end = at + fi.hdr_size;
+    if (headers_end > o) {
+        l.add("GFH headers", "headers", o, headers_end - o, 0, std::to_string(img.chain.size() - 1) + " behind FILE_INFO");
+        for (size_t i = 1; i < img.chain.size(); ++i) {
+            const mtkgfh::Header& h = img.chain[i];
+            l.add(mtkgfh::type_name(h.type), "", o, h.size(), 1, mtkgfh::describe(h));
+            o += h.size();
+        }
+        if (headers_end > o) l.add("padding", "", o, headers_end - o, 1, "");
+    }
+    if (!img.payload.empty()) {
+        Region& r = l.add("loader", "loader", headers_end, img.payload.size(), 0, "");
+        r.codec = codec_at(d, r.offset, r.size);
+        if (const std::optional<mtkgfh::Marker> m = mtkgfh::find_bloader_marker(img.payload)) r.note = m->text + " at " + hex(headers_end + m->offset);
+    }
+    if (!img.signature.empty()) {
+        const uint64_t sig_at = img.consumed - img.signature.size();
+        l.add("signature", img.sha256_trailer ? "" : "signature", sig_at, img.signature.size(), 0,
+              img.sha256_trailer ? "SHA-256 of the image from the first header; pack makes it again" : mtkgfh::sig_type_name(fi.sig_type) + ", kept as it is");
     }
     return l;
 }
