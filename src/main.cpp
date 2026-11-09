@@ -54,6 +54,7 @@
 #include "abr/legacy/osip.hpp"
 #include "abr/legacy/sin.hpp"
 #include "abr/manifest.hpp"
+#include "abr/mbn.hpp"
 #include "abr/mtkgfh.hpp"
 #include "abr/mtkimg.hpp"
 #include "abr/parallel.hpp"
@@ -101,7 +102,7 @@ std::string tails_text(std::initializer_list<std::pair<const char*, const Bytes*
 
 // ------------------------------------------------------------ detection --
 
-enum class Fmt { BOOT, VENDOR_BOOT, DTBO, DTB, FIT, QCDT, VBMETA, UIMAGE, ELF_BOOT, KRNL, BLOB, OSIP, CHROMEOS, MTK_IMAGE, MTK_PRELOADER, UNKNOWN };
+enum class Fmt { BOOT, VENDOR_BOOT, DTBO, DTB, FIT, QCDT, VBMETA, UIMAGE, ELF_BOOT, KRNL, BLOB, OSIP, CHROMEOS, MTK_IMAGE, MTK_PRELOADER, MBN, MBN_ELF, UNKNOWN };
 
 // Where the "ANDROID!" container starts: within the first kMagicSearchLimit bytes (a vendor
 // wrapper in front of it), or -- Barnes & Noble Nook images -- right behind the fixed-size
@@ -121,6 +122,8 @@ Fmt detect_format(const Bytes& d) {
     if (d.size() >= 8 && std::memcmp(d.data(), "ANDROID!", 8) == 0) return Fmt::BOOT;
     if (d.size() >= 8 && std::memcmp(d.data(), "VNDRBOOT", 8) == 0) return Fmt::VENDOR_BOOT;
     if (d.size() >= 4 && std::memcmp(d.data(), "AVB0", 4) == 0) return Fmt::VBMETA;
+    // The codeword and the magic of an SBL header begin nothing else: a file that has them is an MBN image, or one that abr cannot read (describe_unknown()).
+    if (mbn::has_sbl_words(d)) return mbn::flat_looks_like(d) ? Fmt::MBN : Fmt::UNKNOWN;
     if (mtkimg::looks_like(d, 0)) return Fmt::MTK_IMAGE;
     if (mtkgfh::looks_like(d)) return Fmt::MTK_PRELOADER;
     if (qcdt::looks_like(d)) return Fmt::QCDT;
@@ -133,9 +136,15 @@ Fmt detect_format(const Bytes& d) {
     }
     if (BlobImage::looks_like(d)) return Fmt::BLOB;
     if (d.size() >= 64 && std::memcmp(d.data() + d.size() - 64, "AVBf", 4) == 0) return Fmt::VBMETA;
+    // An ELF with a hash segment is an image of Qualcomm's secure boot, not a Sony boot image: asked first.
+    if (mbn::elf_looks_like(d)) return Fmt::MBN_ELF;
+    // ... and one whose hash segment cannot be read (the .mdt of a split firmware, say) is not a Sony boot image either: describe_unknown() says what is wrong.
+    if (!mbn::elf_problem(d).empty()) return Fmt::UNKNOWN;
     if (ElfBootImage::looks_like(d)) return Fmt::ELF_BOOT;
     if (KrnlImage::looks_like(d)) return Fmt::KRNL;
     if (OsipImage::looks_like(d)) return Fmt::OSIP;
+    // The flat MBN image has no magic, only a small number and a version in its first two words: asked last of the formats.
+    if (mbn::flat_looks_like(d)) return Fmt::MBN;
     // What starts like a Sony SIN container is never an ordinary image behind a vendor wrapper, even if an
     // "ANDROID!" can be found in the first 64 KiB: when the container holds a boot-family image,
     // peel_wrappers() has taken it off before this is asked, and when it does not (a system.sin) or is damaged,
@@ -200,6 +209,18 @@ std::string describe_unknown(const Bytes& d) {
     if (const std::optional<mtkgfh::Marker> mark = mtkgfh::find_bloader_marker(d); mark && mark->offset == 0)
         return "this starts with " + mark->text + ", the text that stands near the end of the code of a MediaTek preloader: it is that record on its own, not a loader image "
                "(a preloader has the GFH headers, FILE_INFO first, in front of its code), and abr cannot unpack it";
+    if (const std::string why = mbn::elf_problem(d); !why.empty())
+        return "this is an ELF with a hash segment, an image of Qualcomm's secure boot (an MBN), but abr cannot read it: " + why;
+    if (mbn::has_sbl_words(d)) {
+        const std::string why = mbn::flat_problem(d);
+        return "this starts with the codeword and the magic of the SBL header of an MBN image of Qualcomm's secure boot, but abr cannot read it: " +
+               (why.empty() ? std::string("it holds no code") : why);
+    }
+    if (d.size() >= 40 && u32le(0) <= 0xFF && (u32le(4) == 3 || u32le(4) == 5 || u32le(4) == 6 || u32le(4) == 7)) {
+        const std::string why = mbn::block_problem(d, 0, d.size());
+        return "this starts like the header of an MBN image of Qualcomm's secure boot (version " + std::to_string(u32le(4)) + "), but abr cannot read it: " +
+               (why.empty() ? std::string("it holds no code") : why);
+    }
     if (u16le(0x438) == 0xEF53)
         return "this is an ext2/3/4 filesystem image (system/vendor/product/... or a recovery "
                "dumped as a filesystem), not a boot-family container. Filesystems are out of "
@@ -242,6 +263,8 @@ const char* fmt_name(Fmt f) {
         case Fmt::CHROMEOS: return "chromeos";
         case Fmt::MTK_IMAGE: return "mtk_image";
         case Fmt::MTK_PRELOADER: return "mtk_preloader";
+        case Fmt::MBN: return "mbn";
+        case Fmt::MBN_ELF: return "mbn_elf";
         case Fmt::UNKNOWN: return "unknown";
     }
     return "unknown";
@@ -263,6 +286,8 @@ Fmt fmt_from_name(const std::string& s) {
     if (s == "chromeos") return Fmt::CHROMEOS;
     if (s == "mtk_image") return Fmt::MTK_IMAGE;
     if (s == "mtk_preloader") return Fmt::MTK_PRELOADER;
+    if (s == "mbn") return Fmt::MBN;
+    if (s == "mbn_elf") return Fmt::MBN_ELF;
     return Fmt::UNKNOWN;
 }
 
@@ -3480,7 +3505,7 @@ void print_mtk_image_info(const Bytes& data) {
 
 constexpr size_t kPreloaderSector = 0x200;  // the images of a partition that were looked at are a multiple of it
 
-std::string mtk_hex(uint64_t v) {
+std::string hex_text(uint64_t v) {
     char b[24];
     std::snprintf(b, sizeof b, "0x%llx", static_cast<unsigned long long>(v));
     return b;
@@ -3498,9 +3523,9 @@ std::optional<uint8_t> preloader_round_fill(const mtkgfh::Image& img, const Byte
 
 std::string preloader_basis_text(const mtkgfh::Device& v, mtkgfh::SizeBasis basis) {
     switch (basis) {
-        case mtkgfh::SizeBasis::File: return "the size of the file, " + mtk_hex(v.total_size);
-        case mtkgfh::SizeBasis::Chain: return "the end of the loader, " + mtk_hex(v.total_size);
-        default: return mtk_hex(v.total_size) + ", kept as it is";
+        case mtkgfh::SizeBasis::File: return "the size of the file, " + hex_text(v.total_size);
+        case mtkgfh::SizeBasis::Chain: return "the end of the loader, " + hex_text(v.total_size);
+        default: return hex_text(v.total_size) + ", kept as it is";
     }
 }
 
@@ -3565,34 +3590,34 @@ void unpack_mtk_preloader(const Bytes& data, const fs::path& dir) {
     if (!env.tail.empty()) note(std::to_string(env.tail.size()) + " bytes after the signature are kept verbatim (tail.bin)");
 
     // What was done, with the offsets and the sizes.
-    std::cout << "FILE_INFO: load address " << mtk_hex(fi.load_addr) << ", code at " << mtk_hex(uint64_t{fi.load_addr} + fi.jump_offset) << ", flash type "
+    std::cout << "FILE_INFO: load address " << hex_text(fi.load_addr) << ", code at " << hex_text(uint64_t{fi.load_addr} + fi.jump_offset) << ", flash type "
               << unsigned{fi.flash_type} << " (" << mtkgfh::flash_type_name(fi.flash_type) << "), signature " << mtkgfh::sig_type_name(fi.sig_type) << "\n";
     if (img.device) {
         const mtkgfh::Device& v = *img.device;
         std::cout << "  [device header and BRLYT] " << img.prefix.size() << " bytes at 0x0, " << v.boot_name << ", BRLYT " << mtkgfh::brlyt_type_name(v.type)
                   << " -> device.bin\n";
     }
-    std::cout << "  [FILE_INFO] " << img.chain[0].size() << " bytes at " << mtk_hex(img.at()) << "\n";
+    std::cout << "  [FILE_INFO] " << img.chain[0].size() << " bytes at " << hex_text(img.at()) << "\n";
     if (img.chain.size() > 1 || !img.chain_pad.empty()) {
         std::string names;
         for (size_t i = 1; i < img.chain.size(); ++i) names += (names.empty() ? "" : ", ") + mtkgfh::type_name(img.chain[i].type);
         std::cout << "  [headers] " << (img.chain.size() - 1) << " behind FILE_INFO (" << names << (img.chain_pad.empty() ? "" : "; " + std::to_string(img.chain_pad.size()) + " bytes of padding")
-                  << "), " << headers.size() << " bytes at " << mtk_hex(img.at() + img.chain[0].size()) << " -> headers.bin\n";
+                  << "), " << headers.size() << " bytes at " << hex_text(img.at() + img.chain[0].size()) << " -> headers.bin\n";
     }
     if (loader.present) {
-        std::cout << "  [loader] " << img.payload.size() << " bytes at " << mtk_hex(img.at() + fi.hdr_size) << ", "
+        std::cout << "  [loader] " << img.payload.size() << " bytes at " << hex_text(img.at() + fi.hdr_size) << ", "
                   << (loader.codec == Codec::NONE ? std::string("not compressed") : std::string(codec_name(loader.codec)) + " stream taken off") << " -> loader.bin\n";
         if (const std::optional<mtkgfh::Marker> mark = mtkgfh::find_bloader_marker(img.payload))
-            std::cout << "           " << mark->text << " at " << mtk_hex(img.at() + fi.hdr_size + mark->offset) << "\n";
+            std::cout << "           " << mark->text << " at " << hex_text(img.at() + fi.hdr_size + mark->offset) << "\n";
     }
     if (!img.signature.empty())
-        std::cout << "  [signature] " << img.signature.size() << " bytes at " << mtk_hex(sig_at) << ", " << mtkgfh::sig_type_name(fi.sig_type)
+        std::cout << "  [signature] " << img.signature.size() << " bytes at " << hex_text(sig_at) << ", " << mtkgfh::sig_type_name(fi.sig_type)
                   << (img.sha256_trailer ? ", the SHA-256 of the image from the first header (made again by pack)" : ", kept as it is (signature.bin)") << "\n";
     if (!img.sha256_trailer && !img.signature.empty())
         note(std::string("the signature is ") + (fi.sig_type == mtkgfh::kSigSha256 ? "not the SHA-256 of the image (it is kept as it is)" : "of a kind that abr cannot make again") +
              ": a loader that is edited no longer matches it");
     if (fi.max_size && fi.total_size > fi.max_size)
-        warn("the image is " + std::to_string(fi.total_size) + " bytes, more than the max_size that FILE_INFO gives (" + mtk_hex(fi.max_size) + ")");
+        warn("the image is " + std::to_string(fi.total_size) + " bytes, more than the max_size that FILE_INFO gives (" + hex_text(fi.max_size) + ")");
 
     m.save(dir / "manifest.txt",
            "abr mtk_preloader manifest -- edit then `abr pack -i " + dir.string() + " -o out.img`\n"
@@ -3616,7 +3641,7 @@ Bytes repack_mtk_preloader(const Manifest& m, const fs::path& dir, const RepackO
         if (!img.device)
             throw FormatError("device.bin is not the device header and the BRLYT of a boot medium (EMMC_BOOT, SF_BOOT or SDMMC_BOOT, 0x200 bytes, then \"BRLYT\")");
         if (img.device->header_size != img.prefix.size())
-            throw FormatError("device.bin is " + std::to_string(img.prefix.size()) + " bytes, and its BRLYT says that the headers begin at " + mtk_hex(img.device->header_size) +
+            throw FormatError("device.bin is " + std::to_string(img.prefix.size()) + " bytes, and its BRLYT says that the headers begin at " + hex_text(img.device->header_size) +
                               " (the BRLYT is at 0x200: header_size, then total_size)");
         const std::string basis = m.get("brlyt_basis", "literal");
         const std::optional<mtkgfh::SizeBasis> b = mtkgfh::size_basis_from_name(basis);
@@ -3668,7 +3693,7 @@ Bytes repack_mtk_preloader(const Manifest& m, const fs::path& dir, const RepackO
                  " bytes, signature.bin) came with: it is kept as it is, abr cannot make it again, and a boot ROM that checks it will not accept this image");
     }
     if (fi.max_size && total > fi.max_size)
-        warn("the image is " + std::to_string(total) + " bytes, more than the max_size of FILE_INFO (" + mtk_hex(fi.max_size) + "); raise max_size in manifest.txt if that is meant");
+        warn("the image is " + std::to_string(total) + " bytes, more than the max_size of FILE_INFO (" + hex_text(fi.max_size) + "); raise max_size in manifest.txt if that is meant");
 
     Bytes out = assemble_envelope(m, dir, core, opt);
     const uint64_t align = m.get_int("file_align", 1, 1, 1 << 20);
@@ -3685,14 +3710,14 @@ void print_mtk_preloader_info(const Bytes& data) {
     if (img.device) {
         const mtkgfh::Device& v = *img.device;
         std::cout << "device header:  " << v.boot_name << ", version " << v.boot_version << ", " << v.boot_size << " bytes\n";
-        std::cout << "BRLYT:          " << mtkgfh::brlyt_type_name(v.type) << ", version " << v.version << ", the headers begin at " << mtk_hex(v.header_size) << ", size "
+        std::cout << "BRLYT:          " << mtkgfh::brlyt_type_name(v.type) << ", version " << v.version << ", the headers begin at " << hex_text(v.header_size) << ", size "
                   << preloader_basis_text(v, img.basis) << "\n";
     }
     std::cout << "FILE_INFO:      " << shown(fi.name_text()) << ", header version " << unsigned{fi.version} << ", file version " << fi.file_ver << ", file type " << fi.file_type
-              << ", flash type " << unsigned{fi.flash_type} << " (" << mtkgfh::flash_type_name(fi.flash_type) << "), processed " << mtk_hex(fi.processed) << "\n";
-    std::cout << "load address:   " << mtk_hex(fi.load_addr) << ", jump offset " << mtk_hex(fi.jump_offset) << ": the code is at " << mtk_hex(uint64_t{fi.load_addr} + fi.jump_offset) << "\n";
+              << ", flash type " << unsigned{fi.flash_type} << " (" << mtkgfh::flash_type_name(fi.flash_type) << "), processed " << hex_text(fi.processed) << "\n";
+    std::cout << "load address:   " << hex_text(fi.load_addr) << ", jump offset " << hex_text(fi.jump_offset) << ": the code is at " << hex_text(uint64_t{fi.load_addr} + fi.jump_offset) << "\n";
     std::cout << "sizes:          headers " << fi.hdr_size << ", loader " << img.payload.size() << ", signature " << fi.sig_size << ", total " << fi.total_size << " bytes (max_size "
-              << mtk_hex(fi.max_size) << (fi.max_size && fi.total_size > fi.max_size ? ": EXCEEDED" : "") << ")\n";
+              << hex_text(fi.max_size) << (fi.max_size && fi.total_size > fi.max_size ? ": EXCEEDED" : "") << ")\n";
     std::cout << "signature:      " << mtkgfh::sig_type_name(fi.sig_type);
     if (img.sha256_trailer) std::cout << ", the SHA-256 of the image from the first header (pack makes it again)";
     else if (fi.sig_size) std::cout << ", " << fi.sig_size << " bytes, kept as it is (abr cannot make it again)";
@@ -3701,19 +3726,451 @@ void print_mtk_preloader_info(const Bytes& data) {
     uint64_t at = img.at();
     for (size_t i = 0; i < img.chain.size(); ++i) {
         const mtkgfh::Header& h = img.chain[i];
-        std::cout << "  [" << i << "] " << mtkgfh::type_name(h.type) << " at " << mtk_hex(at) << ", " << h.size() << " bytes, version " << unsigned{h.version};
+        std::cout << "  [" << i << "] " << mtkgfh::type_name(h.type) << " at " << hex_text(at) << ", " << h.size() << " bytes, version " << unsigned{h.version};
         if (const std::string what = i > 0 ? mtkgfh::describe(h) : std::string(); !what.empty()) std::cout << ": " << what;
         std::cout << "\n";
         at += h.size();
     }
     if (!img.payload.empty()) {
-        std::cout << "loader:         " << img.payload.size() << " bytes at " << mtk_hex(img.at() + fi.hdr_size);
+        std::cout << "loader:         " << img.payload.size() << " bytes at " << hex_text(img.at() + fi.hdr_size);
         const Codec codec = detect_codec(img.payload);
         std::cout << ", " << (codec == Codec::NONE ? std::string("not compressed") : std::string(codec_name(codec))) << "\n";
         if (const std::optional<mtkgfh::Marker> mark = mtkgfh::find_bloader_marker(img.payload))
-            std::cout << "                " << mark->text << " at " << mtk_hex(img.at() + fi.hdr_size + mark->offset) << "\n";
+            std::cout << "                " << mark->text << " at " << hex_text(img.at() + fi.hdr_size + mark->offset) << "\n";
     }
     print_envelope_info(Envelope::capture(data, 0, img.consumed));
+}
+
+// ------------------------------------------------------------------ mbn --
+//
+// The images of Qualcomm's secure boot (abr/mbn.hpp): sbl1/xbl, tz, hyp, rpm, aboot/appsboot, devcfg, keymaster and the like. One structure -- a header and what
+// hangs on it: metadata, code, signature, certificate chain -- in one of two containers.
+//
+//   type=mbn      the file is the structure (aboot/appsboot, the SBL1 of older chips). `unpack` writes
+//                   code.bin                              the code, with a compression taken off if it has one,
+//                   metadata*.bin, signature*.bin, cert_chain*.bin    the other parts (QTI's and the OEM's; only those the image has),
+//                 and the words of the header that are not sizes into the manifest. `pack` works out the sizes, image_size and -- where they were address
+//                 plus size -- the addresses of the signature and the chain again, from the files.
+//   type=mbn_elf  the file is an ELF whose program headers describe the segments of the firmware, one of them the hash segment, which holds the structure
+//                 and whose code is a table of the hashes of the segments. `unpack` writes seg<N>.bin, the data of program header N (a compression on it taken
+//                 off), the parts of the structure as above, and into the manifest the ELF header and every program header. `pack` writes the ELF again
+//                 (the layout that Qualcomm's tools make; an ELF that is laid out in another way is kept as skeleton.bin) and makes the table of hashes
+//                 again.
+// A signature and a certificate chain cannot be made again: they are kept as they are, and a warning says when what they were made for has changed.
+
+// The parts of the structure that follow the header and are files of their own (the code is a component, and in an ELF the table of hashes is made again).
+struct MbnPart {
+    const char* prefix;  // the prefix of its keys and the stem of its file: signature -> signature_file=signature.bin
+    Bytes mbn::Block::*member;
+    const char* what;
+};
+const MbnPart kMbnParts[] = {
+    {"metadata_qti", &mbn::Block::metadata_qti, "QTI metadata"},
+    {"metadata", &mbn::Block::metadata, "metadata"},
+    {"signature_qti", &mbn::Block::sig_qti, "QTI signature"},
+    {"cert_chain_qti", &mbn::Block::cert_qti, "QTI certificate chain"},
+    {"signature", &mbn::Block::sig, "signature"},
+    {"cert_chain", &mbn::Block::cert, "certificate chain"},
+};
+
+// "header version 3 (40 bytes), image id 5 (APPSBL)".
+std::string mbn_block_text(const mbn::Block& b) {
+    std::string s = mbn::describe_header(b);
+    if (b.has_word("image_id")) {
+        const uint32_t id = b.word("image_id");
+        const std::string name = mbn::image_id_name(id);
+        s += ", image id " + std::to_string(id) + (name.empty() ? std::string() : " (" + name + ")");
+    }
+    return s;
+}
+
+// What of the header is written to the manifest: the version, the words that nothing derives, how the addresses of the signature and the chain were made,
+// the rounding; and the parts as files. The sizes are not: pack works them out.
+void save_mbn_block(Manifest& m, const fs::path& dir, const mbn::Block& b) {
+    if (b.kind == mbn::Kind::Sbl) m.set("header_kind", "sbl");
+    else m.set_u32("header_version", b.version);
+    for (const mbn::Field& f : mbn::fields(b.kind, b.version))
+        if (f.use == mbn::Field::Use::Keep) m.set_addr(f.name, b.w[f.index]);
+    if (b.has_word("sig_ptr")) {
+        if (b.derived_ptrs) {
+            m.set("ptrs", "derived");
+            m.set_addr("ptr_base", b.ptr_base);
+        } else {
+            m.set("ptrs", "literal");
+            m.set_addr("sig_ptr", b.word("sig_ptr"));
+            m.set_addr("cert_ptr", b.word("cert_ptr"));
+        }
+    }
+    if (b.has_word("image_size")) m.set_bool("align4", b.align4);
+    if (!b.slack.empty()) m.set_hex("slack", b.slack);
+    for (const MbnPart& p : kMbnParts) save_raw(m, dir, p.prefix, b.*p.member, std::string(p.prefix) + ".bin");
+}
+
+// The structure of the manifest, without the code (the caller loads that).
+mbn::Block load_mbn_block(const Manifest& m, const fs::path& dir) {
+    const std::string kind = m.get("header_kind", "boot");
+    if (kind != "boot" && kind != "sbl") throw FormatError("manifest.txt: " + shown("header_kind=" + kind) + " is neither boot nor sbl");
+    const mbn::Kind k = kind == "sbl" ? mbn::Kind::Sbl : mbn::Kind::Boot;
+    uint32_t version = 0;
+    if (k == mbn::Kind::Boot) {
+        if (!m.has("header_version")) throw FormatError("manifest.txt: header_version is missing (3, 5, 6 or 7)");
+        version = m.get_u32("header_version", 0);
+        if (mbn::header_size(k, version) == 0) throw FormatError("manifest.txt: " + shown("header_version=" + m.get("header_version")) + " is none of 3, 5, 6, 7");
+    }
+    mbn::Block b = mbn::make_block(k, version);
+    for (const mbn::Field& f : mbn::fields(b.kind, b.version))
+        if (f.use == mbn::Field::Use::Keep && m.has(f.name)) b.w[f.index] = m.get_addr32(f.name, b.w[f.index]);
+    if (b.has_word("sig_ptr")) {
+        const std::string ptrs = m.get("ptrs", "literal");
+        if (ptrs == "derived") {
+            b.derived_ptrs = true;
+            b.ptr_base = m.get_addr32("ptr_base", 0);
+        } else if (ptrs == "literal") {
+            b.set_word("sig_ptr", m.get_addr32("sig_ptr", 0));
+            b.set_word("cert_ptr", m.get_addr32("cert_ptr", 0));
+        } else {
+            throw FormatError("manifest.txt: " + shown("ptrs=" + ptrs) + " is neither derived nor literal");
+        }
+    }
+    if (b.has_word("image_size")) b.align4 = m.get_bool("align4", false);
+    b.slack = m.get_hex("slack");
+    for (const MbnPart& p : kMbnParts) b.*p.member = load_raw(m, dir, p.prefix);
+    return b;
+}
+
+// SHA-256 of the signature and the certificate chains (QTI's and the OEM's), to tell at pack whether they are the ones the image came with.
+Bytes mbn_signature_parts_hash(const mbn::Block& b) {
+    hash::Sha256 h;
+    for (const Bytes* part : {&b.sig_qti, &b.cert_qti, &b.sig, &b.cert})
+        if (!part->empty()) h.update(part->data(), part->size());
+    return h.finish();
+}
+
+size_t mbn_signature_bytes(const mbn::Block& b) { return b.sig_qti.size() + b.cert_qti.size() + b.sig.size() + b.cert.size(); }
+
+// An image that was changed is no longer the one that its signature and its certificate chain were made for, and abr cannot make them again. Said
+// unless the files of the signature were put there by somebody (they are not the ones the image came with).
+void warn_stale_signature(const Manifest& m, const Bytes& core, const mbn::Block& b) {
+    const size_t n = mbn_signature_bytes(b);
+    if (n == 0 || !core_changed(m, core)) return;
+    if (m.has("signature_parts_sha256") && mbn_signature_parts_hash(b) != m.get_hex("signature_parts_sha256")) return;
+    warn("the image was changed, and its signature and certificate chain (" + std::to_string(n) + " bytes) are kept as they were: abr cannot sign, and a loader that checks "
+         "the signature will not accept an image that is not the one it was made for");
+}
+
+// What `unpack` records of the image's own bytes: what is kept around the structure, a hash of the structure (to tell a changed image from an untouched
+// one) and of the signature (to tell whether it was replaced).
+void save_mbn_envelope(Manifest& m, const fs::path& dir, const Bytes& data, size_t consumed, const mbn::Block& b) {
+    const Envelope env = Envelope::capture(data, 0, consumed);
+    save_envelope(m, dir, env, data, 0, consumed);
+    if (!env.tail.empty()) note(std::to_string(env.tail.size()) + " bytes after the image are kept verbatim (tail.bin)");
+    m.set_hex("core_sha256", hash::sha256(data.data(), consumed));
+    if (mbn_signature_bytes(b)) m.set_hex("signature_parts_sha256", mbn_signature_parts_hash(b));
+}
+
+// "code 350880, QTI signature 256, certificate chain 2764".
+std::string mbn_sizes_text(const mbn::Block& b, const char* code_what) {
+    std::string s = std::string(code_what) + " " + std::to_string(b.code.size());
+    for (const MbnPart& p : kMbnParts)
+        if (!(b.*p.member).empty()) s += std::string(", ") + p.what + " " + std::to_string((b.*p.member).size());
+    return s;
+}
+
+// The certificates of a chain, one line each: the subject, and what the subject says of the image in the words of Qualcomm's documents (SW_ID, HW_ID, ...).
+void print_mbn_chain(const std::string& label, const Bytes& chain) {
+    if (chain.empty()) return;
+    size_t rest = 0;
+    const std::vector<mbn::Cert> certs = mbn::read_chain(chain, &rest);
+    std::cout << label << chain.size() << " bytes, " << certs.size() << (certs.size() == 1 ? " certificate" : " certificates")
+              << (rest ? ", then " + std::to_string(rest) + " bytes of fill" : std::string()) << "\n";
+    for (size_t i = 0; i < certs.size(); ++i) {
+        std::cout << "    [" << i << "] " << shown(certs[i].subject) << "\n";
+        std::string attributes;
+        for (const std::string& ou : certs[i].attributes)
+            if (const std::string t = mbn::attribute_text(ou); !t.empty()) attributes += (attributes.empty() ? "" : ", ") + t;
+        if (!attributes.empty()) std::cout << "        " << attributes << "\n";
+        if (certs[i].issuer != certs[i].subject) std::cout << "        issued by " << shown(certs[i].issuer) << "\n";
+    }
+}
+
+// What `info` says of a structure -- the same for a flat file and for the hash segment of an ELF.
+void print_mbn_block_info(const mbn::Block& b, const char* code_what) {
+    std::cout << "header:         " << mbn_block_text(b) << "\n";
+    std::string words;
+    for (const mbn::Field& f : mbn::fields(b.kind, b.version)) {
+        if (f.use != mbn::Field::Use::Keep || std::string_view(f.name) == "image_id") continue;
+        if (b.w[f.index] == 0 && std::string_view(f.name).substr(0, 8) == "reserved") continue;
+        words += (words.empty() ? "" : ", ") + std::string(f.name) + " " + hex_text(b.w[f.index]);
+    }
+    if (!words.empty()) std::cout << "words:          " << words << "\n";
+    std::cout << "sizes:          " << mbn_sizes_text(b, code_what);
+    if (b.has_word("image_size")) std::cout << ", image_size " << b.word("image_size") << (b.slack.empty() ? std::string() : " (" + std::to_string(b.slack.size()) + " bytes of rounding)");
+    std::cout << "\n";
+    if (b.has_word("sig_ptr"))
+        std::cout << "addresses:      signature " << hex_text(b.word("sig_ptr")) << ", certificate chain " << hex_text(b.word("cert_ptr"))
+                  << (b.derived_ptrs ? " (pack works them out from the sizes)" : " (kept as they are)") << "\n";
+    if (const size_t n = mbn_signature_bytes(b))
+        std::cout << "signature:      " << n << " bytes of signature and certificate chain, kept as they are (abr cannot sign: an image that is edited no longer matches them)\n";
+    print_mbn_chain("certificates:   QTI's ", b.cert_qti);
+    print_mbn_chain("certificates:   ", b.cert);
+}
+
+// ---- mbn: unpack
+
+void unpack_mbn(const Bytes& data, const fs::path& dir) {
+    const mbn::Block b = mbn::parse_block(data, 0, data.size());
+    Manifest m;
+    m.set("type", "mbn");
+    save_mbn_block(m, dir, b);
+
+    // The code: a compression on it is taken off, like that of any component.
+    DecodedComponent code;
+    if (!b.code.empty()) {
+        progress::enter("decode", b.code.size());
+        const progress::Activity doing("code.bin");
+        fs::create_directories(dir / ".abr_raw");
+        code = decode_component(b.code, "code.bin", /*strip_mtk=*/false);
+        write_file(dir / "code.bin", code.plain);
+        write_file(dir / ".abr_raw" / "code.bin.raw", code.stored(b.code));
+        progress::advance(b.code.size());
+        record_component(m, "code", "code.bin", code);
+    }
+    save_mbn_envelope(m, dir, data, b.consumed, b);
+
+    std::cout << "MBN: " << mbn_block_text(b) << "\n";
+    if (code.present)
+        std::cout << "  [code] " << b.code.size() << " bytes, " << (code.codec == Codec::NONE ? std::string("not compressed") : std::string(codec_name(code.codec)) + " stream taken off")
+                  << " -> code.bin\n";
+    for (const MbnPart& p : kMbnParts)
+        if (!(b.*p.member).empty()) std::cout << "  [" << p.what << "] " << (b.*p.member).size() << " bytes -> " << p.prefix << ".bin\n";
+    print_mbn_chain("  certificates: QTI's ", b.cert_qti);
+    print_mbn_chain("  certificates: ", b.cert);
+    if (mbn_signature_bytes(b))
+        note("the signature and the certificate chain are kept as they are (abr cannot sign): an image that is edited no longer matches them, and a loader that checks the signature will not accept it");
+
+    m.save(dir / "manifest.txt",
+           "abr mbn manifest -- edit then `abr pack -i " + dir.string() + " -o out.mbn`\n"
+           "# NOTE: pack works out the sizes of the header (code_size, sig_size, cert_size, ...), image_size and, with ptrs=derived, the addresses of the signature and the\n"
+           "# chain, from the files. code.bin is the code (code_compression says what it was compressed with: it is compressed again). metadata*.bin, signature*.bin and\n"
+           "# cert_chain*.bin are the other parts of the structure; delete the key of one (metadata_file, signature_file, ...) to leave it out. The other words of the header\n"
+           "# are kept as they are. abr cannot sign: the signature and the chain are kept as they are, and an image that was changed no longer matches them.");
+}
+
+// ---- mbn: pack
+
+Bytes repack_mbn(const Manifest& m, const fs::path& dir, const RepackOptions& opt) {
+    mbn::Block b = load_mbn_block(m, dir);
+    if (!m.has("code_file")) throw FormatError("manifest.txt: code_file is missing: a flat MBN image holds code (code.bin)");
+    b.code = load_component(m, dir, "code", opt);
+    const Bytes core = mbn::build_block(b);
+    warn_stale_signature(m, core, b);
+    return assemble_envelope(m, dir, core, opt);
+}
+
+// ---- mbn: info
+
+void print_mbn_info(const Bytes& data) {
+    const mbn::Block b = mbn::parse_block(data, 0, data.size());
+    print_mbn_block_info(b, "code");
+    if (!b.code.empty()) {
+        const Codec codec = detect_codec(b.code);
+        std::cout << "code:           " << b.code.size() << " bytes, " << (codec == Codec::NONE ? std::string("not compressed") : std::string(codec_name(codec))) << "\n";
+    }
+    print_envelope_info(Envelope::capture(data, 0, b.consumed));
+}
+
+// ---- mbn_elf
+
+// The type of a program header in the manifest: its name when it has one, else the number.
+const char* const kPhdrTypeNames[] = {"null", "load", "dynamic", "interp", "note", "shlib", "phdr", "tls"};
+constexpr size_t kPhdrTypeNameCount = sizeof kPhdrTypeNames / sizeof kPhdrTypeNames[0];
+
+std::string phdr_type_text(uint32_t type) { return type < kPhdrTypeNameCount ? std::string(kPhdrTypeNames[type]) : hex_text(type); }
+
+uint32_t phdr_type_value(const Manifest& m, const std::string& key, uint32_t def) {
+    if (!m.has(key)) return def;
+    const std::string text = m.get(key);
+    for (size_t i = 0; i < kPhdrTypeNameCount; ++i)
+        if (text == kPhdrTypeNames[i]) return static_cast<uint32_t>(i);
+    return m.get_u32(key, def);  // a number, or the error that names the key and the value
+}
+
+std::string mbn_phdr_text(size_t index, const mbn::Segment& s) {
+    const mbn::Phdr& p = s.ph;
+    std::string text = "  [" + std::to_string(index) + "] " + phdr_type_text(p.type) + ", " + mbn::describe_flags(p.flags) + ": offset " + hex_text(p.offset) + ", " + std::to_string(p.filesz) +
+                       " bytes, address " + hex_text(p.paddr) + (p.vaddr != p.paddr ? " (virtual " + hex_text(p.vaddr) + ")" : std::string()) + ", memory " + std::to_string(p.memsz) +
+                       " bytes, align " + hex_text(p.align);
+    if (s.role == mbn::Role::Headers) text += " -- placeholder for the ELF header and the program headers";
+    else if (s.role == mbn::Role::Hash) text += " -- the hash segment";
+    return text;
+}
+
+std::string mbn_table_text(const mbn::Elf& e) {
+    if (e.block.code.empty()) return "no table of hashes";
+    if (e.algo != mbn::Algo::None)
+        return std::to_string(e.block.code.size() / mbn::digest_size(e.algo)) + " hashes of " + mbn::algo_name(e.algo) + ", the table abr makes of these segments (pack makes it again)";
+    return std::to_string(e.block.code.size()) + " bytes, not a table that abr can make of the segments: kept as it is, and not checked";
+}
+
+void unpack_mbn_elf(const Bytes& data, const fs::path& dir) {
+    const mbn::Elf e = mbn::parse_elf(data);
+    Manifest m;
+    m.set("type", "mbn_elf");
+    m.set_u32("elf_class", e.is64 ? 64 : 32);
+    m.set_u32("elf_type", e.type);
+    m.set_u32("elf_machine", e.machine);
+    m.set_addr("elf_entry", e.entry);
+    m.set_addr("elf_flags", e.flags);
+    m.set_u32("elf_shentsize", e.shentsize);
+    m.set("elf_layout", e.tidy ? "tidy" : "skeleton");
+    if (e.tidy) m.set_addr("elf_fill", e.fill);
+    else save_raw(m, dir, "skeleton", e.skeleton, "skeleton.bin");
+    m.set_u32("segments", static_cast<uint32_t>(e.seg.size()));
+    if (e.tidy) {
+        // (a layout that is not tidy keeps the program headers in skeleton.bin)
+        for (size_t i = 0; i < e.seg.size(); ++i) {
+            const mbn::Phdr& p = e.seg[i].ph;
+            const std::string k = "seg" + std::to_string(i);
+            m.set(k + "_type", phdr_type_text(p.type));
+            m.set_addr(k + "_flags", p.flags);
+            m.set_addr(k + "_offset", p.offset);
+            m.set_addr(k + "_vaddr", p.vaddr);
+            m.set_addr(k + "_paddr", p.paddr);
+            m.set_addr(k + "_memsz", p.memsz);
+            m.set_addr(k + "_align", p.align);
+        }
+    }
+    save_mbn_block(m, dir, e.block);
+    if (e.algo != mbn::Algo::None) m.set("hash_table", mbn::algo_key(e.algo));
+    else save_raw(m, dir, "hash_table", e.block.code, "hash_table.bin");
+    save_raw(m, dir, "hash_pad", e.hash_pad, "hash_pad.bin");
+
+    // The data of the segments: a compression on it is taken off, like that of any component.
+    std::vector<ComponentSource> sources;
+    std::vector<size_t> index;
+    for (size_t i = 0; i < e.seg.size(); ++i) {
+        if (e.seg[i].role != mbn::Role::Plain || e.seg[i].data.empty()) continue;
+        sources.push_back({&e.seg[i].data, "seg" + std::to_string(i) + ".bin"});
+        index.push_back(i);
+    }
+    const std::vector<DecodedComponent> decoded = save_components(dir, sources);
+    for (size_t k = 0; k < decoded.size(); ++k) record_component(m, "seg" + std::to_string(index[k]), sources[k].filename, decoded[k]);
+    save_mbn_envelope(m, dir, data, e.consumed, e.block);
+
+    std::cout << "MBN ELF: " << (e.is64 ? "ELF64" : "ELF32") << ", " << e.seg.size() << " program headers; the hash segment is program header " << e.hash_index << ", "
+              << mbn_block_text(e.block) << "; table: " << mbn_table_text(e) << "\n";
+    for (size_t k = 0; k < decoded.size(); ++k)
+        if (decoded[k].codec != Codec::NONE)
+            std::cout << "  [segment " << index[k] << "] " << sources[k].raw->size() << " bytes, " << codec_name(decoded[k].codec) << " stream taken off -> " << sources[k].filename << "\n";
+    print_mbn_chain("  certificates: QTI's ", e.block.cert_qti);
+    print_mbn_chain("  certificates: ", e.block.cert);
+    if (!e.tidy)
+        note("the layout of this ELF is not the one that Qualcomm's tools make (section headers, bytes between the segments that are not a fill, or other sizes of the headers): its headers and "
+             "the bytes between the segments are kept in skeleton.bin, and every segment must keep its size when it is packed");
+    if (e.algo == mbn::Algo::None && !e.block.code.empty())
+        note("the table of hashes is not one that abr can make of these segments: it is kept as it is (hash_table.bin), and an edited segment is not in it");
+    if (mbn_signature_bytes(e.block))
+        note("the signature and the certificate chain are kept as they are (abr cannot sign): an image that is edited no longer matches them, and a loader that checks the signature will not accept it");
+
+    m.save(dir / "manifest.txt",
+           "abr mbn_elf manifest -- edit then `abr pack -i " + dir.string() + " -o out.mbn`\n"
+           "# NOTE: seg<N>.bin is the data of program header N (seg<N>_compression says what it was compressed with: it is compressed again). pack writes the ELF header, the\n"
+           "# program headers and the data of the segments in the order they were in, and works out p_filesz and the hash segment; segN_offset is where the data of segment N was\n"
+           "# and is kept while the segments before it leave room (they move it on when they grow); p_memsz grows with p_filesz where it must. hash_table=sha256 (sha1, sha384) is\n"
+           "# the table of hashes of the segments, made again; hash_table.bin is a table that abr cannot make: it is kept as it is. The header words, metadata*.bin, signature*.bin\n"
+           "# and cert_chain*.bin are as in an `mbn` folder. With elf_layout=skeleton the ELF header, the program headers and the bytes between the segments are skeleton.bin.\n"
+           "# abr cannot sign: the signature and the chain are kept as they are, and an image that was changed no longer matches them.");
+}
+
+// ---- mbn_elf: pack
+
+Bytes repack_mbn_elf(const Manifest& m, const fs::path& dir, const RepackOptions& opt) {
+    const std::string layout = m.get("elf_layout", "tidy");
+    mbn::Elf e;
+    if (layout == "skeleton") {
+        const Bytes skeleton = load_raw(m, dir, "skeleton");
+        if (skeleton.empty()) throw FormatError("manifest.txt: elf_layout=skeleton needs skeleton_file (skeleton.bin): the ELF header and the program headers as they were");
+        e = mbn::elf_shell(skeleton);
+    } else if (layout == "tidy") {
+        const uint64_t cls = m.get_int("elf_class", 32, 1, 64);
+        if (cls != 32 && cls != 64) throw FormatError("manifest.txt: " + shown("elf_class=" + m.get("elf_class")) + " is neither 32 nor 64");
+        e.is64 = cls == 64;
+        const unsigned bits = e.is64 ? 64 : 32;
+        e.type = static_cast<uint16_t>(m.get_bounded("elf_type", 2, 16));
+        e.machine = static_cast<uint16_t>(m.get_bounded("elf_machine", 0, 16));
+        e.entry = m.get_bounded("elf_entry", 0, bits);
+        e.flags = static_cast<uint32_t>(m.get_bounded("elf_flags", 0, 32));
+        e.shentsize = static_cast<uint16_t>(m.get_bounded("elf_shentsize", 0, 16));
+        e.fill = static_cast<uint8_t>(m.get_bounded("elf_fill", 0, 8));
+        if (!m.has("segments")) throw FormatError("manifest.txt: segments is missing (the number of program headers)");
+        const uint32_t count = m.get_count("segments");
+        for (uint32_t i = 0; i < count; ++i) {
+            const std::string k = "seg" + std::to_string(i);
+            mbn::Segment s;
+            s.ph.type = phdr_type_value(m, k + "_type", 1);
+            s.ph.flags = static_cast<uint32_t>(m.get_bounded(k + "_flags", 0, 32));
+            s.ph.offset = m.get_bounded(k + "_offset", 0, bits);
+            s.ph.vaddr = m.get_bounded(k + "_vaddr", 0, bits);
+            s.ph.paddr = m.get_bounded(k + "_paddr", 0, bits);
+            s.ph.memsz = m.get_bounded(k + "_memsz", 0, bits);
+            s.ph.align = m.get_bounded(k + "_align", 0, bits);
+            e.seg.push_back(std::move(s));
+        }
+        mbn::classify(e);
+    } else {
+        throw FormatError("manifest.txt: " + shown("elf_layout=" + layout) + " is neither tidy nor skeleton");
+    }
+
+    e.block = load_mbn_block(m, dir);
+    if (m.has("hash_table")) {
+        const std::string name = m.get("hash_table");
+        const std::optional<mbn::Algo> algo = mbn::algo_from_key(name);
+        if (!algo || *algo == mbn::Algo::None)
+            throw FormatError("manifest.txt: " + shown("hash_table=" + name) + " is none of sha1, sha256, sha384 (the hashes that abr makes; a table of another kind is the file hash_table.bin, hash_table_file=)");
+        e.algo = *algo;
+    } else {
+        e.block.code = load_raw(m, dir, "hash_table");
+    }
+    e.hash_pad = load_raw(m, dir, "hash_pad");
+
+    // The data of the segments, compressed again where it is an edited file.
+    std::vector<std::string> prefixes;
+    std::vector<size_t> index;
+    for (size_t i = 0; i < e.seg.size(); ++i) {
+        const std::string k = "seg" + std::to_string(i);
+        if (e.seg[i].role != mbn::Role::Plain || !m.has(k + "_file")) continue;
+        prefixes.push_back(k);
+        index.push_back(i);
+    }
+    std::vector<Bytes> data = load_components(m, dir, prefixes, opt);
+    for (size_t j = 0; j < index.size(); ++j) e.seg[index[j]].data = std::move(data[j]);
+
+    std::string moved;
+    const Bytes core = mbn::build_elf(e, &moved);
+    if (!moved.empty()) note("a segment grew, and what is behind it moved on: " + moved.substr(moved.find(' ') + 1));
+    warn_stale_signature(m, core, e.block);
+    if (e.algo == mbn::Algo::None && !e.block.code.empty() && core_changed(m, core))
+        warn("the image was changed, but its table of hashes (hash_table.bin) is not one that abr can make: it is kept as it is, and a loader that checks the segments against it will not accept an image whose segments were changed");
+    return assemble_envelope(m, dir, core, opt);
+}
+
+// ---- mbn_elf: info
+
+void print_mbn_elf_info(const Bytes& data) {
+    const mbn::Elf e = mbn::parse_elf(data);
+    std::cout << "class:          " << (e.is64 ? "ELF64" : "ELF32") << ", little-endian, type " << e.type << ", machine " << e.machine << ", entry " << hex_text(e.entry) << ", flags "
+              << hex_text(e.flags) << "\n";
+    std::cout << "program headers: " << e.seg.size() << " at " << hex_text(e.phoff) << ", " << e.phentsize << " bytes each\n";
+    for (size_t i = 0; i < e.seg.size(); ++i) std::cout << mbn_phdr_text(i, e.seg[i]) << "\n";
+    std::cout << "layout:         "
+              << (e.tidy ? "the one that Qualcomm's tools make (the ELF header, the program headers, then the segments; pack writes it again)"
+                         : "not the one that Qualcomm's tools make: kept as it is (skeleton.bin), every segment keeps its size when packed")
+              << "\n";
+    std::cout << "hash segment:   program header " << e.hash_index << "\n";
+    print_mbn_block_info(e.block, "hash table");
+    std::cout << "hash table:     " << mbn_table_text(e) << "\n";
+    if (!e.hash_pad.empty()) std::cout << "padding:        " << e.hash_pad.size() << " bytes behind the structure inside the hash segment (kept)\n";
+    print_envelope_info(Envelope::capture(data, 0, e.consumed));
 }
 
 // ------------------------------------------------------------------ layout --
@@ -3865,6 +4322,18 @@ std::optional<layout::Layout> describe_layout(Fmt f, const Bytes& whole) {
                 layout::Layout l = layout::mtk_preloader(whole);
                 if (l.regions.empty()) return std::nullopt;
                 layout::around(l, whole, whole.size(), 0, mtkgfh::parse(whole).consumed);
+                return l;
+            }
+            case Fmt::MBN: {
+                layout::Layout l = layout::mbn(whole);
+                if (l.regions.empty()) return std::nullopt;
+                layout::around(l, whole, whole.size(), 0, mbn::parse_block(whole, 0, whole.size()).consumed);
+                return l;
+            }
+            case Fmt::MBN_ELF: {
+                layout::Layout l = layout::mbn_elf(whole);
+                if (l.regions.empty()) return std::nullopt;
+                layout::around(l, whole, whole.size(), 0, mbn::parse_elf(whole).consumed);
                 return l;
             }
             default:
@@ -4266,6 +4735,14 @@ void print_info(const fs::path& path) {
             print_mtk_preloader_info(data);
             break;
         }
+        case Fmt::MBN: {
+            print_mbn_info(data);
+            break;
+        }
+        case Fmt::MBN_ELF: {
+            print_mbn_elf_info(data);
+            break;
+        }
         case Fmt::CHROMEOS: {
             Bytes kernel;
             const std::optional<legacy::ChromeosInfo> c = legacy::strip_chromeos(data, kernel);
@@ -4361,6 +4838,8 @@ Bytes build_image_once(const fs::path& dir, const RepackOptions& opt) {
         case Fmt::CHROMEOS: result = repack_chromeos(m, dir, opt); break;
         case Fmt::MTK_IMAGE: result = repack_mtk_image(m, dir, opt); break;
         case Fmt::MTK_PRELOADER: result = repack_mtk_preloader(m, dir, opt); break;
+        case Fmt::MBN: result = repack_mbn(m, dir, opt); break;
+        case Fmt::MBN_ELF: result = repack_mbn_elf(m, dir, opt); break;
         case Fmt::UNKNOWN:
             throw FormatError("manifest.txt has no (or an unrecognized) 'type=' field");
     }
@@ -4509,6 +4988,8 @@ void do_unpack(const fs::path& in, const fs::path& outdir) {
             case Fmt::CHROMEOS: unpack_chromeos(payload, outdir); break;
             case Fmt::MTK_IMAGE: unpack_mtk_image(payload, outdir); break;
             case Fmt::MTK_PRELOADER: unpack_mtk_preloader(payload, outdir); break;
+            case Fmt::MBN: unpack_mbn(payload, outdir); break;
+            case Fmt::MBN_ELF: unpack_mbn_elf(payload, outdir); break;
             case Fmt::UNKNOWN:
                 throw FormatError(in.string() + ": " + describe_unknown(payload));
         }
@@ -4751,7 +5232,10 @@ void usage(std::ostream& os) {
         "vbmeta_system.img (AVB), U-Boot legacy uImage and FIT image, Sony ELF\n"
         "boot images, Rockchip KRNL (kernel.img / boot.img), ASUS blobs (\"MSM-RADIO-UPDATE\",\n"
         "signed with the SIGNBLOB header or not), Intel OSIP boot images, ChromeOS kernel blobs\n"
-        "(the vboot format of a Chromebook's kernel partition).\n"
+        "(the vboot format of a Chromebook's kernel partition); firmware partitions: MediaTek images with the 0x58881688\n"
+        "header (md1img/modem, lk, tee, scp, sspm, logo) and the MediaTek preloader (GFH), Qualcomm secure boot images (MBN: a flat\n"
+        "file with header version 3, 5, 6 or 7 or an SBL header, or an ELF with a hash segment -- sbl1/xbl, tz, rpm, aboot, ...).\n"
+        "A signature of a firmware image cannot be made again: it is kept as it is, and a warning says when what it was made for changed.\n"
         "Also transparently handled: a trailing AVB hash footer on boot/\n"
         "vendor_boot/dtbo; a DHTB wrapper (with SEAndroid footer/padding) around\n"
         "any of them; a ChromeOS kernel blob or an ASUS blob around one image; the LOKI patch (loki_tool) of a\n"
@@ -4838,6 +5322,7 @@ fs::path default_pack_file(const fs::path& folder) {
         const Fmt f = fmt_from_name(Manifest::load(p / "manifest.txt").get("type"));
         if (f == Fmt::DTB) extension = ".dtb";
         else if (f == Fmt::FIT) extension = ".itb";
+        else if (f == Fmt::MBN || f == Fmt::MBN_ELF) extension = ".mbn";
     }
     const std::string name = p.filename().string();
     fs::path out = p.parent_path() / (name + extension);

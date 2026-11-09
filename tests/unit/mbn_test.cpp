@@ -173,6 +173,16 @@ void test_names() {
     EXPECT(describe_flags(0x01300005) == "r-x, AMSS, RO, paged");
     EXPECT(describe_flags(0x6) == "rw-");
     EXPECT(segment_type(0x02200000) == 2 && access_type(0x02200000) == 1 && segment_type(0x80000000) == 0);
+
+    // The names of the image ids (ImageType in Qualcomm's mbn_tools.py).
+    EXPECT(image_id_name(0) == "NONE" && image_id_name(1) == "OEM_SBL" && image_id_name(5) == "APPSBL" && image_id_name(21) == "SBL1" && image_id_name(23) == "RPM" &&
+           image_id_name(25) == "TZ" && image_id_name(32) == "PSI");
+    EXPECT(image_id_name(26).empty() && image_id_name(31).empty() && image_id_name(33).empty() && image_id_name(0xFFFFFFFFu).empty());
+    // Which words a header has: version 7 has no image id, no image_size and no addresses.
+    const Block b3 = make_block(Kind::Boot, 3), b7 = make_block(Kind::Boot, 7), bs = make_block(Kind::Sbl, 0);
+    EXPECT(b3.has_word("image_id") && b3.has_word("image_size") && b3.has_word("sig_ptr") && !b3.has_word("nonsense") && !b3.has_word(""));
+    EXPECT(!b7.has_word("image_id") && !b7.has_word("image_size") && !b7.has_word("sig_ptr") && b7.has_word("code_size") && b7.has_word("reserved"));
+    EXPECT(bs.has_word("image_id") && bs.has_word("image_src") && bs.has_word("sig_ptr") && !bs.has_word("version"));
 }
 
 void test_blocks() {
@@ -335,6 +345,7 @@ void test_flat() {
     for (int v : {0, 3, 5, 6, 7}) {
         const Bytes d = make_block(secure_spec(v));
         EXPECT(flat_looks_like(d));
+        EXPECT(has_sbl_words(d) == (v == 0));  // the codeword and the magic are the SBL header's
         Bytes padded = d;
         padded.insert(padded.end(), 4096, 0xFF);  // the fill up to the partition size
         EXPECT(flat_looks_like(padded));
@@ -355,6 +366,7 @@ void test_flat() {
     EXPECT(!flat_looks_like(make_block(u)));
     // Other things.
     EXPECT(!flat_looks_like({}));
+    EXPECT(!has_sbl_words({}) && !has_sbl_words(Bytes(7, 0)) && !has_sbl_words(Bytes(100, 0)));
     EXPECT(!flat_looks_like(Bytes(100, 0)));
     EXPECT(!flat_looks_like(Bytes(100, 0xFF)));
     EXPECT(!flat_looks_like(pattern(4096, 1)));

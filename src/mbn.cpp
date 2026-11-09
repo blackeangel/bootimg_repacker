@@ -176,7 +176,19 @@ uint64_t Block::parts_size() const {
     return uint64_t{metadata_qti.size()} + metadata.size() + code.size() + sig_qti.size() + cert_qti.size() + sig.size() + cert.size();
 }
 
+bool Block::has_word(std::string_view name) const { return index_of(kind, version, name) >= 0; }
+
 uint32_t Block::word(std::string_view name) const { return word_at(w, index_of(kind, version, name)); }
+
+std::string image_id_name(uint32_t id) {
+    // The ids of the image types in the header (ImageType in coreboot's mbn_tools.py, which is Qualcomm's).
+    static const char* const kNames[] = {"NONE",    "OEM_SBL", "AMSS",     "QCSBL",   "HASH",   "APPSBL",  "APPS",        "HOSTDL",       "DSP1",
+                                         "FSBL",    "DBL",     "OSBL",     "DSP2",    "EHOSTDL", "NANDPRG", "NORPRG",    "RAMFS1",       "RAMFS2",
+                                         "ADSP_Q5", "APPS_KERNEL", "BACKUP_RAMFS", "SBL1", "SBL2", "RPM",    "SBL3",        "TZ"};
+    if (id < sizeof kNames / sizeof kNames[0]) return kNames[id];
+    if (id == 32) return "PSI";
+    return {};
+}
 
 bool Block::set_word(std::string_view name, uint32_t value) {
     const int i = index_of(kind, version, name);
@@ -319,6 +331,8 @@ Bytes build_block(const Block& b) {
     for (size_t i = 0; i < slack_len; ++i) out.push_back(i < b.slack.size() ? b.slack[i] : 0);
     return out;
 }
+
+bool has_sbl_words(const Bytes& d) { return d.size() >= 8 && le32(d, 0) == kSblCodeword && le32(d, 4) == kSblMagic; }
 
 bool flat_looks_like(const Bytes& d) {
     if (d.size() < 40) return false;

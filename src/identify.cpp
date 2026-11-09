@@ -61,15 +61,21 @@ void signed_by(Identity& id, Kind k, std::string label, size_t payload = 0) {
 }
 
 // "ELF bootimg (ARM)": the machine word, then ")" or "64)" for the class byte
-// (so a 64-bit x86 file reads "(x86_64)").
+// (so a 64-bit x86 file reads "(x86_64)"). A machine that has no name here
+// gets none (not a bare ")").
 std::string elf_label(const Bytes& d) {
     std::string s = "ELF";
     if (at(d, 5, "\x01\x01\x61"sv)) s += " bootimg";  // EI_DATA, EI_VERSION, Sony's OSABI
+    bool named = true;
     if (at(d, 18, "\x28"sv)) s += " (ARM";
     else if (at(d, 18, "\x03"sv)) s += " (x86_";
     else if (at(d, 18, "\x08"sv)) s += " (MIPS";
-    if (at(d, 4, "\x01"sv)) s += ")";
-    else if (at(d, 4, "\x02"sv)) s += "64)";
+    else if (at(d, 18, "\xB7"sv)) s += " (ARM64";  // EM_AARCH64: the class byte adds no "64"
+    else if (at(d, 18, "\xA4"sv)) s += " (Hexagon";  // EM_QDSP6: the modem, ADSP and sensor firmware of Qualcomm
+    else named = false;
+    const bool wide_arm = at(d, 18, "\xB7"sv);
+    if (named && at(d, 4, "\x01"sv)) s += ")";
+    else if (named && at(d, 4, "\x02"sv)) s += wide_arm ? ")" : "64)";
     if (search(d, 0, kMagicSearchLimit, kMtkMagic) != kNone) s += ", MTK headers";
     return s;
 }

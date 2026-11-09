@@ -17,6 +17,7 @@
 #include "abr/legacy/elf_boot.hpp"
 #include "abr/legacy/krnl.hpp"
 #include "abr/legacy/osip.hpp"
+#include "abr/mbn.hpp"
 #include "abr/mtkgfh.hpp"
 #include "abr/mtkimg.hpp"
 #include "abr/qcdt.hpp"
@@ -614,6 +615,109 @@ Layout mtk_preloader(const Bytes& d) {
         const uint64_t sig_at = img.consumed - img.signature.size();
         l.add("signature", img.sha256_trailer ? "" : "signature", sig_at, img.signature.size(), 0,
               img.sha256_trailer ? "SHA-256 of the image from the first header; pack makes it again" : mtkgfh::sig_type_name(fi.sig_type) + ", kept as it is");
+    }
+    return l;
+}
+
+// ----------------------------------------------------------------------------------------------------- Qualcomm MBN --
+
+namespace {
+
+// What names a certificate in a line of the layout: the common name of its subject (the whole subject when it has none).
+std::string subject_label(const std::string& subject) {
+    const size_t cn = subject.rfind("CN=");
+    return cn == std::string::npos ? subject : subject.substr(cn + 3);
+}
+
+// The certificates of the chain that lies at `at`, one region each.
+void add_chain(Layout& l, const Bytes& chain, uint64_t at, unsigned depth) {
+    const std::vector<mbn::Cert> certs = mbn::read_chain(chain);
+    for (size_t i = 0; i < certs.size(); ++i) l.add("certificate " + std::to_string(i), "", at + certs[i].offset, certs[i].size, depth, subject_label(certs[i].subject));
+}
+
+// "a, b" for the parts that are not empty.
+std::string joined(std::initializer_list<std::string> parts) {
+    std::string out;
+    for (const std::string& p : parts)
+        if (!p.empty()) out += (out.empty() ? "" : ", ") + p;
+    return out;
+}
+
+// The regions of the structure `b` that lies at `at` in `d`: its header, then its parts one behind the other, all at `depth`. What the code is called
+// (an ELF has a table of hashes there) and its note are the caller's; only a code that is a key of `code` can be a stream.
+void add_block(Layout& l, const Bytes& d, const mbn::Block& b, uint64_t at, unsigned depth, const char* code_name, const char* code_key, const std::string& code_note) {
+    std::string head = mbn::describe_header(b);
+    if (b.has_word("image_id")) {
+        const uint32_t id = b.word("image_id");
+        const std::string name = mbn::image_id_name(id);
+        head += ", image id " + std::to_string(id) + (name.empty() ? std::string() : " (" + name + ")");
+    }
+    l.add("header", "", at, b.header_bytes(), depth, head);
+    uint64_t pos = at + b.header_bytes();
+    const auto part = [&](const char* name, const char* key, const Bytes& bytes, bool chain) {
+        if (bytes.empty()) return;
+        l.add(name, key, pos, bytes.size(), depth);
+        if (chain) add_chain(l, bytes, pos, depth + 1);
+        pos += bytes.size();
+    };
+    part("QTI metadata", "metadata_qti", b.metadata_qti, false);
+    part("metadata", "metadata", b.metadata, false);
+    if (!b.code.empty()) {
+        Region& r = l.add(code_name, code_key, pos, b.code.size(), depth, code_note);
+        if (std::strcmp(code_key, "code") == 0) r.codec = codec_at(d, pos, b.code.size());
+        pos += b.code.size();
+    }
+    part("QTI signature", "signature_qti", b.sig_qti, false);
+    part("QTI certificate chain", "cert_chain_qti", b.cert_qti, true);
+    part("signature", "signature", b.sig, false);
+    part("certificate chain", "cert_chain", b.cert, true);
+    if (!b.slack.empty()) l.add("rounding", "", pos, b.slack.size(), depth, b.align4 ? "up to a multiple of 4" : "behind the parts, inside image_size");
+}
+
+}  // namespace
+
+Layout mbn(const Bytes& d) {
+    Layout l;
+    l.size = d.size();
+    mbn::Block b;
+    try {
+        b = mbn::parse_block(d, 0, d.size());
+    } catch (const FormatError&) {
+        return l;
+    }
+    l.format = b.kind == mbn::Kind::Sbl ? "Qualcomm SBL image" : "Qualcomm MBN image, header version " + std::to_string(b.version);
+    add_block(l, d, b, 0, 0, "code", "code", "");
+    return l;
+}
+
+Layout mbn_elf(const Bytes& d) {
+    Layout l;
+    l.size = d.size();
+    mbn::Elf e;
+    try {
+        e = mbn::parse_elf(d);
+    } catch (const FormatError&) {
+        return l;
+    }
+    const std::string cls = e.is64 ? "ELF64" : "ELF32";
+    l.format = "Qualcomm " + cls + " image, header version " + std::to_string(e.block.version);
+    l.add("ELF header", "", 0, e.ehsize, 0, cls + ", machine " + std::to_string(e.machine) + ", entry " + hex(e.entry));
+    l.add("program headers", "", e.phoff, uint64_t{e.seg.size()} * e.phentsize, 0, std::to_string(e.seg.size()) + " entries");
+    for (size_t i = 0; i < e.seg.size(); ++i) {
+        const mbn::Segment& s = e.seg[i];
+        if (s.role == mbn::Role::Headers || s.ph.filesz == 0) continue;
+        const std::string where = "program header " + std::to_string(i);
+        const std::string flags = mbn::describe_flags(s.ph.flags);
+        if (s.role == mbn::Role::Hash) {
+            l.add("hash segment", "", s.ph.offset, s.ph.filesz, 0, joined({where, flags}));
+            std::string table = "kept as it is";
+            if (e.algo != mbn::Algo::None) table = std::to_string(e.block.code.size() / mbn::digest_size(e.algo)) + " hashes (" + mbn::algo_name(e.algo) + "), made again by pack";
+            add_block(l, d, e.block, s.ph.offset, 1, "hash table", "hash_table", table);
+            if (!e.hash_pad.empty()) l.add("padding", "", s.ph.offset + e.block.consumed, e.hash_pad.size(), 1);
+        } else {
+            Region& r = l.add("segment " + std::to_string(i), "seg" + std::to_string(i), s.ph.offset, s.ph.filesz, 0, joined({where, flags, "address " + hex(s.ph.paddr)}));
+            r.codec = codec_at(d, r.offset, r.size);
+        }
     }
     return l;
 }

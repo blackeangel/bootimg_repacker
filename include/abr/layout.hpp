@@ -107,6 +107,16 @@ Layout mtk_image(const Bytes& file);
 // it one by one (key `headers` for all of them), the loader's code (key `loader`), the signature (key `signature`, none for a SHA-256 that is made again).
 Layout mtk_preloader(const Bytes& file);
 
+// A flat Qualcomm MBN image (abr/mbn.hpp), read from `file`: the header, then the parts that hang on it one behind the other -- the metadata, the code
+// (key `code`), the signature and the certificate chain (QTI's and the OEM's; the certificates of a chain are regions of depth 1) -- and the bytes that round
+// them up. The key of a part is the prefix of its keys in the manifest (`metadata`, `signature`, `cert_chain`, ...). Empty for a file that is no such image.
+Layout mbn(const Bytes& file);
+
+// A Qualcomm ELF image with a hash segment, read from `file`: the ELF header, the program headers, the data of every segment (key `seg<i>` for the program
+// header i) and the hash segment, whose structure is laid out at depth 1 -- the header, the metadata, the table of hashes (key `hash_table`), the signature
+// and the certificate chain. Empty for a file that is no such image.
+Layout mbn_elf(const Bytes& file);
+
 // What is around the container that lies at [core_off, core_off + core_len) of `whole`: the bytes in front of it, the bytes after
 // it, the fill up to the size of the partition (Envelope), and the AVB hash footer at the end (vbmeta block and footer). The regions of
 // the container are moved by core_off; the size and the regions of the layout are those of `whole`. `host_size` is the number of bytes

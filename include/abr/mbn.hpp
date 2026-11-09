@@ -102,11 +102,16 @@ struct Block {
     size_t header_bytes() const { return header_size(kind, version); }
     // The sizes of the parts, added.
     uint64_t parts_size() const;
+    // Whether this header has a word of that name (version 7 has no image_id, no image_size and no addresses).
+    bool has_word(std::string_view name) const;
     // The word of that name, or 0 when this header has none.
     uint32_t word(std::string_view name) const;
     // Sets it; false when this header has no such word.
     bool set_word(std::string_view name, uint32_t value);
 };
+
+// The name that Qualcomm's tools give an image_id ("SBL1", "TZ", "RPM", "APPSBL", ...); empty for an id that has none.
+std::string image_id_name(uint32_t id);
 
 // A block of that kind and version with the fixed words in place and everything else zero.
 Block make_block(Kind kind, uint32_t version);
@@ -118,6 +123,8 @@ Block parse_block(const Bytes& d, size_t at, size_t limit);
 // The bytes of the structure: the header (the derived words made from the parts), the parts, the slack.
 Bytes build_block(const Block& b);
 
+// The codeword and the magic of an SBL header, the first two words of `d`.
+bool has_sbl_words(const Bytes& d);
 // A flat MBN image: the structure at the start of the file, at least 4-byte aligned parts that end inside the file, an image_id that is a small number
 // (a header of version 3..6 has one). Weak by nature -- ten words and a version -- so it is meant to be asked last.
 bool flat_looks_like(const Bytes& d);
