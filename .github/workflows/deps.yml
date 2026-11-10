@@ -1,0 +1,63 @@
+name: dependencies
+
+# Are the libraries that abr is built with behind their newest releases, and does abr still build and pass its codec tests with them?
+# Once a week and on request. The versions that the shipping binaries use are those of cmake/dependency_versions.cmake (a build that is
+# repeated must give the same bytes); this is what tells when that file is due for a change, before a fix that matters has been out for months.
+
+on:
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+# `shell: bash` is "bash -eo pipefail": a step that pipes a command into `tee` fails when the command does.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # tools/check_deps.py: git ls-remote on the repository of each library (for LZO, the download page of its author). The job fails when a library is
+  # behind; one that could not be asked is said and does not fail it.
+  freshness:
+    name: newest releases
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ask the repositories
+        run: |
+          python3 tools/check_deps.py --markdown | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # The newest release of every library (cmake -DABR_DEPS_LATEST=ON), built and tried on what is built on the codecs. A release that
+  # breaks abr (a function that is gone, an output that is not the one the tests know) fails here, and the pins of the shipping build stay.
+  newest-builds:
+    name: build with the newest releases
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # the build number of the version (1.YYYYMMDD.N) counts the commits of the day
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cmake ninja-build python3 g++-14
+
+      - name: Configure (the newest release of each library)
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14 \
+            -DABR_STATIC_BINARY=ON -DABR_DEPS_LATEST=ON | tee configure.log
+          { echo "### Built with"; echo; echo '```'; grep -E '^-- abr: ABR_' configure.log || true; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build
+        run: cmake --build build -j 2 --target abr abr_unit_tests
+
+      - name: Unit tests of the codecs and of what is built on them
+        run: |
+          for group in compression levels png mtkimg mtkgfh mbn splash fit; do
+            echo "== $group"
+            ./build/abr_unit_tests "$group"
+          done

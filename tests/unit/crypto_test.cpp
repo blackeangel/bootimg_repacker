@@ -219,6 +219,7 @@ int run_mtkimg_tests();  // mtkimg_test.cpp
 int run_mtkgfh_tests();  // mtkgfh_test.cpp
 int run_mbn_tests();  // mbn_test.cpp
 int run_splash_tests();  // splash_test.cpp
+int run_codec_tool(int argc, char** argv);  // compression_test.cpp
 
 int main(int argc, char** argv) {
     set_binary_stdio();
@@ -243,6 +244,7 @@ int main(int argc, char** argv) {
         if (cmd == "mbn") return run_mbn_tests();
         if (cmd == "splash") return run_splash_tests();
         if (cmd == "png-decode" || cmd == "png-encode") return run_png_tool(argc, argv);
+        if (cmd == "codec-compress" || cmd == "codec-decompress" || cmd == "codec-level" || cmd == "codec-detect") return run_codec_tool(argc, argv);
         if (cmd == "fit") return run_fit_tests();
         if (cmd == "fit-files") return run_fit_files(argc, argv);
         if (cmd == "sha-impl") {

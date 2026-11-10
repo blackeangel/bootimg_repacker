@@ -88,17 +88,15 @@ if(ABR_SANITIZE)
 endif()
 
 option(ABR_VENDOR_DEPS
-       "Fetch and statically build zlib/lz4/zstd/xz/bzip2 from source (the shipping default). Turn OFF to use system dev packages instead, for fast local iteration." ON)
+       "Build zlib/lz4/zstd/xz/bzip2 (fetched) and LZO (third_party/lzo) statically from source (the shipping default). Turn OFF to use system dev packages instead, for fast local iteration." ON)
+option(ABR_DEPS_LATEST
+       "Fetch the newest release that the repository of each library tags, instead of the version cmake/dependency_versions.cmake names (asks with git ls-remote at configure time)." OFF)
 option(ABR_STATIC_BINARY
        "Link the abr executable statically (-static on Linux; -static-libgcc/-static-libstdc++ on Windows/Android, since bionic has no static libc to link against in the first place)." OFF)
 
 include(FetchContent)
 
-set(ABR_ZLIB_VERSION   "1.3.2"  CACHE STRING "")
-set(ABR_LZ4_VERSION    "1.10.0" CACHE STRING "")
-set(ABR_ZSTD_VERSION   "1.5.7"  CACHE STRING "")
-set(ABR_XZ_VERSION     "5.8.4"  CACHE STRING "")
-set(ABR_BZIP2_VERSION  "1.0.8"  CACHE STRING "")
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/dependency_versions.cmake)
 
 if(ABR_VENDOR_DEPS)
   include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/vendor_deps.cmake)

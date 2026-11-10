@@ -7,17 +7,17 @@ the binaries the CI publishes (`THIRD_PARTY_NOTICES.md`).
 
 | Component | Version | Licence | Where in `abr` |
 |---|---|---|---|
-| zlib | 1.3.2 | zlib licence | gzip (ramdisks, kernels) |
-| LZ4 (`lib/`) | 1.10.0 | BSD-2-Clause | lz4 frames and Android's legacy lz4 blocks; the LZ4 parts of Sony SIN containers |
+| zlib | 1.4 | zlib licence | gzip (ramdisks, kernels) |
+| LZ4 (`lib/`) | 1.11.1 | BSD-2-Clause | lz4 frames and Android's legacy lz4 blocks; the LZ4 parts of Sony SIN containers |
 | Zstandard | 1.5.7 | BSD-3-Clause (the project is dual BSD / GPLv2; abr uses it under the BSD licence) | zstd (ramdisks, vendor_boot v4) |
 | XZ Utils, liblzma | 5.8.4 | BSD Zero Clause (0BSD) | xz and lzma |
 | bzip2 / libbzip2 | 1.0.8 | bzip2 licence (BSD-style) | bzip2 |
-| miniLZO (LZO1X subset of LZO) | 2.10 | GPL-2.0-or-later, used under GPL-3.0-or-later with the rest of `abr` | lzo (in the lzop framing); the files are in `third_party/minilzo/` with their own headers |
+| LZO (the LZO1X family) | 2.10 | GPL-2.0-or-later, used under GPL-3.0-or-later with the rest of `abr` | lzo (in the lzop framing); the files are in `third_party/lzo/` with their own headers |
 | the patch code of `loki_tool` (56 bytes) | -- | BSD-2-Clause, Copyright (c) 2013 Dan Rosenberg | LOKI images; the notice is kept in `src/legacy/loki.cpp` |
 | the public developer keyblock and key of vboot_reference | -- | BSD-3-Clause, Copyright (c) 2010 The Chromium OS Authors | ChromeOS kernel blobs; the notice is kept in `src/legacy/chromeos_devkeys.cpp` |
 | the public AOSP "verity" test key | -- | Apache-2.0 | AVBv1 boot signatures; `src/legacy/avb1_aosp_key.cpp` |
 
-The versions are the ones `cmake/vendor_deps.cmake` and `CMakeLists.txt` pin. The libraries are fetched from their own
+The versions are the ones `cmake/dependency_versions.cmake` pins (LZO's is that of `third_party/lzo/`). The libraries but LZO are fetched from their own
 repositories when `abr` is built and are not part of this repository. What follows are their licence texts, as the projects
 ship them.
 

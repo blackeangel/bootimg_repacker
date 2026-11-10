@@ -322,7 +322,7 @@ cp lzo_payload.bin lzo_manifest/ramdisk.cpio
 roundtrip_check lzo_boot.img "boot v4 (lzo ramdisk)" lzoboot
 
 if python3 -c "import lzo" 2>/dev/null; then
-    # abr's encoder -> independently decompressed by real liblzo2 (not minilzo)
+    # abr's encoder -> independently decompressed by real liblzo2 (not the copy in third_party/lzo)
     python3 - <<'PYEOF'
 import struct, lzo, sys
 raw = open("rt_lzoboot/.abr_raw/ramdisk.cpio.raw", "rb").read()
@@ -353,7 +353,7 @@ PYEOF
         FAIL=$((FAIL + 1))
     fi
 
-    # real liblzo2 (not minilzo) -> abr's decoder, via a hand-built boot.img
+    # real liblzo2 (not the copy in third_party/lzo) -> abr's decoder, via a hand-built boot.img
     # so abr's own recompress-on-repack convenience doesn't mask the check
     python3 - <<'PYEOF'
 import struct, lzo, zlib

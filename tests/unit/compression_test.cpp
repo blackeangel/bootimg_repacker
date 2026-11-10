@@ -2,6 +2,8 @@
 //
 // Checks of the limit on what a decoder lets a stream become (include/abr/compression.hpp: kMaxDecompressedSize, and the
 // `max_size` of decompress()). Run by tests/run_tests.sh as `abr_unit_tests compression`.
+// The same binary has the commands that tests/run_tests.sh uses to put abr's codecs next to the tools of the system (`lzop`, `lz4`, `zstd`, `xz`, ...):
+// codec-compress, codec-decompress, codec-level and codec-detect (run_codec_tool() below).
 //
 // For every codec, with plain data of several kinds and sizes, and limits on both sides of the size of the data:
 //   * exactly `max_size` bytes is taken and comes back as it was; no limit at all (SIZE_MAX) is not an overflow of the
@@ -279,6 +281,7 @@ void test_progress_reports() {
             // gzip says it as it goes: more than once for data of more than a slice
             if (codec == Codec::GZIP && size > 2 * mib) EXPECT(calls >= 2);
             if (codec == Codec::LZ4_LEGACY && size > 8 * mib) EXPECT(calls >= 2);
+            if (codec == Codec::LZO && size > 512 * 1024) EXPECT(calls >= 2);  // one report for every block of 256 KiB (from the thread that made it)
             EXPECT(with == compress(codec, data));
             EXPECT(decompress(codec, with) == data);
         }
@@ -292,6 +295,48 @@ void test_progress_reports() {
         EXPECT(total == data.size());
         EXPECT(decompress(Codec::GZIP, stream) == data);
     }
+}
+
+// abr_unit_tests codec-compress <codec> <level> <in> <out>  what compress() makes of a file (level -1: the default of the codec)
+//                codec-decompress <codec|auto> <in> <out>   what decompress() makes of a stream (auto: the codec that detect_codec() finds)
+//                codec-level <codec> <stream> <plain>       what detect_level() says of a stream: "<level> <basis>"
+//                codec-detect <in>                          the codec that detect_codec() finds, or "none"
+int run_codec_tool(int argc, char** argv) {
+    const std::string cmd = argv[1];
+    const auto codec_of = [](const std::string& name) {
+        const std::optional<Codec> c = codec_from_name(name);
+        if (!c) throw FormatError("unknown codec '" + name + "'");
+        return *c;
+    };
+    try {
+        if (cmd == "codec-compress" && argc == 6) {
+            const Bytes plain = read_file(argv[4]);
+            const Bytes packed = compress(codec_of(argv[2]), plain, std::stoi(argv[3]));
+            write_file(argv[5], packed);
+            std::printf("%zu\n", packed.size());
+            return 0;
+        }
+        if (cmd == "codec-decompress" && argc == 5) {
+            const Bytes packed = read_file(argv[3]);
+            const std::string name = argv[2];
+            write_file(argv[4], decompress(name == "auto" ? detect_codec(packed) : codec_of(name), packed));
+            return 0;
+        }
+        if (cmd == "codec-level" && argc == 5) {
+            const LevelGuess g = detect_level(codec_of(argv[2]), read_file(argv[3]), read_file(argv[4]));
+            std::printf("%d %s\n", g.level, g.basis.c_str());
+            return 0;
+        }
+        if (cmd == "codec-detect" && argc == 3) {
+            std::printf("%s\n", std::string(codec_name(detect_codec(read_file(argv[2])))).c_str());
+            return 0;
+        }
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "%s: %s\n", cmd.c_str(), e.what());
+        return 1;
+    }
+    std::fprintf(stderr, "usage: codec-compress codec level in out | codec-decompress codec|auto in out | codec-level codec stream plain | codec-detect in\n");
+    return 2;
 }
 
 int run_compression_tests() {

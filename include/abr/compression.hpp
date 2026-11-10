@@ -30,7 +30,7 @@ enum class Codec {
     XZ,     // .xz container
     LZMA,   // legacy "LZMA alone" stream (no container), as used by 7-Zip's .lzma
     BZIP2,
-    LZO,    // LZO1X wrapped in the lzop container framing (see compression.cpp for why)
+    LZO,    // LZO1X (all three compressors of lzop) wrapped in the lzop container framing (see compression.cpp for why)
     // A zlib stream (RFC 1950: two header bytes, deflate, Adler-32) -- what MediaTek's logo.bin holds for each picture. It starts with
     // two bytes that any data may start with, so detect_codec() never says it is one: only a format that knows it is there (and a
     // manifest that says `<part>_compression=zlib`) uses it.
@@ -80,7 +80,7 @@ Bytes lzma_alone_compress(const Bytes& data, const LzmaAloneParams& params);
 // `lz4 -l -12` uses). Codec::NONE returns `data` unchanged.
 //
 // May use several threads (abr/parallel.hpp): the independent 8 MiB blocks of
-// an lz4_legacy stream, the workers of a zstd frame. The output is the same for
+// an lz4_legacy stream, the 256 KiB blocks of an lzo stream, the workers of a zstd frame and of an lz4 frame. The output is the same for
 // any number of threads.
 //
 // `on_progress`, when there is one, is told how many more bytes of `data` have been compressed -- the work as it is done, for a bar --
@@ -89,13 +89,14 @@ Bytes lzma_alone_compress(const Bytes& data, const LzmaAloneParams& params);
 Bytes compress(Codec codec, const Bytes& data, int level = -1, const std::function<void(size_t)>& on_progress = {});
 
 // The level compress() uses when it is given none (-1): gzip 6, zlib 6, lz4_legacy 12 (HC, the densest), lz4 frame 0, zstd 3, xz 6, bzip2 9;
-// -1 for the codecs that have no setting (lzma, lzo, none).
+// lzo 9 (LZO1X-999, the densest, what the kernel's build makes with `lzop -9`; the levels are lzop's: 1 is LZO1X-1(15), 2 to 6 are LZO1X-1, 7 to 9 are
+// LZO1X-999), -1 for the codecs that have no setting (lzma, none).
 int default_level(Codec codec);
 
 // The densest setting of a codec that the decoders in the wild still take (gzip 9, zstd 19 -- an 8 MiB
 // window, what `zstd -19` writes --, xz 9, lz4 frame 12, lz4_legacy 12, bzip2 9); -1 where the codec has
 // no setting. For when the usual one makes an edited image too big for its partition: the images of
-// builds that care about size were compressed this way in the first place. A codec whose default_level()
+// builds that care about size were compressed this way in the first place (lzo 9). A codec whose default_level()
 // is already this one has nothing denser to try.
 int dense_level(Codec codec);
 
@@ -107,7 +108,8 @@ struct LevelGuess {
 };
 
 // `stored` is a stream of `codec` (what detect_codec() said it is) and `plain` what it holds. bzip2 tells its level in its header; gzip
-// tells whether it is the densest (9) or the fastest (1) setting; a zlib stream and an xz stream tell a group of levels (the xz one by the size
+// tells whether it is the densest (9) or the fastest (1) setting; an lzop stream tells the method of its blocks and the level of the dense one
+// (1, 3, or 7 to 9: the header says what lzop was asked); a zlib stream and an xz stream tell a group of levels (the xz one by the size
 // of its dictionary), and the level in the group that makes the very bytes is the one; for the others, and for a gzip with no mark, the stream is made again
 // at the levels in use -- all of it when it is small, the first blocks of it when the codec has blocks that stand on their own (lz4_legacy,
 // zstd) -- and the first level that makes the bytes of the stream is the one. A stream that another program made in another way (GNU gzip's

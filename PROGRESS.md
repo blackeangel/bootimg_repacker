@@ -266,7 +266,8 @@ repeated `{dst_len BE32, src_len BE32, checksum BE32, block bytes}`
 until a `dst_len == 0` terminator). That's what's implemented
 (`lzo_compress`/`lzo_decompress` in `src/compression.cpp`), using
 miniLZO (`third_party/minilzo/`, vendored directly rather than
-FetchContent'd -- see its README for why) for the actual LZO1X
+FetchContent'd -- see its README for why; since 10 Nov it is LZO 2.10 in
+`third_party/lzo/`, see below) for the actual LZO1X
 compress/decompress calls. Since 4 Oct the encoder writes what
 `lzop -c < file` writes (version 1.04 layout, LZO1X-1, 256 KiB blocks, an
 Adler-32 of each block's uncompressed data, incompressible blocks stored as
@@ -277,6 +278,34 @@ incompressible blocks longer than their data, which the kernel rejects (see
 newer/optional fields (filter info, mtime_high, a filename, one or two checksum
 words per block) a real lzop file could have, matching the kernel
 decompressor's own leniency.
+
+**10 Nov: the whole LZO1X family, with levels.** The review of the compression libraries (zlib 1.4 and LZ4 1.11 had been
+released; `lzo` was down to the one fast compressor of miniLZO) showed what that cost: a kernel's `Image.lzo` or an initramfs made
+with `lzop -9` -- what the kernel's own build does -- came back from `abr` about 30% bigger, and a size-tight partition overflows.
+`third_party/lzo/` is now the LZO1X family of LZO 2.10 (the compressors LZO1X-1, LZO1X-1(15) and LZO1X-999, the optimizer of
+compressed blocks, the decompressors; copied unmodified from the nemequ/lzo mirror, commit 0083878 "Release 2.10"; LZO has no
+repository of its own, only tarballs). Levels: 1 is `lzop -1` (LZO1X-1(15)), 2 to 6 are `lzop`'s default (LZO1X-1, written as
+level 5 in the header, as lzop does), 7 to 9 are LZO1X-999 at that level; the default and the dense level are 9; the 256 KiB blocks
+are compressed on parallel threads and joined in order; `detect_level` reads method and level from the lzop header. Checked
+against the real `lzop 1.04` (LZO 2.10) on eight inputs -- text, an executable, pieces of two real images, noise, zeros, one
+byte, nothing -- at -1, -3, -7, -8 and -9: the blocks are byte for byte the same, and the header but for the time and its own checksum;
+`lzop -t` and `lzop -dc` accept what `abr` writes at every level, and `abr` reads what `lzop -1` to `-9` write, with or without a
+file name in the header. The first comparison differed at -7 to -9 in blocks of the same size and other bytes: `lzop` runs
+`lzo1x_optimize()` on the blocks of the dense compressor (python-lzo's `optimize()` confirms it: its output is lzop's block, the
+unoptimized one is not); `src/lzo1x_o.c` came in for that, and the known-answer vectors of `tests/unit/level_test.cpp` (the files
+that `lzop -1` and `-9` made of a text) pin it.
+
+**The same day: zlib 1.4, LZ4 1.11.1.** `cmake/dependency_versions.cmake` holds every pin (zlib 1.4 of 4 Nov, LZ4 1.11.1 of 9 Nov,
+zstd 1.5.7 and xz 5.8.4, which are the newest, bzip2 1.0.8, the last: CVE-2026-42250 is in `bzip2recover`, which is not built);
+`-DABR_DEPS_LATEST=ON` builds with whatever each repository tags newest; `tools/check_deps.py` and `.github/workflows/deps.yml`
+(weekly) say when a pin is behind -- its first run found LZ4 1.11.1 (9 Nov, six days after 1.11.0), which fixes a write out of
+bounds in `LZ4_resetStreamHC()` at levels 10 and up, on a state that holds garbage, that 1.11.0 has. LZ4 1.11's frame compressor has workers
+(`LZ4F_preferences_t.nbWorkers`; built with `LZ4_STATIC_MULTITHREAD`), used through `par::Lease`: the stream is the same for any
+number of workers (checked: 1, 2 and 8 threads, levels 1, 3, 9 and 12, 60 MB; `lz4 1.9.4` reads the frames). What 1.11 costs: the
+parser of HC levels 10 to 12 and the fast level 1 make other bytes than 1.9's did, so the level of an LZ4 legacy ramdisk made by an
+older `lz4 -l -12` is no longer found (levels 3 to 9 came out the same on the real ramdisk that was tried; +0.006% in size at 12).
+All 13 real images that `abr` reads still come back byte for byte, and ramdisks edited and packed by the new build (gzip,
+lz4 legacy, zstd) are read back correctly by the build with the old libraries.
 
 Verified in both directions independently of `abr`'s own code, using
 `python-lzo` (real liblzo2, not miniLZO) -- see the `lzo` section of

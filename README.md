@@ -49,7 +49,10 @@ Compression: gzip, lz4 (frame and the Android/GKI "legacy" block
 format), zstd, xz, LZMA (headerless "alone" stream), bzip2, and LZO
 (in the lzop file format -- the framing the Linux kernel's own
 decompressor expects, and the one `lzop` itself reads -- since raw LZO1X
-has no header of its own to detect or frame blocks with).
+has no header of its own to detect or frame blocks with; the compressors are
+those of LZO 2.10 at the levels of `lzop -1`, `-2` to `-6` and `-7` to `-9`, and the blocks are
+the ones that `lzop 1.04` writes). The libraries are built from the newest releases that the
+project has tested (see *Building*): zlib 1.4, LZ4 1.11.1, Zstandard 1.5.7, xz 5.8.4, bzip2 1.0.8.
 
 Format is auto-detected from magic bytes; you don't need to tell `abr`
 what kind of file it's looking at. Things that are not boot-family
@@ -182,8 +185,13 @@ ramdisk_level_basis=compress() at level 6 makes the same deflate data
 the stream: bzip2 says it in its header; gzip says the densest (9) and the fastest (1) setting in its header, and a gzip without such a
 mark is level 6 when the deflate of `abr` makes the very same stream from the plain data; LZ4 legacy and zstd are made again at the
 levels that are in use (the first 8 MiB block, or the first 256 KiB of the frame) and the first level that makes the same bytes is the
-one. xz, lzma, LZ4 frame, LZO, and streams that another program made in another way have no `_level`: `pack` then uses the usual level
-of the codec. When the file is not touched `pack` puts the very bytes of the image back, and the level does not matter; when it is, the
+one; an lzop file (LZO) says the method and the level in its header: 1 is `lzop -1`, 3 stands for `-2` to `-6` (they make the same
+blocks), 7, 8 and 9 are `-7` to `-9`. xz, lzma, LZ4 frame, and streams that another program made in another way have no `_level`:
+`pack` then uses the usual level of the codec. (LZ4 1.11, the library that `abr` is built with, parses the levels 10 to 12 of
+LZ4 HC and the fast level 1 in another way than LZ4 1.9 did: an LZ4 legacy ramdisk that an older `lz4` made at one of those levels --
+`lz4 -l -12`, which is what Android's build used -- is not made again by `abr`, so it gets no `_level` and is compressed again at
+the usual level 12 when it is edited, to a stream of nearly the same size (+0.006% on the 14 MB ramdisk of a real `vendor_boot`) that
+every LZ4 decoder reads. Levels 3 to 9 made the same bytes as `lz4 1.9.4` on the ramdisk that was tried. A part that is not edited keeps its bytes.) When the file is not touched `pack` puts the very bytes of the image back, and the level does not matter; when it is, the
 part is compressed again at `<part>_level`, and the image has the same kind of stream as before. You may write another level (or
 another `<part>_compression`) in the manifest.
 
@@ -604,7 +612,7 @@ name that an image holds -- as an escape.
 The work uses several cores where that pays: the components of an image (kernel,
 ramdisk, each vendor ramdisk fragment, ...) are decoded, hashed and written
 side by side; when an edited component has to be compressed again, the
-independent 8 MiB blocks of an LZ4 "legacy" ramdisk and the jobs of a zstd
+independent 8 MiB blocks of an LZ4 "legacy" ramdisk, the 256 KiB blocks of an LZO file, the workers of an LZ4 frame (LZ4 1.11) and the jobs of a zstd
 frame are compressed side by side. The environment variable `ABR_THREADS=N` sets the most threads
 the work may use. The default is the number of hardware threads, at most 16; `ABR_THREADS=1` runs the work on the main thread (the
 thread that writes to the terminal runs beside it all the same).
@@ -627,7 +635,8 @@ are written by a single stream each, so they gain nothing from more threads
 When a component has to be compressed again, `abr` uses the level that `<component>_level=N` in the manifest gives
 (`ramdisk_level=9`, `ramdisk1_level=6`, ...), with the codec's own meaning of the number: `unpack` writes it when it could tell what
 the stream was made with (see *Compressed parts, and the level they were compressed with*), and you may write another. Without
-one it uses the codec's usual setting: gzip 6, zstd 3, xz 6, bzip2 9, and for LZ4 legacy the densest level (HC 12), which is what
+one it uses the codec's usual setting: gzip 6, zstd 3, xz 6, bzip2 9, lzo 9 (the dense compressor, `lzop -9`, which is what the
+kernel's build uses for `Image.lzo`: about a third smaller than the fast one on code and text) and for LZ4 legacy the densest level (HC 12), which is what
 Android's build uses (`lz4 -l -12`): a faster setting makes an edited ramdisk
 enough larger to overflow a tightly sized `vendor_boot` partition.
 
@@ -642,7 +651,7 @@ the fill it was padded to -- and something was compressed again at a setting
 that has a denser one, `abr` says so and builds the image once more with
 everything it compresses again at the densest setting the decoders still read
 (when the level in the manifest is not that already): gzip 9, zstd 19 (an 8 MiB window, what `zstd -19` writes), xz 9, lz4 frame 12,
-lz4 legacy 12.
+lz4 legacy 12, lzo 9.
 ```
 note: image plus AVB metadata (67117760 bytes) no longer fits the original partition size (67108864 bytes); compressing what was edited again, as densely as the codecs allow
 ```
@@ -653,7 +662,7 @@ try costs time -- level 19 is slow (24 s against 1 s for `zstd` on that
 ramdisk, two threads) -- and only runs when the first one did not fit. If even
 the densest setting is too big the error says so ("... -- not even with what
 was edited compressed as densely as the codecs allow"). Where nothing has a
-denser setting (an LZ4 legacy stream at level 12 and bzip2 are at their densest, lzma and lzo have no
+denser setting (an LZ4 legacy stream at level 12, lzo at 9 and bzip2 are at their densest, lzma has no
 setting) there is no second try: an AVB footer that no longer fits is refused,
 a padded image is written bigger with a warning, as it always was.
 
@@ -817,6 +826,17 @@ cmake --build build -j
 library dependencies (verify with `ldd build/abr` -> "not a dynamic
 executable"). Omit it for a normal dynamically-linked build during
 development, which is faster to iterate on.
+
+**The libraries and their versions.** `cmake/dependency_versions.cmake` is the one place that names them: zlib 1.4, LZ4 1.11.1 (built
+with its multithreaded frame compressor, `LZ4F_preferences_t.nbWorkers`: the stream it makes does not depend on the number of workers),
+Zstandard 1.5.7, xz 5.8.4 and bzip2 1.0.8, each fetched from its repository at that tag, so that a build can be repeated. LZO 2.10 (its
+LZO1X family: the three compressors, the optimizer of compressed blocks and the decompressors) is in `third_party/lzo/`, because the
+library has no repository, only tarballs. `-DABR_ZLIB_VERSION=1.3.2` (and the same for the others) builds with another version;
+`-DABR_DEPS_LATEST=ON` asks each repository for its newest release tag when cmake configures and builds with that. `tools/check_deps.py`
+says which of the libraries is behind its newest release (it is what `.github/workflows/deps.yml` runs once a week, and the same
+workflow builds `abr` with `-DABR_DEPS_LATEST=ON` and runs the codec tests on it, so that a release that breaks something is known
+before the pins are moved). With `-DABR_VENDOR_DEPS=OFF` the libraries of the system are used; an LZ4 older than 1.11 there compresses
+a frame on one thread.
 
 ### Running the tests
 
@@ -1137,12 +1157,12 @@ Two smaller gaps:
 GPL-3.0-or-later, see `LICENSE`. A binary of `abr` contains code of zlib, LZ4, Zstandard, liblzma and bzip2 (and the
 runtime of the toolchain): their notices are in `THIRD_PARTY_NOTICES.md`, which the CI publishes next to the binaries.
 A few directories are vendored
-third-party code, used only by parts of `abr` (`third_party/minilzo`)
+third-party code, used only by parts of `abr` (`third_party/lzo`)
 or only by the test suite (`tests/reference/mkbootimg`,
 `tests/reference/avb`, `tests/reference/boot_signer`), each with its own
 README explaining exactly what and why -- see those for details:
 
-- `third_party/minilzo/`: LZO1X compress/decompress, GPL-2.0-or-later
+- `third_party/lzo/`: the LZO1X family of LZO 2.10 (compressors, optimizer, decompressors), GPL-2.0-or-later
   (compatible with, and combined here under, this project's own
   GPL-3.0-or-later).
 - `src/legacy/loki.cpp`: 56 bytes of machine code (the patch of `loki_tool`,

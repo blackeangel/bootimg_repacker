@@ -9,7 +9,7 @@
 #include <zlib.h>
 #include <zstd.h>
 
-#include "minilzo.h"
+#include <lzo/lzo1x.h>
 
 #include <algorithm>
 #include <atomic>
@@ -188,16 +188,36 @@ Bytes gzip_decompress(const Bytes& in, size_t max_out) {
 
 // ------------------------------------------------------------ lz4 frame --
 
+// LZ4 1.11 cuts a frame into jobs (1 MB, or a block when that is more) and compresses them on worker threads
+// (LZ4F_preferences_t.nbWorkers; the static library is built with the support, cmake/vendor_deps.cmake). The frame depends on the data
+// and on the settings, never on the number of workers (>= 1), nor on the scheduling, nor on whether the library has the support at all (it
+// then does the jobs on the calling thread). So abr always asks for at least one worker, as it does with zstd: the output is the same on
+// every machine, even with -j1. (Only against nbWorkers = 0 it differs, slightly, with the linked blocks that are the default: each job
+// starts again with the last 64 KB before it as its dictionary.) A system liblz4 older than 1.11 has no such field: one thread then.
 Bytes lz4_frame_compress(const Bytes& in, int level) {
     LZ4F_preferences_t prefs{};
     prefs.compressionLevel = (level < 0) ? 0 : level;
     prefs.frameInfo.contentSize = in.size();
-    size_t bound = LZ4F_compressFrameBound(in.size(), &prefs);
-    Bytes out(bound);
-    size_t n = LZ4F_compressFrame(out.data(), out.size(), in.data(), in.size(), &prefs);
-    if (LZ4F_isError(n)) fail(std::string("LZ4F_compressFrame failed: ") + LZ4F_getErrorName(n));
-    out.resize(n);
-    return out;
+#if LZ4_VERSION_NUMBER >= 11100
+    // The calling thread fills and emits the jobs, and compresses one itself when no worker is on it: its place in the budget goes to
+    // the workers, as with zstd (N extra threads from the budget = N + 1 workers).
+    par::Lease lease(par::max_threads() - 1);
+    prefs.nbWorkers = lease.threads() + 1;
+#endif
+    for (;;) {
+        Bytes out(LZ4F_compressFrameBound(in.size(), &prefs));
+        const size_t n = LZ4F_compressFrame(out.data(), out.size(), in.data(), in.size(), &prefs);
+#if LZ4_VERSION_NUMBER >= 11100
+        // The system would not give a worker thread (the frame cannot start without one): this thread, then.
+        if (LZ4F_isError(n) && prefs.nbWorkers != 0) {
+            prefs.nbWorkers = 0;
+            continue;
+        }
+#endif
+        if (LZ4F_isError(n)) fail(std::string("LZ4F_compressFrame failed: ") + LZ4F_getErrorName(n));
+        out.resize(n);
+        return out;
+    }
 }
 
 Bytes lz4_frame_decompress(const Bytes& in, size_t max_out) {
@@ -535,12 +555,27 @@ Bytes bzip2_decompress(const Bytes& in, size_t max_out) {
 // also what the Linux kernel's lib/decompress_unlzo.c (the code that actually
 // unpacks an LZO-compressed kernel/ramdisk/initramfs on a device) parses.
 // The encoder writes the same header and framing `lzop -c < file` does
-// (version 1.04 layout, LZO1X-1, 256 KiB blocks, one Adler-32 per block of the
+// (version 1.04 layout, 256 KiB blocks, one Adler-32 per block of the
 // *uncompressed* data) so the stream is accepted by the real `lzop` as well as
 // by the kernel; the decoder is ported from decompress_unlzo.c's
-// parse_header()/unlzo() (see third_party/minilzo/README.md) and tolerates what
+// parse_header()/unlzo() (see third_party/lzo/README.md) and tolerates what
 // else a real lzop file may carry.
+//
+// The levels are lzop's own, and each makes the blocks that `lzop -N` makes (the tests compare them with the real tool): 1 is LZO1X-1(15), the
+// fastest; 3 is LZO1X-1, the default of lzop (`lzop -2` to `-6` all make the same stream); 7, 8 and 9 are LZO1X-999, the dense compressor, at
+// that level, and each block goes through lzo1x_optimize() as lzop does it (the same size, and a stream that decompresses faster) -- what the kernel's
+// build uses for Image.lzo and for the initramfs (`lzop -9`), a third smaller than the fast one on text and on code. The default here is 9, for the reason that lz4_legacy's is 12: a ramdisk or a kernel that is made again should not come out bigger
+// than the one of the build, enough to stop a tightly sized partition from taking it. The decoder is the same for all of them, one format.
 constexpr size_t kLzoBlockSize = 256 * 1024;  // kernel's LZO_BLOCK_SIZE; also its declared max
+// The most a block of a stream made by another program may hold: lzop's MAX_BLOCK_SIZE (`lzop -b`). The kernel takes 256 KiB at most, and that is
+// what abr writes; a stream with bigger blocks (a tool that was told so) is read all the same.
+constexpr size_t kLzoMaxBlockSize = size_t{64} << 20;
+constexpr int kLzoDefaultLevel = 9;
+
+// The method bytes of the lzop header (lzop's M_LZO1X_*); the others (the NRV methods of lzop 0.x, zlib) are not LZO1X.
+constexpr uint8_t kLzopMethod1x1 = 1;
+constexpr uint8_t kLzopMethod1x1_15 = 2;
+constexpr uint8_t kLzopMethod1x999 = 3;
 
 // lzop header flags (lzop.h)
 constexpr uint32_t kLzopAdler32D = 0x00000001;  // Adler-32 of each block's uncompressed data
@@ -559,15 +594,68 @@ void lzo_init_once() {
     if (rc != LZO_E_OK) fail("lzo_init failed: rc=" + std::to_string(rc));
 }
 
-Bytes lzo_compress(const Bytes& in) {
+// What the `level` of compress() stands for in an lzop stream: the method byte and the level byte of the header (what lzop writes for the
+// same level), and the level in the canonical form (1, 3, 7, 8 or 9).
+struct LzoSetting {
+    uint8_t method;
+    uint8_t header_level;
+    int level;
+    bool optimize;  // run lzo1x_optimize() on the packed block, as lzop does for the dense compressor (on the output of the fast ones it changes nothing)
+};
+
+LzoSetting lzo_setting(int level) {
+    if (level < 0) level = kLzoDefaultLevel;
+    if (level <= 1) return {kLzopMethod1x1_15, 1, 1, false};
+    if (level <= 6) return {kLzopMethod1x1, 5, 3, false};  // lzop writes level 5 in the header for all of -2 to -6
+    level = std::min(level, 9);
+    return {kLzopMethod1x999, static_cast<uint8_t>(level), level, true};
+}
+
+// One block of `len` bytes at `src`, compressed as `set` says, into `out` (room for the worst case: len + len / 16 + 67); its size.
+lzo_uint lzo_block(const LzoSetting& set, const uint8_t* src, size_t len, uint8_t* out) {
+    lzo_uint n = 0;
+    int rc = LZO_E_ERROR;
+    switch (set.method) {
+        case kLzopMethod1x1_15: {
+            Bytes work(LZO1X_1_15_MEM_COMPRESS);
+            rc = lzo1x_1_15_compress(src, len, out, &n, work.data());
+            break;
+        }
+        case kLzopMethod1x1: {
+            Bytes work(LZO1X_1_MEM_COMPRESS);
+            rc = lzo1x_1_compress(src, len, out, &n, work.data());
+            break;
+        }
+        default: {
+            Bytes work(LZO1X_999_MEM_COMPRESS);
+            rc = lzo1x_999_compress_level(src, len, out, &n, work.data(), nullptr, 0, nullptr, set.level);
+            break;
+        }
+    }
+    if (rc != LZO_E_OK) fail("LZO compression failed: rc=" + std::to_string(rc));
+    if (set.optimize && n >= 3 && n < len) {
+        // lzo1x_optimize() rewrites the packed block in place to one of the same size that decompresses faster; it decompresses it to do so, into
+        // a buffer of the size of the plain data
+        Bytes plain(len + 64);
+        lzo_uint plain_len = len;
+        rc = lzo1x_optimize(out, n, plain.data(), &plain_len, nullptr);
+        if (rc != LZO_E_OK || plain_len != len) fail("LZO optimization failed: rc=" + std::to_string(rc));
+    }
+    return n;
+}
+
+// The blocks are independent of one another (as the format makes them), so they are compressed on all the threads we may use and joined in
+// order: the bytes are the same whatever the thread count. The dense compressor is slow, a few MB a second on a core, which is what the threads are for.
+Bytes lzo_compress(const Bytes& in, int level, Reporter& report) {
     lzo_init_once();
+    const LzoSetting set = lzo_setting(level);
     BinaryWriter w;
     w.bytes(kLzopMagic, sizeof(kLzopMagic));
     w.be16(0x1040);       // version: lzop 1.04
     w.be16(LZO_VERSION);  // version of the LZO library that compressed it
     w.be16(0x0940);       // version needed to extract: the first with this header layout
-    w.u8(1);              // method: M_LZO1X_1
-    w.u8(5);              // level
+    w.u8(set.method);
+    w.u8(set.header_level);
     w.be32(kLzopOsUnix | kLzopAdler32D | kLzopStdin | kLzopStdout);  // what `lzop -c < file` sets
     w.be32(0x81a4);       // mode: regular file, 0644
     w.be32(0);            // mtime_low
@@ -577,29 +665,32 @@ Bytes lzo_compress(const Bytes& in) {
         adler32(1, w.data().data() + sizeof(kLzopMagic), w.size() - sizeof(kLzopMagic)));
     w.be32(hchk);          // header checksum (Adler-32, as the flags carry no F_H_CRC32)
 
-    Bytes wrkmem(LZO1X_1_MEM_COMPRESS);
-    Bytes cbuf(kLzoBlockSize + kLzoBlockSize / 16 + 64 + 3);
-    size_t pos = 0;
-    while (pos < in.size()) {
-        size_t chunk = std::min(kLzoBlockSize, in.size() - pos);
-        lzo_uint out_len = 0;
-        int rc = lzo1x_1_compress(in.data() + pos, chunk, cbuf.data(), &out_len, wrkmem.data());
-        if (rc != LZO_E_OK) fail("lzo1x_1_compress failed: rc=" + std::to_string(rc));
-        w.be32(static_cast<uint32_t>(chunk));  // dst_len: uncompressed size of this block
+    const size_t blocks = (in.size() + kLzoBlockSize - 1) / kLzoBlockSize;
+    std::vector<Bytes> parts(blocks);  // each block as it goes into the stream: its three words and its data
+    par::for_each(blocks, [&](size_t i) {
+        const size_t pos = i * kLzoBlockSize;
+        const size_t chunk = std::min(kLzoBlockSize, in.size() - pos);
+        Bytes cbuf(chunk + chunk / 16 + 64 + 3);
+        const size_t out_len = lzo_block(set, in.data() + pos, chunk, cbuf.data());
+        BinaryWriter b;
+        b.be32(static_cast<uint32_t>(chunk));  // dst_len: uncompressed size of this block
+        const uint32_t check = static_cast<uint32_t>(adler32(1, in.data() + pos, static_cast<uInt>(chunk)));
         if (out_len < chunk) {
-            w.be32(static_cast<uint32_t>(out_len));  // src_len: compressed size of this block
-            w.be32(static_cast<uint32_t>(adler32(1, in.data() + pos, static_cast<uInt>(chunk))));
-            w.bytes(cbuf.data(), out_len);
+            b.be32(static_cast<uint32_t>(out_len));  // src_len: compressed size of this block
+            b.be32(check);
+            b.bytes(cbuf.data(), out_len);
         } else {
             // Incompressible: stored as it is, which a reader recognises by
             // src_len == dst_len. (A "compressed" block longer than the original
             // is what the kernel calls a corrupt file.)
-            w.be32(static_cast<uint32_t>(chunk));
-            w.be32(static_cast<uint32_t>(adler32(1, in.data() + pos, static_cast<uInt>(chunk))));
-            w.bytes(in.data() + pos, chunk);
+            b.be32(static_cast<uint32_t>(chunk));
+            b.be32(check);
+            b.bytes(in.data() + pos, chunk);
         }
-        pos += chunk;
-    }
+        parts[i] = b.take();
+        report(chunk);
+    });
+    for (const Bytes& part : parts) w.bytes(part.data(), part.size());
     w.be32(0);  // dst_len == 0 marks end of stream
     return w.take();
 }
@@ -611,7 +702,11 @@ Bytes lzo_decompress(const Bytes& in, size_t max_out) {
         fail("not an lzop/LZO stream (bad magic)");
     r.skip(sizeof(kLzopMagic));
     uint16_t version = r.be16();
-    r.skip(5);  // library_version(2) + version_needed(2) + method(1)
+    r.skip(4);  // library_version(2) + version_needed(2)
+    const uint8_t method = r.u8();
+    if (method < kLzopMethod1x1 || method > kLzopMethod1x999)
+        fail("the lzop stream is not LZO1X (its method byte is " + std::to_string(method) +
+             "; abr reads the methods 1 to 3 of lzop: LZO1X-1, LZO1X-1(15) and LZO1X-999)");
     if (version >= 0x0940) r.skip(1);  // level
     uint32_t flags = r.be32();
     if (flags & kLzopHasFilter) r.skip(4);  // filter info, only present with HEADER_HAS_FILTER
@@ -634,7 +729,8 @@ Bytes lzo_decompress(const Bytes& in, size_t max_out) {
     for (;;) {
         uint32_t dst_len = r.be32();
         if (dst_len == 0) break;  // end-of-stream marker
-        if (dst_len > kLzoBlockSize) fail("lzo block's uncompressed size exceeds the max block size");
+        if (dst_len > kLzoMaxBlockSize) fail("lzo block's uncompressed size exceeds the max block size");
+        if (scratch.size() < dst_len) scratch.resize(dst_len);  // (blocks of 256 KiB, unless the tool that made the stream was told otherwise)
         uint32_t src_len = r.be32();
         if (src_len > dst_len) fail("lzo block is longer compressed than uncompressed (corrupt stream)");
         r.skip(4 * d_words);                        // checksums -- not validated, as in decompress_unlzo.c
@@ -725,7 +821,7 @@ Bytes compress(Codec codec, const Bytes& data, int level, const std::function<vo
         case Codec::XZ: out = xz_compress(data, level); break;
         case Codec::LZMA: out = lzma_stream_run(data, /*encode=*/true); break;
         case Codec::BZIP2: out = bzip2_compress(data, level); break;
-        case Codec::LZO: out = lzo_compress(data); break;
+        case Codec::LZO: out = lzo_compress(data, level, report); break;
         case Codec::ZLIB: out = zlib_encode(data, level < 0 ? Z_DEFAULT_COMPRESSION : std::min(level, 9), /*windowBits=*/15, report); break;
         default: fail("unknown codec");
     }
@@ -742,7 +838,8 @@ int default_level(Codec codec) {
         case Codec::ZSTD: return ZSTD_CLEVEL_DEFAULT;
         case Codec::XZ: return 6;
         case Codec::BZIP2: return 9;
-        default: return -1;          // lzma, lzo and none have no setting
+        case Codec::LZO: return kLzoDefaultLevel;  // LZO1X-999, the densest: what the kernel's build makes (`lzop -9`)
+        default: return -1;          // lzma and none have no setting
     }
 }
 
@@ -755,6 +852,7 @@ int dense_level(Codec codec) {
         case Codec::ZSTD: return 19;                      // windowLog 23 (8 MiB): anything that reads zstd reads it
         case Codec::XZ: return 9;
         case Codec::BZIP2: return 9;                      // also the usual one
+        case Codec::LZO: return 9;                        // also the usual one
         default: return -1;                               // the others have no setting
     }
 }
@@ -920,7 +1018,7 @@ uint64_t xz_dict_size(const Bytes& s) {
         v = 0;
         for (int i = 0; i < 9 && q < end; ++i) {
             const uint8_t b = s[q++];
-            v |= uint64_t{b & 0x7f} << (7 * i);
+            v |= static_cast<uint64_t>(b & 0x7f) << (7 * i);
             if (!(b & 0x80)) return true;
         }
         return false;
@@ -965,6 +1063,26 @@ LevelGuess xz_level(const Bytes& stored, const Bytes& plain) {
     }
     return {};  // a dictionary that no preset has
 }
+
+// An lzop stream: the method byte of its header (1: LZO1X-1, 2: LZO1X-1(15), 3: LZO1X-999) and, from lzop 0.94 on, the level byte. The level of
+// compress() that makes the same kind of blocks (lzo_setting()) is the answer. The stream is not made again to see: the header is what the tool
+// that wrote it says it did, and a stream of another version of LZO (or of another tool) has other blocks at the same level all the same.
+LevelGuess lzo_level(const Bytes& stored) {
+    constexpr size_t at = sizeof(kLzopMagic);  // the version(2), the library version(2), the version needed(2), the method, the level
+    if (stored.size() < at + 8 || !same_prefix(stored, kLzopMagic, sizeof(kLzopMagic))) return {};
+    const unsigned version = (unsigned{stored[at]} << 8) | stored[at + 1];
+    const uint8_t method = stored[at + 6];
+    const int header_level = version >= 0x0940 ? stored[at + 7] : 0;
+    switch (method) {
+        case kLzopMethod1x1_15: return {1, "the lzop header says LZO1X-1(15), the fastest setting (lzop -1)"};
+        case kLzopMethod1x1: return {3, "the lzop header says LZO1X-1 (lzop -2 to -6 make this stream; 3 is the default of lzop)"};
+        case kLzopMethod1x999: {
+            const int level = header_level == 0 ? 9 : std::clamp(header_level, 7, 9);
+            return {level, "the lzop header says LZO1X-999" + (header_level == 0 ? std::string(" (no level in it: the densest, 9)") : " at level " + std::to_string(header_level))};
+        }
+        default: return {};
+    }
+}
 }  // namespace
 
 LevelGuess detect_level(Codec codec, const Bytes& stored, const Bytes& plain) {
@@ -978,7 +1096,8 @@ LevelGuess detect_level(Codec codec, const Bytes& stored, const Bytes& plain) {
         case Codec::XZ: return xz_level(stored, plain);
         case Codec::LZ4_LEGACY: return lz4_legacy_level(stored, plain);
         case Codec::ZSTD: return zstd_level(stored, plain);
-        default: return {};  // lzma (its settings are lzma_alone_params()), lz4 frame, lzo: abr cannot tell
+        case Codec::LZO: return lzo_level(stored);
+        default: return {};  // lzma (its settings are lzma_alone_params()) and lz4 frame: abr cannot tell
     }
 }
 

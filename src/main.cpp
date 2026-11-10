@@ -550,7 +550,7 @@ void record_component(Manifest& m, const std::string& prefix, const std::string&
     m.set(prefix + "_file", filename);
     m.set(prefix + "_compression", std::string(codec_name(d.codec)));
     // The level of the stream, when abr could tell: pack compresses the component again at it when the file was changed. Without the
-    // key (xz, lzma, lz4 frame, lzo, or a stream made in a way abr does not make) pack uses the usual level of the compression.
+    // key (xz, lzma, lz4 frame, or a stream made in a way abr does not make) pack uses the usual level of the compression.
     if (d.level >= 0) {
         m.set(prefix + "_level", std::to_string(d.level));
         m.set(prefix + "_level_basis", d.level_basis);  // for a person: pack does not read it
