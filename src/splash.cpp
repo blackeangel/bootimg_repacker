@@ -257,11 +257,12 @@ QcFields qc_read_fields(const Bytes& d) {
         f.why = "no \"SPLASH!!\" and 512 bytes of header";
         return f;
     }
-    const auto picture_problem = [&](const QcPicture& p, const std::string& who) -> std::string {
+    // (the one picture of the single form may say 0 blocks, as the images of Qualcomm's own do: the picture then tells how long its data is)
+    const auto picture_problem = [&](const QcPicture& p, const std::string& who, bool zero_blocks_ok) -> std::string {
         if (p.width == 0 || p.height == 0 || p.width > kMaxSide || p.height > kMaxSide || uint64_t{p.width} * p.height > kMaxPixels)
             return who + " is " + std::to_string(p.width) + "x" + std::to_string(p.height) + " pixels (the sides are 1 to " + std::to_string(kMaxSide) + ")";
         if (p.type > kQcRle24) return who + " has the type " + std::to_string(p.type) + "; abr knows 0 (pixels) and 1 (RLE24)";
-        if (p.blocks == 0) return who + " has no blocks";
+        if (p.blocks == 0 && !zero_blocks_ok) return who + " has no blocks";
         return {};
     };
 
@@ -280,7 +281,7 @@ QcFields qc_read_fields(const Bytes& d) {
             p.blocks = le32(d, at + 12);
             p.offset = le32(d, at + 16);
             const std::string who = "picture " + std::to_string(i);
-            several_why = picture_problem(p, who);
+            several_why = picture_problem(p, who, false);
             if (several_why.empty() && p.offset != expected)
                 several_why = who + " is at " + hex(p.offset) + ", not right behind the one before it (" + hex(expected) + ")";
             if (several_why.empty() && p.offset >= d.size()) several_why = who + " begins at " + hex(p.offset) + ", past the end of the file";
@@ -304,7 +305,7 @@ QcFields qc_read_fields(const Bytes& d) {
     p.type = le32(d, 16);
     p.blocks = le32(d, 20);
     p.offset = static_cast<uint32_t>(kQcHeaderSize);
-    if (const std::string why = picture_problem(p, "the picture"); !why.empty()) {
+    if (const std::string why = picture_problem(p, "the picture", true); !why.empty()) {
         // A count that could be one makes the table a reading worth naming.
         f.why = count >= 1 && count <= kQcMaxPictures ? "as a table of " + std::to_string(count) + " pictures: " + several_why + "; as a single picture: " + why : why;
         return f;
@@ -341,20 +342,24 @@ QcSplash qc_parse(const Bytes& d) {
     for (size_t i = 0; i < s.pictures.size(); ++i) {
         QcPicture& p = s.pictures[i];
         const std::string who = s.several ? "picture " + std::to_string(i) : "the picture";
-        const uint64_t end = std::min<uint64_t>(d.size(), uint64_t{p.offset} + uint64_t{p.blocks} * kQcBlock);
-        p.data.assign(d.begin() + p.offset, d.begin() + static_cast<std::ptrdiff_t>(end));
+        // The blocks of the header give the extent of the data (the file may end before them). A picture that says 0 blocks -- the images that Qualcomm's own tool
+        // makes of pixels do -- has the data its pixels take, or the packets that make it.
+        uint64_t end = p.blocks ? std::min<uint64_t>(d.size(), uint64_t{p.offset} + uint64_t{p.blocks} * kQcBlock) : d.size();
         if (p.type == kQcRaw) {
             p.stream = size_t{p.width} * p.height * 3;
-            if (p.data.size() < p.stream)
+            if (end - p.offset < p.stream)
                 throw FormatError("splash: " + who + " is cut short: its " + std::to_string(p.width) + "x" + std::to_string(p.height) + " pixels are " + std::to_string(p.stream) +
-                                  " bytes, the file holds " + std::to_string(p.data.size()) + " from its start");
+                                  " bytes, the file holds " + std::to_string(end - p.offset) + " from its start");
+            if (!p.blocks) end = p.offset + p.stream;
         } else {
             try {
-                (void)rle24_decode(p.data.data(), p.data.size(), p.width, p.height, &p.stream);
+                (void)rle24_decode(d.data() + p.offset, static_cast<size_t>(end - p.offset), p.width, p.height, &p.stream);
             } catch (const FormatError& e) {
                 throw FormatError("splash: " + who + ": " + e.what());
             }
+            if (!p.blocks) end = p.offset + p.stream;
         }
+        p.data.assign(d.begin() + p.offset, d.begin() + static_cast<std::ptrdiff_t>(end));
         s.consumed = static_cast<size_t>(end);
     }
     return s;
@@ -404,6 +409,7 @@ Bytes qc_build(const QcSplash& s) {
     if (s.several) put32(out, 8, static_cast<uint32_t>(s.pictures.size()));
     for (size_t i = 0; i < s.pictures.size(); ++i) {
         const QcPicture& p = s.pictures[i];
+        if (s.several && p.blocks == 0) throw FormatError("splash: picture " + std::to_string(i) + " has no blocks (only the single picture may say 0: its data is the pixels or the packets)");
         if (s.several && i + 1 < s.pictures.size() && p.data.size() != size_t{p.blocks} * kQcBlock)
             throw FormatError("splash: the data of picture " + std::to_string(i) + " is " + std::to_string(p.data.size()) + " bytes, its " + std::to_string(p.blocks) +
                               " blocks are " + std::to_string(size_t{p.blocks} * kQcBlock) + " (the next picture follows at once)");

@@ -346,6 +346,44 @@ void test_qc() {
         EXPECT(throws([&] { qc_build(s); }));
     }
 
+    // A single picture that says 0 blocks, as the sample images of Qualcomm's own do (mm_splash.img, lp_splash.img: 1080x1920, type 0, blocks 0, exactly the
+    // pixels behind the header): its data is its pixels, or the packets that make the picture.
+    for (uint32_t type : {kQcRaw, kQcRle24}) {
+        const Bitmap b = make_bitmap(37, 21, 6);
+        QcSplash s;
+        s.pictures.push_back(qc_picture(b, type, false));
+        s.pictures[0].blocks = 0;
+        const Bytes file = qc_build(s);
+        EXPECT(get32(file, 20) == 0 && file.size() == kQcHeaderSize + s.pictures[0].data.size());
+        EXPECT(qc_looks_like(file) && qc_problem(file).empty());
+        const QcSplash back = qc_parse(file);
+        EXPECT(!back.several && back.pictures[0].blocks == 0 && back.consumed == file.size());
+        EXPECT(back.pictures[0].stream == s.pictures[0].data.size() && back.pictures[0].data == s.pictures[0].data);
+        EXPECT(qc_decode(back.pictures[0]).bgr == b.bgr);
+        EXPECT(qc_build(back) == file);
+        // The fill of a partition behind the picture is no part of it (with the blocks it would have been the end of the last block).
+        Bytes part = file;
+        part.resize(file.size() + 3000, 0xFF);
+        const QcSplash in_part = qc_parse(part);
+        EXPECT(in_part.consumed == file.size() && in_part.pictures[0].data == s.pictures[0].data && qc_build(in_part) == file);
+        // Cut short, the picture is refused whatever the type.
+        for (size_t cut = 513; cut < file.size(); cut += 41) {
+            const Bytes cutoff(file.begin(), file.begin() + static_cast<std::ptrdiff_t>(cut));
+            EXPECT(throws([&] { qc_parse(cutoff); }));
+        }
+        // A table has no entry of 0 blocks: refused when it is read (the header is no table, and no single picture either) and when it is built.
+        QcSplash t;
+        t.several = true;
+        t.pictures.push_back(qc_picture(b, type, true));
+        t.pictures.push_back(qc_picture(b, type, false));
+        Bytes table = qc_build(t);
+        EXPECT(qc_looks_like(table));
+        put32(table, 12 + 12, 0);
+        EXPECT(!qc_looks_like(table) || throws([&] { qc_parse(table); }));
+        t.pictures[1].blocks = 0;
+        EXPECT(throws([&] { qc_build(t); }));
+    }
+
     // Several pictures: the table, the offsets one behind the other, the last one in the middle of its block.
     {
         const Bitmap b0 = make_bitmap(40, 30, 1), b1 = make_bitmap(100, 7, 3), b2 = make_bitmap(5, 5, 5);
@@ -397,8 +435,8 @@ void test_qc() {
         EXPECT(!qc_looks_like(d));
         d = good, put32(d, 12, kMaxSide + 1);
         EXPECT(!qc_looks_like(d));
-        d = good, put32(d, 20, 0);
-        EXPECT(!qc_looks_like(d));
+        d = good, put32(d, 20, 0);  // (0 blocks is the single picture as Qualcomm's own images say it: its data is the pixels; a table has none such, see below)
+        EXPECT(qc_looks_like(d) && !throws([&] { qc_parse(d); }));
         d = good, d[3] = 'X';
         EXPECT(!qc_looks_like(d) && !qc_problem(d).empty());
         EXPECT(!qc_looks_like(Bytes(good.begin(), good.begin() + 511)));  // (the header is not whole)

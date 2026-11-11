@@ -117,6 +117,16 @@ Layout mbn(const Bytes& file);
 // and the certificate chain. Empty for a file that is no such image.
 Layout mbn_elf(const Bytes& file);
 
+// The picture partitions of a phone (abr/splash.hpp), read from `file`: Qualcomm's "SPLASH!!" image (the header, the pictures: key `picture<i>`; a region
+// is the pixels or the packets of a picture, the padding up to the block is not one), the OPLUS "SPLASH LOGO!" image (the preamble in front of the header, the
+// header with its descriptions and table at depth 1, the pictures: key `entry<i>`), the Xiaomi "LOGO!!!!" image (the preamble, the table, the pictures: key
+// `picture<i>`; a region is the file, not the zeros that fill its last unit) and the Motorola "MotoLogo" image (the table, the pictures: key `entry<i>`, empty
+// slots are no region). Empty for a file that is no such image.
+Layout qc_splash(const Bytes& file);
+Layout oplus_logo(const Bytes& file);
+Layout xiaomi_logo(const Bytes& file);
+Layout moto_logo(const Bytes& file);
+
 // What is around the container that lies at [core_off, core_off + core_len) of `whole`: the bytes in front of it, the bytes after
 // it, the fill up to the size of the partition (Envelope), and the AVB hash footer at the end (vbmeta block and footer). The regions of
 // the container are moved by core_off; the size and the regions of the layout are those of `whole`. `host_size` is the number of bytes

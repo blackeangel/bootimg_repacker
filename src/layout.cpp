@@ -21,6 +21,7 @@
 #include "abr/mtkgfh.hpp"
 #include "abr/mtkimg.hpp"
 #include "abr/qcdt.hpp"
+#include "abr/splash.hpp"
 #include "abr/uimage.hpp"
 #include "abr/vbmeta.hpp"
 #include "abr/vendor_boot.hpp"
@@ -718,6 +719,116 @@ Layout mbn_elf(const Bytes& d) {
             Region& r = l.add("segment " + std::to_string(i), "seg" + std::to_string(i), s.ph.offset, s.ph.filesz, 0, joined({where, flags, "address " + hex(s.ph.paddr)}));
             r.codec = codec_at(d, r.offset, r.size);
         }
+    }
+    return l;
+}
+
+// ------------------------------------------------------------------------------------------------ the picture partitions --
+
+namespace {
+
+std::string pixels_text(uint32_t width, uint32_t height) { return std::to_string(width) + "x" + std::to_string(height); }
+
+bool all_zero(const Bytes& b) { return std::all_of(b.begin(), b.end(), [](uint8_t v) { return v == 0; }); }
+
+}  // namespace
+
+Layout qc_splash(const Bytes& d) {
+    Layout l;
+    l.size = d.size();
+    splash::QcSplash s;
+    try {
+        s = splash::qc_parse(d);
+    } catch (const FormatError&) {
+        return l;
+    }
+    l.format = "Qualcomm splash image (SPLASH!!)";
+    l.add("header", "", 0, splash::kQcHeaderSize, 0,
+          s.several ? "table of " + std::to_string(s.pictures.size()) + " pictures" + (s.header_rest.empty() ? std::string() : ", " + std::to_string(s.header_rest.size()) + " more bytes kept")
+                    : std::string("one picture"));
+    for (size_t i = 0; i < s.pictures.size(); ++i) {
+        const splash::QcPicture& p = s.pictures[i];
+        // (the bytes of the pictures up to the block are padding: they are not a part)
+        l.add("picture " + std::to_string(i), "picture" + std::to_string(i), p.offset, p.stream, 0,
+              pixels_text(p.width, p.height) + ", " + splash::qc_type_name(p.type) + ", " +
+                  (p.blocks == 0 ? std::string("no block count in the header") : std::to_string(p.blocks) + (p.blocks == 1 ? " block" : " blocks")));
+    }
+    return l;
+}
+
+Layout oplus_logo(const Bytes& d) {
+    Layout l;
+    l.size = d.size();
+    splash::OplusLogo o;
+    try {
+        o = splash::oplus_parse(d);
+    } catch (const FormatError&) {
+        return l;
+    }
+    l.format = "OPLUS splash logo image";
+    const bool ddph = o.preamble.size() >= 4 && le32(o.preamble, 0) == splash::kDdphMagic;
+    const bool zeros = all_zero(o.preamble);
+    l.add("preamble", zeros ? "" : "preamble", 0, splash::kOplusPreamble, 0, zeros ? "zeros" : ddph ? "DDPH header, kept as it is" : "kept as it is");
+    l.add("header", "", splash::kOplusPreamble, splash::kOplusHeaderSize, 0,
+          std::to_string(o.entries.size()) + (o.entries.size() == 1 ? " picture" : " pictures") + ", version " + std::to_string(o.version) + ", " + pixels_text(o.width, o.height));
+    l.add("descriptions", "", splash::kOplusPreamble + 12, 4 * splash::kOplusDescSize, 1, "");
+    l.add("table", "", splash::kOplusPreamble + splash::kOplusTableAt, o.entries.size() * splash::kOplusEntrySize, 1, std::to_string(o.entries.size()) + " entries");
+    uint64_t at = splash::kOplusDataAt;
+    for (size_t i = 0; i < o.entries.size(); ++i) {
+        const splash::OplusEntry& e = o.entries[i];
+        l.add("picture " + std::to_string(i), "entry" + std::to_string(i), at, e.data.size(), 0, e.name + "; " + std::to_string(e.plain_size) + " bytes unpacked");
+        at += e.data.size();
+    }
+    return l;
+}
+
+Layout xiaomi_logo(const Bytes& d) {
+    Layout l;
+    l.size = d.size();
+    splash::XiaomiLogo x;
+    try {
+        x = splash::xiaomi_parse(d);
+    } catch (const FormatError&) {
+        return l;
+    }
+    l.format = "Xiaomi logo image (LOGO!!!!)";
+    l.add("preamble", all_zero(x.preamble) ? "" : "preamble", 0, splash::kXiaomiPreamble, 0, all_zero(x.preamble) ? "zeros" : "kept as it is");
+    l.add("table", "", splash::kXiaomiPreamble, splash::kXiaomiTableSize, 0, std::to_string(x.pictures.size()) + (x.pictures.size() == 1 ? " picture" : " pictures") + ", in units of 4096 bytes");
+    uint64_t at = splash::kXiaomiPreamble + splash::kXiaomiTableSize;
+    for (size_t i = 0; i < x.pictures.size(); ++i) {
+        const Bytes& p = x.pictures[i];
+        // (a picture lies in whole units; what is behind the file in the last of them is padding)
+        const size_t content = splash::xiaomi_content_size(p);
+        l.add("picture " + std::to_string(i), "picture" + std::to_string(i), at, content, 0, splash::picture_extension(p) + ", " + std::to_string(p.size() / splash::kXiaomiUnit) + " units");
+        at += p.size();
+    }
+    return l;
+}
+
+Layout moto_logo(const Bytes& d) {
+    Layout l;
+    l.size = d.size();
+    splash::MotoLogo m;
+    try {
+        m = splash::moto_parse(d);
+    } catch (const FormatError&) {
+        return l;
+    }
+    l.format = "Motorola logo image (MotoLogo)";
+    size_t pictures = 0;
+    for (const splash::MotoEntry& e : m.entries) pictures += e.data.empty() ? 0 : 1;
+    l.add("table", "", 0, le32(d, 9), 0,
+          std::to_string(m.entries.size()) + " entries, " + std::to_string(pictures) + (pictures == 1 ? " picture" : " pictures") + ", pictures at multiples of " + std::to_string(m.align));
+    for (size_t i = 0; i < m.entries.size(); ++i) {
+        const splash::MotoEntry& e = m.entries[i];
+        if (e.data.empty()) continue;
+        const size_t at = splash::kMotoTableAt + i * splash::kMotoEntrySize + splash::kMotoNameSize;
+        std::string note = e.name;
+        if (e.data.size() >= splash::kMotoHeaderSize && std::memcmp(e.data.data(), "MotoRun\0", 8) == 0)
+            note += "; MotoRun, " + pixels_text(static_cast<uint32_t>(e.data[8] << 8 | e.data[9]), static_cast<uint32_t>(e.data[10] << 8 | e.data[11]));
+        else
+            note += "; " + splash::picture_extension(e.data);
+        l.add("picture " + std::to_string(i), "entry" + std::to_string(i), le32(d, at), e.data.size(), 0, note);
     }
     return l;
 }

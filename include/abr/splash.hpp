@@ -92,6 +92,8 @@ Bytes moto_encode(const Bitmap& bmp);
 //
 // The data of a picture is its pixels (width * height * 3 bytes) or its RLE24 packets. What follows it up to the block is padding;
 // the file may end in the middle of the last block (logo_gen.py writes no padding) and may go on behind the last one (a partition).
+// The single picture may say 0 blocks -- the images of Qualcomm's own (the mm_splash.img and lp_splash.img of its sample images, 1080x1920
+// pixels) do -- and then its data is exactly the pixels, or the packets that make the picture; a table has no entry of 0 blocks.
 
 inline constexpr char kQcMagic[8] = {'S', 'P', 'L', 'A', 'S', 'H', '!', '!'};
 inline constexpr size_t kQcHeaderSize = 512;
@@ -102,7 +104,7 @@ inline constexpr uint32_t kQcRaw = 0, kQcRle24 = 1;
 struct QcPicture {
     uint32_t width = 0, height = 0;
     uint32_t type = kQcRaw;
-    uint32_t blocks = 0;  // as the header says
+    uint32_t blocks = 0;  // as the header says (0: the single picture does not say; `data` is then `stream` bytes)
     uint32_t offset = 0;  // from the start of the file; 512 for the single picture
     Bytes data;           // the bytes of the picture as they lie: `blocks` * 512 of them, fewer where the file ends first
     size_t stream = 0;    // how many of them are the pixels or the packets (what follows is padding)

@@ -10,6 +10,9 @@
 //   * a uImage; a Qualcomm device tree table made by qcdt::build; flattened device trees one after the other;
 //   * a FIT image with its data in the tree, behind it by data-offset and by data-position; a Sony ELF boot image (ELF32 and ELF64); a
 //     Rockchip KRNL image; an ASUS blob, signed and not; an Intel OSIP image with and without its header; a ChromeOS kernel blob;
+//   * the picture partitions: Qualcomm's SPLASH!! (one picture, one that counts no blocks, a table), the OPLUS logo image (with a zero and a DDPH
+//     preamble, the most pictures the header holds), the Xiaomi LOGO!!!! (BMP, PNG, other pictures, a preamble that is kept) and the Motorola
+//     MotoLogo (with an empty slot, two alignments); for each, what is not an image and a header damaged anywhere give no exception;
 //   * a vbmeta image (header, hash, signature, descriptors, public key) and the vbmeta block and footer of an AVB hash footer;
 //   * the bytes around a container: a prefix, a tail, the fill up to the partition size;
 //   * the text (render) and the lines of a manifest (manifest_lines, write_manifest_block: an earlier block is replaced, the rest stays).
@@ -37,6 +40,7 @@
 #include "abr/legacy/krnl.hpp"
 #include "abr/legacy/osip.hpp"
 #include "abr/qcdt.hpp"
+#include "abr/splash.hpp"
 #include "abr/uimage.hpp"
 #include "abr/vbmeta.hpp"
 #include "abr/vendor_boot.hpp"
@@ -871,6 +875,341 @@ void test_fit() {
     }
 }
 
+// ---------------------------------------------------------------------------------------------------- the picture partitions --
+
+void put_le32(Bytes& b, size_t at, uint32_t v) {
+    for (size_t i = 0; i < 4; ++i) b[at + i] = static_cast<uint8_t>(v >> (8 * i));
+}
+
+// A picture with runs of one colour and some pixels that differ.
+splash::Bitmap picture(uint32_t w, uint32_t h, uint8_t seed) {
+    splash::Bitmap b;
+    b.width = w;
+    b.height = h;
+    b.bgr.resize(size_t{w} * h * 3);
+    for (uint32_t y = 0; y < h; ++y)
+        for (uint32_t x = 0; x < w; ++x)
+            for (uint32_t c = 0; c < 3; ++c) b.bgr[(size_t{y} * w + x) * 3 + c] = static_cast<uint8_t>(((x / 5 + y / 3) * (c + 2) + seed) * 17 + ((x * y) % 11 == 0 ? x : 0));
+    return b;
+}
+
+splash::QcPicture qc_picture(const splash::Bitmap& bmp, uint32_t type, bool padded) {
+    splash::QcPicture p;
+    p.width = bmp.width;
+    p.height = bmp.height;
+    p.type = type;
+    p.data = splash::qc_encode(bmp, type);
+    p.stream = p.data.size();
+    p.blocks = splash::qc_blocks(p.data.size());
+    if (padded) p.data.resize(size_t{p.blocks} * splash::kQcBlock, 0);
+    return p;
+}
+
+// What a layout describes lies in the file, whatever the bytes are.
+void expect_inside(const layout::Layout& l, const Bytes& file) {
+    for (const auto& r : l.regions) EXPECT(r.offset + r.size <= file.size());
+}
+
+bool has_line(const layout::Layout& l, const std::string& key, const std::string& value) {
+    for (const auto& [k, v] : layout::manifest_lines(l))
+        if (k == key && v == value) return true;
+    return false;
+}
+
+std::string hex_of(uint64_t v) {
+    char b[32];
+    std::snprintf(b, sizeof b, "0x%llx", static_cast<unsigned long long>(v));
+    return b;
+}
+
+bool contains(const std::string& text, const std::string& what) { return text.find(what) != std::string::npos; }
+
+void test_qc_splash() {
+    const splash::Bitmap a = picture(40, 25, 1), b = picture(13, 7, 2), c = picture(64, 48, 3);
+    const Bytes ea = splash::qc_encode(a, splash::kQcRle24), eb = splash::qc_encode(b, splash::kQcRaw), ec = splash::qc_encode(c, splash::kQcRle24);
+    EXPECT(ea.size() % splash::kQcBlock != 0 && eb.size() == 13 * 7 * 3 && ec.size() % splash::kQcBlock != 0);  // (so there is padding to tell from the pictures)
+
+    {  // one picture, run-length coded, padded up to the block
+        splash::QcSplash s;
+        s.pictures.push_back(qc_picture(a, splash::kQcRle24, true));
+        const Bytes file = splash::qc_build(s);
+        const layout::Layout l = layout::qc_splash(file);
+        EXPECT(l.size == file.size());
+        EXPECT(contains(l.format, "SPLASH!!"));
+        EXPECT(l.regions.size() == 2);
+        const layout::Region* h = find_name(l, "header");
+        EXPECT(h && h->offset == 0 && h->size == 512 && h->depth == 0 && h->note == "one picture");
+        const layout::Region* p = find_key(l, "picture0");
+        EXPECT(p && p->offset == 512 && p->size == ea.size());
+        EXPECT(p && p->offset + p->size < file.size());  // (the padding up to the block is no part)
+        EXPECT(p && contains(p->note, "40x25") && contains(p->note, splash::qc_type_name(splash::kQcRle24)) && contains(p->note, "blocks"));
+        check_layout(l, file, {{"picture0", ea}});
+    }
+    {  // one picture that counts no blocks (the sample images of Qualcomm): the pixels are the rest of the file
+        splash::QcSplash s;
+        splash::QcPicture p = qc_picture(b, splash::kQcRaw, false);
+        p.blocks = 0;
+        s.pictures.push_back(p);
+        const Bytes file = splash::qc_build(s);
+        EXPECT(file.size() == 512 + eb.size());
+        const layout::Layout l = layout::qc_splash(file);
+        const layout::Region* r = find_key(l, "picture0");
+        EXPECT(r && r->offset == 512 && r->size == eb.size());
+        EXPECT(r && contains(r->note, "no block count"));
+        check_layout(l, file, {{"picture0", eb}});
+    }
+    {  // a table: three pictures, the first two padded up to their blocks, the last not
+        splash::QcSplash s;
+        s.several = true;
+        s.pictures = {qc_picture(a, splash::kQcRle24, true), qc_picture(b, splash::kQcRaw, true), qc_picture(c, splash::kQcRle24, false)};
+        const Bytes file = splash::qc_build(s);
+        const layout::Layout l = layout::qc_splash(file);
+        EXPECT(l.regions.size() == 4);
+        const layout::Region* h = find_name(l, "header");
+        EXPECT(h && h->offset == 0 && h->size == 512 && contains(h->note, "table of 3 pictures"));
+        const Bytes* parts[3] = {&ea, &eb, &ec};
+        uint64_t at = 512;
+        std::map<std::string, Bytes> want;
+        for (size_t i = 0; i < 3; ++i) {
+            const std::string key = "picture" + std::to_string(i);
+            const layout::Region* r = find_key(l, key);
+            EXPECT(r && r->offset == at && r->size == parts[i]->size());
+            EXPECT(has_line(l, "layout_" + key + "_offset", hex_of(at)));
+            EXPECT(has_line(l, "layout_" + key + "_size", std::to_string(parts[i]->size())));
+            at += s.pictures[i].data.size();
+            want[key] = *parts[i];
+        }
+        EXPECT(at == file.size());
+        check_layout(l, file, want);
+        EXPECT(contains(layout::render(l), "picture 2"));
+
+        // not an image: nothing is made up; a header that is damaged anywhere, a file that is cut anywhere: no exception, what is described is in the file
+        EXPECT(layout::qc_splash(Bytes()).regions.empty());
+        EXPECT(layout::qc_splash(Bytes(700, 9)).regions.empty());
+        EXPECT(layout::qc_splash(Bytes(file.begin(), file.begin() + 600)).regions.empty());
+        for (size_t at2 = 0; at2 < 512; ++at2) {
+            Bytes bad = file;
+            bad[at2] ^= 0xFF;
+            expect_inside(layout::qc_splash(bad), bad);
+        }
+        for (size_t cut = 0; cut < file.size(); cut += 331) {
+            const Bytes bad(file.begin(), file.begin() + static_cast<long>(cut));
+            expect_inside(layout::qc_splash(bad), bad);
+        }
+    }
+}
+
+splash::OplusLogo oplus_sample(bool ddph, size_t entries) {
+    splash::OplusLogo o;
+    o.preamble = Bytes(splash::kOplusPreamble, 0);
+    if (ddph) {
+        o.preamble = pattern(splash::kOplusPreamble, 9);
+        put_le32(o.preamble, 0, splash::kDdphMagic);
+    }
+    o.desc[0] = "test logo";
+    o.version = 2;
+    o.width = 1080;
+    o.height = 2400;
+    o.compression = 1;
+    for (size_t i = 0; i < entries; ++i) {
+        splash::OplusEntry e;
+        e.name = i == 1 ? "fhd_wallpaper.bmp" : "logo" + std::to_string(i);
+        e.data = pattern(300 + 217 * i, static_cast<uint8_t>(i + 1));
+        e.plain_size = static_cast<uint32_t>(e.data.size() * 3);
+        o.entries.push_back(std::move(e));
+    }
+    return o;
+}
+
+void test_oplus_logo() {
+    for (const bool ddph : {false, true}) {
+        const splash::OplusLogo o = oplus_sample(ddph, 3);
+        const Bytes file = splash::oplus_build(o);
+        const layout::Layout l = layout::oplus_logo(file);
+        EXPECT(l.size == file.size());
+        EXPECT(contains(l.format, "OPLUS"));
+        const layout::Region* pre = find_name(l, "preamble");
+        EXPECT(pre && pre->offset == 0 && pre->size == 0x4000 && pre->depth == 0);
+        EXPECT(pre && (pre->key == "preamble") == ddph);  // (a preamble of zeros is not a file of its own)
+        EXPECT(pre && contains(pre->note, ddph ? "DDPH" : "zeros"));
+        const layout::Region* h = find_name(l, "header");
+        EXPECT(h && h->offset == 0x4000 && h->size == 0x4000 && h->depth == 0 && contains(h->note, "3 pictures, version 2, 1080x2400"));
+        const layout::Region* d = find_name(l, "descriptions");
+        EXPECT(d && d->offset == 0x400C && d->size == 256 && d->depth == 1);
+        const layout::Region* t = find_name(l, "table");
+        EXPECT(t && t->offset == 0x4000 + 288 && t->size == 3 * 128 && t->depth == 1);
+        uint64_t at = 0x8000;
+        std::map<std::string, Bytes> want;
+        for (size_t i = 0; i < 3; ++i) {
+            const std::string key = "entry" + std::to_string(i);
+            const layout::Region* r = find_key(l, key);
+            EXPECT(r && r->offset == at && r->size == o.entries[i].data.size());
+            EXPECT(r && r->depth == 0 && contains(r->note, o.entries[i].name) && contains(r->note, std::to_string(o.entries[i].plain_size)));
+            at += o.entries[i].data.size();
+            want[key] = o.entries[i].data;
+        }
+        if (ddph) want["preamble"] = o.preamble;
+        EXPECT(at == file.size());
+        check_layout(l, file, want);
+    }
+    {  // the most the header holds
+        splash::OplusLogo o = oplus_sample(false, splash::kOplusMaxEntries);
+        for (auto& e : o.entries) e.data.resize(5);
+        const Bytes file = splash::oplus_build(o);
+        const layout::Layout l = layout::oplus_logo(file);
+        EXPECT(l.regions.size() == 4 + splash::kOplusMaxEntries);  // preamble, header, descriptions, table, the pictures
+        const layout::Region* t = find_name(l, "table");
+        EXPECT(t && t->offset + t->size <= 0x8000);
+        check_layout(l, file, {});
+    }
+    {  // not an image
+        const Bytes file = splash::oplus_build(oplus_sample(false, 2));
+        EXPECT(layout::oplus_logo(Bytes()).regions.empty());
+        EXPECT(layout::oplus_logo(Bytes(0x9000, 0)).regions.empty());
+        EXPECT(layout::oplus_logo(Bytes(file.begin(), file.end() - 5)).regions.empty());  // the last picture is cut short
+        for (size_t at = 0x4000; at < 0x4000 + 600; ++at) {
+            Bytes bad = file;
+            bad[at] ^= 0xFF;
+            expect_inside(layout::oplus_logo(bad), bad);
+        }
+    }
+}
+
+Bytes bmp_file(size_t size, uint8_t seed) {
+    Bytes b = pattern(size, seed);
+    b[0] = 'B';
+    b[1] = 'M';
+    put_le32(b, 2, static_cast<uint32_t>(size));
+    return b;
+}
+
+// A PNG that has the chunks that make one a file (a signature, IHDR, IDAT of `idat` bytes, IEND); the bytes in them are not a picture.
+Bytes png_file(size_t idat) {
+    static constexpr uint8_t kSignature[8] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n'};
+    Bytes b(kSignature, kSignature + 8);
+    const auto chunk = [&b](const char* type, size_t len) {
+        const size_t at = b.size();
+        b.resize(at + 12 + len, 0x55);
+        for (size_t i = 0; i < 4; ++i) b[at + i] = static_cast<uint8_t>(len >> (24 - 8 * i));
+        std::memcpy(b.data() + at + 4, type, 4);
+    };
+    chunk("IHDR", 13);
+    chunk("IDAT", idat);
+    chunk("IEND", 0);
+    return b;
+}
+
+void test_xiaomi_logo() {
+    for (const bool kept : {false, true}) {
+        splash::XiaomiLogo x;
+        x.preamble = kept ? pattern(splash::kXiaomiPreamble, 7) : Bytes(splash::kXiaomiPreamble, 0);
+        const Bytes bmp = bmp_file(9270, 1), png = png_file(5000), other = pattern(4096, 3), tiny = bmp_file(100, 4);
+        x.pictures = {bmp, png, other, tiny};
+        const Bytes file = splash::xiaomi_build(x);
+        const layout::Layout l = layout::xiaomi_logo(file);
+        EXPECT(l.size == file.size());
+        EXPECT(contains(l.format, "Xiaomi"));
+        const layout::Region* pre = find_name(l, "preamble");
+        EXPECT(pre && pre->offset == 0 && pre->size == 0x4000 && (pre->key == "preamble") == kept);
+        const layout::Region* t = find_name(l, "table");
+        EXPECT(t && t->offset == 0x4000 && t->size == 0x1000 && contains(t->note, "4 pictures"));
+        const Bytes* parts[4] = {&bmp, &png, &other, &tiny};
+        const char* kinds[4] = {"bmp", "png", "bin", "bmp"};
+        uint64_t at = 0x5000;
+        std::map<std::string, Bytes> want;
+        for (size_t i = 0; i < 4; ++i) {
+            const std::string key = "picture" + std::to_string(i);
+            const layout::Region* r = find_key(l, key);
+            EXPECT(r && r->offset == at && r->size == parts[i]->size());  // the file, not the units that hold it
+            EXPECT(r && contains(r->note, kinds[i]) && contains(r->note, "unit"));
+            at += (parts[i]->size() + splash::kXiaomiUnit - 1) / splash::kXiaomiUnit * splash::kXiaomiUnit;
+            want[key] = *parts[i];
+        }
+        if (kept) want["preamble"] = x.preamble;
+        EXPECT(at == file.size());
+        check_layout(l, file, want);
+    }
+    {  // not an image
+        splash::XiaomiLogo x;
+        x.preamble = Bytes(splash::kXiaomiPreamble, 0);
+        x.pictures = {bmp_file(5000, 1), bmp_file(300, 2)};
+        const Bytes file = splash::xiaomi_build(x);
+        EXPECT(layout::xiaomi_logo(Bytes()).regions.empty());
+        EXPECT(layout::xiaomi_logo(Bytes(0x5000, 0)).regions.empty());
+        EXPECT(layout::xiaomi_logo(Bytes(file.begin(), file.end() - 4096)).regions.empty());  // the last picture is cut short
+        for (size_t at = 0x4000; at < 0x4000 + 64; ++at) {
+            Bytes bad = file;
+            bad[at] ^= 0xFF;
+            expect_inside(layout::xiaomi_logo(bad), bad);
+        }
+    }
+}
+
+// What a picture of the Motorola image that is run-length coded begins with: "MotoRun", a zero, the width and the height (big-endian); the rest is not decoded here.
+Bytes motorun_stub(uint16_t w, uint16_t h, size_t payload) {
+    Bytes b = pattern(splash::kMotoHeaderSize + payload, 6);
+    std::memcpy(b.data(), "MotoRun\0", 8);
+    b[8] = static_cast<uint8_t>(w >> 8);
+    b[9] = static_cast<uint8_t>(w);
+    b[10] = static_cast<uint8_t>(h >> 8);
+    b[11] = static_cast<uint8_t>(h);
+    return b;
+}
+
+void test_moto_logo() {
+    for (const uint32_t align : {512u, 4096u}) {
+        splash::MotoLogo m;
+        m.align = align;
+        splash::MotoEntry boot, empty, raw, battery;
+        boot.name = "logo_boot";
+        boot.data = motorun_stub(64, 48, 6000);
+        empty.name = "empty_slot";
+        raw.name = "raw_data";
+        raw.data = pattern(380, 5);
+        battery.name = "logo_battery";
+        battery.data = motorun_stub(300, 20, 100);
+        m.entries = {boot, empty, raw, battery};
+        const Bytes file = splash::moto_build(m);
+        const layout::Layout l = layout::moto_logo(file);
+        EXPECT(l.size == file.size());
+        EXPECT(contains(l.format, "Motorola"));
+        const layout::Region* t = find_name(l, "table");
+        EXPECT(t && t->offset == 0 && t->size == 13 + 32 * 4 && contains(t->note, "4 entries, 3 pictures") && contains(t->note, std::to_string(align)));
+        EXPECT(find_key(l, "entry1") == nullptr);  // (an empty slot is no part)
+        const auto up = [align](uint64_t v) { return (v + align - 1) / align * align; };
+        uint64_t end = 13 + 32 * 4;
+        std::map<std::string, Bytes> want;
+        const char* notes[4] = {"logo_boot; MotoRun, 64x48", "", "raw_data; bin", "logo_battery; MotoRun, 300x20"};
+        for (const size_t i : {size_t{0}, size_t{2}, size_t{3}}) {
+            const std::string key = "entry" + std::to_string(i);
+            const layout::Region* r = find_key(l, key);
+            const uint64_t at = up(end);
+            EXPECT(r && r->offset == at && r->size == m.entries[i].data.size());
+            EXPECT(r && contains(r->note, notes[i]));
+            end = at + m.entries[i].data.size();
+            want[key] = m.entries[i].data;
+        }
+        EXPECT(end == file.size());
+        check_layout(l, file, want);
+    }
+    {  // not an image
+        splash::MotoLogo m;
+        splash::MotoEntry e;
+        e.name = "logo";
+        e.data = motorun_stub(10, 10, 300);
+        m.entries = {e};
+        const Bytes file = splash::moto_build(m);
+        EXPECT(layout::moto_logo(Bytes()).regions.empty());
+        EXPECT(layout::moto_logo(Bytes(100, 0xFF)).regions.empty());
+        EXPECT(layout::moto_logo(Bytes(file.begin(), file.end() - 1)).regions.empty());  // the picture is cut short
+        for (size_t at = 0; at < 80; ++at) {
+            Bytes bad = file;
+            bad[at] ^= 0xFF;
+            expect_inside(layout::moto_logo(bad), bad);
+        }
+    }
+}
+
 }  // namespace
 
 int run_layout_tests() {
@@ -885,6 +1224,10 @@ int run_layout_tests() {
     test_osip();
     test_chromeos();
     test_fit();
+    test_qc_splash();
+    test_oplus_logo();
+    test_xiaomi_logo();
+    test_moto_logo();
     test_vbmeta();
     test_around();
     test_text();

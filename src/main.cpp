@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <iostream>
 #include <mutex>
 #include <optional>
@@ -63,6 +64,7 @@
 #include "abr/qcdt.hpp"
 #include "abr/ramdisk_tree.hpp"
 #include "abr/sha.hpp"
+#include "abr/splash.hpp"
 #include "abr/textquote.hpp"
 #include "abr/uimage.hpp"
 #include "abr/vbmeta.hpp"
@@ -102,7 +104,7 @@ std::string tails_text(std::initializer_list<std::pair<const char*, const Bytes*
 
 // ------------------------------------------------------------ detection --
 
-enum class Fmt { BOOT, VENDOR_BOOT, DTBO, DTB, FIT, QCDT, VBMETA, UIMAGE, ELF_BOOT, KRNL, BLOB, OSIP, CHROMEOS, MTK_IMAGE, MTK_PRELOADER, MBN, MBN_ELF, UNKNOWN };
+enum class Fmt { BOOT, VENDOR_BOOT, DTBO, DTB, FIT, QCDT, VBMETA, UIMAGE, ELF_BOOT, KRNL, BLOB, OSIP, CHROMEOS, MTK_IMAGE, MTK_PRELOADER, MBN, MBN_ELF, SPLASH, OPLUS_LOGO, XIAOMI_LOGO, MOTO_LOGO, UNKNOWN };
 
 // Where the "ANDROID!" container starts: within the first kMagicSearchLimit bytes (a vendor
 // wrapper in front of it), or -- Barnes & Noble Nook images -- right behind the fixed-size
@@ -124,6 +126,12 @@ Fmt detect_format(const Bytes& d) {
     if (d.size() >= 4 && std::memcmp(d.data(), "AVB0", 4) == 0) return Fmt::VBMETA;
     // The codeword and the magic of an SBL header begin nothing else: a file that has them is an MBN image, or one that abr cannot read (describe_unknown()).
     if (mbn::has_sbl_words(d)) return mbn::flat_looks_like(d) ? Fmt::MBN : Fmt::UNKNOWN;
+    // The picture partitions of a phone: each has a magic word of its own (at 0, or at 0x4000 behind a preamble), and what follows it adds up or it is not one
+    // (describe_unknown() says what is wrong).
+    if (splash::qc_looks_like(d)) return Fmt::SPLASH;
+    if (splash::moto_looks_like(d)) return Fmt::MOTO_LOGO;
+    if (splash::oplus_looks_like(d)) return Fmt::OPLUS_LOGO;
+    if (splash::xiaomi_looks_like(d)) return Fmt::XIAOMI_LOGO;
     if (mtkimg::looks_like(d, 0)) return Fmt::MTK_IMAGE;
     if (mtkgfh::looks_like(d)) return Fmt::MTK_PRELOADER;
     if (qcdt::looks_like(d)) return Fmt::QCDT;
@@ -221,6 +229,14 @@ std::string describe_unknown(const Bytes& d) {
         return "this starts like the header of an MBN image of Qualcomm's secure boot (version " + std::to_string(u32le(4)) + "), but abr cannot read it: " +
                (why.empty() ? std::string("it holds no code") : why);
     }
+    if (d.size() >= sizeof splash::kQcMagic && std::memcmp(d.data(), splash::kQcMagic, sizeof splash::kQcMagic) == 0)
+        return "this starts with \"SPLASH!!\", the image of the pictures that the boot loader of a Qualcomm phone shows, but abr cannot read it: " + splash::qc_problem(d);
+    if (d.size() >= sizeof splash::kMotoMagic && std::memcmp(d.data(), splash::kMotoMagic, sizeof splash::kMotoMagic) == 0)
+        return "this starts with \"MotoLogo\", the image of the pictures that the boot loader of a Motorola phone shows, but abr cannot read it: " + splash::moto_problem(d);
+    if (d.size() >= splash::kOplusPreamble + sizeof splash::kOplusMagic && std::memcmp(d.data() + splash::kOplusPreamble, splash::kOplusMagic, sizeof splash::kOplusMagic) == 0)
+        return "this has \"SPLASH LOGO!\" at 0x4000, the logo image of an OPPO, realme or OnePlus phone, but abr cannot read it: " + splash::oplus_problem(d);
+    if (d.size() >= splash::kXiaomiPreamble + sizeof splash::kXiaomiMagic && std::memcmp(d.data() + splash::kXiaomiPreamble, splash::kXiaomiMagic, sizeof splash::kXiaomiMagic) == 0)
+        return "this has \"LOGO!!!!\" at 0x4000, the logo image of a Xiaomi or Redmi phone, but abr cannot read it: " + splash::xiaomi_problem(d);
     if (u16le(0x438) == 0xEF53)
         return "this is an ext2/3/4 filesystem image (system/vendor/product/... or a recovery "
                "dumped as a filesystem), not a boot-family container. Filesystems are out of "
@@ -265,6 +281,10 @@ const char* fmt_name(Fmt f) {
         case Fmt::MTK_PRELOADER: return "mtk_preloader";
         case Fmt::MBN: return "mbn";
         case Fmt::MBN_ELF: return "mbn_elf";
+        case Fmt::SPLASH: return "splash";
+        case Fmt::OPLUS_LOGO: return "oplus_logo";
+        case Fmt::XIAOMI_LOGO: return "xiaomi_logo";
+        case Fmt::MOTO_LOGO: return "moto_logo";
         case Fmt::UNKNOWN: return "unknown";
     }
     return "unknown";
@@ -288,6 +308,10 @@ Fmt fmt_from_name(const std::string& s) {
     if (s == "mtk_preloader") return Fmt::MTK_PRELOADER;
     if (s == "mbn") return Fmt::MBN;
     if (s == "mbn_elf") return Fmt::MBN_ELF;
+    if (s == "splash") return Fmt::SPLASH;
+    if (s == "oplus_logo") return Fmt::OPLUS_LOGO;
+    if (s == "xiaomi_logo") return Fmt::XIAOMI_LOGO;
+    if (s == "moto_logo") return Fmt::MOTO_LOGO;
     return Fmt::UNKNOWN;
 }
 
@@ -4173,6 +4197,706 @@ void print_mbn_elf_info(const Bytes& data) {
     print_envelope_info(Envelope::capture(data, 0, e.consumed));
 }
 
+// ------------------------------------------------------------------ splash --
+//
+// The pictures that the boot loader of a Qualcomm phone shows before Android starts (abr/splash.hpp): the partitions `splash` and `logo`. Four containers, each known by
+// its magic word. `unpack` writes every picture to a file of its own, and the manifest says where it lay, how it was coded (what was taken off it) and the words of the
+// header that are not worked out from the pictures.
+//
+//   type=splash       Qualcomm's "SPLASH!!" image: one picture, or a table of up to 25. A picture is a PNG, `NN_picture.png`: its pixels as the image holds them
+//                     (`picture<N>_compression=none`) or decoded from the RLE24 coding (`rle24`). `pack` codes them again that way and works out the sizes, the
+//                     blocks and the places of the pictures.
+//   type=oplus_logo   the "SPLASH LOGO!" image of OPPO, realme and OnePlus phones: a file for every picture (a BMP), `NN_<name>.bmp`, with the gzip taken off where
+//                     the picture was a gzip stream (`entry<N>_compression`, `entry<N>_level`).
+//   type=xiaomi_logo  the "LOGO!!!!" image of Xiaomi and Redmi phones: the file of every picture as it is (a BMP; a PNG in some images), `NN_picture.bmp`.
+//   type=moto_logo    the "MotoLogo" image of Motorola phones: a PNG for every picture that is "MotoRun" (`entry<N>_compression=motorun`); any other picture is the
+//                     file it is.
+//
+// A picture that is a coding of pixels (RLE24, MotoRun, the pixels of a SPLASH!! image) goes back into the image as the very bytes the image had when its PNG is not
+// changed: the encoders of abr do not make the bytes that the tools of the vendors make, so those bytes are kept in .abr_raw/ and believed only while they give the
+// picture back. A picture that was changed is coded again. What cannot be worked out from the pictures (the bytes in front of an OPLUS header, the words behind a
+// table) is kept as it is.
+
+// The pictures of one image may be this many bytes of pixels (three a pixel) all together, unpacked: what a header may ask of the memory is decided here.
+constexpr uint64_t kSplashPixelLimit = uint64_t{512} << 20;
+
+bool is_all_zero(const Bytes& b) {
+    return std::all_of(b.begin(), b.end(), [](uint8_t v) { return v == 0; });
+}
+
+// `00_oppo_logo.bmp`: the number of the picture (two digits at least), its name made safe for a file name ("picture" when it has none), the extension of what the
+// picture is. A name that ends in that extension already (logo.bmp) is not given it twice.
+std::string splash_file_name(size_t index, size_t count, std::string_view name, const std::string& extension) {
+    const size_t width = std::max<size_t>(2, std::to_string(count > 0 ? count - 1 : 0).size());
+    std::string number = std::to_string(index);
+    if (number.size() < width) number.insert(0, width - number.size(), '0');
+    std::string clean;
+    for (const char c : name) {
+        const bool plain = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '.' || c == '_' || c == '-';
+        clean += plain ? c : '_';
+    }
+    const std::string dot = "." + extension;
+    if (clean.size() > dot.size()) {
+        std::string end = clean.substr(clean.size() - dot.size());
+        for (char& c : end) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (end == dot) clean.resize(clean.size() - dot.size());
+    }
+    while (!clean.empty() && clean.back() == '.') clean.pop_back();
+    if (clean.empty()) clean = "picture";
+    return number + "_" + clean + dot;
+}
+
+// What `unpack` records of the image's own bytes: what is kept around the structure, and a hash of the structure (to tell a changed image from an untouched one).
+void save_core_envelope(Manifest& m, const fs::path& dir, const Bytes& data, size_t consumed) {
+    const Envelope env = Envelope::capture(data, 0, consumed);
+    save_envelope(m, dir, env, data, 0, consumed);
+    if (!env.tail.empty()) note(std::to_string(env.tail.size()) + " bytes after the last picture are kept verbatim (tail.bin)");
+    m.set_hex("core_sha256", hash::sha256(data.data(), std::min(consumed, data.size())));
+}
+
+// ---- pictures that are pixels in a coding of their own
+
+// SHA-256 of what makes a picture the one it is: its coding, its size and its pixels (the same pixels at another size or in another coding are another picture).
+Bytes bitmap_hash(const splash::Bitmap& bmp, const std::string& coding) {
+    hash::Sha256 h;
+    h.update(reinterpret_cast<const uint8_t*>(coding.data()), coding.size());
+    uint8_t size[9] = {0};  // (the zero in front ends the name of the coding)
+    for (int i = 0; i < 4; ++i) {
+        size[1 + i] = static_cast<uint8_t>(bmp.width >> (8 * i));
+        size[5 + i] = static_cast<uint8_t>(bmp.height >> (8 * i));
+    }
+    h.update(size, sizeof size);
+    if (!bmp.bgr.empty()) h.update(bmp.bgr.data(), bmp.bgr.size());
+    return h.finish();
+}
+
+Bytes bitmap_png(const splash::Bitmap& bmp) {
+    png::Image img;
+    img.width = bmp.width;
+    img.height = bmp.height;
+    img.rgba = splash::bitmap_to_rgba(bmp);
+    return png::encode(img, /*with_alpha=*/false);
+}
+
+// The picture that the PNG `filename` of the folder holds. The image has no alpha: a pixel that is not opaque is put on black, and that is said.
+splash::Bitmap read_picture_png(const fs::path& dir, const std::string& filename) {
+    try {
+        const png::Image img = png::decode(read_file(dir / filename));
+        if (img.has_alpha) {
+            for (size_t i = 3; i < img.rgba.size(); i += 4) {
+                if (img.rgba[i] == 255) continue;
+                note(shown(filename) + " has pixels that are not opaque: the image holds no alpha, they are put on black");
+                break;
+            }
+        }
+        return splash::bitmap_from_rgba(img.rgba, img.width, img.height);
+    } catch (const FormatError& e) {
+        throw FormatError(shown(filename) + ": " + e.what());
+    }
+}
+
+// How the pixels of a picture lie in the image: `decode` makes the pixels of the bytes the image holds (nullopt for bytes that are no picture), `encode` makes the
+// bytes of pixels.
+struct PictureCoding {
+    std::function<std::optional<splash::Bitmap>(const Bytes&)> decode;
+    std::function<Bytes(const splash::Bitmap&)> encode;
+};
+
+struct LoadedPicture {
+    splash::Bitmap pixels;
+    Bytes stored;            // the picture as the image holds it
+    bool untouched = false;  // the picture is the one that was unpacked (its coding too)
+    bool replayed = false;   // `stored` is what the image had (.abr_raw), not made of the pixels
+};
+
+// The picture of `<prefix>_file` (a PNG) as the bytes of the image: the ones it had (.abr_raw/<file>.raw) when the picture is what it was -- believed only when they
+// give that picture back, as the raw copy of a component is --, else the pixels coded again.
+LoadedPicture load_picture(const Manifest& m, const fs::path& dir, const std::string& prefix, const std::string& coding, const PictureCoding& how) {
+    if (!m.has(prefix + "_file")) throw FormatError("manifest.txt: " + shown(prefix + "_file") + " is missing (the file of the picture)");
+    const std::string filename = m.get_path(prefix + "_file");
+    const progress::Activity doing(filename);
+    LoadedPicture out;
+    out.pixels = read_picture_png(dir, filename);
+    const Bytes now = bitmap_hash(out.pixels, coding);
+    const Bytes was = m.get_hex(prefix + "_orig_hash");
+    const fs::path raw_path = dir / ".abr_raw" / (filename + ".raw");
+    out.untouched = !was.empty() && now == was;
+    if (out.untouched && fs::exists(raw_path)) {
+        Bytes raw = read_file(raw_path);
+        std::string why;
+        try {
+            const std::optional<splash::Bitmap> back = how.decode(raw);
+            if (back && bitmap_hash(*back, coding) == was) {
+                out.stored = std::move(raw);
+                out.replayed = true;
+                progress::advance(out.pixels.bgr.size());
+                return out;
+            }
+            why = "it does not give the picture of " + filename + " as it was unpacked";
+        } catch (const std::exception& e) {
+            why = std::string("it does not decode (") + e.what() + ")";
+        }
+        throw FormatError(shown(raw_path.generic_string()) + " does not belong to " + shown(filename) + ": " + why + ". Delete it to have " + shown(filename) +
+                          " coded again, or unpack the image again");
+    }
+    out.stored = how.encode(out.pixels);
+    progress::advance(out.pixels.bgr.size());
+    return out;
+}
+
+// A picture that `unpack` decoded and wrote as a PNG, as the manifest keeps it.
+struct PictureFile {
+    std::string file;
+    uint32_t width = 0, height = 0;
+    Bytes hash;  // bitmap_hash()
+};
+
+// The PNG, and the bytes as they lay in the image (.abr_raw/<file>.raw: the folder has to be there) unless `keep_raw` is false: for pixels that are kept as they are
+// (what no encoder can make otherwise) the picture's bytes are the pixels, and the copy would be the same bytes again.
+PictureFile write_picture(const fs::path& dir, const std::string& file, const std::string& coding, const splash::Bitmap& bmp, const Bytes& stored, bool keep_raw = true) {
+    PictureFile f;
+    f.file = file;
+    f.width = bmp.width;
+    f.height = bmp.height;
+    f.hash = bitmap_hash(bmp, coding);
+    write_file(dir / file, bitmap_png(bmp));
+    if (keep_raw) write_file(dir / ".abr_raw" / (file + ".raw"), stored);
+    return f;
+}
+
+// A folder with an empty .abr_raw/ in it has no use for the directory (a raw copy that was needed is a file in it): taken away -- remove() does not go into a directory, so one
+// with files in it stays.
+void drop_empty_raw_dir(const fs::path& dir) {
+    std::error_code ec;
+    fs::remove(dir / ".abr_raw", ec);
+}
+
+void record_picture(Manifest& m, const std::string& prefix, const PictureFile& f, const std::string& coding) {
+    m.set(prefix + "_file", f.file);
+    m.set(prefix + "_compression", coding);
+    m.set_u32(prefix + "_width", f.width);
+    m.set_u32(prefix + "_height", f.height);
+    m.set_hex(prefix + "_orig_hash", f.hash);
+}
+
+// A PNG that is not the size the picture was: the header of the image says the size it has now.
+void note_new_size(const std::string& filename, const splash::Bitmap& now, uint32_t was_width, uint32_t was_height) {
+    if (was_width == 0 || was_height == 0 || (now.width == was_width && now.height == was_height)) return;
+    note(shown(filename) + " is " + std::to_string(now.width) + "x" + std::to_string(now.height) + " pixels, it was " + std::to_string(was_width) + "x" + std::to_string(was_height) +
+         ": the image says the new size");
+}
+
+std::string pixels_text(uint32_t width, uint32_t height) { return std::to_string(width) + "x" + std::to_string(height); }
+
+// ---- splash: Qualcomm's "SPLASH!!"
+
+void unpack_splash(const Bytes& data, const fs::path& dir) {
+    const splash::QcSplash s = splash::qc_parse(data);
+    const size_t n = s.pictures.size();
+    uint64_t pixels = 0;
+    for (const splash::QcPicture& p : s.pictures) pixels += uint64_t{p.width} * p.height * 3;
+    if (pixels > kSplashPixelLimit)
+        throw FormatError("the pictures of this image are " + std::to_string(pixels >> 20) + " MiB of pixels unpacked; abr unpacks " + std::to_string(kSplashPixelLimit >> 20) +
+                          " MiB of them at most");
+    fs::create_directories(dir / ".abr_raw");
+    progress::enter("decode", pixels);
+    std::vector<PictureFile> files(n);
+    par::for_each(n, [&](size_t i) {
+        const splash::QcPicture& p = s.pictures[i];
+        const std::string name = splash_file_name(i, n, "picture", "png");
+        const progress::Activity doing(name);
+        const splash::Bitmap bmp = splash::qc_decode(p);
+        // (pixels that the image holds as they are need no copy -- unless the bytes behind them, up to the block, are not zeros: they would be lost)
+        const bool keep_raw = p.type == splash::kQcRle24 || !std::all_of(p.data.begin() + static_cast<std::ptrdiff_t>(p.stream), p.data.end(), [](uint8_t v) { return v == 0; });
+        files[i] = write_picture(dir, name, p.type == splash::kQcRle24 ? "rle24" : "none", bmp, p.data, keep_raw);
+        progress::advance(bmp.bgr.size());
+    });
+
+    Manifest m;
+    m.set("type", "splash");
+    m.set("form", s.several ? "several" : "single");
+    m.set_u32("pictures", static_cast<uint32_t>(n));
+    if (!s.header_rest.empty()) m.set_hex("header_rest", s.header_rest);
+    for (size_t i = 0; i < n; ++i) {
+        const splash::QcPicture& p = s.pictures[i];
+        const std::string prefix = "picture" + std::to_string(i);
+        record_picture(m, prefix, files[i], p.type == splash::kQcRle24 ? "rle24" : "none");
+        m.set_u32(prefix + "_blocks", p.blocks);
+    }
+    // The last picture is padded up to its blocks when the image shows it (bytes behind the pixels or the packets); when it cannot -- the picture fills its blocks -- the
+    // image is taken to be made the way the tool of its form makes it: the table of Magic-Splash-Wand pads every picture, the single picture of Qualcomm's logo_gen.py none.
+    const splash::QcPicture& last = s.pictures.back();
+    const bool fills = last.blocks != 0 && last.data.size() == size_t{last.blocks} * splash::kQcBlock;
+    m.set_bool("last_padded", fills && (last.stream < last.data.size() || s.several));
+    save_core_envelope(m, dir, data, s.consumed);
+    drop_empty_raw_dir(dir);
+
+    std::cout << "splash: " << (s.several ? "a table of " + std::to_string(n) + " pictures" : std::string("one picture")) << "\n";
+    for (size_t i = 0; i < n; ++i) {
+        const splash::QcPicture& p = s.pictures[i];
+        std::cout << "  [" << i << "] " << pixels_text(p.width, p.height) << ", " << splash::qc_type_name(p.type) << ": " << p.stream << " bytes at " << hex_text(p.offset) << " ("
+                  << (p.blocks == 0 ? std::string("the header counts no blocks") : std::to_string(p.blocks) + (p.blocks == 1 ? " block" : " blocks")) << ") -> " << files[i].file << "\n";
+    }
+    m.save(dir / "manifest.txt",
+           "abr splash manifest -- edit then `abr pack -i " + dir.string() + " -o out.img`\n"
+           "# NOTE: every picture is a PNG (picture<N>_file). picture<N>_compression says how the image holds its pixels: rle24 (run-length coded) or none (as they are, blue,\n"
+           "# green, red). A picture that is not changed goes back as the very bytes it was; a changed one is coded again, and pack works out its size, the blocks that\n"
+           "# the header names and the places of the pictures. The size of a PNG may differ from the original: the header of the image says the size the picture has.");
+}
+
+Bytes repack_splash(const Manifest& m, const fs::path& dir, const RepackOptions& opt) {
+    const std::string form = m.get("form", "single");
+    if (form != "single" && form != "several") throw FormatError("manifest.txt: " + shown("form=" + form) + " is neither single nor several");
+    const size_t n = m.get_count("pictures", 0);
+    if (n == 0 || n > splash::kQcMaxPictures || (form == "single" && n != 1))
+        throw FormatError("manifest.txt: " + shown("pictures=" + m.get("pictures")) + " is the number of the pictures of the image, " +
+                          (form == "single" ? std::string("1 in a single-picture image (form=single)") : "1 to " + std::to_string(splash::kQcMaxPictures)));
+    splash::QcSplash s;
+    s.several = form == "several";
+    s.header_rest = m.get_hex("header_rest");
+    s.pictures.resize(n);
+    const bool last_padded = m.get_bool("last_padded", false);
+    par::for_each(n, [&](size_t i) {
+        const std::string prefix = "picture" + std::to_string(i);
+        const std::string coding = m.get(prefix + "_compression", "rle24");
+        if (coding != "rle24" && coding != "none")
+            throw FormatError("manifest.txt: " + shown(prefix + "_compression=" + coding) + " is neither rle24 nor none (a picture of this image is run-length coded or kept as pixels)");
+        const uint32_t type = coding == "rle24" ? splash::kQcRle24 : splash::kQcRaw;
+        const uint32_t was_width = m.get_u32(prefix + "_width", 0), was_height = m.get_u32(prefix + "_height", 0);
+        PictureCoding how;
+        how.decode = [&](const Bytes& raw) -> std::optional<splash::Bitmap> {
+            splash::QcPicture q;
+            q.width = was_width;
+            q.height = was_height;
+            q.type = type;
+            q.data = raw;
+            return splash::qc_decode(q);
+        };
+        how.encode = [&](const splash::Bitmap& bmp) { return splash::qc_encode(bmp, type); };
+        LoadedPicture loaded = load_picture(m, dir, prefix, coding, how);
+        splash::QcPicture& p = s.pictures[i];
+        p.type = type;
+        if (loaded.replayed) {
+            p.width = was_width;
+            p.height = was_height;
+            p.data = std::move(loaded.stored);
+            p.blocks = m.get_u32(prefix + "_blocks", splash::qc_blocks(p.data.size()));
+        } else {
+            if (!loaded.untouched) note_new_size(m.get_path(prefix + "_file"), loaded.pixels, was_width, was_height);
+            p.width = loaded.pixels.width;
+            p.height = loaded.pixels.height;
+            p.data = std::move(loaded.stored);
+            // The blocks the header names: those it had while the picture is the one it was (an image of Qualcomm's own says 0 for its pixels), those of the data otherwise;
+            // pixels that were 0 stay 0 (the picture is told by its size), a run-length coded picture has to be told how long it is.
+            const uint32_t was_blocks = m.get_u32(prefix + "_blocks", 0);
+            const uint32_t needed = splash::qc_blocks(p.data.size());
+            if (type == splash::kQcRaw && m.has(prefix + "_blocks") && was_blocks == 0) p.blocks = 0;
+            else if (loaded.untouched && m.has(prefix + "_blocks")) p.blocks = std::max(was_blocks, needed);
+            else p.blocks = needed;
+            // (every picture but the last is followed by the next at once; the last is padded as the image's was)
+            if (p.blocks != 0 && (i + 1 < n || last_padded)) p.data.resize(size_t{p.blocks} * splash::kQcBlock, 0);
+        }
+    });
+    return assemble_envelope(m, dir, splash::qc_build(s), opt);
+}
+
+void print_splash_info(const Bytes& data) {
+    const splash::QcSplash s = splash::qc_parse(data);
+    std::cout << "header:         " << (s.several ? "a table of " + std::to_string(s.pictures.size()) + " pictures" : std::string("one picture")) << ", the data in blocks of "
+              << splash::kQcBlock << " bytes\n";
+    for (size_t i = 0; i < s.pictures.size(); ++i) {
+        const splash::QcPicture& p = s.pictures[i];
+        std::cout << "  [" << i << "] " << pixels_text(p.width, p.height) << ", " << splash::qc_type_name(p.type) << ": " << p.stream << " bytes at " << hex_text(p.offset) << ", "
+                  << (p.blocks == 0 ? std::string("the header counts no blocks") : std::to_string(p.blocks) + (p.blocks == 1 ? " block" : " blocks"));
+        if (p.type == splash::kQcRle24) std::cout << " (" << uint64_t{p.width} * p.height * 3 << " bytes as pixels)";
+        if (p.data.size() > p.stream) std::cout << ", " << p.data.size() - p.stream << " bytes of padding";
+        std::cout << "\n";
+    }
+    if (!s.header_rest.empty()) std::cout << "header:         " << s.header_rest.size() << " more bytes behind the fields (kept)\n";
+    print_envelope_info(Envelope::capture(data, 0, s.consumed));
+}
+
+// ---- oplus_logo: the "SPLASH LOGO!" image of OPPO, realme and OnePlus
+
+// The bytes in front of the header, when they are not zeros, are kept as they are; this says it when the image is changed (what they are, abr does not know).
+void warn_stale_preamble(const Manifest& m, const Bytes& core, const Bytes& preamble) {
+    if (is_all_zero(preamble) || !core_changed(m, core)) return;
+    const bool ddph = preamble.size() >= 4 && (uint32_t{preamble[0]} | (uint32_t{preamble[1]} << 8) | (uint32_t{preamble[2]} << 16) | (uint32_t{preamble[3]} << 24)) == splash::kDdphMagic;
+    warn(std::string("the image was changed, and the ") + std::to_string(preamble.size()) + " bytes in front of its header (preamble.bin" + (ddph ? ", it begins \"DDPH\"" : "") +
+         ") are kept as they were: if they hold a hash or a signature of the image, it is the one of the original");
+}
+
+void unpack_oplus_logo(const Bytes& data, const fs::path& dir) {
+    const splash::OplusLogo l = splash::oplus_parse(data);
+    const size_t n = l.entries.size();
+    Manifest m;
+    m.set("type", "oplus_logo");
+    if (!is_all_zero(l.preamble)) save_raw(m, dir, "preamble", l.preamble, "preamble.bin");
+    for (size_t k = 0; k < l.desc.size(); ++k) {
+        if (l.desc[k].empty() && l.desc_tail[k].empty()) continue;
+        m.set("description" + std::to_string(k), l.desc[k]);
+        m.set_tail("description" + std::to_string(k) + "_tail", l.desc_tail[k]);
+    }
+    m.set_u32("logo_version", l.version);
+    m.set_u32("logo_width", l.width);
+    m.set_u32("logo_height", l.height);
+    m.set_u32("logo_compression", l.compression);
+    save_raw(m, dir, "header_rest", l.header_rest, "header_rest.bin");
+    m.set_u32("entries", static_cast<uint32_t>(n));
+
+    uint64_t work = 0;
+    bool any_stream = false;
+    std::vector<size_t> order(n);
+    for (size_t i = 0; i < n; ++i) {
+        order[i] = i;
+        work += l.entries[i].data.size();
+        any_stream = any_stream || detect_codec(l.entries[i].data) != Codec::NONE;
+    }
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return l.entries[a].data.size() > l.entries[b].data.size(); });
+    if (any_stream) fs::create_directories(dir / ".abr_raw");
+    progress::enter("decode", work);
+    std::vector<DecodedComponent> decoded(n);
+    std::vector<std::string> files(n);
+    par::for_each(n, [&](size_t k) {
+        const size_t i = order[k];
+        const splash::OplusEntry& e = l.entries[i];
+        const std::string label = e.name.empty() ? "picture " + std::to_string(i) : e.name;
+        const progress::Activity doing(label);
+        decoded[i] = decode_component(e.data, label, /*strip_mtk=*/false);
+        if (decoded[i].present) {
+            files[i] = splash_file_name(i, n, e.name, splash::picture_extension(decoded[i].plain));
+            write_file(dir / files[i], decoded[i].plain);
+            if (decoded[i].codec != Codec::NONE) write_file(dir / ".abr_raw" / (files[i] + ".raw"), e.data);  // (an untouched stream comes back as it was)
+        }
+        progress::advance(e.data.size());
+    });
+    for (size_t i = 0; i < n; ++i) {
+        const splash::OplusEntry& e = l.entries[i];
+        const std::string prefix = "entry" + std::to_string(i);
+        m.set(prefix + "_name", e.name);
+        m.set_tail(prefix + "_name_tail", e.name_tail);
+        m.set_u32(prefix + "_plain_size", e.plain_size);
+        if (decoded[i].present) record_component(m, prefix, files[i], decoded[i]);
+    }
+    save_core_envelope(m, dir, data, l.consumed);
+    drop_empty_raw_dir(dir);
+
+    std::cout << "OPLUS logo: " << n << (n == 1 ? " picture" : " pictures") << ", version " << l.version << ", " << pixels_text(l.width, l.height) << "\n";
+    uint64_t at = splash::kOplusDataAt;
+    for (size_t i = 0; i < n; ++i) {
+        const splash::OplusEntry& e = l.entries[i];
+        std::cout << "  [" << i << "] " << shown(e.name) << ": " << e.data.size() << " bytes at " << hex_text(at) << ", ";
+        if (!decoded[i].present) std::cout << "no data\n";
+        else std::cout << (decoded[i].codec == Codec::NONE ? std::string("plain") : std::string(codec_name(decoded[i].codec)) + " stream taken off") << " -> " << files[i] << "\n";
+        at += e.data.size();
+    }
+    if (!is_all_zero(l.preamble))
+        note("the " + std::to_string(l.preamble.size()) + " bytes in front of the header are not zeros: kept as they are (preamble.bin; abr cannot make them again)");
+    m.save(dir / "manifest.txt",
+           "abr oplus_logo manifest -- edit then `abr pack -i " + dir.string() + " -o out.img`\n"
+           "# NOTE: entry<N>_file is the picture (a BMP) with the compression taken off (entry<N>_compression, entry<N>_level: pack compresses it again). pack works out the\n"
+           "# places of the pictures and their sizes; entry<N>_plain_size is the size of the BMP as the header says (the size of the file, when the file was changed).\n"
+           "# To leave a picture out delete its keys, number the ones behind it again and change entries=. The words of the header (logo_*) are kept as they are.");
+}
+
+Bytes repack_oplus_logo(const Manifest& m, const fs::path& dir, const RepackOptions& opt) {
+    splash::OplusLogo l;
+    l.preamble = load_raw(m, dir, "preamble");
+    if (l.preamble.size() > splash::kOplusPreamble)
+        throw FormatError("preamble.bin is " + std::to_string(l.preamble.size()) + " bytes; the bytes in front of the header are " + std::to_string(splash::kOplusPreamble));
+    for (size_t k = 0; k < l.desc.size(); ++k) {
+        l.desc[k] = m.get("description" + std::to_string(k));
+        l.desc_tail[k] = m.get_tail("description" + std::to_string(k) + "_tail");
+    }
+    l.version = m.get_u32("logo_version", 0);
+    l.width = m.get_u32("logo_width", 0);
+    l.height = m.get_u32("logo_height", 0);
+    l.compression = m.get_u32("logo_compression", 1);
+    l.header_rest = load_raw(m, dir, "header_rest");
+    const size_t n = m.get_count("entries", 0);
+    if (n == 0 || n > splash::kOplusMaxEntries)
+        throw FormatError("manifest.txt: " + shown("entries=" + m.get("entries")) + " is the number of the pictures of the image, 1 to " + std::to_string(splash::kOplusMaxEntries));
+    std::vector<std::string> prefixes(n);
+    for (size_t i = 0; i < n; ++i) prefixes[i] = "entry" + std::to_string(i);
+    std::vector<Bytes> stored = load_components(m, dir, prefixes, opt);
+    l.entries.resize(n);
+    for (size_t i = 0; i < n; ++i) {
+        splash::OplusEntry& e = l.entries[i];
+        e.name = m.get(prefixes[i] + "_name");
+        e.name_tail = m.get_tail(prefixes[i] + "_name_tail");
+        e.data = std::move(stored[i]);
+        // The size of the BMP that the header says: what it said while the picture is the one it was (unpack saw it), else the size of the file.
+        uint64_t plain = m.get_u32(prefixes[i] + "_plain_size", 0);
+        if (m.has(prefixes[i] + "_file")) {
+            const Bytes file = read_file(dir / m.get_path(prefixes[i] + "_file"));
+            const bool same = m.has(prefixes[i] + "_orig_hash") && m.has(prefixes[i] + "_plain_size") && hash::sha256(file) == m.get_hex(prefixes[i] + "_orig_hash");
+            if (!same) plain = file.size();
+        }
+        if (plain > 0xFFFFFFFFull) throw FormatError(shown(prefixes[i]) + " is more than 4 GiB: the header holds the size in 32 bits");
+        e.plain_size = static_cast<uint32_t>(plain);
+    }
+    const Bytes core = splash::oplus_build(l);
+    warn_stale_preamble(m, core, l.preamble);
+    return assemble_envelope(m, dir, core, opt);
+}
+
+void print_oplus_logo_info(const Bytes& data) {
+    const splash::OplusLogo l = splash::oplus_parse(data);
+    std::cout << "header:         " << l.entries.size() << (l.entries.size() == 1 ? " picture" : " pictures") << ", version " << l.version << ", " << pixels_text(l.width, l.height)
+              << ", compression word " << l.compression << "\n";
+    for (size_t k = 0; k < l.desc.size(); ++k)
+        if (!l.desc[k].empty()) std::cout << "description " << k << ":  " << shown(l.desc[k]) << "\n";
+    if (!is_all_zero(l.preamble)) {
+        const bool ddph = l.preamble.size() >= 4 && (uint32_t{l.preamble[0]} | (uint32_t{l.preamble[1]} << 8) | (uint32_t{l.preamble[2]} << 16) | (uint32_t{l.preamble[3]} << 24)) == splash::kDdphMagic;
+        std::cout << "preamble:       " << l.preamble.size() << " bytes in front of the header" << (ddph ? ", begins with \"DDPH\"" : "") << " (kept as they are)\n";
+    }
+    uint64_t at = splash::kOplusDataAt;
+    for (size_t i = 0; i < l.entries.size(); ++i) {
+        const splash::OplusEntry& e = l.entries[i];
+        std::cout << "  [" << i << "] " << shown(e.name) << ": " << e.data.size() << " bytes at " << hex_text(at);
+        const Codec codec = detect_codec(e.data);
+        std::cout << ", " << (codec == Codec::NONE ? std::string("not compressed") : std::string(codec_name(codec)));
+        if (codec != Codec::NONE) {
+            try {
+                const DecodedComponent d = decode_component(e.data, {}, /*strip_mtk=*/false);
+                std::cout << ", " << d.plain.size() << " bytes unpacked";
+                if (d.level >= 0) std::cout << ", level " << d.level;
+                std::cout << ", " << splash::picture_extension(d.plain);
+            } catch (const FormatError& why) {
+                std::cout << " (cannot be decompressed: " << why.what() << ")";
+            }
+        } else {
+            std::cout << ", " << splash::picture_extension(e.data);
+        }
+        std::cout << ", the header says " << e.plain_size << " bytes unpacked\n";
+        at += e.data.size();
+    }
+    print_envelope_info(Envelope::capture(data, 0, l.consumed));
+}
+
+// ---- xiaomi_logo: the "LOGO!!!!" image of Xiaomi and Redmi
+
+void unpack_xiaomi_logo(const Bytes& data, const fs::path& dir) {
+    const splash::XiaomiLogo l = splash::xiaomi_parse(data);
+    const size_t n = l.pictures.size();
+    Manifest m;
+    m.set("type", "xiaomi_logo");
+    if (!is_all_zero(l.preamble)) save_raw(m, dir, "preamble", l.preamble, "preamble.bin");
+    save_raw(m, dir, "table_rest", l.table_rest, "table_rest.bin");
+    m.set_u32("pictures", static_cast<uint32_t>(n));
+    uint64_t work = 0;
+    for (const Bytes& p : l.pictures) work += p.size();
+    progress::enter("decode", work);
+    std::vector<std::string> files(n);
+    std::vector<size_t> content(n);
+    par::for_each(n, [&](size_t i) {
+        const Bytes& p = l.pictures[i];
+        content[i] = splash::xiaomi_content_size(p);
+        files[i] = splash_file_name(i, n, "picture", splash::picture_extension(p));
+        const progress::Activity doing(files[i]);
+        write_file(dir / files[i], p.data(), content[i]);
+        progress::advance(p.size());
+    });
+    for (size_t i = 0; i < n; ++i) m.set("picture" + std::to_string(i) + "_file", files[i]);
+    save_core_envelope(m, dir, data, l.consumed);
+
+    std::cout << "Xiaomi logo: " << n << (n == 1 ? " picture" : " pictures") << "\n";
+    uint64_t at = splash::kXiaomiPreamble + splash::kXiaomiTableSize;
+    for (size_t i = 0; i < n; ++i) {
+        std::cout << "  [" << i << "] " << splash::picture_extension(l.pictures[i]) << ": " << content[i] << " bytes at " << hex_text(at) << " (" << l.pictures[i].size() / splash::kXiaomiUnit
+                  << (l.pictures[i].size() == splash::kXiaomiUnit ? " unit" : " units") << ") -> " << files[i] << "\n";
+        at += l.pictures[i].size();
+    }
+    if (!is_all_zero(l.preamble))
+        note("the " + std::to_string(l.preamble.size()) + " bytes in front of the table are not zeros: kept as they are (preamble.bin)");
+    m.save(dir / "manifest.txt",
+           "abr xiaomi_logo manifest -- edit then `abr pack -i " + dir.string() + " -o out.img`\n"
+           "# NOTE: picture<N>_file is the file of a picture, as the image holds it (a BMP; a PNG in some images). pack puts every file into whole units of 4096 bytes\n"
+           "# (zeros behind it) and works out the table. To leave a picture out delete its key, number the ones behind it again and change pictures=.");
+}
+
+Bytes repack_xiaomi_logo(const Manifest& m, const fs::path& dir, const RepackOptions& opt) {
+    splash::XiaomiLogo l;
+    l.preamble = load_raw(m, dir, "preamble");
+    if (l.preamble.size() > splash::kXiaomiPreamble)
+        throw FormatError("preamble.bin is " + std::to_string(l.preamble.size()) + " bytes; the bytes in front of the table are " + std::to_string(splash::kXiaomiPreamble));
+    l.table_rest = load_raw(m, dir, "table_rest");
+    const size_t n = m.get_count("pictures", 0);
+    if (n == 0 || n > splash::kXiaomiMaxEntries)
+        throw FormatError("manifest.txt: " + shown("pictures=" + m.get("pictures")) + " is the number of the pictures of the image, 1 to " + std::to_string(splash::kXiaomiMaxEntries));
+    l.pictures.resize(n);
+    for (size_t i = 0; i < n; ++i) {
+        const std::string key = "picture" + std::to_string(i) + "_file";
+        if (!m.has(key)) throw FormatError("manifest.txt: " + shown(key) + " is missing (the file of the picture)");
+        const progress::Activity doing(m.get_path(key));
+        l.pictures[i] = read_file(dir / m.get_path(key));
+        progress::advance(l.pictures[i].size());
+    }
+    return assemble_envelope(m, dir, splash::xiaomi_build(l), opt);
+}
+
+void print_xiaomi_logo_info(const Bytes& data) {
+    const splash::XiaomiLogo l = splash::xiaomi_parse(data);
+    std::cout << "table:          " << l.pictures.size() << (l.pictures.size() == 1 ? " picture" : " pictures") << ", in units of " << splash::kXiaomiUnit << " bytes\n";
+    if (!is_all_zero(l.preamble)) std::cout << "preamble:       " << l.preamble.size() << " bytes in front of the table, not zeros (kept as they are)\n";
+    uint64_t at = splash::kXiaomiPreamble + splash::kXiaomiTableSize;
+    for (size_t i = 0; i < l.pictures.size(); ++i) {
+        const Bytes& p = l.pictures[i];
+        std::cout << "  [" << i << "] " << splash::picture_extension(p) << ": " << splash::xiaomi_content_size(p) << " bytes at " << hex_text(at) << ", " << p.size() / splash::kXiaomiUnit
+                  << (p.size() == splash::kXiaomiUnit ? " unit" : " units") << "\n";
+        at += p.size();
+    }
+    if (!l.table_rest.empty()) std::cout << "table:          " << l.table_rest.size() << " more bytes behind the entries (kept)\n";
+    print_envelope_info(Envelope::capture(data, 0, l.consumed));
+}
+
+// ---- moto_logo: the "MotoLogo" image of Motorola
+
+bool is_moto_run(const Bytes& b) { return b.size() >= splash::kMotoHeaderSize && std::memcmp(b.data(), "MotoRun\0", 8) == 0; }
+
+void unpack_moto_logo(const Bytes& data, const fs::path& dir) {
+    const splash::MotoLogo l = splash::moto_parse(data);
+    const size_t n = l.entries.size();
+    Manifest m;
+    m.set("type", "moto_logo");
+    m.set_u32("entries", static_cast<uint32_t>(n));
+    m.set_u32("align", l.align);
+    m.set_addr("header_fill", l.header_fill);
+    m.set_addr("gap_fill", l.gap_fill);
+
+    // A "MotoRun" picture becomes a PNG, as many as the memory allows; every other picture, and one that is not a whole MotoRun picture after all, stays the file it is.
+    std::vector<char> as_png(n, 0);
+    uint64_t used = 0, work = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const Bytes& b = l.entries[i].data;
+        work += b.size();
+        if (!is_moto_run(b)) continue;
+        const uint64_t px = uint64_t{static_cast<uint32_t>(b[8] << 8 | b[9])} * static_cast<uint32_t>(b[10] << 8 | b[11]) * 3;
+        if (used + px > kSplashPixelLimit) continue;
+        as_png[i] = 1;
+        used += px;
+    }
+    if (std::any_of(as_png.begin(), as_png.end(), [](char c) { return c != 0; })) fs::create_directories(dir / ".abr_raw");
+    progress::enter("decode", work);
+    std::vector<std::string> files(n);
+    std::vector<PictureFile> pictures(n);
+    par::for_each(n, [&](size_t i) {
+        const splash::MotoEntry& e = l.entries[i];
+        if (e.data.empty()) return;
+        if (as_png[i]) {
+            const std::string name = splash_file_name(i, n, e.name, "png");
+            const progress::Activity doing(name);
+            if (const std::optional<splash::Bitmap> bmp = splash::moto_decode(e.data)) {
+                files[i] = name;
+                pictures[i] = write_picture(dir, name, "motorun", *bmp, e.data);
+                progress::advance(e.data.size());
+                return;
+            }
+            as_png[i] = 0;
+        }
+        files[i] = splash_file_name(i, n, e.name, splash::picture_extension(e.data));
+        const progress::Activity doing(files[i]);
+        write_file(dir / files[i], e.data);
+        progress::advance(e.data.size());
+    });
+    for (size_t i = 0; i < n; ++i) {
+        const splash::MotoEntry& e = l.entries[i];
+        const std::string prefix = "entry" + std::to_string(i);
+        m.set(prefix + "_name", e.name);
+        m.set_tail(prefix + "_name_tail", e.name_tail);
+        if (e.data.empty()) continue;  // (an empty slot)
+        if (as_png[i]) {
+            record_picture(m, prefix, pictures[i], "motorun");
+        } else {
+            m.set(prefix + "_file", files[i]);
+            m.set(prefix + "_compression", "none");
+        }
+    }
+    save_core_envelope(m, dir, data, l.consumed);
+    drop_empty_raw_dir(dir);
+
+    size_t pics = 0;
+    for (const splash::MotoEntry& e : l.entries) pics += e.data.empty() ? 0 : 1;
+    std::cout << "Motorola logo: " << n << (n == 1 ? " entry" : " entries") << ", " << pics << (pics == 1 ? " picture" : " pictures") << ", at multiples of " << l.align << "\n";
+    for (size_t i = 0; i < n; ++i) {
+        const splash::MotoEntry& e = l.entries[i];
+        const size_t at = splash::kMotoTableAt + i * splash::kMotoEntrySize + splash::kMotoNameSize;
+        std::cout << "  [" << i << "] " << shown(e.name) << ": ";
+        if (e.data.empty()) {
+            std::cout << "empty slot\n";
+            continue;
+        }
+        const uint32_t offset = static_cast<uint32_t>(data[at] | (data[at + 1] << 8) | (data[at + 2] << 16) | (uint32_t{data[at + 3]} << 24));
+        std::cout << e.data.size() << " bytes at " << hex_text(offset) << ", ";
+        if (as_png[i]) std::cout << "MotoRun " << pixels_text(pictures[i].width, pictures[i].height) << " -> " << files[i] << "\n";
+        else std::cout << "kept as it is -> " << files[i] << "\n";
+    }
+    m.save(dir / "manifest.txt",
+           "abr moto_logo manifest -- edit then `abr pack -i " + dir.string() + " -o out.img`\n"
+           "# NOTE: a MotoRun picture is a PNG (entry<N>_file, entry<N>_compression=motorun): unchanged, it goes back as the very bytes it was; changed, it is run-length\n"
+           "# coded again. Any other picture is the file it is. pack puts the pictures at multiples of align, filled up with header_fill (up to the first) and gap_fill (between\n"
+           "# two), and works out the table. An entry with no entry<N>_file is an empty slot.");
+}
+
+Bytes repack_moto_logo(const Manifest& m, const fs::path& dir, const RepackOptions& opt) {
+    const size_t n = m.get_count("entries", 0);
+    if (n == 0 || n > splash::kMotoMaxEntries)
+        throw FormatError("manifest.txt: " + shown("entries=" + m.get("entries")) + " is the number of the entries of the table, 1 to " + std::to_string(splash::kMotoMaxEntries));
+    splash::MotoLogo l;
+    l.align = m.get_u32("align", 512);
+    l.header_fill = static_cast<uint8_t>(m.get_bounded("header_fill", 0xFF, 8));
+    l.gap_fill = static_cast<uint8_t>(m.get_bounded("gap_fill", 0xFF, 8));
+    l.entries.resize(n);
+    par::for_each(n, [&](size_t i) {
+        const std::string prefix = "entry" + std::to_string(i);
+        splash::MotoEntry& e = l.entries[i];
+        e.name = m.get(prefix + "_name");
+        e.name_tail = m.get_tail(prefix + "_name_tail");
+        if (!m.has(prefix + "_file")) return;  // an empty slot
+        if (m.has(prefix + "_width")) {
+            const std::string coding = m.get(prefix + "_compression", "motorun");
+            if (coding != "motorun")
+                throw FormatError("manifest.txt: " + shown(prefix + "_compression=" + coding) + " is not motorun (the pictures that abr decodes of this image are run-length coded as MotoRun)");
+            PictureCoding how;
+            how.decode = [](const Bytes& raw) { return splash::moto_decode(raw); };
+            how.encode = [](const splash::Bitmap& bmp) { return splash::moto_encode(bmp); };
+            LoadedPicture loaded = load_picture(m, dir, prefix, coding, how);
+            if (!loaded.replayed) note_new_size(m.get_path(prefix + "_file"), loaded.pixels, m.get_u32(prefix + "_width", 0), m.get_u32(prefix + "_height", 0));
+            e.data = std::move(loaded.stored);
+        } else {
+            const std::string coding = m.get(prefix + "_compression", "none");
+            if (coding != "none") throw FormatError("manifest.txt: " + shown(prefix + "_compression=" + coding) + " is not none (the picture is put into the image as the file it is)");
+            const progress::Activity doing(m.get_path(prefix + "_file"));
+            e.data = read_file(dir / m.get_path(prefix + "_file"));
+            progress::advance(e.data.size());
+        }
+    });
+    return assemble_envelope(m, dir, splash::moto_build(l), opt);
+}
+
+void print_moto_logo_info(const Bytes& data) {
+    const splash::MotoLogo l = splash::moto_parse(data);
+    size_t pics = 0;
+    for (const splash::MotoEntry& e : l.entries) pics += e.data.empty() ? 0 : 1;
+    std::cout << "table:          " << l.entries.size() << (l.entries.size() == 1 ? " entry" : " entries") << ", " << pics << (pics == 1 ? " picture" : " pictures") << "\n";
+    std::cout << "alignment:      the pictures lie at multiples of " << l.align << ", filled up with " << hex_text(l.header_fill) << " in front of the first and " << hex_text(l.gap_fill)
+              << " between them\n";
+    for (size_t i = 0; i < l.entries.size(); ++i) {
+        const splash::MotoEntry& e = l.entries[i];
+        const size_t at = splash::kMotoTableAt + i * splash::kMotoEntrySize + splash::kMotoNameSize;
+        std::cout << "  [" << i << "] " << shown(e.name) << ": ";
+        if (e.data.empty()) {
+            std::cout << "empty slot\n";
+            continue;
+        }
+        const uint32_t offset = static_cast<uint32_t>(data[at] | (data[at + 1] << 8) | (data[at + 2] << 16) | (uint32_t{data[at + 3]} << 24));
+        std::cout << e.data.size() << " bytes at " << hex_text(offset) << ", ";
+        if (is_moto_run(e.data)) std::cout << "MotoRun " << pixels_text(static_cast<uint32_t>(e.data[8] << 8 | e.data[9]), static_cast<uint32_t>(e.data[10] << 8 | e.data[11])) << "\n";
+        else std::cout << splash::picture_extension(e.data) << "\n";
+    }
+    print_envelope_info(Envelope::capture(data, 0, l.consumed));
+}
+
 // ------------------------------------------------------------------ layout --
 //
 // Where the parts of an image are (abr/layout.hpp). `unpack` says it of the image it took apart, `pack` of the image it built and `info`
@@ -4334,6 +5058,30 @@ std::optional<layout::Layout> describe_layout(Fmt f, const Bytes& whole) {
                 layout::Layout l = layout::mbn_elf(whole);
                 if (l.regions.empty()) return std::nullopt;
                 layout::around(l, whole, whole.size(), 0, mbn::parse_elf(whole).consumed);
+                return l;
+            }
+            case Fmt::SPLASH: {
+                layout::Layout l = layout::qc_splash(whole);
+                if (l.regions.empty()) return std::nullopt;
+                layout::around(l, whole, whole.size(), 0, splash::qc_parse(whole).consumed);
+                return l;
+            }
+            case Fmt::OPLUS_LOGO: {
+                layout::Layout l = layout::oplus_logo(whole);
+                if (l.regions.empty()) return std::nullopt;
+                layout::around(l, whole, whole.size(), 0, splash::oplus_parse(whole).consumed);
+                return l;
+            }
+            case Fmt::XIAOMI_LOGO: {
+                layout::Layout l = layout::xiaomi_logo(whole);
+                if (l.regions.empty()) return std::nullopt;
+                layout::around(l, whole, whole.size(), 0, splash::xiaomi_parse(whole).consumed);
+                return l;
+            }
+            case Fmt::MOTO_LOGO: {
+                layout::Layout l = layout::moto_logo(whole);
+                if (l.regions.empty()) return std::nullopt;
+                layout::around(l, whole, whole.size(), 0, splash::moto_parse(whole).consumed);
                 return l;
             }
             default:
@@ -4743,6 +5491,22 @@ void print_info(const fs::path& path) {
             print_mbn_elf_info(data);
             break;
         }
+        case Fmt::SPLASH: {
+            print_splash_info(data);
+            break;
+        }
+        case Fmt::OPLUS_LOGO: {
+            print_oplus_logo_info(data);
+            break;
+        }
+        case Fmt::XIAOMI_LOGO: {
+            print_xiaomi_logo_info(data);
+            break;
+        }
+        case Fmt::MOTO_LOGO: {
+            print_moto_logo_info(data);
+            break;
+        }
         case Fmt::CHROMEOS: {
             Bytes kernel;
             const std::optional<legacy::ChromeosInfo> c = legacy::strip_chromeos(data, kernel);
@@ -4840,6 +5604,10 @@ Bytes build_image_once(const fs::path& dir, const RepackOptions& opt) {
         case Fmt::MTK_PRELOADER: result = repack_mtk_preloader(m, dir, opt); break;
         case Fmt::MBN: result = repack_mbn(m, dir, opt); break;
         case Fmt::MBN_ELF: result = repack_mbn_elf(m, dir, opt); break;
+        case Fmt::SPLASH: result = repack_splash(m, dir, opt); break;
+        case Fmt::OPLUS_LOGO: result = repack_oplus_logo(m, dir, opt); break;
+        case Fmt::XIAOMI_LOGO: result = repack_xiaomi_logo(m, dir, opt); break;
+        case Fmt::MOTO_LOGO: result = repack_moto_logo(m, dir, opt); break;
         case Fmt::UNKNOWN:
             throw FormatError("manifest.txt has no (or an unrecognized) 'type=' field");
     }
@@ -4990,6 +5758,10 @@ void do_unpack(const fs::path& in, const fs::path& outdir) {
             case Fmt::MTK_PRELOADER: unpack_mtk_preloader(payload, outdir); break;
             case Fmt::MBN: unpack_mbn(payload, outdir); break;
             case Fmt::MBN_ELF: unpack_mbn_elf(payload, outdir); break;
+            case Fmt::SPLASH: unpack_splash(payload, outdir); break;
+            case Fmt::OPLUS_LOGO: unpack_oplus_logo(payload, outdir); break;
+            case Fmt::XIAOMI_LOGO: unpack_xiaomi_logo(payload, outdir); break;
+            case Fmt::MOTO_LOGO: unpack_moto_logo(payload, outdir); break;
             case Fmt::UNKNOWN:
                 throw FormatError(in.string() + ": " + describe_unknown(payload));
         }
@@ -5234,7 +6006,9 @@ void usage(std::ostream& os) {
         "signed with the SIGNBLOB header or not), Intel OSIP boot images, ChromeOS kernel blobs\n"
         "(the vboot format of a Chromebook's kernel partition); firmware partitions: MediaTek images with the 0x58881688\n"
         "header (md1img/modem, lk, tee, scp, sspm, logo) and the MediaTek preloader (GFH), Qualcomm secure boot images (MBN: a flat\n"
-        "file with header version 3, 5, 6 or 7 or an SBL header, or an ELF with a hash segment -- sbl1/xbl, tz, rpm, aboot, ...).\n"
+        "file with header version 3, 5, 6 or 7 or an SBL header, or an ELF with a hash segment -- sbl1/xbl, tz, rpm, aboot, ...), and the\n"
+        "picture partitions of phones (splash, logo: Qualcomm's \"SPLASH!!\" image, the \"SPLASH LOGO!\" image of OPPO/realme/OnePlus, the\n"
+        "\"LOGO!!!!\" image of Xiaomi, Motorola's MotoLogo): every picture becomes a file, a PNG where its pixels are coded (RLE24, MotoRun).\n"
         "A signature of a firmware image cannot be made again: it is kept as it is, and a warning says when what it was made for changed.\n"
         "Also transparently handled: a trailing AVB hash footer on boot/\n"
         "vendor_boot/dtbo; a DHTB wrapper (with SEAndroid footer/padding) around\n"
