@@ -170,6 +170,26 @@ Fmt detect_format(const Bytes& d) {
     return Fmt::UNKNOWN;
 }
 
+// The kind of FAT volume whose boot sector `d` starts with ("FAT16", and how many bytes the volume has), or nothing when the bytes are no boot sector of one. The fields of the BIOS
+// parameter block have to make sense (a sector of 512 to 4096 bytes, a cluster of a power of two of them, a reserved sector at least, one or two FATs, a media byte of the
+// specification), and the variant is told by the number of clusters as the specification of Microsoft says: below 4085 FAT12, below 65525 FAT16, else FAT32.
+std::optional<std::pair<std::string, uint64_t>> fat_volume(const Bytes& d) {
+    if (d.size() < 512 || d[510] != 0x55 || d[511] != 0xAA || (d[0] != 0xEB && d[0] != 0xE9)) return std::nullopt;
+    const auto le16 = [&](size_t at) -> uint32_t { return uint32_t{d[at]} | (uint32_t{d[at + 1]} << 8); };
+    const auto le32 = [&](size_t at) -> uint32_t { return le16(at) | (le16(at + 2) << 16); };
+    const auto power_of_two = [](uint32_t v) { return v != 0 && (v & (v - 1)) == 0; };
+    const uint32_t sector = le16(11), per_cluster = d[13], reserved = le16(14), fats = d[16], root_entries = le16(17), media = d[21];
+    if (sector < 512 || sector > 4096 || !power_of_two(sector) || !power_of_two(per_cluster) || per_cluster > 128 || reserved == 0 || fats < 1 || fats > 2) return std::nullopt;
+    if (media != 0xF0 && media < 0xF8) return std::nullopt;
+    const uint64_t total = le16(19) != 0 ? le16(19) : le32(32);
+    const uint64_t fat_sectors = le16(22) != 0 ? le16(22) : le32(36);
+    if (total == 0 || fat_sectors == 0) return std::nullopt;
+    const uint64_t overhead = reserved + fats * fat_sectors + (uint64_t{root_entries} * 32 + sector - 1) / sector;
+    if (overhead >= total) return std::nullopt;
+    const uint64_t clusters = (total - overhead) / per_cluster;
+    return std::pair<std::string, uint64_t>{clusters < 4085 ? "FAT12" : clusters < 65525 ? "FAT16" : "FAT32", total * sector};
+}
+
 // A clear message for the things people commonly feed to a boot-image tool
 // by mistake, instead of a bare "unrecognized format".
 std::string describe_unknown(const Bytes& d) {
@@ -237,6 +257,12 @@ std::string describe_unknown(const Bytes& d) {
         return "this has \"SPLASH LOGO!\" at 0x4000, the logo image of an OPPO, realme or OnePlus phone, but abr cannot read it: " + splash::oplus_problem(d);
     if (d.size() >= splash::kXiaomiPreamble + sizeof splash::kXiaomiMagic && std::memcmp(d.data() + splash::kXiaomiPreamble, splash::kXiaomiMagic, sizeof splash::kXiaomiMagic) == 0)
         return "this has \"LOGO!!!!\" at 0x4000, the logo image of a Xiaomi or Redmi phone, but abr cannot read it: " + splash::xiaomi_problem(d);
+    if (const auto fat = fat_volume(d))
+        return "this is a " + fat->first + " file system image of " + (fat->second >= (uint64_t{8} << 20) ? std::to_string(fat->second >> 20) + " MiB" : std::to_string(fat->second >> 10) + " KiB") +
+               " (the modem partition of a Qualcomm phone, NON-HLOS.bin, is usually one), not a boot-family container. Filesystems are out of scope for abr; 7-Zip or mtools open it";
+    if (d.size() >= 520 && (std::memcmp(d.data() + 512, "EFI PART", 8) == 0 || (d.size() >= 4104 && std::memcmp(d.data() + 4096, "EFI PART", 8) == 0)))
+        return "this holds a GUID partition table (\"EFI PART\"): a GPT file of a firmware package (gpt_main0.bin, say) or the start of a whole-disk dump. It lists the partitions of "
+               "a disk, it is not the image of one, and abr does not read partition tables";
     if (u16le(0x438) == 0xEF53)
         return "this is an ext2/3/4 filesystem image (system/vendor/product/... or a recovery "
                "dumped as a filesystem), not a boot-family container. Filesystems are out of "
