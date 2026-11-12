@@ -1727,8 +1727,11 @@ Bytes repack_dtbo(const Manifest& m, const fs::path& dir, const RepackOptions& o
 
 // The blobs are the flattened device trees at the start of the file, back to back, each as long as its header says;
 // what is behind the last one (the zeros a partition image is filled up with, a trailer) is the envelope's, as in the
-// other images.
-void unpack_dtb(const Bytes& data, const fs::path& dir) {
+// other images. An AVB hash footer at the end of the partition (a dtb partition that is verified has one) is the
+// footer's: it is kept, and put back with a new hash when the trees changed.
+void unpack_dtb(const Bytes& whole, const fs::path& dir) {
+    const AvbFooter footer = detect_avb_footer(whole);
+    const Bytes data(whole.begin(), whole.begin() + static_cast<long>(footer.host_size));
     const FdtBlobs split = split_fdt_blobs(data);
     if (split.blobs.empty()) throw FormatError("this is not a dtb: it does not start with a flattened device tree");
     Manifest m;
@@ -1740,6 +1743,7 @@ void unpack_dtb(const Bytes& data, const fs::path& dir) {
         write_file(dir / filename, split.blobs[i]);
     }
     save_envelope(m, dir, Envelope::capture(data, 0, split.consumed), data, 0, split.consumed);
+    save_avb_footer(m, dir, footer, data);
     m.save(dir / "manifest.txt",
            "abr dtb manifest -- edit then `abr pack -i " + dir.string() + " -o out.dtb`");
 }
@@ -1754,7 +1758,8 @@ Bytes repack_dtb(const Manifest& m, const fs::path& dir, const RepackOptions& op
         blobs.push_back(read_file(dir / name));
         check_fdt_blob(blobs.back(), key + " (" + textquote::quote_shown(name) + ")");
     }
-    return assemble_envelope(m, dir, join_fdt_blobs(blobs), opt);
+    Bytes host = assemble_envelope(m, dir, join_fdt_blobs(blobs), opt);
+    return reattach_avb_footer(m, dir, std::move(host), opt.avb_key_pem);
 }
 
 // ------------------------------------------------------------- vbmeta --
@@ -4979,11 +4984,13 @@ std::optional<layout::Layout> describe_layout(Fmt f, const Bytes& whole) {
                 return l;
             }
             case Fmt::DTB: {
-                const FdtBlobs split = split_fdt_blobs(whole);
+                const AvbFooter footer = detect_avb_footer(whole);
+                const Bytes& host = part_of(whole, 0, footer.host_size, storage);
+                const FdtBlobs split = split_fdt_blobs(host);
                 std::vector<size_t> sizes;
                 for (const Bytes& b : split.blobs) sizes.push_back(b.size());
                 layout::Layout l = layout::dtb_blobs(sizes);
-                layout::around(l, whole, whole.size(), 0, split.consumed);
+                layout::around(l, whole, footer.host_size, 0, split.consumed);
                 return l;
             }
             case Fmt::QCDT: {
@@ -5323,11 +5330,14 @@ void print_info(const fs::path& path) {
             break;
         }
         case Fmt::DTB: {
-            const FdtBlobs split = split_fdt_blobs(data);
+            const AvbFooter footer = detect_avb_footer(data);
+            const Bytes host(data.begin(), data.begin() + static_cast<long>(footer.host_size));
+            const FdtBlobs split = split_fdt_blobs(host);
             std::cout << "fdt blobs: " << split.blobs.size() << "\n";
             for (size_t i = 0; i < split.blobs.size(); ++i)
                 std::cout << "  [" << i << "] " << split.blobs[i].size() << " bytes\n";
-            print_envelope_info(Envelope::capture(data, 0, split.consumed));
+            print_envelope_info(Envelope::capture(host, 0, split.consumed));
+            print_avb_footer_info(footer, host);
             break;
         }
         case Fmt::QCDT: {
