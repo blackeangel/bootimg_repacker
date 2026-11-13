@@ -1719,6 +1719,113 @@ void test_dtb_blobs() {
         EXPECT(s.blobs.size() == n && s.consumed == blobs_end);
         for (const Bytes& blob : s.blobs) EXPECT(refusal_of([&] { check_fdt_blob(blob, "blob"); }).empty());
         EXPECT(concat({join_fdt_blobs(s.blobs), Bytes(data.begin() + static_cast<std::ptrdiff_t>(s.consumed), data.end())}) == data);
+        EXPECT(s.gaps == std::vector<size_t>(n, 0) && fdt_gap_alignment(s) == 0);
+    }
+}
+
+// Trees that are put at multiples of an alignment have zeros between them: a gap, when a tree follows the zeros. The gaps are told by
+// alignment when one makes them all, and the file is joined again from the blobs and the gaps.
+void test_dtb_gaps() {
+    std::puts("dtb: zeros between the blobs");
+    std::mt19937_64 rng(0xD7B6A9);
+    const Bytes a = fdt_of(192, 192), b = fdt_of(100, 100);
+    using Gaps = std::vector<size_t>;
+    {
+        const Bytes data = concat({b, Bytes(4, 0), a});  // 100 bytes, the next multiple of 8 is 104
+        const FdtBlobs s = split_fdt_blobs(data);
+        EXPECT(s.blobs.size() == 2 && s.blobs[0] == b && s.blobs[1] == a);
+        EXPECT(s.gaps == Gaps({0, 4}));
+        EXPECT(s.consumed == data.size());
+        EXPECT(fdt_gap_alignment(s) == 8);
+        EXPECT(join_fdt_blobs(s.blobs, s.gaps) == data);
+        EXPECT(fdt_aligned_gaps(s.blobs, 8) == s.gaps);
+        EXPECT(fdt_aligned_gaps(s.blobs, 4) == Gaps({0, 0}));  // (100 is a multiple of 4)
+        EXPECT(fdt_aligned_gaps(s.blobs, 1) == Gaps({0, 0}));
+        EXPECT(fdt_aligned_gaps(s.blobs, 128) == Gaps({0, 28}));
+        EXPECT(join_fdt_blobs(s.blobs) == concat({b, a}));  // (no gaps given: the trees follow one another)
+    }
+    {
+        const Bytes data = concat({b, Bytes(12, 0), a, b, Bytes(50, 0)});  // multiples of 16: 112, 304, 404
+        const FdtBlobs s = split_fdt_blobs(data);
+        EXPECT(s.blobs.size() == 3 && s.gaps == Gaps({0, 12, 0}));
+        EXPECT(s.consumed == data.size() - 50);
+        EXPECT(fdt_gap_alignment(s) == 16);
+        EXPECT(fdt_aligned_gaps(s.blobs, 16) == s.gaps);
+    }
+    {
+        const Bytes data = concat({a, Bytes(3904, 0), b});  // a page
+        const FdtBlobs s = split_fdt_blobs(data);
+        EXPECT(s.blobs.size() == 2 && s.gaps == Gaps({0, 3904}) && fdt_gap_alignment(s) == 4096);
+        EXPECT(fdt_aligned_gaps(s.blobs, 4096) == s.gaps);
+        // a bigger first tree moves the second to the next multiple
+        const std::vector<Bytes> bigger = {fdt_of(4100, 4100), b};
+        EXPECT(fdt_aligned_gaps(bigger, 4096) == Gaps({0, 4092}));
+    }
+    {
+        // gaps that no alignment makes: 104 and 299 have no common multiple of 8
+        const Bytes data = concat({b, Bytes(4, 0), a, Bytes(3, 0), b});
+        const FdtBlobs s = split_fdt_blobs(data);
+        EXPECT(s.blobs.size() == 3 && s.gaps == Gaps({0, 4, 3}));
+        EXPECT(fdt_gap_alignment(s) == 0);
+        EXPECT(join_fdt_blobs(s.blobs, s.gaps) == data);
+        // a gap of 8 needs an alignment above 8 (16), and the second tree starts at 200, which is not a multiple of 16
+        const FdtBlobs t = split_fdt_blobs(concat({a, Bytes(8, 0), b}));
+        EXPECT(t.gaps == Gaps({0, 8}) && fdt_gap_alignment(t) == 0);
+        // the same gap with a tree that starts at a multiple of 16 is made by 16
+        const FdtBlobs u = split_fdt_blobs(concat({fdt_of(184, 184), Bytes(8, 0), b}));
+        EXPECT(u.gaps == Gaps({0, 8}) && fdt_gap_alignment(u) == 16);
+    }
+    // zeros that no tree follows are not a gap; a tree that does not stand is not a blob behind zeros (and is not refused either)
+    {
+        const Bytes junk = some_bytes(rng, 300);
+        const Bytes behind[] = {Bytes(16, 0), junk, concat({Bytes(16, 0), junk}), concat({Bytes(8, 0), fdt_of(4096, 100)}),
+                                concat({Bytes(8, 0), fdt_of(8, 100)}), concat({Bytes(8, 0), fdt_of(40, 30)}),
+                                concat({Bytes(8, 0), Bytes{0xD0, 0x0D, 0xFE, 0xED}}), concat({Bytes(8, 0), Bytes{0xD0, 0x0D}})};
+        for (const Bytes& tail : behind) {
+            const FdtBlobs s = split_fdt_blobs(concat({a, tail}));
+            EXPECT(s.blobs.size() == 1 && s.blobs[0] == a && s.gaps == Gaps({0}) && s.consumed == a.size());
+        }
+        EXPECT_HAS(refusal_of([&] { split_fdt_blobs(concat({a, fdt_of(4096, 100)})); }), "the FDT blob at offset 192 has a totalsize of 4096");
+    }
+    {
+        // a tree that is no more than a header stands behind a gap
+        const FdtBlobs s = split_fdt_blobs(concat({a, Bytes(8, 0), fdt_of(40, 40), Bytes(60, 0)}));
+        EXPECT(s.blobs.size() == 2 && s.gaps == Gaps({0, 8}) && s.consumed == 192 + 8 + 40);
+        // a zero in the data of the tree is no gap: the blob is as long as its header says
+        const FdtBlobs t = split_fdt_blobs(concat({fdt_of(64, 64), a}));
+        EXPECT(t.blobs.size() == 2 && t.gaps == Gaps({0, 0}));
+    }
+    // join: one gap for each blob, or none
+    EXPECT_HAS(refusal_of([&] { join_fdt_blobs({a, b}, {0}); }), "was given 1 gaps");
+    EXPECT_HAS(refusal_of([&] { join_fdt_blobs({a, b}, {0, 1, 2}); }), "was given 3 gaps");
+    EXPECT(refusal_of([&] { join_fdt_blobs({a, b}, {0, 1}); }).empty());
+    EXPECT(join_fdt_blobs({}, {}).empty());
+    EXPECT_HAS(refusal_of([&] { fdt_aligned_gaps({a, b}, 0); }), "alignment of the blobs of a dtb is 0");
+    EXPECT(fdt_gap_alignment(FdtBlobs{}) == 0);
+    // whatever is built at an alignment is split into the same trees and gaps, joins into the same file, and the alignment that is told
+    // makes the same gaps again (it is not always the one the file was made with: the smallest that does it)
+    const size_t aligns[] = {2, 4, 8, 16, 64, 4096};
+    for (int i = 0; i < 300; ++i) {
+        const size_t align = aligns[rng() % 6];
+        std::vector<Bytes> blobs;
+        const size_t n = 1 + rng() % 5;
+        for (size_t k = 0; k < n; ++k) {
+            const size_t size = 40 + rng() % 400;
+            blobs.push_back(fdt_of(static_cast<uint32_t>(size), size));
+        }
+        const Gaps gaps = fdt_aligned_gaps(blobs, align);
+        Bytes data = join_fdt_blobs(blobs, gaps);
+        const size_t blobs_end = data.size();
+        data = concat({data, rng() % 2 ? Bytes(rng() % 200, 0) : some_bytes(rng, rng() % 200)});
+        const FdtBlobs s = split_fdt_blobs(data);
+        EXPECT(s.blobs == blobs && s.gaps == gaps && s.consumed == blobs_end);
+        EXPECT(join_fdt_blobs(s.blobs, s.gaps) == Bytes(data.begin(), data.begin() + static_cast<std::ptrdiff_t>(blobs_end)));
+        const size_t told = fdt_gap_alignment(s);
+        const bool any = std::any_of(gaps.begin(), gaps.end(), [](size_t g) { return g != 0; });
+        EXPECT((told != 0) == any);
+        if (told) {
+            EXPECT(told <= align && fdt_aligned_gaps(s.blobs, told) == s.gaps);
+        }
     }
 }
 
@@ -1920,6 +2027,7 @@ int run_manifest_tests() {
     test_file_helpers();
     test_base64_messages();
     test_dtb_blobs();
+    test_dtb_gaps();
     test_osip_tells();
     test_versions();
     if (g_failures == 0) std::printf("manifest: ok (%d checks)\n", g_checks);

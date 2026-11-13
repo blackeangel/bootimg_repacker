@@ -305,6 +305,12 @@ void test_uimage_and_dtb() {
 
     const layout::Layout d = layout::dtb_blobs({100, 200, 50});
     EXPECT(d.regions.size() == 3 && d.regions[2].offset == 300 && d.regions[2].size == 50 && d.regions[2].key == "blob2");
+    // zeros between the trees are regions of their own, the trees keep their keys
+    const layout::Layout g = layout::dtb_blobs({100, 200, 50}, {0, 4, 0});
+    EXPECT(g.regions.size() == 4 && g.size == 354);
+    EXPECT(g.regions.size() == 4 && g.regions[1].name == "padding" && g.regions[1].offset == 100 && g.regions[1].size == 4 && g.regions[1].key.empty());
+    EXPECT(g.regions.size() == 4 && g.regions[2].key == "blob1" && g.regions[2].offset == 104 && g.regions[3].key == "blob2" && g.regions[3].offset == 304);
+    EXPECT(layout::dtb_blobs({100, 200}, {0, 0}).regions.size() == 2);
 }
 
 // The smallest flattened device tree there is: the header, the empty memory reservation block, an empty root node, no strings.

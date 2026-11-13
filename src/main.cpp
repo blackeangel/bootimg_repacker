@@ -1737,9 +1737,14 @@ void unpack_dtb(const Bytes& whole, const fs::path& dir) {
     Manifest m;
     m.set("type", "dtb");
     m.set_u32("blob_count", static_cast<uint32_t>(split.blobs.size()));
+    // Zero bytes between the trees: when the trees are put at multiples of an alignment that says all of it (a bigger tree then moves
+    // the ones behind it on to the next multiple); the gaps of trees that follow no such rule are kept as they are, one by one.
+    const size_t align = fdt_gap_alignment(split);
+    if (align) m.set_u64("blob_align", align);
     for (size_t i = 0; i < split.blobs.size(); ++i) {
         std::string filename = "blob" + std::to_string(i) + ".dtb";
         m.set("blob" + std::to_string(i) + "_file", filename);
+        if (!align && split.gaps[i]) m.set_u64("blob" + std::to_string(i) + "_pad", split.gaps[i]);
         write_file(dir / filename, split.blobs[i]);
     }
     save_envelope(m, dir, Envelope::capture(data, 0, split.consumed), data, 0, split.consumed);
@@ -1758,7 +1763,32 @@ Bytes repack_dtb(const Manifest& m, const fs::path& dir, const RepackOptions& op
         blobs.push_back(read_file(dir / name));
         check_fdt_blob(blobs.back(), key + " (" + textquote::quote_shown(name) + ")");
     }
-    Bytes host = assemble_envelope(m, dir, join_fdt_blobs(blobs), opt);
+    // The zero bytes in front of each tree after the first: blob_align puts the trees at multiples of it; blob<N>_pad says how many
+    // zeros there are in front of tree N (and wins over the alignment for that tree). Neither: the trees follow one another.
+    std::vector<size_t> gaps;
+    if (m.has("blob_align")) {
+        const uint64_t align = m.get_size("blob_align", 0);
+        if (align == 0)
+            throw FormatError("manifest.txt: blob_align is 0; it is the size the trees are put at multiples of (1 or more), or leave it out "
+                              "when they follow one another");
+        gaps = fdt_aligned_gaps(blobs, static_cast<size_t>(align));
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+        const std::string key = "blob" + std::to_string(i) + "_pad";
+        if (!m.has(key)) continue;
+        const uint64_t pad = m.get_size(key, 0);
+        if (i == 0 && pad)
+            throw FormatError("manifest.txt: blob0_pad is " + std::to_string(pad) + "; the first tree starts the file (there is nothing in front of it)");
+        if (gaps.empty()) gaps.assign(count, 0);
+        gaps[i] = static_cast<size_t>(pad);
+    }
+    uint64_t total = 0;
+    for (const Bytes& b : blobs) total += b.size();
+    for (const size_t g : gaps) total += g;
+    if (total > kMaxImageSize)
+        throw FormatError("the trees and the zeros between them come to " + std::to_string(total) + " bytes (blob_align and blob<N>_pad of manifest.txt "
+                          "set the zeros); no image of the family is more than " + std::to_string(kMaxImageSize >> 20) + " MiB");
+    Bytes host = assemble_envelope(m, dir, join_fdt_blobs(blobs, gaps), opt);
     return reattach_avb_footer(m, dir, std::move(host), opt.avb_key_pem);
 }
 
@@ -4989,7 +5019,7 @@ std::optional<layout::Layout> describe_layout(Fmt f, const Bytes& whole) {
                 const FdtBlobs split = split_fdt_blobs(host);
                 std::vector<size_t> sizes;
                 for (const Bytes& b : split.blobs) sizes.push_back(b.size());
-                layout::Layout l = layout::dtb_blobs(sizes);
+                layout::Layout l = layout::dtb_blobs(sizes, split.gaps);
                 layout::around(l, whole, footer.host_size, 0, split.consumed);
                 return l;
             }
@@ -5335,7 +5365,10 @@ void print_info(const fs::path& path) {
             const FdtBlobs split = split_fdt_blobs(host);
             std::cout << "fdt blobs: " << split.blobs.size() << "\n";
             for (size_t i = 0; i < split.blobs.size(); ++i)
-                std::cout << "  [" << i << "] " << split.blobs[i].size() << " bytes\n";
+                std::cout << "  [" << i << "] " << split.blobs[i].size() << " bytes"
+                          << (split.gaps[i] ? " (" + std::to_string(split.gaps[i]) + " bytes of zeros before it)" : std::string()) << "\n";
+            if (const size_t align = fdt_gap_alignment(split))
+                std::cout << "  the trees are put at multiples of " << align << " bytes\n";
             print_envelope_info(Envelope::capture(host, 0, split.consumed));
             print_avb_footer_info(footer, host);
             break;

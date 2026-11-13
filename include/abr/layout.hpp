@@ -79,8 +79,9 @@ Layout qcdt(const Bytes& data, const std::string& key_prefix = "");
 // keys for it ("" for a vbmeta image, "avb_" for the footer of another partition). Nothing is added for what is not a vbmeta blob.
 void vbmeta(Layout& l, const Bytes& data, uint64_t at, unsigned depth, const std::string& key_prefix);
 Layout vbmeta_image(const Bytes& data);
-// Flattened device trees one after the other (a dtb file): the size of each.
-Layout dtb_blobs(const std::vector<size_t>& sizes);
+// Flattened device trees one after the other (a dtb file): the size of each, and the zero bytes in front of each (`gaps`, as many as
+// the sizes, or none: the trees follow one another).
+Layout dtb_blobs(const std::vector<size_t>& sizes, const std::vector<size_t>& gaps = {});
 // A U-Boot FIT image, read from `file` (the flattened tree is walked): the header, the reservation map, the structure block and the strings
 // block, and the data of every image, where it is -- inside the structure block (`data`), or behind the tree (data-offset, data-position).
 // `keys[i]` is the key of the manifest for the i-th child of /images (empty: none).

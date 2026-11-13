@@ -510,11 +510,15 @@ Layout vbmeta_image(const Bytes& d) {
     return l;
 }
 
-Layout dtb_blobs(const std::vector<size_t>& sizes) {
+Layout dtb_blobs(const std::vector<size_t>& sizes, const std::vector<size_t>& gaps) {
     Layout l;
     l.format = "flattened device trees";
     uint64_t at = 0;
     for (size_t i = 0; i < sizes.size(); ++i) {
+        if (i < gaps.size() && gaps[i]) {
+            l.add("padding", "", at, gaps[i], 0, "zeros");
+            at += gaps[i];
+        }
         l.add("device tree " + std::to_string(i), "blob" + std::to_string(i), at, sizes[i]);
         at += sizes[i];
     }
