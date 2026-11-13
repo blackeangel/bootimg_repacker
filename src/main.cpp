@@ -516,6 +516,8 @@ public:
 struct DecodedComponent {
     bool present = false;                // false: the component was empty, nothing is recorded
     std::optional<std::string> mtk_name;
+    std::optional<Bytes> mtk_header;     // the 512 bytes of its MTK sub-header, when that is not the plain one (kept: pack puts the same bytes back)
+    int64_t mtk_extra = 0;               // the bytes the component holds beyond the size that sub-header declares (see legacy::MtkHeader::extra)
     std::optional<Bytes> stripped;       // the stored bytes without their MTK sub-header, when it had one
     Codec codec = Codec::NONE;
     int level = -1;                      // the level the stream was made with, when abr could tell (detect_level()); else -1
@@ -537,6 +539,10 @@ DecodedComponent decode_component(const Bytes& raw, std::string_view what = {}, 
     Bytes after_mtk;
     if (auto mtk = strip_mtk ? strip_mtk_header(raw, after_mtk) : std::nullopt) {
         d.mtk_name = mtk->name;
+        if (!mtk->plain) {
+            d.mtk_header = std::move(mtk->raw);
+            d.mtk_extra = mtk->extra;
+        }
         d.stripped = std::move(after_mtk);
     }
     const Bytes& working = d.stored(raw);
@@ -561,6 +567,9 @@ struct ComponentSource {
     const Bytes* raw;       // the component as found in the image
     std::string filename;   // its file in the unpack directory
 };
+
+// The file that keeps the MTK sub-header of a component when it is not the plain one: "kernel.mtk_header" beside "kernel".
+std::string mtk_header_file_name(const std::string& component_file) { return component_file + ".mtk_header"; }
 
 // Decodes every component and writes its files (the decompressed content, and
 // the original bytes under .abr_raw/). Results come back in input order.
@@ -587,6 +596,7 @@ std::vector<DecodedComponent> save_components(const fs::path& dir,
         if (out[i].present) {
             write_file(dir / sources[i].filename, out[i].plain);
             write_file(dir / ".abr_raw" / (sources[i].filename + ".raw"), out[i].stored(*sources[i].raw));
+            if (out[i].mtk_header) write_file(dir / mtk_header_file_name(sources[i].filename), *out[i].mtk_header);
         }
         progress::advance(sources[i].raw->size());
     });
@@ -597,6 +607,12 @@ void record_component(Manifest& m, const std::string& prefix, const std::string&
                       const DecodedComponent& d) {
     if (!d.present) return;
     if (d.mtk_name) m.set(prefix + "_mtk_name", *d.mtk_name);
+    // A sub-header that is not the plain one (magic, size, name, 0xFF) is a file of its own, which pack puts back with the size it
+    // declares worked out again; `_mtk_size_extra` is how many bytes the component holds beyond the size the header declared.
+    if (d.mtk_header) {
+        m.set(prefix + "_mtk_header_file", mtk_header_file_name(filename));
+        if (d.mtk_extra) m.set(prefix + "_mtk_size_extra", std::to_string(d.mtk_extra));
+    }
     m.set(prefix + "_file", filename);
     m.set(prefix + "_compression", std::string(codec_name(d.codec)));
     // The level of the stream, when abr could tell: pack compresses the component again at it when the file was changed. Without the
@@ -838,7 +854,17 @@ Bytes load_component(const Manifest& m, const fs::path& dir, const std::string& 
         }
         if (codec == Codec::NONE) check_unpacks_as_is(result, prefix, filename);
     }
-    if (m.has(prefix + "_mtk_name")) result = add_mtk_header(result, m.get(prefix + "_mtk_name"));
+    if (m.has(prefix + "_mtk_header_file")) {
+        const std::string header_file = m.get_path(prefix + "_mtk_header_file");
+        const int64_t extra = m.get_int(prefix + "_mtk_size_extra", 0, -static_cast<int64_t>(kMaxImageSize), static_cast<int64_t>(kMaxImageSize));
+        try {
+            result = add_mtk_header(result, read_file(dir / header_file), extra);
+        } catch (const FormatError& e) {
+            throw FormatError(textquote::quote_shown(header_file) + " (the MTK header of " + textquote::quote_shown(filename) + "): " + e.what());
+        }
+    } else if (m.has(prefix + "_mtk_name")) {
+        result = add_mtk_header(result, m.get(prefix + "_mtk_name"));
+    }
     return result;
 }
 

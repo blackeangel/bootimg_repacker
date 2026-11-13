@@ -33,6 +33,7 @@
 #include "abr/asn1.hpp"
 #include "abr/byte_io.hpp"
 #include "abr/dtb.hpp"
+#include "abr/legacy/mtk.hpp"
 #include "abr/legacy/osip.hpp"
 #include "abr/manifest.hpp"
 #include "abr/textquote.hpp"
@@ -1829,6 +1830,89 @@ void test_dtb_gaps() {
     }
 }
 
+// The MTK sub-header in front of a kernel or a ramdisk. The plain one (magic, size, name, 0xFF) is made again from the name; any other is kept
+// byte for byte, and what changes in it when the data changed is the size it declares.
+void test_mtk_subheader() {
+    std::puts("MTK sub-header: the plain one, and one that is kept as it was");
+    using namespace abr::legacy;
+    std::mt19937_64 rng(0x7BA);
+    const Bytes payload = some_bytes(rng, 1000);
+    const Bytes plain_image = add_mtk_header(payload, "KERNEL");
+    EXPECT(plain_image.size() == 512 + 1000);
+    EXPECT(plain_image[0] == 0x88 && plain_image[1] == 0x16 && plain_image[2] == 0x88 && plain_image[3] == 0x58);
+    EXPECT(plain_image[4] == (1000 & 0xFF) && plain_image[5] == (1000 >> 8) && plain_image[100] == 0xFF && plain_image[511] == 0xFF);
+    {
+        Bytes out;
+        const std::optional<MtkHeader> h = strip_mtk_header(plain_image, out);
+        EXPECT(h.has_value());
+        if (h) {
+            EXPECT(h->plain && h->name == "KERNEL" && h->size == 1000 && h->extra == 0 && h->raw.size() == 512);
+            EXPECT(out == payload);
+            EXPECT(add_mtk_header(out, h->name) == plain_image);
+            EXPECT(mtk_header_bytes(1000, "KERNEL") == h->raw);
+        }
+    }
+    {
+        Bytes out;
+        EXPECT(!strip_mtk_header(payload, out) && out == payload);
+        Bytes cut = plain_image;
+        cut.resize(511);
+        EXPECT(!strip_mtk_header(cut, out) && out == cut);
+    }
+    // every way a header can differ from the plain one: it is told, kept, and put back as it was
+    const auto put32 = [](Bytes& b, size_t at, uint32_t v) {
+        for (size_t i = 0; i < 4; ++i) b[at + i] = static_cast<uint8_t>(v >> (8 * i));
+    };
+    struct Variant {
+        const char* what;
+        std::function<Bytes(Bytes)> make;  // the image with the header changed
+        int64_t extra;                     // what the payload holds beyond the size the header declares
+    };
+    const std::vector<Variant> variants = {
+        {"address and mode", [&](Bytes b) { put32(b, 40, 0x80008000); put32(b, 44, 0); return b; }, 0},
+        {"the extension of part_hdr_t", [&](Bytes b) {
+             put32(b, 40, 0x40080000); put32(b, 44, 0xFFFFFFFF); put32(b, 48, 0x58891689); put32(b, 52, 512); put32(b, 56, 1);
+             put32(b, 60, 2); put32(b, 64, 1); put32(b, 68, 16); put32(b, 72, 0); put32(b, 76, 0);
+             return b; }, 0},
+        {"bytes behind the zero of the name", [&](Bytes b) { b[8 + 7] = 'o'; b[8 + 8] = 'l'; b[8 + 9] = 'd'; return b; }, 0},
+        {"zeros where the plain header has 0xFF", [&](Bytes b) { std::fill(b.begin() + 100, b.begin() + 512, uint8_t{0}); return b; }, 0},
+        {"one byte of the fill", [&](Bytes b) { b[300] = 0x5A; return b; }, 0},
+        {"a size that is 10 bytes less than the data", [&](Bytes b) { put32(b, 4, 990); return b; }, 10},
+        {"a size that is 10 bytes more than the data", [&](Bytes b) { put32(b, 4, 1010); return b; }, -10},
+        {"a size that is 0", [&](Bytes b) { put32(b, 4, 0); return b; }, 1000},
+    };
+    for (const Variant& v : variants) {
+        const Bytes image = v.make(plain_image);
+        Bytes out;
+        const std::optional<MtkHeader> h = strip_mtk_header(image, out);
+        EXPECT(h.has_value());
+        if (!h) continue;
+        EXPECT(!h->plain);
+        EXPECT(h->extra == v.extra);
+        EXPECT(out == payload);
+        EXPECT(h->raw == Bytes(image.begin(), image.begin() + 512));
+        EXPECT(add_mtk_header(out, h->raw, h->extra) == image);  // what was unpacked comes back byte for byte
+        // the data changed (another size): the header is the same, but for the size it declares, which keeps its distance from the data
+        for (const size_t n : {size_t{0}, size_t{1}, size_t{999}, size_t{1001}, size_t{70000}}) {
+            const int64_t declared = static_cast<int64_t>(n) - v.extra;
+            if (declared < 0) {
+                EXPECT_HAS(refusal_of([&] { add_mtk_header(some_bytes(rng, n), h->raw, h->extra); }), "cannot go in front of");
+                continue;
+            }
+            const Bytes changed = add_mtk_header(some_bytes(rng, n), h->raw, h->extra);
+            EXPECT(changed.size() == 512 + n);
+            Bytes expected_head = h->raw;
+            put32(expected_head, 4, static_cast<uint32_t>(declared));
+            EXPECT(Bytes(changed.begin(), changed.begin() + 512) == expected_head);
+        }
+    }
+    // bytes that are no header are refused, with what is wrong
+    EXPECT_HAS(refusal_of([&] { add_mtk_header(payload, Bytes(511, 0xFF), 0); }), "an MTK header is 512 bytes; the one given is 511");
+    EXPECT_HAS(refusal_of([&] { add_mtk_header(payload, Bytes(512, 0), 0); }), "do not start with its magic");
+    EXPECT_HAS(refusal_of([&] { add_mtk_header(Bytes(10, 1), plain_image.size() >= 512 ? Bytes(plain_image.begin(), plain_image.begin() + 512) : Bytes{}, 100); }),
+               "cannot go in front of 10 bytes");
+}
+
 // An OSIP image is told by its header ("$OS$" 00 00 01) or, when it has none, by its bootstub (FC FA BC 00): what build()
 // writes has to be an image that parse() takes up again, whatever the pieces were.
 void test_osip_tells() {
@@ -2028,6 +2112,7 @@ int run_manifest_tests() {
     test_base64_messages();
     test_dtb_blobs();
     test_dtb_gaps();
+    test_mtk_subheader();
     test_osip_tells();
     test_versions();
     if (g_failures == 0) std::printf("manifest: ok (%d checks)\n", g_checks);
