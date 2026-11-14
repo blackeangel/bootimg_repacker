@@ -520,6 +520,7 @@ struct DecodedComponent {
     int64_t mtk_extra = 0;               // the bytes the component holds beyond the size that sub-header declares (see legacy::MtkHeader::extra)
     std::optional<Bytes> stripped;       // the stored bytes without their MTK sub-header, when it had one
     Codec codec = Codec::NONE;
+    std::string damage;                  // what is wrong with a stream that was taken all the same (cut short: see decompress()); else empty
     int level = -1;                      // the level the stream was made with, when abr could tell (detect_level()); else -1
     std::string level_basis;             // how it told
     std::optional<LzmaAloneParams> lzma; // a "LZMA alone" stream: the settings its header names (lc, lp, pb, the dictionary)
@@ -548,7 +549,7 @@ DecodedComponent decode_component(const Bytes& raw, std::string_view what = {}, 
     const Bytes& working = d.stored(raw);
     d.codec = detect_codec(working);
     try {
-        d.plain = decompress(d.codec, working);
+        d.plain = decompress(d.codec, working, kMaxDecompressedSize, &d.damage);
     } catch (const FormatError& e) {
         throw FormatError((what.empty() ? std::string() : shown(what) + ": ") + std::string(codec_name(d.codec)) +
                           " stream cannot be decompressed: " + e.what());
@@ -593,6 +594,10 @@ std::vector<DecodedComponent> save_components(const fs::path& dir,
         const size_t i = order[k];
         const progress::Activity doing(sources[i].filename);
         out[i] = decode_component(*sources[i].raw, sources[i].filename);
+        if (!out[i].damage.empty())
+            warn(shown(sources[i].filename) + " (" + std::string(codec_name(out[i].codec)) + "): " + out[i].damage +
+                 ". The file holds what came out. An untouched pack puts the stored bytes back as they were; a pack of a file that was edited "
+                 "writes a whole stream of the data that is in it");
         if (out[i].present) {
             write_file(dir / sources[i].filename, out[i].plain);
             write_file(dir / ".abr_raw" / (sources[i].filename + ".raw"), out[i].stored(*sources[i].raw));
@@ -5237,6 +5242,7 @@ void annotate_streams(layout::Layout& l, const Bytes& image) {
             if (d.codec == Codec::NONE) return;
             r.unpacked = d.plain.size();
             r.level = d.level;
+            if (!d.damage.empty()) r.note += (r.note.empty() ? "" : "; ") + std::string("the stream is cut short");
         } catch (const std::exception&) {
         }
     });

@@ -56,7 +56,13 @@ inline constexpr size_t kMaxDecompressedSize = 0x40000000;
 // never hold more than that in memory (a decoder that works in a buffer of its own has one byte more, to tell "exactly
 // max_size" from "more", and one that makes the buffer larger as it goes needs the old and the new at the same moment).
 // Exactly `max_size` bytes is taken.
-Bytes decompress(Codec codec, const Bytes& data, size_t max_size = kMaxDecompressedSize);
+//
+// `damage`, when given, is set (to a text for a person) for a stream that is taken all the same but is not whole: a gzip, zlib or lz4 frame
+// stream that ends before its end marker (cut short -- what came out is what the stream holds up to there, and it may be all of the data
+// when only the check value at the end is missing), an lz4-legacy stream whose last block is shorter than its size says (its plain data
+// stops with the block before). It is left as it was for a stream that is whole, and for one with other bytes behind its end (a device tree
+// put after a kernel, zeros): those are not part of the stream. The other codecs refuse a stream that is cut short.
+Bytes decompress(Codec codec, const Bytes& data, size_t max_size = kMaxDecompressedSize, std::string* damage = nullptr);
 
 // The settings of a "LZMA alone" stream that its first thirteen bytes tell (the properties byte, the dictionary size, the size of the plain data),
 // and that a stream that is made again has to have for the decoder that reads it to be the same as the one that read the first.

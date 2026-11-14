@@ -17,9 +17,13 @@
 //     as the damaged one it is, and a frame that declares nothing is cut off at the limit like any stream;
 //   * a stream that is a thousand times its own size (a gzip of zeros, a zstd frame of run-length blocks) stops at the
 //     limit, where the plain data the decoder had made so far is a few megabytes, not the gigabytes it asks for;
+//   * a stream that is cut short (gzip, zlib, lz4 frame, lz4_legacy take it) is told by the `damage` of decompress(): what comes out is a
+//     prefix of the data, a whole stream says nothing, nor does one with other bytes behind its end (zeros, a pad of 0xFF, a device tree);
+//     the other codecs refuse such a stream, as they always did;
 //   * the progress that compress() reports (`on_progress`) adds up to the size of the data for every codec, at every size around
 //     the slices gzip is fed in and the blocks lz4_legacy is cut into, from any number of threads, and the stream is the same as
 //     the one made without anybody listening and decompresses to the data.
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -164,6 +168,85 @@ void test_damaged_streams() {
             EXPECT(!said.empty());
             if (max >= 20000) EXPECT(said.find("it would be more than") == std::string::npos);
         }
+    }
+}
+
+// A stream that is cut short is taken by the codecs that cannot tell on their own (the end of the input is all they see), and told by
+// `damage`; a whole stream, and a whole stream with other bytes behind it, are not. The codecs that check their input refuse it.
+void test_cut_short_streams() {
+    const Bytes data = mixed(300000, 21);
+    const std::string untouched = "<untouched>";
+    // decompress() of `stream`: what it says in `damage` (`untouched` when it says nothing), the data in `out`
+    const auto told = [&](Codec codec, const Bytes& stream, Bytes& out) {
+        std::string damage = untouched;
+        out = decompress(codec, stream, kMaxDecompressedSize, &damage);
+        return damage;
+    };
+    const auto is_prefix = [](const Bytes& part, const Bytes& whole) { return part.size() <= whole.size() && std::equal(part.begin(), part.end(), whole.begin()); };
+    const Bytes behind[] = {Bytes{}, Bytes(1, 0), Bytes(3, 0xFF), Bytes(4, 0), Bytes(100, 0), Bytes(8, 0xFF),
+                            Bytes{0xD0, 0x0D, 0xFE, 0xED, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x38}};  // (a device tree behind a kernel)
+    for (Codec codec : {Codec::GZIP, Codec::ZLIB, Codec::LZ4, Codec::LZ4_LEGACY}) {
+        const std::string name(codec_name(codec));
+        const Bytes stream = compress(codec, data, codec == Codec::LZ4_LEGACY ? 1 : -1);
+        for (const Bytes& tail : behind) {
+            Bytes out;
+            Bytes with = stream;
+            with.insert(with.end(), tail.begin(), tail.end());
+            const std::string said = told(codec, with, out);
+            if (said != untouched) std::printf("  note %s with %zu bytes behind it: %s\n", name.c_str(), tail.size(), said.c_str());
+            EXPECT(said == untouched);
+            EXPECT(out == data);
+        }
+        for (const size_t cut : {size_t(1), size_t(4), size_t(8), size_t(100), stream.size() / 2}) {
+            Bytes out;
+            const Bytes part(stream.begin(), stream.end() - static_cast<std::ptrdiff_t>(cut));
+            const std::string said = told(codec, part, out);
+            if (said == untouched) std::printf("  note %s cut by %zu bytes: said nothing\n", name.c_str(), cut);
+            EXPECT(said != untouched);
+            EXPECT(said.find("cut short") != std::string::npos);
+            EXPECT(is_prefix(out, data));
+            // gzip: the last 8 bytes are the check value and the length, all the data is in the bytes before them; lz4: the end mark
+            if (codec == Codec::GZIP && cut <= 8) EXPECT(out == data);
+            if (codec == Codec::LZ4 && cut <= 4) EXPECT(out == data);
+        }
+    }
+    // lz4_legacy, in blocks of 8 MiB: the stream is cut in the last block, so the blocks before it are what comes out; cut in the first,
+    // nothing does (and the stream is not refused: it is taken, and said to be cut short)
+    {
+        const Bytes big = mixed((size_t(8) << 20) + 5000, 22);
+        const Bytes stream = compress(Codec::LZ4_LEGACY, big, 1);
+        Bytes out;
+        const Bytes part(stream.begin(), stream.end() - 100);
+        const std::string said = told(Codec::LZ4_LEGACY, part, out);
+        EXPECT(said != untouched && said.find("last block is cut short") != std::string::npos);
+        EXPECT(out.size() == (size_t(8) << 20) && is_prefix(out, big));
+        EXPECT(told(Codec::LZ4_LEGACY, stream, out) == untouched && out == big);
+        const Bytes small = compress(Codec::LZ4_LEGACY, data, 1);
+        const Bytes head(small.begin(), small.begin() + 40);
+        EXPECT(told(Codec::LZ4_LEGACY, head, out) != untouched && out.empty());
+    }
+    // the magic of an lz4_legacy stream and nothing else is a stream without blocks, not a damaged one
+    {
+        Bytes out;
+        const Bytes only_magic = {0x02, 0x21, 0x4C, 0x18};
+        EXPECT(told(Codec::LZ4_LEGACY, only_magic, out) == untouched && out.empty());
+    }
+    // the others refuse
+    for (Codec codec : {Codec::ZSTD, Codec::XZ, Codec::LZMA, Codec::BZIP2, Codec::LZO}) {
+        const Bytes stream = compress(codec, data);
+        for (const size_t cut : {size_t(1), size_t(100), stream.size() / 2}) {
+            const Bytes part(stream.begin(), stream.end() - static_cast<std::ptrdiff_t>(cut));
+            const std::string said = verdict(codec, part, kMaxDecompressedSize, nullptr);
+            if (said.empty()) std::printf("  note %s cut by %zu bytes: taken\n", std::string(codec_name(codec)).c_str(), cut);
+            EXPECT(!said.empty());
+        }
+    }
+    // no `damage` asked for: the stream is taken all the same, with what it holds
+    {
+        const Bytes gz = compress(Codec::GZIP, data);
+        const Bytes part(gz.begin(), gz.end() - 100);
+        const Bytes out = decompress(Codec::GZIP, part);
+        EXPECT(!out.empty() && out.size() < data.size() && is_prefix(out, data));
     }
 }
 
@@ -344,6 +427,7 @@ int run_compression_tests() {
     test_none_is_not_limited();
     test_default_limit();
     test_damaged_streams();
+    test_cut_short_streams();
     test_zstd_frames();
     test_limits_every_codec();
     test_bombs();
