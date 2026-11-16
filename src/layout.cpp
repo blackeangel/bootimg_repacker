@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <vector>
 
 #include "abr/boot_image.hpp"
 #include "abr/compression.hpp"
@@ -22,6 +23,7 @@
 #include "abr/mtkimg.hpp"
 #include "abr/qcdt.hpp"
 #include "abr/splash.hpp"
+#include "abr/textquote.hpp"
 #include "abr/uimage.hpp"
 #include "abr/vbmeta.hpp"
 #include "abr/vendor_boot.hpp"
@@ -913,11 +915,23 @@ std::string slug(const std::string& name) {
 }  // namespace
 
 std::string render(const Layout& l, const std::string& indent) {
+    // The names and the notes are made of what the image holds (the name of a picture, of a section, of a ramdisk, the subject of a
+    // certificate): what a terminal would act on in them is written as \xNN, here and for every part at once, whatever put it there.
+    std::vector<std::string> names, notes;
+    for (const Region& r : l.regions) {
+        names.push_back(textquote::escape_for_terminal(r.name));
+        std::string what = textquote::escape_for_terminal(r.note);
+        // (the text of the stream names the file a component was unpacked to, and that name is the manifest's: the name of a ramdisk
+        // directory with a C1 control in it came out as it was)
+        if (const std::string s = stream_text(r); !s.empty()) what += (what.empty() ? "" : "; ") + textquote::escape_for_terminal(s);
+        notes.push_back(std::move(what));
+    }
     uint64_t top = 0;
     size_t name_w = 4, size_w = 4;
-    for (const Region& r : l.regions) {
+    for (size_t i = 0; i < l.regions.size(); ++i) {
+        const Region& r = l.regions[i];
         top = std::max(top, r.offset + r.size);
-        name_w = std::max(name_w, r.depth * 2 + r.name.size());
+        name_w = std::max(name_w, r.depth * 2 + names[i].size());
         size_w = std::max(size_w, std::to_string(r.size).size());
     }
     name_w = std::min<size_t>(name_w, 36);
@@ -928,12 +942,16 @@ std::string render(const Layout& l, const std::string& indent) {
     char buf[64];
     std::snprintf(buf, sizeof buf, "%-*s", hex_w + 2, "offset");
     out += indent + buf + "  " + std::string(size_w > 4 ? size_w - 4 : 0, ' ') + "size  part\n";
-    for (const Region& r : l.regions) {
+    for (size_t i = 0; i < l.regions.size(); ++i) {
+        const Region& r = l.regions[i];
         std::snprintf(buf, sizeof buf, "0x%0*" PRIx64, hex_w, r.offset);
-        std::string name = std::string(r.depth * 2, ' ') + r.name;
-        if (name.size() > name_w) name = name.substr(0, name_w - 1) + "~";
-        std::string what = r.note;
-        if (const std::string s = stream_text(r); !s.empty()) what += (what.empty() ? "" : "; ") + s;
+        std::string name = std::string(r.depth * 2, ' ') + names[i];
+        if (name.size() > name_w) {
+            size_t cut = name_w - 1;
+            while (cut > 0 && (static_cast<unsigned char>(name[cut]) & 0xC0) == 0x80) --cut;  // (not in the middle of a character)
+            name = name.substr(0, cut) + "~";
+        }
+        const std::string& what = notes[i];
         char size[32];
         std::snprintf(size, sizeof size, "%*" PRIu64, static_cast<int>(size_w), r.size);
         std::string line = indent + buf + "  " + size + "  " + name;

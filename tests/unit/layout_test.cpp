@@ -41,6 +41,7 @@
 #include "abr/legacy/osip.hpp"
 #include "abr/qcdt.hpp"
 #include "abr/splash.hpp"
+#include "abr/textquote.hpp"
 #include "abr/uimage.hpp"
 #include "abr/vbmeta.hpp"
 #include "abr/vendor_boot.hpp"
@@ -1216,6 +1217,117 @@ void test_moto_logo() {
     }
 }
 
+// What a terminal would act on in a line of the table: the control characters, the C1 controls (in UTF-8 C2 80 to C2 9F), the bytes that are not UTF-8.
+bool terminal_clean(const std::string& text) {
+    for (size_t i = 0; i < text.size();) {
+        const unsigned char c = static_cast<unsigned char>(text[i]);
+        if (c == '\n' || c == '\t') {
+            ++i;
+        } else if (c < 0x20 || c == 0x7F) {
+            return false;
+        } else if (c < 0x80) {
+            ++i;
+        } else if (c >= 0xC2 && c <= 0xDF && i + 1 < text.size() && (static_cast<unsigned char>(text[i + 1]) & 0xC0) == 0x80) {
+            if (c == 0xC2 && static_cast<unsigned char>(text[i + 1]) < 0xA0) return false;
+            i += 2;
+        } else if (c >= 0xE0 && c <= 0xEF && i + 2 < text.size() && (static_cast<unsigned char>(text[i + 1]) & 0xC0) == 0x80 &&
+                   (static_cast<unsigned char>(text[i + 2]) & 0xC0) == 0x80) {
+            i += 3;
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
+void test_text_of_images() {
+    // the escaper: what a terminal acts on becomes \xNN, everything else (UTF-8 text, quotes, backslashes, blanks) stays
+    EXPECT(textquote::escape_for_terminal("plain text, \"quoted\" \\ and\ttab") == "plain text, \"quoted\" \\ and\\x09tab");
+    EXPECT(textquote::escape_for_terminal("a\x1b[2Jb") == "a\\x1b[2Jb");
+    EXPECT(textquote::escape_for_terminal("bell\x07" "del\x7f") == "bell\\x07del\\x7f");
+    EXPECT(textquote::escape_for_terminal("line\nbreak") == "line\\x0abreak");
+    EXPECT(textquote::escape_for_terminal("caf\xc3\xa9 \xe2\x82\xac") == "caf\xc3\xa9 \xe2\x82\xac");       // UTF-8 is text
+    EXPECT(textquote::escape_for_terminal("c1\xc2\x9b" "31m") == "c1\\xc2\\x9b31m");                           // U+009B starts a sequence in a UTF-8 terminal
+    EXPECT(textquote::escape_for_terminal("cut\xe2\x82") == "cut\\xe2\\x82");                                   // a character that is cut off
+    EXPECT(textquote::escape_for_terminal("\xff\xfe") == "\\xff\\xfe");
+    EXPECT(textquote::escape_for_terminal("\xed\xa0\x80") == "\\xed\\xa0\\x80");                               // a surrogate is no character
+    EXPECT(textquote::escape_for_terminal("\xc0\x80") == "\\xc0\\x80");                                         // an overlong NUL
+    EXPECT(textquote::escape_for_terminal("").empty());
+    EXPECT(terminal_clean(textquote::escape_for_terminal(std::string("\x00\x01\x1b\x7f\x80\x9b\xc2\x85\xff", 9))));
+    // (the judge itself: it sees what it is there for)
+    EXPECT(!terminal_clean("a\x1b[2J") && !terminal_clean("bell\x07") && !terminal_clean("c1\xc2\x9b" "31m") && !terminal_clean("cut\xe2\x82") && !terminal_clean("\xff"));
+    EXPECT(terminal_clean("caf\xc3\xa9 \xe2\x82\xac and\ttab\nlines"));
+
+    const std::vector<std::string> hostile = {"\x1b[2J\x1b[Hx", "a\x07" "b\x08" "c\x7f" "d", "cut\xe2\x82", "c1\xc2\x9b" "31mx", "\xff\xfe\x80" "ab", "two\nlines", "tab\there"};
+    for (const std::string& name : hostile) {
+        {  // Motorola: the name of a picture
+            splash::MotoLogo m;
+            splash::MotoEntry e;
+            e.name = name;
+            e.data = motorun_stub(10, 10, 300);
+            m.entries = {e};
+            const Bytes file = splash::moto_build(m);
+            const std::string text = layout::render(layout::moto_logo(file));
+            EXPECT(!text.empty());
+            EXPECT(terminal_clean(text));
+        }
+        {  // vendor_boot v4: the name of a ramdisk fragment
+            VendorBootImage v;
+            v.header_version = 4;
+            v.page_size = 4096;
+            v.dtb = pattern(2500, 1);
+            VendorRamdiskEntry a, b;
+            a.name = name;
+            a.data = pattern(100, 1);
+            b.name = "second";
+            b.data = pattern(100, 2);
+            v.ramdisk_fragments = {a, b};
+            const Bytes built = v.build();
+            const std::string text = layout::render(layout::vendor_boot(VendorBootImage::parse(built)));
+            EXPECT(text.find("ramdisk fragment 0") != std::string::npos);
+            EXPECT(terminal_clean(text));
+        }
+        {  // OPLUS: the name of a picture
+            splash::OplusLogo o;
+            splash::OplusEntry e;
+            e.name = name;
+            e.plain_size = 100;
+            e.data = pattern(50, 3);
+            o.entries = {e};
+            const std::string text = layout::render(layout::oplus_logo(splash::oplus_build(o)));
+            EXPECT(terminal_clean(text));
+        }
+    }
+    {  // a long name is cut on a character boundary, with its ~
+        splash::MotoLogo m;
+        splash::MotoEntry e;
+        e.name = "";
+        for (int i = 0; i < 8; ++i) e.name += "\xe2\x82\xac";  // eight euro signs: the name column is cut inside the name
+        e.data = motorun_stub(10, 10, 300);
+        m.entries = {e};
+        layout::Layout l = layout::moto_logo(splash::moto_build(m));
+        l.add(std::string(30, 'x') + "\xe2\x82\xac" + "\xe2\x82\xac" + "\xe2\x82\xac", "", 5000, 1, 0, "n");  // (the 36th column falls inside a character)
+        EXPECT(terminal_clean(layout::render(l)));
+    }
+    for (const std::string& name : hostile) {  // the file a part was unpacked to, which the caller that knows the manifest puts on the part
+        layout::Layout l;
+        l.format = "boot image";
+        l.size = 4096;
+        layout::Region& plain = l.add("kernel", "kernel", 0, 100, 0, "");
+        plain.file = name;                    // "file <name>"
+        layout::Region& packed = l.add("ramdisk", "ramdisk", 100, 100, 0, "a note");
+        packed.codec = "gzip";
+        packed.file = "ramdisk.cpio + " + name + "/";  // "gzip -> <the files> (N bytes, level 9)"
+        packed.unpacked = 300;
+        packed.level = 9;
+        layout::Region& looked = l.add("second", "second", 200, 100, 0, "");
+        looked.codec = name;                   // (what `info` found by looking into a stream: a name that is not one of the codecs)
+        const std::string text = layout::render(l);
+        EXPECT(text.find("kernel") != std::string::npos && text.find("gzip -> ") != std::string::npos);
+        EXPECT(terminal_clean(text));
+    }
+}
+
 }  // namespace
 
 int run_layout_tests() {
@@ -1237,6 +1349,7 @@ int run_layout_tests() {
     test_vbmeta();
     test_around();
     test_text();
+    test_text_of_images();
     test_manifest_block();
     if (g_failures == 0) std::printf("layout: ok (%d checks)\n", g_checks);
     else std::printf("layout: %d failure(s)\n", g_failures);

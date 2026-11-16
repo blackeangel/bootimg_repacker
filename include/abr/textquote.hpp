@@ -28,6 +28,12 @@ std::string quote(std::string_view s, bool quote_empty);
 // What is left is text that a terminal only shows. `unquote` reads it back as the bytes it was made of.
 std::string quote_shown(std::string_view s);
 
+// `s` as a line of a table that is only read shows it: the control characters (the tab and the line break too: they would break the
+// table), the C1 controls and the bytes that are not well-formed UTF-8 as \xNN, and nothing else changed -- no quotes, the backslashes and
+// the blanks as they are. For text out of an image in a place that nobody reads back (a cell of the layout table); what the text
+// is meant to be read back from (a manifest) is `quote`, and a name in a message is `quote_shown`.
+std::string escape_for_terminal(std::string_view s);
+
 // The reverse, for the rest of a line after any white space that leads it: a string in double quotes is unescaped,
 // anything else is itself without the white space at its end. false, with `why` saying what is wrong, for a quoted
 // string that is not closed, that ends in a backslash or in a \x without two hexadecimal digits, that has another

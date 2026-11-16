@@ -105,11 +105,39 @@ std::string quote(std::string_view s, bool quote_empty) { return quote_impl(s, q
 
 std::string quote_shown(std::string_view s) { return quote_impl(s, false, true); }
 
-// ---- TerminalSafeBuf ---------------------------------------------------------------------------------------------------
-
 namespace {
 bool is_c1(std::string_view s) { return s.size() >= 2 && static_cast<unsigned char>(s[0]) == 0xC2 && static_cast<unsigned char>(s[1]) < 0xA0; }
 }  // namespace
+
+std::string escape_for_terminal(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size();) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        if (c < 0x80) {
+            if (c < 0x20 || c == 0x7F) escape_byte(out, c);
+            else out += static_cast<char>(c);
+            ++i;
+            continue;
+        }
+        const std::string_view rest = s.substr(i);
+        size_t len = 0;
+        if (utf8_scan(rest, len) != Utf8::Good) {  // (a character that is cut off at the end of the text is not one)
+            escape_byte(out, c);
+            ++i;
+        } else if (is_c1(rest)) {
+            escape_byte(out, c);
+            escape_byte(out, static_cast<unsigned char>(s[i + 1]));
+            i += 2;
+        } else {
+            out.append(rest.substr(0, len));
+            i += len;
+        }
+    }
+    return out;
+}
+
+// ---- TerminalSafeBuf ---------------------------------------------------------------------------------------------------
 
 bool TerminalSafeBuf::write(const char* s, size_t n) {
     std::string in = std::move(pending_);
