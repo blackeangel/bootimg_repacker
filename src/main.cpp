@@ -1335,7 +1335,9 @@ qcdt::Table load_qcdt(const Manifest& m, const fs::path& dir, const std::string&
         const std::string key = prefix + "dtb" + std::to_string(j) + "_file";
         const std::string name = m.get_path(key);
         if (name.empty()) throw FormatError("manifest.txt has no " + shown(key) + " (the file of device tree " + std::to_string(j) + ")");
-        t.dtbs.push_back(read_file(dir / name));
+        Bytes blob = read_file(dir / name);
+        qcdt::check_device_tree(blob, key + " (" + textquote::quote_shown(name) + ")");  // (the file is named, not "device tree 0")
+        t.dtbs.push_back(std::move(blob));
     }
     return t;
 }

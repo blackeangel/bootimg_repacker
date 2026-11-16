@@ -95,6 +95,11 @@ Table parse(const Bytes& data, uint32_t page_hint = 0);
 // header gives, a table of 4 GiB or more (an offset is a 32-bit word).
 Bytes build(const Table& table);
 
+// FormatError, with `what` named as the culprit, for bytes that cannot stand as a tree of a table: not a flattened device tree, cut short, or
+// not as long as its header says. build() checks every tree the same way and names it "device tree N"; a caller that knows the file a tree came
+// from checks it first with the name of the file.
+void check_device_tree(const Bytes& blob, const std::string& what);
+
 // What the root node of a tree says about the boards it is for, or nullopt when it has no qcom,msm-id (the tree is not for a
 // Qualcomm board). `version` is the lowest that has a word for everything: 1 with just qcom,msm-id, 2 with a qcom,board-id, 3 with
 // a qcom,pmic-id. FormatError for a property that is not in the form of its version: a size that is not whole cells, the wrong number

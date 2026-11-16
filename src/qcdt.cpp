@@ -149,6 +149,8 @@ std::vector<uint32_t> page_candidates(uint64_t common, uint32_t hint) {
 
 }  // namespace
 
+void check_device_tree(const Bytes& blob, const std::string& what) { check_tree(blob, what); }
+
 bool looks_like(const Bytes& data) { return data.size() >= 4 && std::memcmp(data.data(), "QCDT", 4) == 0; }
 
 Bytes build(const Table& t) {
