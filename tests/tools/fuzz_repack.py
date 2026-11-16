@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Mutation fuzzing of `abr repack`: the directory that `unpack` wrote, damaged the ways a hand, a script or a hostile
+"""Mutation fuzzing of `abr pack`: the directory that `unpack` wrote, damaged the ways a hand, a script or a hostile
 archive damages it.
 
-tests/tools/fuzz_images.py damages images and looks at `unpack`. This damages what `unpack` made and looks at `repack`:
+tests/tools/fuzz_images.py damages images and looks at `unpack`. This damages what `unpack` made and looks at `pack`:
 
   manifest   `manifest.txt`: a value that is too big or not a number, a key twice, not at all or from another format, a
              line that is no line, a path that leaves the directory, a manifest that belongs to another image
@@ -13,12 +13,12 @@ tests/tools/fuzz_images.py damages images and looks at `unpack`. This damages wh
   tree       the ramdisk directory (a name that is a control character, a file that is a fifo, a link to `/`, a file of
              4 GiB, a tree 1500 levels deep)
   meta       `ramdisk.meta` (a mode that is no mode, a hard link without its partner, a type that is none, a path twice)
-  keys       the keys that sign (`--avb-key`, `--avb1-key`, `--avb1-cert`, `--chromeos-key`, `--chromeos-keyblock`): a PEM
-             cut in the middle, a length in the DER that is a lie
+  keys       the keys that sign, which are files in the folder (`keys/avb_key.pem`, `keys/avb1.pk8`, `keys/avb1.x509.pem`,
+             `keys/chromeos.vbprivk`, `keys/chromeos.keyblock`): a PEM cut in the middle, a length in the DER that is a lie
   output     where `-o` points (a directory, a path whose parent is not there, one of the files that are read)
 
 What is judged is how abr behaves, not what it says. A directory that is wrong may be refused (exit status 1 and a message)
-or taken; `repack` must never crash, hang, run out of memory, stop for a reason that is not the directory's (an exception
+or taken; `pack` must never crash, hang, run out of memory, stop for a reason that is not the directory's (an exception
 of the standard library that nobody meant to reach), print a control character (the manifest and the names in a ramdisk
 are the sender's: a terminal would obey an escape sequence in them), say nothing when it refuses, leave something behind
 when it refuses, change the directory it reads, or write an image that abr itself does not know again. An image that it
@@ -218,7 +218,7 @@ class Ctx:
         self.rng = rng
         self.work = work
         self.d = os.path.join(work, "d")
-        self.extra = []  # more command line for `repack`
+        self.extra = []  # more command line for `pack`
         self.out = None  # another place for -o than work/re.img
         self.aux = os.path.join(work, "aux")
         self.counter = 0
@@ -1459,7 +1459,7 @@ def key_candidates(ctx):
 
 @mutator("keys", 10)
 def m_keys(ctx):
-    """Options for the keys, whatever the image is: a key (damaged or whole) where one is asked for."""
+    """Keys in keys/ of the directory, whatever the image is: a key (damaged or whole) where one is looked for."""
     text = b"\n".join(ctx.read_manifest_lines() or [])
     r = ctx.rng
     wants = []
@@ -1477,7 +1477,8 @@ def m_keys(ctx):
     corpus = key_candidates(ctx)
     notes = []
 
-    def key_file(label):
+    def key_file(label, filename):
+        """A key (whole or damaged, from the corpus or at random) as keys/<filename> of the directory, where `abr pack` looks for it."""
         if corpus and r.random() < 0.9:
             src = r.choice(corpus)
             data = read_file(src)
@@ -1487,21 +1488,22 @@ def m_keys(ctx):
         note = "whole"
         if r.random() < 0.8:
             data, note = mutate_key(r, data)
-        path = ctx.aux_file(f"{label}_{ctx.counter}_{name[:40]}", data)
+        keys_dir = os.path.join(ctx.d, "keys")
+        os.makedirs(keys_dir, exist_ok=True)
+        write_file(os.path.join(keys_dir, filename), data)
         ctx.counter += 1
         notes.append(f"{label}: {name} {note}")
-        return path
 
     if want == "avb":
-        ctx.extra += ["--avb-key", key_file("avb")]
+        key_file("avb", "avb_key.pem")
     elif want == "avb1":
-        ctx.extra += ["--avb1-key", key_file("avb1key")]
+        key_file("avb1key", "avb1.pk8")
         if r.random() < 0.6:
-            ctx.extra += ["--avb1-cert", key_file("avb1cert")]
+            key_file("avb1cert", r.choice(("avb1.x509.pem", "avb1.x509.der")))
     else:
-        ctx.extra += ["--chromeos-key", key_file("croskey")]
+        key_file("croskey", "chromeos.vbprivk")
         if r.random() < 0.7:
-            ctx.extra += ["--chromeos-keyblock", key_file("croskb")]
+            key_file("croskb", "chromeos.keyblock")
     return "keys (" + want + "): " + "; ".join(notes) + (f"; {edited}" if edited else "")
 
 
@@ -1685,11 +1687,13 @@ class Campaign:
             path, _, sha = seed
             tdir = os.path.join(self.root, sha)
             mode = int(sha[:2], 16) % 5
-            argv = ["unpack", path, "-o", tdir] + (["--no-tree"] if mode == 0 else ["--tree-only"] if mode == 1 else [])
+            argv = ["unpack", "-i", path, "-o", tdir]
             status, err, secs, out = self.runner.run(argv, self.root)
             if status != 0 or not os.path.isfile(os.path.join(tdir, "manifest.txt")):
                 rm_rf(tdir)
                 return None
+            # an unpack leaves a ramdisk as its archive and its directory: a fifth of the templates keep only the archive, a fifth only the directory
+            fz.thin_ramdisk(tdir, "cpio" if mode == 0 else "tree" if mode == 1 else None)
             size = sum(s[1] for s in snapshot(tdir).values() if len(s) > 1 and s[0] == stat.S_IFREG)
             if size > self.args.max_template_mb << 20:
                 rm_rf(tdir)
@@ -1831,28 +1835,28 @@ class Campaign:
         out = ctx.out if ctx.out is not None else os.path.join(ctx.work, "re.img")  # what abr is told
         out_path = os.path.normpath(os.path.join(ctx.work, out)) if out else ""  # where that is (abr runs in the work directory)
         inside = bool(out_path) and (out_path.startswith(d + os.sep) or out_path == d)
-        base = ["repack", d]
+        base = ["pack", "-i", d]
         tail = []
         if rng.random() < 0.2:
-            tail += ["--ramdisk-from", rng.choice(("cpio", "tree"))]
+            fz.thin_ramdisk(d, rng.choice(("cpio", "tree")))  # (one of the two ramdisks deleted: the other is what the image is made from)
         tail += ctx.extra
         with self.lock:
             self.mutants += 1
         reference = None
         if ctx.out is not None:
             ref = os.path.join(ctx.work, "ref.img")
-            st, er, _, ou = self.run(ctx, "reference", ["-j", threads] + base + ["-o", ref] + tail, origin)
+            st, er, _, ou = self.run(ctx, "reference", [f"ABR_THREADS={threads}"] + base + ["-o", ref] + tail, origin)
             if st == 0 and os.path.isfile(ref):
                 reference = read_file(ref)
             if os.path.lexists(ref):
                 os.unlink(ref)
         existed = bool(out_path) and os.path.lexists(out_path)
         before = snapshot(d)
-        argv = ["-j", threads] + base + ["-o", out] + tail
-        status, err, secs, stdout = self.run(ctx, "repack", argv, origin)
-        verdict = fz.classify("repack", status, err, stdout)
+        argv = [f"ABR_THREADS={threads}"] + base + ["-o", out] + tail
+        status, err, secs, stdout = self.run(ctx, "pack", argv, origin)
+        verdict = fz.classify("pack", status, err, stdout)
         if verdict:
-            self.report(ctx, verdict[0], verdict[1], "repack", status, fz.report_of(verdict, err, stdout), origin, argv)
+            self.report(ctx, verdict[0], verdict[1], "pack", status, fz.report_of(verdict, err, stdout), origin, argv)
             return
         after = snapshot(d)
         changed = sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k))
@@ -1906,23 +1910,29 @@ class Campaign:
             return
         # the image is known again, with another number of threads it is the same, and it comes back as it is
         label = self.run(ctx, "identify", ["identify", "-b", out_path], origin)
-        if label[0] != 0 or label[3].strip() == b"data":
+        known = label[0] == 0 and label[3].strip() != b"data"
+        if label[0] == 0 and not known:
+            # (the signatures `identify` knows are those of Android Image Kitchen: a picture partition, a preloader or a flat MBN is not among them, and
+            # `info` reads those)
+            info = self.run(ctx, "info-of-output", ["info", "-i", out_path], origin)
+            known = info[0] == 0 and any(line.startswith(b"format:") and line.split(b":", 1)[1].strip() not in (b"", b"unknown") for line in info[3].splitlines())
+        if not known:
             self.report(ctx, "unknown-output", "abr does not know the image it wrote", "identify", label[0], label[1] + label[3], origin, argv)
             return
         other = "1" if threads != "1" else "3"
         out2 = os.path.join(ctx.work, "re2.img")
-        argv2 = ["-j", other] + base + ["-o", out2] + tail
-        st2, er2, _, ou2 = self.run(ctx, "repack-again", argv2, origin)
+        argv2 = [f"ABR_THREADS={other}"] + base + ["-o", out2] + tail
+        st2, er2, _, ou2 = self.run(ctx, "pack-again", argv2, origin)
         if st2 != 0 or not os.path.isfile(out2) or read_file(out2) != image:
-            cls = fz.classify("repack", st2, er2, ou2)
-            self.report(ctx, cls[0] if cls else "threads", cls[1] if cls else f"-j {threads} and -j {other} do not give the same image",
-                        "repack", st2, er2, origin, argv2)
+            cls = fz.classify("pack", st2, er2, ou2)
+            self.report(ctx, cls[0] if cls else "threads", cls[1] if cls else f"ABR_THREADS={threads} and ABR_THREADS={other} do not give the same image",
+                        "pack", st2, er2, origin, argv2)
             return
         os.unlink(out2)
         if rng.random() > self.args.deep:
             return
         un = os.path.join(ctx.work, "again")
-        argv3 = ["unpack", out_path, "-o", un] + (["--no-tree"] if rng.random() < 0.2 else [])
+        argv3 = ["unpack", "-i", out_path, "-o", un]
         st3, er3, _, ou3 = self.run(ctx, "unpack-result", argv3, origin)
         verdict = fz.classify("unpack", st3, er3, ou3)
         if verdict:
@@ -1932,16 +1942,18 @@ class Campaign:
             self.report(ctx, "unreadable-output", "repack wrote an image that unpack refuses", "unpack", st3, er3, origin, argv3)
             return
         said = b"warning" in (er3 + ou3).lower() or b"is not kept" in (er3 + ou3)
-        argv4 = ["repack", un, "-o", os.path.join(ctx.work, "re3.img")]
-        st4, er4, _, ou4 = self.run(ctx, "repack-result", argv4, origin)
-        verdict = fz.classify("repack", st4, er4, ou4)
+        if rng.random() < 0.2:
+            fz.thin_ramdisk(un, "cpio")  # (as a person who edits the archive and not the directory leaves it)
+        argv4 = ["pack", "-i", un, "-o", os.path.join(ctx.work, "re3.img")]
+        st4, er4, _, ou4 = self.run(ctx, "pack-result", argv4, origin)
+        verdict = fz.classify("pack", st4, er4, ou4)
         if verdict:
-            self.report(ctx, verdict[0], verdict[1], "repack", st4, fz.report_of(verdict, er4, ou4), origin, argv4)
+            self.report(ctx, verdict[0], verdict[1], "pack", st4, fz.report_of(verdict, er4, ou4), origin, argv4)
             return
         with self.lock:
             self.stable_checked += 1
         if st4 != 0:
-            self.report(ctx, "result-not-repackable", "unpack of what repack wrote cannot be repacked", "repack", st4, er4, origin, argv4)
+            self.report(ctx, "result-not-repackable", "unpack of what pack wrote cannot be packed again", "pack", st4, er4, origin, argv4)
             return
         again = read_file(os.path.join(ctx.work, "re3.img"))
         if again != image and not said:
@@ -1966,8 +1978,8 @@ def repro(args):
         with open(os.path.join(work, "REPRO_ARGV")) as f:
             argv = json.load(f)
         status, err, secs, out = runner.run(argv, work)
-        verdict = fz.classify("repack", status, err, out)
-        print(f"== abr {' '.join(argv)}: status {status}, {secs:.1f} s, verdict {verdict}")
+        verdict = fz.classify("pack", status, err, out)
+        print(f"== {fz.command_text(argv)}: status {status}, {secs:.1f} s, verdict {verdict}")
         sys.stdout.write((fz.report_of(verdict, err, out) if verdict else err)[:6000].decode(errors="replace"))
     finally:
         rm_rf(work)

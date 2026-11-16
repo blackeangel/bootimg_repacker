@@ -108,7 +108,10 @@ def samples():
     s["elf_x86_64"] = elf(2, 0x61, 3)
     s["elf_mips"] = elf(1, 0x61, 8)
     s["elf_plain"] = elf(1, 0, 0x28)
-    s["elf_other"] = elf(1, 0x61, 0xB7)
+    s["elf_other"] = elf(1, 0x61, 0xF3)  # RISC-V: a machine that neither file(1)'s table nor abr names
+    s["elf_aarch64"] = elf(2, 0x61, 0xB7)
+    s["elf_aarch64_32"] = elf(1, 0x61, 0xB7)
+    s["elf_hexagon"] = elf(1, 0, 0xA4)
     s["elf_noclass"] = elf(0, 0x61, 0x28)
     s["elf_arm_mtk"] = elf(1, 0x61, 0x28) + MTK + b"\0" * 100
     s["elf_aosp"] = elf(1, 0x61, 0x28) + bytes(hdr)
@@ -208,7 +211,6 @@ EXPECT = {
     "elf_x86_64": "ELF bootimg (x86_64)",
     "elf_mips": "ELF bootimg (MIPS)",
     "elf_plain": "ELF (ARM)",
-    "elf_other": "ELF bootimg)",
     "elf_arm_mtk": "ELF bootimg (ARM), MTK headers",
     "elf_aosp": "ELF bootimg (ARM)",
     "mtk_kernel": "MTK header, kernel type",
@@ -256,6 +258,13 @@ DEVIATIONS = {
     "zeros_mtk_deep": "data",
     # file(1)'s own ELF code adds its words when the class byte is nonsense; abr stops at the signature file's
     "elf_noclass": "ELF bootimg (ARM",
+    # a machine that the signature file does not name gets a bare ")" from file(1); abr says nothing where it knows no name ...
+    "elf_other": "ELF bootimg",
+    # ... and it names two machines the file does not: AArch64 (the class byte adds no "64") and Hexagon (the modem, ADSP and sensor
+    # firmware of Qualcomm, which is where abr meets an ELF that is not a boot image)
+    "elf_aarch64": "ELF bootimg (ARM64)",
+    "elf_aarch64_32": "ELF bootimg (ARM64)",
+    "elf_hexagon": "ELF (Hexagon)",
     # abr does not guess at text
     "text": "data",
 }

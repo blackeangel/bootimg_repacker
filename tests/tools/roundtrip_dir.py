@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Round-trip every image in a directory through `abr unpack` + `abr repack`.
+"""Round-trip every image in a directory through `abr unpack` + `abr pack`.
 
 usage: roundtrip_dir.py <abr-binary> <image-dir> [<work-dir>] [-k pattern]
 
 Prints one line per file: IDENTICAL, or DIFF (first differing offset and
-sizes), or UNPACK-FAIL / REPACK-FAIL with abr's error text.  Exit status is
+sizes), or UNPACK-FAIL / PACK-FAIL with abr's error text.  Exit status is
 0 only when every file is byte-identical.  Real device images are not part
 of the repository; this is the tool used to validate against them.
 """
@@ -40,7 +40,7 @@ def first_diff(a, b):
 
 
 def run(cmd):
-    p = subprocess.run(cmd, capture_output=True, text=True)
+    p = subprocess.run(cmd, capture_output=True, text=True, env=dict(os.environ, NO_COLOR="1", ABR_PROGRESS="0"))
     return p.returncode, (p.stdout + p.stderr).strip()
 
 
@@ -68,15 +68,15 @@ def main():
         safe = name.replace(" ", "_").replace("(", "").replace(")", "")
         d = os.path.join(work, safe + ".unpacked")
         out = os.path.join(work, safe + ".repacked")
-        rc, msg = run([abr, "unpack", path, "-o", d])
+        rc, msg = run([abr, "unpack", "-i", path, "-o", d])
         if rc != 0:
             print(f"UNPACK-FAIL  {name}: {msg.splitlines()[-1] if msg else rc}")
             bad += 1
             continue
         warn = [l for l in msg.splitlines() if l.lower().startswith("warning")]
-        rc, msg2 = run([abr, "repack", d, "-o", out])
+        rc, msg2 = run([abr, "pack", "-i", d, "-o", out])
         if rc != 0:
-            print(f"REPACK-FAIL  {name}: {msg2.splitlines()[-1] if msg2 else rc}")
+            print(f"PACK-FAIL    {name}: {msg2.splitlines()[-1] if msg2 else rc}")
             bad += 1
             continue
         if sha(path) == sha(out):

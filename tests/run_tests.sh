@@ -116,9 +116,16 @@ check() {
 }
 roundtrip_check() {
     local original="$1" label="$2" dir="rt_$3"
-    "$ABR" unpack "$original" -o "$dir" >/dev/null
-    "$ABR" repack "$dir" -o "${dir}.out" >/dev/null
+    "$ABR" unpack -i "$original" -o "$dir" >/dev/null
+    "$ABR" pack -i "$dir" -o "${dir}.out" >/dev/null
     check "$original" "${dir}.out" "$label"
+}
+
+# put_key <folder> <name> <file>: the key goes to keys/<name> of the unpacked folder, where `abr pack` looks for it. (The first command
+# line had options for this: --avb-key, --avb1-key and --avb1-cert, --chromeos-key and --chromeos-keyblock; the names are keys/avb_key.pem,
+# keys/avb1.pk8 and keys/avb1.x509.pem, keys/chromeos.vbprivk and keys/chromeos.keyblock.)
+put_key() {
+    mkdir -p "$1/keys" && cp "$3" "$1/keys/$2"
 }
 
 MKBOOTIMG="$REPO_ROOT/tests/reference/mkbootimg/mkbootimg.py"
@@ -252,7 +259,7 @@ s = s.replace("entry0_extra=0200000000000000000000000000000000000000000000000000
 open(p, "w").write(s)
 PYEOF
 cp a.dtb dtbo_manifest/entry0.dtb
-"$ABR" repack dtbo_manifest -o dtbo_built.img >/dev/null
+"$ABR" pack -i dtbo_manifest -o dtbo_built.img >/dev/null
 roundtrip_check dtbo_built.img "dtbo (v1, zlib-compressed entry)" dtbo1
 
 # --------------------------------------------------------------- mtk --
@@ -318,7 +325,7 @@ ramdisk_compression=lzo
 EOF
 cp lzo_payload.bin lzo_manifest/kernel
 cp lzo_payload.bin lzo_manifest/ramdisk.cpio
-"$ABR" repack lzo_manifest -o lzo_boot.img >/dev/null
+"$ABR" pack -i lzo_manifest -o lzo_boot.img >/dev/null
 roundtrip_check lzo_boot.img "boot v4 (lzo ramdisk)" lzoboot
 
 if python3 -c "import lzo" 2>/dev/null; then
@@ -383,7 +390,7 @@ img += kernel + b"\x00" * ((-len(kernel)) % 4096)
 img += ramdisk + b"\x00" * ((-len(ramdisk)) % 4096)
 open("liblzo2_cross.img", "wb").write(bytes(img))
 PYEOF
-    "$ABR" unpack liblzo2_cross.img -o liblzo2_cross_unpacked >/dev/null
+    "$ABR" unpack -i liblzo2_cross.img -o liblzo2_cross_unpacked >/dev/null
     if cmp -s lzo_payload.bin liblzo2_cross_unpacked/ramdisk.cpio; then
         echo "PASS: lzo -- abr's decoder correctly reads a real-liblzo2-produced stream"
         PASS=$((PASS + 1))
@@ -417,7 +424,7 @@ data = struct.pack(">II", 0, len(cmdline)) + cmdline
 data += b"\x00" * ((-len(data)) % 8)
 open("vbmeta_unsigned/descriptor0.bin", "wb").write(data)
 PYEOF
-"$ABR" repack vbmeta_unsigned -o vbmeta_unsigned.img >/dev/null
+"$ABR" pack -i vbmeta_unsigned -o vbmeta_unsigned.img >/dev/null
 roundtrip_check vbmeta_unsigned.img "vbmeta (unsigned, kernel_cmdline descriptor)" vbu
 
 openssl genrsa -out avb_test_key.pem 2048 >/dev/null 2>&1
@@ -426,7 +433,8 @@ mkdir -p vbmeta_signed
 cp vbmeta_unsigned/manifest.txt vbmeta_signed/manifest.txt
 sed -i 's/algorithm_type=0/algorithm_type=1/' vbmeta_signed/manifest.txt
 cp vbmeta_unsigned/descriptor0.bin vbmeta_signed/descriptor0.bin
-"$ABR" repack vbmeta_signed -o vbmeta_signed.img --avb-key avb_test_key.pem >/dev/null
+put_key vbmeta_signed avb_key.pem avb_test_key.pem
+"$ABR" pack -i vbmeta_signed -o vbmeta_signed.img >/dev/null
 roundtrip_check vbmeta_signed.img "vbmeta (RSA-2048 signed, passthrough repack w/o key)" vbs
 
 python3 - <<'PYEOF'
@@ -486,14 +494,14 @@ expect_key() {  # <unpacked dir> <manifest key> <label>
 # Replace the ramdisk of an unpacked image with new contents and repack it.
 edit_and_repack() {  # <unpacked dir> <out image>
     head -c 3000 /dev/urandom >"$1/ramdisk.cpio"
-    "$ABR" repack "$1" -o "$2" >/dev/null 2>"$2.err"
+    "$ABR" pack -i "$1" -o "$2" >/dev/null 2>"$2.err"
 }
 # After editing the ramdisk, the boot `id` must follow the scheme the source
 # used, and the new ramdisk must really be in the rebuilt image.
 id_follows_edit() {  # <image> <scheme> <tag> <label>
-    "$ABR" unpack "$1" -o "ed_$3" >/dev/null 2>&1
+    "$ABR" unpack -i "$1" -o "ed_$3" >/dev/null 2>&1
     edit_and_repack "ed_$3" "ed_$3.out"
-    "$ABR" unpack "ed_$3.out" -o "ed_${3}_re" >/dev/null 2>&1
+    "$ABR" unpack -i "ed_$3.out" -o "ed_${3}_re" >/dev/null 2>&1
     if python3 "$TOOLS/verify.py" boot-id "ed_$3.out" "$2" >/dev/null &&
         cmp -s "ed_$3/ramdisk.cpio" "ed_${3}_re/ramdisk.cpio"; then
         pass "$4"
@@ -518,7 +526,7 @@ id_follows_edit fx/boot_v0_sha256.img sha256 sha256id "sha256: id recomputed aft
 
 roundtrip_check fx/boot_v0_rawid.img "boot v0 (unrecognised id, kept verbatim)" rawid
 expect_line rt_rawid "id_scheme=raw" "unrecognised id falls back to raw"
-"$ABR" unpack fx/boot_v0_rawid.img -o ed_raw >/dev/null 2>&1
+"$ABR" unpack -i fx/boot_v0_rawid.img -o ed_raw >/dev/null 2>&1
 edit_and_repack ed_raw ed_raw.out
 if [ "$(python3 "$TOOLS/verify.py" boot-field fx/boot_v0_rawid.img id)" = \
      "$(python3 "$TOOLS/verify.py" boot-field ed_raw.out id)" ]; then
@@ -552,11 +560,11 @@ trim_edit() {   # <image> <part (verify.py)> <file in the unpacked directory> <n
     for delta in 3000 -400 1000000; do
         d="te_${name}_$delta"
         rm -rf "$d" "$d.img" "$d.part" "$d.re"
-        "$ABR" unpack "$img" -o "$d" >/dev/null 2>&1 || { fail "$name: unpack"; return; }
+        "$ABR" unpack -i "$img" -o "$d" >/dev/null 2>&1 || { fail "$name: unpack"; return; }
         old=$(stat -c %s "$d/$file")
         if [ "$delta" -gt 0 ]; then head -c "$delta" /dev/urandom >>"$d/$file"; else truncate -s $((old + delta)) "$d/$file"; fi
         new=$(stat -c %s "$d/$file")
-        "$ABR" repack "$d" -o "$d.img" >/dev/null 2>&1 || { fail "$name: repack after $delta bytes"; return; }
+        "$ABR" pack -i "$d" -o "$d.img" >/dev/null 2>&1 || { fail "$name: repack after $delta bytes"; return; }
         want=$(($(stat -c %s "$img") - old + new))
         if [ "$(stat -c %s "$d.img")" != "$want" ]; then
             echo "  $name ($delta): $(stat -c %s "$d.img") bytes, expected $want (the old size, $(stat -c %s "$img"), moved by the change of the component)"
@@ -565,7 +573,7 @@ trim_edit() {   # <image> <part (verify.py)> <file in the unpacked directory> <n
         if [ -n "$part" ]; then
             python3 "$TOOLS/verify.py" boot-part "$d.img" "$part" "$d.part" && cmp -s "$d.part" "$d/$file" || { echo "  $name ($delta): the component read back by an independent parser differs"; ok=0; }
         else
-            "$ABR" unpack "$d.img" -o "$d.re" >/dev/null 2>&1 && cmp -s "$d.re/$file" "$d/$file" || { echo "  $name ($delta): the component read back differs"; ok=0; }
+            "$ABR" unpack -i "$d.img" -o "$d.re" >/dev/null 2>&1 && cmp -s "$d.re/$file" "$d/$file" || { echo "  $name ($delta): the component read back differs"; ok=0; }
         fi
     done
     [ $ok = 1 ] && pass "$name: the last component of a dump without its final padding, made bigger or smaller, is rebuilt whole and still without the padding" \
@@ -582,9 +590,9 @@ expect_key rt_vbempty header_size "vendor_boot v4: non-standard header_size reco
 roundtrip_check fx/boot_v2_tail_padded.img "boot v2 (SEAndroid tail + zero fill up to the partition size)" tailpad
 expect_key rt_tailpad tail_file "tail after the image kept as a file"
 expect_key rt_tailpad pad_to "partition-size fill recorded"
-"$ABR" unpack fx/boot_v2_tail_padded.img -o ed_tail >/dev/null 2>&1
+"$ABR" unpack -i fx/boot_v2_tail_padded.img -o ed_tail >/dev/null 2>&1
 edit_and_repack ed_tail ed_tail.out
-"$ABR" unpack ed_tail.out -o ed_tail_re >/dev/null 2>&1
+"$ABR" unpack -i ed_tail.out -o ed_tail_re >/dev/null 2>&1
 if [ "$(stat -c %s ed_tail.out)" = "$(stat -c %s fx/boot_v2_tail_padded.img)" ] &&
     cmp -s ed_tail/ramdisk.cpio ed_tail_re/ramdisk.cpio &&
     cmp -s rt_tailpad/tail.bin ed_tail_re/tail.bin; then
@@ -595,13 +603,13 @@ fi
 roundtrip_check fx/boot_v4_prefixed_signed.img "boot v4 inside a BFBF/SSSS-style signed wrapper (prefix + trailer)" bfbf
 expect_key rt_bfbf prefix_file "wrapper before the boot image kept as a file"
 expect_key rt_bfbf tail_file "signature trailer after the image kept as a file"
-"$ABR" repack rt_bfbf -o rt_bfbf.again >/dev/null 2>rt_bfbf.again.err
+"$ABR" pack -i rt_bfbf -o rt_bfbf.again >/dev/null 2>rt_bfbf.again.err
 if ! grep -q "kept as they were" rt_bfbf.again.err; then
     pass "an unedited image inside a vendor wrapper repacks without a stale-signature warning"
 else
     fail "unedited image inside a vendor wrapper triggered a stale-signature warning"
 fi
-"$ABR" unpack fx/boot_v4_prefixed_signed.img -o ed_bfbf >/dev/null 2>&1
+"$ABR" unpack -i fx/boot_v4_prefixed_signed.img -o ed_bfbf >/dev/null 2>&1
 edit_and_repack ed_bfbf ed_bfbf.out
 if grep -q "kept as they were" ed_bfbf.out.err; then
     pass "editing an image inside a vendor wrapper warns that the wrapper's signature/sizes are stale"
@@ -623,9 +631,9 @@ expect_line rt_nooktab "prefix_kind=NOOKTAB" "Nook tablet header recognised as a
 for pair in nook:1048576 nooktab:262144; do
     t=${pair%%:*}
     hdr=${pair##*:}
-    "$ABR" unpack "fx/boot_v0_$t.img" -o "ed_$t" >/dev/null 2>&1
+    "$ABR" unpack -i "fx/boot_v0_$t.img" -o "ed_$t" >/dev/null 2>&1
     edit_and_repack "ed_$t" "ed_$t.out"
-    "$ABR" unpack "ed_$t.out" -o "ed_${t}_re" >/dev/null 2>&1
+    "$ABR" unpack -i "ed_$t.out" -o "ed_${t}_re" >/dev/null 2>&1
     if cmp -s <(head -c "$hdr" "fx/boot_v0_$t.img") <(head -c "$hdr" "ed_$t.out") &&
         cmp -s "ed_$t/ramdisk.cpio" "ed_${t}_re/ramdisk.cpio" &&
         ! grep -q "kept as they were" "ed_$t.out.err"; then
@@ -646,9 +654,9 @@ roundtrip_check fx/boot_v0_bump_seandroid.img "boot v0 + SEAndroid marker + LG B
 for pair in bump:bump1 bump_filled:bump2 bump_seandroid:bump3; do
     t=${pair%%:*}
     rt=${pair##*:}
-    "$ABR" unpack "fx/boot_v0_$t.img" -o "ed_$t" >/dev/null 2>&1
+    "$ABR" unpack -i "fx/boot_v0_$t.img" -o "ed_$t" >/dev/null 2>&1
     edit_and_repack "ed_$t" "ed_$t.out"
-    "$ABR" unpack "ed_$t.out" -o "ed_${t}_re" >/dev/null 2>&1
+    "$ABR" unpack -i "ed_$t.out" -o "ed_${t}_re" >/dev/null 2>&1
     before=$(stat -c %s "fx/boot_v0_$t.img")
     after=$(stat -c %s "ed_$t.out")
     ok=1
@@ -674,7 +682,7 @@ if python3 "$TOOLS/verify.py" avb-footer fx/boot_v2_avbfooter_unaligned.img >/de
 else
     fail "AVB footer fixture/rebuild does not verify"
 fi
-"$ABR" unpack fx/boot_v2_avbfooter_unaligned.img -o ed_avb >/dev/null 2>&1
+"$ABR" unpack -i fx/boot_v2_avbfooter_unaligned.img -o ed_avb >/dev/null 2>&1
 edit_and_repack ed_avb ed_avb.out
 if python3 "$TOOLS/verify.py" avb-footer ed_avb.out &&
     [ "$(stat -c %s ed_avb.out)" = "$(stat -c %s fx/boot_v2_avbfooter_unaligned.img)" ] &&
@@ -686,17 +694,17 @@ fi
 
 # A signed footer cannot be regenerated without the key: that must be an
 # error, not a silently unverifiable image.
-"$ABR" unpack fx/boot_v2_avbfooter_unaligned.img -o ed_avbsig >/dev/null 2>&1
+"$ABR" unpack -i fx/boot_v2_avbfooter_unaligned.img -o ed_avbsig >/dev/null 2>&1
 sed -i 's/^avb_algorithm_type=0$/avb_algorithm_type=1/' ed_avbsig/manifest.txt
 head -c 3000 /dev/urandom >ed_avbsig/ramdisk.cpio
-if "$ABR" repack ed_avbsig -o ed_avbsig.out >/dev/null 2>ed_avbsig.err; then
-    fail "signed AVB footer repacked without a key"
-elif grep -q -- "--avb-key" ed_avbsig.err; then
-    pass "signed AVB footer + changed content without --avb-key is refused with an explanation"
+if ! "$ABR" pack -i ed_avbsig -o ed_avbsig_nokey.out >/dev/null 2>ed_avbsig.err; then
+    fail "signed AVB footer + changed content without a key of its own is refused (abr has public test keys to sign with)"
+elif grep -q "public AVB test key" ed_avbsig.err && grep -q "keys/avb_key.pem" ed_avbsig.err; then
+    pass "signed AVB footer + changed content without a key of its own: signed with a public test key, and abr says so and where the key goes"
 else
-    fail "signed AVB footer refusal message does not mention --avb-key"
+    fail "the warning for a footer signed with a public test key does not name the key and keys/avb_key.pem"
 fi
-if "$ABR" repack ed_avbsig -o ed_avbsig.out --avb-key avb_test_key.pem >/dev/null 2>&1 &&
+if put_key ed_avbsig avb_key.pem avb_test_key.pem && "$ABR" pack -i ed_avbsig -o ed_avbsig.out >/dev/null 2>&1 &&
     python3 "$TOOLS/verify.py" avb-footer ed_avbsig.out avb_test_key_pub.pem >/dev/null; then
     pass "re-signed AVB footer: digest matches the edit and the RSA signature verifies (openssl)"
 else
@@ -710,8 +718,8 @@ d = bytearray(open("fx/boot_v2_avbfooter_unaligned.img", "rb").read())
 d[5000] ^= 0xFF
 open("avb_stale.img", "wb").write(d)
 PYEOF
-"$ABR" unpack avb_stale.img -o rt_stale >/dev/null 2>stale.err
-"$ABR" repack rt_stale -o rt_stale.out >/dev/null 2>&1
+"$ABR" unpack -i avb_stale.img -o rt_stale >/dev/null 2>stale.err
+"$ABR" pack -i rt_stale -o rt_stale.out >/dev/null 2>&1
 if grep -q "does not match its content" stale.err; then
     pass "stale AVB hash descriptor in the source is reported"
 else
@@ -763,11 +771,11 @@ if [ -n "${PXA_MKBOOTIMG:-}" ] && [ -x "$PXA_MKBOOTIMG" ]; then
         if [ "$cmd" = long ]; then args+=(--cmdline "$long_cmd"); else args+=(--cmdline "console=ttyS0 androidboot.selinux=permissive"); fi
         "$PXA_MKBOOTIMG" "${args[@]}" -o pxa_real.img >/dev/null 2>&1 || { pxa_ok=0; echo "  pxa-mkbootimg failed for $variant"; continue; }
         rm -rf pxa_u
-        "$ABR" unpack pxa_real.img -o pxa_u >/dev/null 2>&1 || { pxa_ok=0; echo "  abr cannot unpack the real tool's image ($variant)"; continue; }
-        "$ABR" repack pxa_u -o pxa_re.img >/dev/null 2>&1
+        "$ABR" unpack -i pxa_real.img -o pxa_u >/dev/null 2>&1 || { pxa_ok=0; echo "  abr cannot unpack the real tool's image ($variant)"; continue; }
+        "$ABR" pack -i pxa_u -o pxa_re.img >/dev/null 2>&1
         cmp -s pxa_real.img pxa_re.img || { pxa_ok=0; echo "  untouched repack differs ($variant)"; }
         head -c 123457 /dev/urandom >pxa_u/ramdisk.cpio
-        "$ABR" repack pxa_u -o pxa_ed.img >/dev/null 2>&1
+        "$ABR" pack -i pxa_u -o pxa_ed.img >/dev/null 2>&1
         a2=(--kernel pxa_u/kernel --ramdisk pxa_u/ramdisk.cpio --base 0 --pagesize "$(mvalue pxa_u page_size)"
             --unknown "$(mvalue pxa_u pxa_unknown | sed 's/^0x//')" --kernel_offset "$(mvalue pxa_u kernel_addr | sed 's/^0x//')"
             --ramdisk_offset "$(mvalue pxa_u ramdisk_addr | sed 's/^0x//')" --second_offset "$(mvalue pxa_u second_addr | sed 's/^0x//')"
@@ -792,17 +800,17 @@ else
 fi
 
 # ---- reporting: info, self-check, things that are not boot images
-if said "hash check:   OK" "$ABR" info fx/boot_v2_avbfooter_unaligned.img; then
+if said "hash check:   OK" "$ABR" info -i fx/boot_v2_avbfooter_unaligned.img; then
     pass "info reports the AVB footer and its digest check"
 else
     fail "info does not report the AVB footer digest check"
 fi
-if said "id scheme:      sha1_dt" "$ABR" info fx/boot_v0_qcdt_sha1_dt.img; then
+if said "id scheme:      sha1_dt" "$ABR" info -i fx/boot_v0_qcdt_sha1_dt.img; then
     pass "info reports the boot id scheme"
 else
     fail "info does not report the boot id scheme"
 fi
-"$ABR" unpack fx/boot_v2_header_garbage.img -o sc_ok >sc_ok.out 2>&1
+"$ABR" unpack -i fx/boot_v2_header_garbage.img -o sc_ok >sc_ok.out 2>&1
 if grep -q "reproduces this image byte-for-byte" sc_ok.out; then
     pass "unpack self-check confirms an exact round trip"
 else
@@ -810,20 +818,20 @@ else
 fi
 # An image abr cannot write back exactly -- the header of this vendor_boot gives a size of the ramdisk table that is not the one
 # abr works out from the table (a field that is derived, not kept) -- is said to be one, with the place of the first difference.
-"$ABR" unpack fx/vendor_boot_v4_table_size_lies.img -o sc_bad >sc_bad.out 2>&1
+"$ABR" unpack -i fx/vendor_boot_v4_table_size_lies.img -o sc_bad >sc_bad.out 2>&1
 if grep -q "does NOT reproduce" sc_bad.out && grep -q "first difference at offset 0x840" sc_bad.out; then
     pass "unpack self-check flags an image abr cannot reproduce exactly (a derived size field that lies), and where"
 else
     fail "unpack self-check missed an image abr cannot reproduce exactly"
 fi
 # (bytes in the padding between components used to be that case: they are kept now, see the section on padding below)
-"$ABR" unpack fx/boot_v2_dirty_padding.img -o sc_dirty >sc_dirty.out 2>&1
+"$ABR" unpack -i fx/boot_v2_dirty_padding.img -o sc_dirty >sc_dirty.out 2>&1
 if grep -q "reproduces this image byte-for-byte" sc_dirty.out; then
     pass "unpack self-check confirms the round trip of an image with bytes in its padding"
 else
     fail "unpack self-check does not confirm the round trip of an image with bytes in its padding"
 fi
-if "$ABR" unpack fx/ext4_like.img -o rt_ext4 >/dev/null 2>ext4.err; then
+if "$ABR" unpack -i fx/ext4_like.img -o rt_ext4 >/dev/null 2>ext4.err; then
     fail "an ext4 image was accepted as a boot-family container"
 elif grep -q "ext2/3/4 filesystem" ext4.err; then
     pass "an ext4 image is rejected with an explanatory message"
@@ -888,7 +896,7 @@ thr_codec_check() {  # <codec> <payload> <label> <thread counts...>
     js="${js% }"
     thr_dir "$codec" "$payload" "$dir"
     for j in "$@"; do
-        if ! "$ABR" -j"$j" repack "$dir" -o "$dir.j$j.img" >/dev/null 2>"$dir.err"; then
+        if ! env ABR_THREADS="$j" "$ABR" pack -i "$dir" -o "$dir.j$j.img" >/dev/null 2>"$dir.err"; then
             fail "$label: repack -j$j failed ($(head -c 200 "$dir.err"))"
             return
         fi
@@ -925,7 +933,7 @@ thr_dir gzip thr_text.bin thr_level
 for lvl in 1 9; do
     sed -i '/^ramdisk_level=/d' thr_level/manifest.txt
     echo "ramdisk_level=$lvl" >>thr_level/manifest.txt
-    "$ABR" repack thr_level -o "thr_level_$lvl.img" >/dev/null 2>&1
+    "$ABR" pack -i thr_level -o "thr_level_$lvl.img" >/dev/null 2>&1
     python3 "$TOOLS/verify.py" ramdisk "thr_level_$lvl.img" "thr_level_$lvl.rd"
 done
 if [ -s thr_level_1.rd ] && [ -s thr_level_9.rd ] &&
@@ -938,50 +946,44 @@ fi
 
 # An image with several components that are all recompressed at once (the case
 # the threads help most): vendor_boot v4 with two edited ramdisk fragments.
-"$ABR" unpack vendor_boot_v4.img -o thr_vb >/dev/null
+"$ABR" unpack -i vendor_boot_v4.img -o thr_vb >/dev/null
 head -c 400000 thr_text.bin >thr_vb/ramdisk0.cpio
 head -c 250000 thr_mixed.bin >thr_vb/ramdisk1.cpio
-"$ABR" -j1 repack thr_vb -o thr_vb.j1.img >/dev/null 2>&1
-"$ABR" -j4 repack thr_vb -o thr_vb.j4.img >/dev/null 2>&1
+env ABR_THREADS=1 "$ABR" pack -i thr_vb -o thr_vb.j1.img >/dev/null 2>&1
+env ABR_THREADS=4 "$ABR" pack -i thr_vb -o thr_vb.j4.img >/dev/null 2>&1
 check thr_vb.j1.img thr_vb.j4.img "vendor_boot v4, two edited fragments recompressed: -j1 and -j4 give the same bytes"
-"$ABR" unpack thr_vb.j4.img -o thr_vb_back >/dev/null 2>&1
+"$ABR" unpack -i thr_vb.j4.img -o thr_vb_back >/dev/null 2>&1
 if cmp -s thr_vb_back/ramdisk0.cpio <(head -c 400000 thr_text.bin) && cmp -s thr_vb_back/ramdisk1.cpio <(head -c 250000 thr_mixed.bin); then
     pass "vendor_boot v4, two edited fragments: both come back as edited"
 else
     fail "vendor_boot v4, two edited fragments: contents differ after the round trip"
 fi
 
-# -j / --threads: accepted in every spelling and position without changing the
-# result; refused, with a message, when it is not a number.
-thr_ref="$("$ABR" info boot_v4.img 2>&1)"
+# The thread count: ABR_THREADS (any number from 1 up, 0 and what is no number mean "as many as the machine has") never changes the result; the
+# options -j and --threads of the first command line are gone and are refused by name, not taken for something else.
+thr_ref="$("$ABR" info -i boot_v4.img 2>&1)"
 thr_opt_bad=""
-for form in "-j2" "-j 2" "--threads 2" "--threads=2" "-j0" "-j1" "-j16"; do
-    # shellcheck disable=SC2086
-    [ "$("$ABR" $form info boot_v4.img 2>&1)" = "$thr_ref" ] || thr_opt_bad="$thr_opt_bad [$form]"
+for n in 1 2 3 16 0 abc 2x ""; do
+    [ "$(ABR_THREADS=$n "$ABR" info -i boot_v4.img 2>&1)" = "$thr_ref" ] || thr_opt_bad="$thr_opt_bad [ABR_THREADS=$n]"
 done
-[ "$("$ABR" info boot_v4.img -j3 2>&1)" = "$thr_ref" ] || thr_opt_bad="$thr_opt_bad [trailing -j3]"
-[ "$(ABR_THREADS=3 "$ABR" info boot_v4.img 2>&1)" = "$thr_ref" ] || thr_opt_bad="$thr_opt_bad [ABR_THREADS]"
 if [ -z "$thr_opt_bad" ]; then
-    pass "-j N, -jN, --threads N, --threads=N (before or after the command) and ABR_THREADS are accepted"
+    pass "ABR_THREADS (a number, 0, no number, empty) leaves the output of info as it is"
 else
-    fail "thread options changed the result or were refused:$thr_opt_bad"
+    fail "ABR_THREADS changed the result or was refused:$thr_opt_bad"
 fi
 thr_opt_bad=""
-for form in "-j abc" "--threads=" "--threads=2x" "-j 99999" "-j -1" "-j"; do
+for form in "-j2" "-j 2" "--threads 2" "--threads=2"; do
     # shellcheck disable=SC2086
-    if "$ABR" $form info boot_v4.img >/dev/null 2>thr_opt.err; then
+    if "$ABR" info -i boot_v4.img $form >/dev/null 2>thr_opt.err; then
         thr_opt_bad="$thr_opt_bad [accepted: $form]"
-    elif ! grep -q "number" thr_opt.err; then
+    elif ! grep -q "unknown option" thr_opt.err; then
         thr_opt_bad="$thr_opt_bad [no explanation for: $form]"
     fi
 done
-if "$ABR" info boot_v4.img -j >/dev/null 2>thr_opt.err || ! grep -q "needs a number" thr_opt.err; then
-    thr_opt_bad="$thr_opt_bad [-j without a value at the end]"
-fi
 if [ -z "$thr_opt_bad" ]; then
-    pass "a thread count that is not a number is refused with an explanation"
+    pass "-j and --threads (the options of the first command line) are refused as unknown options"
 else
-    fail "bad thread counts are not handled:$thr_opt_bad"
+    fail "an old thread option is not refused properly:$thr_opt_bad"
 fi
 
 # =========================================================================
@@ -1002,7 +1004,9 @@ avb_verify() {  # <image> <partition name> <public key.pem> [<other image> <its 
     local d; d="$(mktemp -d -p .)"
     cp "$1" "$d/$2.img"
     [ $# -ge 5 ] && cp "$4" "$d/$5.img"
-    python3 "$AVBTOOL" verify_image --image "$d/$2.img" --key "$3" >"$d/out" 2>&1
+    local keyargs=(--key "$3")
+    [ "$3" = "-" ] && keyargs=()  # (no key: the signature against the public key in the image, which says nothing of who holds it)
+    python3 "$AVBTOOL" verify_image --image "$d/$2.img" "${keyargs[@]}" >"$d/out" 2>&1
     local rc=$?
     rm -rf "$d"
     return $rc
@@ -1134,37 +1138,40 @@ if [ -x "$UNIT" ] && python3 "$AVBTOOL" version >/dev/null 2>&1; then
     python3 "$AVBTOOL" add_hash_footer --image av_boot.img --partition_size 4194304 --partition_name boot \
         --algorithm SHA256_RSA2048 --key av_k2048.pem --salt 00112233445566778899aabbccddeeff \
         --prop foo:bar >/dev/null 2>&1
-    "$ABR" unpack av_boot.img -o av_u >av_u.out 2>&1
-    "$ABR" repack av_u -o av_u.out.img >/dev/null 2>&1
+    "$ABR" unpack -i av_boot.img -o av_u >av_u.out 2>&1
+    "$ABR" pack -i av_u -o av_u.out.img >/dev/null 2>&1
     check av_boot.img av_u.out.img "avbtool-signed hash footer (RSA-2048, salted): unpack+repack is byte-identical to avbtool's output"
-    if said "SHA256_RSA2048 (signed)" "$ABR" info av_boot.img && said "hash check:   OK" "$ABR" info av_boot.img; then
+    if said "SHA256_RSA2048 (signed)" "$ABR" info -i av_boot.img && said "hash check:   OK" "$ABR" info -i av_boot.img; then
         pass "info reports the signed footer and its digest check"
     else
         fail "info does not report the signed footer"
     fi
 
     head -c 5000 /dev/urandom >av_u/ramdisk.cpio
-    if "$ABR" repack av_u -o av_edit_nokey.img >/dev/null 2>av_nokey.err; then
-        fail "an edited image with a signed AVB footer was repacked without a key"
-    elif grep -q -- "--avb-key" av_nokey.err; then
-        pass "signed footer + edit without --avb-key is refused (not silently left invalid)"
+    if ! "$ABR" pack -i av_u -o av_edit_nokey.img >/dev/null 2>av_nokey.err; then
+        fail "an edited image with a signed AVB footer was refused without a key (abr signs with a public test key)"
+    elif grep -q "public AVB test key" av_nokey.err && avb_verify av_edit_nokey.img boot -; then
+        pass "signed footer + edit without a key of its own: signed with a public test key (said), and avbtool verifies the signature against the key in the image"
     else
-        fail "refusal for a signed footer does not mention --avb-key"
+        fail "signed footer + edit without a key: no warning of the public test key, or avbtool rejects the image"
     fi
-    "$ABR" repack av_u -o av_edit.img --avb-key av_k2048.pem >/dev/null 2>&1
+    put_key av_u avb_key.pem av_k2048.pem
+    "$ABR" pack -i av_u -o av_edit.img >/dev/null 2>&1
     if avb_verify av_edit.img boot av_k2048_pub.pem; then
         pass "edited image re-signed by abr passes avbtool verify_image (vbmeta signature, embedded key, hash descriptor)"
     else
         fail "avbtool verify_image rejects the image abr re-signed"
     fi
-    if "$ABR" repack av_u -o av_wrongsize.img --avb-key av_k4096.pem >/dev/null 2>av_wrongsize.err; then
+    put_key av_u avb_key.pem av_k4096.pem
+    if "$ABR" pack -i av_u -o av_wrongsize.img >/dev/null 2>av_wrongsize.err; then
         fail "a 4096-bit key was accepted for a SHA256_RSA2048 vbmeta"
     elif grep -q "2048-bit" av_wrongsize.err; then
         pass "a key of the wrong size for the algorithm is refused"
     else
         fail "wrong-size key refusal is not explanatory"
     fi
-    "$ABR" repack av_u -o av_otherkey.img --avb-key av_k2048b.pem >/dev/null 2>av_otherkey.err
+    put_key av_u avb_key.pem av_k2048b.pem
+    "$ABR" pack -i av_u -o av_otherkey.img >/dev/null 2>av_otherkey.err
     if grep -q "public key stored in this vbmeta was replaced" av_otherkey.err &&
         avb_verify av_otherkey.img boot av_k2048b_pub.pem && ! avb_verify av_otherkey.img boot av_k2048_pub.pem; then
         pass "signing with a different key replaces the embedded public key, says so, and verifies only with the new key"
@@ -1176,18 +1183,22 @@ if [ -x "$UNIT" ] && python3 "$AVBTOOL" version >/dev/null 2>&1; then
     python3 "$AVBTOOL" make_vbmeta_image --output av_vbmeta.img --algorithm SHA256_RSA4096 --key av_k4096.pem \
         --rollback_index 7 --prop a:b --kernel_cmdline "androidboot.x=1" \
         --include_descriptors_from_image av_boot.img >/dev/null 2>&1
-    "$ABR" unpack av_vbmeta.img -o av_vu >/dev/null 2>&1
-    "$ABR" repack av_vu -o av_vu.out.img >/dev/null 2>&1
+    "$ABR" unpack -i av_vbmeta.img -o av_vu >/dev/null 2>&1
+    "$ABR" pack -i av_vu -o av_vu.out.img >/dev/null 2>&1
     check av_vbmeta.img av_vu.out.img "avbtool-made signed vbmeta (RSA-4096, 4 descriptors): unpack+repack is byte-identical"
-    "$ABR" repack av_vu -o av_vu_same.img --avb-key av_k4096.pem >/dev/null 2>&1
+    put_key av_vu avb_key.pem av_k4096.pem
+    "$ABR" pack -i av_vu -o av_vu_same.img >/dev/null 2>&1
     check av_vbmeta.img av_vu_same.img "re-signing an unchanged vbmeta with the same key reproduces avbtool's bytes exactly"
     sed -i 's/^flags=0$/flags=2/' av_vu/manifest.txt
-    if "$ABR" repack av_vu -o av_vu_flags_nokey.img >/dev/null 2>&1; then
-        fail "a changed signed vbmeta was repacked without a key"
+    rm -rf av_vu/keys
+    if "$ABR" pack -i av_vu -o av_vu_flags_nokey.img >/dev/null 2>av_vu_nokey.err &&
+        grep -q "public AVB test key" av_vu_nokey.err && avb_verify av_vu_flags_nokey.img vbmeta - av_boot.img boot; then
+        pass "a signed vbmeta whose flags changed, without a key of its own: signed with a public test key (said), and avbtool verifies it"
     else
-        pass "a signed vbmeta whose flags changed is refused without a key"
+        fail "a signed vbmeta whose flags changed, without a key, is not signed with a public test key, or avbtool rejects it"
     fi
-    "$ABR" repack av_vu -o av_vu_flags.img --avb-key av_k4096.pem >/dev/null 2>&1
+    put_key av_vu avb_key.pem av_k4096.pem
+    "$ABR" pack -i av_vu -o av_vu_flags.img >/dev/null 2>&1
     if avb_verify av_vu_flags.img vbmeta av_k4096_pub.pem av_boot.img boot &&
         said "^Flags:  *2" python3 "$AVBTOOL" info_image --image av_vu_flags.img; then
         pass "vbmeta with edited flags, re-signed by abr, passes avbtool verify_image and shows the new flags"
@@ -1230,9 +1241,9 @@ a1_ok=1
 for v in v0 v0_qcdt v1 v2; do
     sign_py fx/avb1_$v.img a1_$v.img
     if ! python3 "$AVB1" verify a1_$v.img >/dev/null; then a1_ok=0; echo "  $v: the Python signer's own output does not verify"; fi
-    if ! said "signature VALID" "$ABR" info a1_$v.img; then a1_ok=0; echo "  $v: info does not report VALID"; fi
-    "$ABR" unpack a1_$v.img -o a1u_$v >a1u_$v.log 2>&1
-    "$ABR" repack a1u_$v -o a1_$v.out >/dev/null 2>&1
+    if ! said "signature VALID" "$ABR" info -i a1_$v.img; then a1_ok=0; echo "  $v: info does not report VALID"; fi
+    "$ABR" unpack -i a1_$v.img -o a1u_$v >a1u_$v.log 2>&1
+    "$ABR" pack -i a1u_$v -o a1_$v.out >/dev/null 2>&1
     cmp -s a1_$v.img a1_$v.out || { a1_ok=0; echo "  $v: unpack+repack is not byte-identical"; }
     grep -q "^avb1_signature=true" a1u_$v/manifest.txt || { a1_ok=0; echo "  $v: manifest lacks avb1_signature"; }
 done
@@ -1245,9 +1256,9 @@ fi
 # --- a damaged image is reported, and still round-trips ---
 cp a1_v0.img a1_v0_bad.img
 printf '\x55' | dd of=a1_v0_bad.img bs=1 seek=3000 conv=notrunc 2>/dev/null
-"$ABR" unpack a1_v0_bad.img -o a1u_bad >a1u_bad.log 2>&1
-"$ABR" repack a1u_bad -o a1_v0_bad.out >/dev/null 2>&1
-if said "signature INVALID" "$ABR" info a1_v0_bad.img &&
+"$ABR" unpack -i a1_v0_bad.img -o a1u_bad >a1u_bad.log 2>&1
+"$ABR" pack -i a1u_bad -o a1_v0_bad.out >/dev/null 2>&1
+if said "signature INVALID" "$ABR" info -i a1_v0_bad.img &&
     grep -q "does not match its content" a1u_bad.log && cmp -s a1_v0_bad.img a1_v0_bad.out; then
     pass "a boot signature that no longer matches the image is reported INVALID at unpack and in info, and kept as it was"
 else
@@ -1258,7 +1269,7 @@ fi
 a1_ok=1
 for v in v0 v0_qcdt v1 v2; do
     printf 'abr-edit' >>a1u_$v/ramdisk.cpio
-    "$ABR" repack a1u_$v -o a1_$v.edit >a1_$v.edit.log 2>&1
+    "$ABR" pack -i a1u_$v -o a1_$v.edit >a1_$v.edit.log 2>&1
     sign_py a1_$v.edit a1_$v.resigned
     cmp -s a1_$v.edit a1_$v.resigned || { a1_ok=0; echo "  $v: differs from the independent signer's image"; }
     python3 "$AVB1" verify a1_$v.edit >/dev/null || { a1_ok=0; echo "  $v: independent verifier rejects it"; }
@@ -1271,7 +1282,7 @@ else
     fail "re-signing after an edit is wrong"
 fi
 
-# --- a signer other than the AOSP test key: --avb1-key / --avb1-cert, AIK-style names, combined PEM ---
+# --- a signer other than the AOSP test key: keys/avb1.pk8 and keys/avb1.x509.pem, AIK-style names, combined PEM ---
 openssl genrsa -traditional -out a1_key.pem 4096 >/dev/null 2>&1 || openssl genrsa -out a1_key.pem 4096 >/dev/null 2>&1
 openssl req -x509 -new -key a1_key.pem -subj "/CN=abr avb1 test/O=abr" -days 3650 -out a1_cert.pem >/dev/null 2>&1
 mkdir -p aik
@@ -1279,29 +1290,41 @@ openssl pkcs8 -topk8 -nocrypt -outform DER -in a1_key.pem -out aik/mykey.pk8
 cp a1_cert.pem aik/mykey.x509.pem
 cat a1_key.pem a1_cert.pem >a1_combined.pem
 cp fx/avb1_v1.img a1_plain_v1.img
-"$ABR" unpack a1_plain_v1.img -o a1u_custom >/dev/null 2>&1
+"$ABR" unpack -i a1_plain_v1.img -o a1u_custom >/dev/null 2>&1
 printf 'abr-edit' >>a1u_custom/ramdisk.cpio
-"$ABR" repack a1u_custom -o a1_custom_flags.img --avb1-key a1_key.pem --avb1-cert a1_cert.pem >/dev/null 2>&1
-"$ABR" repack a1u_custom -o a1_custom_aik.img --avb1-key aik/mykey >/dev/null 2>&1
-"$ABR" repack a1u_custom -o a1_custom_combined.img --avb1-key a1_combined.pem >/dev/null 2>&1
+put_key a1u_custom avb1.pk8 a1_key.pem
+put_key a1u_custom avb1.x509.pem a1_cert.pem
+"$ABR" pack -i a1u_custom -o a1_custom_flags.img >/dev/null 2>&1
+rm -rf a1u_custom/keys
+put_key a1u_custom avb1.pk8 aik/mykey.pk8
+put_key a1u_custom avb1.x509.pem aik/mykey.x509.pem
+"$ABR" pack -i a1u_custom -o a1_custom_aik.img >/dev/null 2>&1
+rm -rf a1u_custom/keys
+put_key a1u_custom avb1.pk8 a1_combined.pem
+"$ABR" pack -i a1u_custom -o a1_custom_combined.img >/dev/null 2>&1
+rm -rf a1u_custom/keys
 sign_py a1_custom_flags.img a1_custom_expected.img a1_key.pem a1_cert.pem
 if cmp -s a1_custom_flags.img a1_custom_expected.img &&
     cmp -s a1_custom_flags.img a1_custom_aik.img && cmp -s a1_custom_flags.img a1_custom_combined.img &&
     python3 "$AVB1" verify a1_custom_flags.img a1_cert.pem >/dev/null; then
-    pass "--avb1-key/--avb1-cert (RSA-4096): equal to the independent signer; the AIK 'name.pk8 + name.x509.pem' form and a combined PEM give the same bytes"
+    pass "keys/avb1.pk8 + keys/avb1.x509.pem (RSA-4096): equal to the independent signer; a key as DER (pk8) or PEM, and one PEM that holds key and certificate, give the same bytes"
 else
     fail "signing with a custom key is wrong"
 fi
-if "$ABR" repack a1u_custom -o x.img --avb1-key a1_key.pem --avb1-cert "$VK_PEM" 2>a1_mismatch.err; then
+put_key a1u_custom avb1.pk8 a1_key.pem
+put_key a1u_custom avb1.x509.pem "$VK_PEM"
+if "$ABR" pack -i a1u_custom -o x.img 2>a1_mismatch.err; then
     fail "a certificate that does not belong to the key was accepted"
 elif grep -q "does not belong to this private key" a1_mismatch.err; then
     pass "a certificate that does not match the private key is refused"
 else
     fail "key/certificate mismatch refusal is not explanatory"
 fi
-if "$ABR" repack a1u_custom -o x.img --avb1-key a1_key.pem 2>a1_nocert.err; then
+rm -rf a1u_custom/keys
+put_key a1u_custom avb1.pk8 a1_key.pem
+if "$ABR" pack -i a1u_custom -o x.img 2>a1_nocert.err; then
     fail "a key without any certificate was accepted"
-elif grep -q -- "--avb1-cert" a1_nocert.err; then
+elif grep -q -- "keys/avb1.x509.pem" a1_nocert.err; then
     pass "a key without a certificate is refused with the way to supply one"
 else
     fail "missing-certificate refusal is not explanatory"
@@ -1318,9 +1341,9 @@ assert len(d) < size + 2048
 d += b"\0" * (size + 2048 - len(d)) + b"EEEE" + bytes(range(96))
 open("a1_trailer.img", "wb").write(d)
 PYEOF
-"$ABR" unpack a1_trailer.img -o a1u_trailer >a1u_trailer.log 2>&1
+"$ABR" unpack -i a1_trailer.img -o a1u_trailer >a1u_trailer.log 2>&1
 sed -i 's/^cmdline=.*/cmdline=androidboot.edited=1/' a1u_trailer/manifest.txt
-"$ABR" repack a1u_trailer -o a1_trailer.out >a1_trailer.log 2>&1
+"$ABR" pack -i a1u_trailer -o a1_trailer.out >a1_trailer.log 2>&1
 if python3 - "$size" <<'PYEOF'
 import sys
 size = int(sys.argv[1])
@@ -1342,37 +1365,40 @@ else
 fi
 
 # --- adding a signature to an unsigned image; options that do not apply ---
-"$ABR" unpack fx/avb1_v0.img -o a1u_unsigned >/dev/null 2>&1
-"$ABR" repack a1u_unsigned -o a1_unsigned.out >/dev/null 2>&1
+"$ABR" unpack -i fx/avb1_v0.img -o a1u_unsigned >/dev/null 2>&1
+"$ABR" pack -i a1u_unsigned -o a1_unsigned.out >/dev/null 2>&1
 echo 'avb1_signature=true' >>a1u_unsigned/manifest.txt
-"$ABR" repack a1u_unsigned -o a1_added.out >/dev/null 2>&1
-"$ABR" unpack fx/avb1_v0.img -o a1u_unsigned2 >/dev/null 2>&1
-"$ABR" repack a1u_unsigned2 -o a1_added_key.out --avb1-key aik/mykey >/dev/null 2>&1
+"$ABR" pack -i a1u_unsigned -o a1_added.out >/dev/null 2>&1
+"$ABR" unpack -i fx/avb1_v0.img -o a1u_unsigned2 >/dev/null 2>&1
+put_key a1u_unsigned2 avb1.pk8 aik/mykey.pk8
+put_key a1u_unsigned2 avb1.x509.pem aik/mykey.x509.pem
+"$ABR" pack -i a1u_unsigned2 -o a1_added_key.out >/dev/null 2>&1
 sign_py fx/avb1_v0.img a1_added_expected.img
 sign_py fx/avb1_v0.img a1_added_key_expected.img a1_key.pem a1_cert.pem
 if cmp -s fx/avb1_v0.img a1_unsigned.out && cmp -s a1_added.out a1_added_expected.img &&
     cmp -s a1_added_key.out a1_added_key_expected.img; then
-    pass "an unsigned image stays unsigned; avb1_signature=true or --avb1-key adds a signature (equal to the independent signer's)"
+    pass "an unsigned image stays unsigned; avb1_signature=true or a key in keys/avb1.pk8 adds a signature (equal to the independent signer's)"
 else
     fail "adding an AVBv1 signature is wrong"
 fi
-if "$ABR" repack vbv3_dummy -o x.img --avb1-key aik/mykey >/dev/null 2>&1; then :; fi
-"$ABR" unpack vendor_boot_v3.img -o a1u_vb >/dev/null 2>&1
-if said "only apply to boot and recovery images" "$ABR" repack a1u_vb -o a1_vb.out --avb1-key aik/mykey; then
-    pass "--avb1-key on a non-boot image is ignored with a warning"
+"$ABR" unpack -i vendor_boot_v3.img -o a1u_vb >/dev/null 2>&1
+put_key a1u_vb avb1.pk8 aik/mykey.pk8
+put_key a1u_vb avb1.x509.pem aik/mykey.x509.pem
+if said "only applies to boot and recovery images" "$ABR" pack -i a1u_vb -o a1_vb.out; then
+    pass "keys/avb1.pk8 in the folder of a non-boot image is ignored with a warning"
 else
-    fail "--avb1-key on a vendor_boot gives no warning"
+    fail "keys/avb1.pk8 in the folder of a vendor_boot gives no warning"
 fi
 
 # --- ECDSA-signed originals: not judged, kept, re-signed (with the AOSP RSA key) after an edit ---
 openssl ecparam -name prime256v1 -genkey -noout -out a1_ec.pem >/dev/null 2>&1
 openssl req -x509 -new -key a1_ec.pem -subj "/CN=abr ec test" -days 3650 -out a1_ec_cert.pem >/dev/null 2>&1
 python3 "$AVB1" sign fx/avb1_v0.img /boot a1_ec.pem a1_ec_cert.pem --ec >a1_ec.img
-"$ABR" unpack a1_ec.img -o a1u_ec >a1u_ec.log 2>&1
-"$ABR" repack a1u_ec -o a1_ec.out >/dev/null 2>&1
+"$ABR" unpack -i a1_ec.img -o a1u_ec >a1u_ec.log 2>&1
+"$ABR" pack -i a1u_ec -o a1_ec.out >/dev/null 2>&1
 printf 'abr-edit' >>a1u_ec/ramdisk.cpio
-"$ABR" repack a1u_ec -o a1_ec.edit >a1_ec.edit.log 2>&1
-if said "signature not checked" "$ABR" info a1_ec.img && cmp -s a1_ec.img a1_ec.out &&
+"$ABR" pack -i a1u_ec -o a1_ec.edit >a1_ec.edit.log 2>&1
+if said "signature not checked" "$ABR" info -i a1_ec.img && cmp -s a1_ec.img a1_ec.out &&
     python3 "$AVB1" verify a1_ec.edit >/dev/null && grep -q "whose private key abr does not have" a1_ec.edit.log; then
     pass "an ECDSA boot signature is reported as not checked, round-trips exactly, and is replaced by an RSA one after an edit (with a warning)"
 else
@@ -1392,9 +1418,9 @@ if command -v javac >/dev/null 2>&1 && command -v java >/dev/null 2>&1 && [ -n "
     for v in v0 v0_qcdt v1 v2; do
         bs /boot fx/avb1_$v.img "$VK_PK8" "$VK_PEM" bs_$v.img || { bs_ok=0; echo "  $v: boot_signer failed"; continue; }
         cmp -s bs_$v.img a1_$v.img || { bs_ok=0; echo "  $v: boot_signer and the Python signer disagree"; }
-        said "signature VALID" "$ABR" info bs_$v.img || { bs_ok=0; echo "  $v: info does not report VALID for boot_signer's image"; }
-        "$ABR" unpack bs_$v.img -o bsu_$v >/dev/null 2>&1
-        "$ABR" repack bsu_$v -o bs_$v.out >/dev/null 2>&1
+        said "signature VALID" "$ABR" info -i bs_$v.img || { bs_ok=0; echo "  $v: info does not report VALID for boot_signer's image"; }
+        "$ABR" unpack -i bs_$v.img -o bsu_$v >/dev/null 2>&1
+        "$ABR" pack -i bsu_$v -o bs_$v.out >/dev/null 2>&1
         cmp -s bs_$v.img bs_$v.out || { bs_ok=0; echo "  $v: round trip of boot_signer's image differs"; }
     done
     if [ $bs_ok -eq 1 ]; then
@@ -1493,12 +1519,12 @@ rd_done() {  # <what the checks show>: one PASS or FAIL for the checks since the
 }
 rd_unpack() {  # <image> <dir>: a fresh unpack
     rm -rf "$2"
-    "$ABR" unpack "$1" -o "$2" >"$2.log" 2>&1
+    "$ABR" unpack -i "$1" -o "$2" >"$2.log" 2>&1
 }
 rd_repack_unpack() {  # <dir> <name>: repack <dir> to <name>.img (log: <name>.rlog), unpack that to <name>_re
-    "$ABR" repack "$1" -o "$2.img" >"$2.rlog" 2>&1 || return 1
+    "$ABR" pack -i "$1" -o "$2.img" >"$2.rlog" 2>&1 || return 1
     rm -rf "${2}_re"
-    "$ABR" unpack "$2.img" -o "${2}_re" >/dev/null 2>&1
+    "$ABR" unpack -i "$2.img" -o "${2}_re" >/dev/null 2>&1
 }
 changed_lines() {  # <archive a> <archive b>: how many lines differ between two listings
     diff <(rd_list "$1") <(rd_list "$2") | grep -c '^[<>]'
@@ -1567,12 +1593,25 @@ if [ -x "$UNIT" ]; then
     fi
 fi
 
+# The other groups of unit tests: device trees (fdt), the filter that makes output safe for a terminal (console), the readers of AVB keys
+# (avbkeys), the tables of the layout (layout), compression levels (levels), PNG (png), the MediaTek containers (mtkimg) and the preloader
+# (mtkgfh), the Qualcomm secure boot images (mbn), the picture partitions (splash), the device tree tables (qcdt) and FIT (fit).
+for unit_group in fdt console avbkeys layout levels png mtkimg mtkgfh mbn splash qcdt fit; do
+    if [ -x "$UNIT" ]; then
+        if out=$("$UNIT" "$unit_group" 2>&1); then
+            pass "unit tests of the group $unit_group ($(tail -n 1 <<<"$out"))"
+        else
+            fail "unit tests of the group $unit_group: $(grep -E 'FAIL|failure' <<<"$out" | head -n 4 | tr '\n' ' ')"
+        fi
+    fi
+done
+
 # ---- archives that become directories: untouched round trip, the directory, GNU cpio's verdict
 for style in mkbootfs crc upper uppercrc owners aik dotroot explicit tail weird big volumes2 volumes3 volumes_tail; do
     if ! rd_image "$style"; then fail "ramdisk directory: could not make the $style fixture"; continue; fi
     n="$(rd_vols "$style")"
     rd_unpack "rdimg_$style.img" "rd_$style"
-    "$ABR" repack "rd_$style" -o "rd_$style.out" >/dev/null 2>&1
+    "$ABR" pack -i "rd_$style" -o "rd_$style.out" >/dev/null 2>&1
     if [ "$RD_WINE" = 1 ] && [ "$style" = weird ]; then
         # A quote, a backslash or a tab cannot be in a name on Windows: the ramdisk stays a file, with the reason.
         rd_ck "stays a file" grep -q "ramdisk.cpio stays a file only" "rd_$style.log"
@@ -1662,7 +1701,7 @@ if [ "$HAVE_GNU_CPIO" = 1 ]; then
         (cd gnu_src && find . | cpio --quiet -R 0:0 -H "$fmt" -o) >"gnu_$fmt.cpio" 2>/dev/null
         rd_image "gnu_$fmt" "gnu_$fmt.cpio"
         rd_unpack "rdimg_gnu_$fmt.img" "rd_gnu_$fmt"
-        "$ABR" repack "rd_gnu_$fmt" -o "rd_gnu_$fmt.out" >/dev/null 2>&1
+        "$ABR" pack -i "rd_gnu_$fmt" -o "rd_gnu_$fmt.out" >/dev/null 2>&1
         rd_ck "directory" grep -qx "ramdisk_tree=ramdisk" "rd_gnu_$fmt/manifest.txt"
         rd_ck "exact" cmp -s "rdimg_gnu_$fmt.img" "rd_gnu_$fmt.out"
         rd_ck "no warning" test -z "$(grep '^warning' "rd_gnu_$fmt.log")"
@@ -1677,7 +1716,7 @@ if [ "$HAVE_GNU_CPIO" = 1 ]; then
     cat gnu_newc.cpio gnu_second.cpio >gnu_vol.cpio
     rd_image gnu_vol gnu_vol.cpio
     rd_unpack rdimg_gnu_vol.img rd_gnu_vol
-    "$ABR" repack rd_gnu_vol -o rd_gnu_vol.out >/dev/null 2>&1
+    "$ABR" pack -i rd_gnu_vol -o rd_gnu_vol.out >/dev/null 2>&1
     rd_ck "two archives" grep -qx "ramdisk_tree_volumes=2" rd_gnu_vol/manifest.txt
     rd_ck "exact" cmp -s rdimg_gnu_vol.img rd_gnu_vol.out
     rd_ck "second directory" test -f rd_gnu_vol/ramdisk.vol2/.backup/.magisk
@@ -1689,8 +1728,8 @@ if [ "$HAVE_GNU_CPIO" = 1 ]; then
     printf 'on init\n    start x\n' >gnu_edit/ramdisk/init.rc
     rm gnu_edit/ramdisk/empty
     printf 'new\n' >gnu_edit/ramdisk/sbin/newtool
-    "$ABR" repack gnu_edit -o gnu_edit.img >/dev/null 2>&1
-    "$ABR" unpack gnu_edit.img -o gnu_edit_re >/dev/null 2>&1
+    "$ABR" pack -i gnu_edit -o gnu_edit.img >/dev/null 2>&1
+    "$ABR" unpack -i gnu_edit.img -o gnu_edit_re >/dev/null 2>&1
     rm -rf gnu_x && mkdir -p gnu_x && (cd gnu_x && cpio --quiet -idm <../gnu_edit_re/ramdisk.cpio) 2>/dev/null
     rd_ck "GNU cpio agrees" rd_oracle gnu_edit_re
     rd_ck "changed file" test "$(cat gnu_x/init.rc)" = "$(printf 'on init\n    start x')"
@@ -1712,7 +1751,7 @@ while IFS='|' read -r style why; do
     [ -n "$style" ] || continue
     if ! rd_image "$style"; then rd_bad_ok=0; rd_bad_names="$rd_bad_names $style(fixture)"; continue; fi
     rd_unpack "rdimg_$style.img" "rd_$style"
-    "$ABR" repack "rd_$style" -o "rd_$style.out" >/dev/null 2>&1
+    "$ABR" pack -i "rd_$style" -o "rd_$style.out" >/dev/null 2>&1
     if grep -q "ramdisk.cpio stays a file only" "rd_$style.log" && grep -q -F -- "$why" "rd_$style.log" &&
         ! grep -q "_tree" "rd_$style/manifest.txt" && [ ! -e "rd_$style/ramdisk" ] && [ ! -e "rd_$style/ramdisk.meta" ] &&
         [ ! -e "rd_$style/ramdisk.vol2" ] && cmp -s "rdimg_$style.cpio" "rd_$style/ramdisk.cpio" &&
@@ -1741,7 +1780,7 @@ EOF
     pass "ramdisk directory: hard links, a name twice, '..', an absolute name, a missing parent, junk after the end or between two archives, an archive off its boundary, odc, a cut-short archive, a link target with a line break and mixed magics or digit cases stay files, with the reason, and round-trip exactly" ||
     fail "ramdisk directory: archives that cannot be a directory are not handled:$rd_bad_names"
 # An image whose ramdisk is no archive at all is not worth a word.
-rm -rf rd_nocpio && "$ABR" unpack fx/boot_v0_rawid.img -o rd_nocpio >rd_nocpio.log 2>&1
+rm -rf rd_nocpio && "$ABR" unpack -i fx/boot_v0_rawid.img -o rd_nocpio >rd_nocpio.log 2>&1
 if ! grep -q "stays a file only" rd_nocpio.log && ! grep -q "_tree" rd_nocpio/manifest.txt; then
     pass "ramdisk directory: a ramdisk that is no cpio archive is left alone without a message"
 else
@@ -1808,90 +1847,86 @@ rd_ck "the archive file is what the image got" cmp -s rd_e6o_re/ramdisk.cpio rd_
 rd_ck "the directory was not used" test -z "$(grep 'built from the director' rd_e6o.rlog)"
 rd_done "ramdisk directory: when only ramdisk.cpio was replaced, the image gets that archive, not the (untouched) directory"
 rm -rf rd_e7 && cp -a rd_base rd_e7 && python3 "$RDG" owners rd_e7/ramdisk.cpio && printf 'more\n' >>rd_e7/ramdisk/init.rc
-if ! "$ABR" repack rd_e7 -o rd_e7.img >rd_e7.log 2>&1 && grep -q "ramdisk-from" rd_e7.log && [ ! -s rd_e7.img ]; then
-    pass "ramdisk directory: when both ramdisk.cpio and the directory were changed, repack stops and says how to choose"
+if "$ABR" pack -i rd_e7 -o rd_e7.img >rd_e7.log 2>&1 && grep -q "cannot merge" rd_e7.log && grep -q "Delete the directory to have the file used" rd_e7.log && [ -s rd_e7.img ]; then
+    pass "ramdisk directory: when both ramdisk.cpio and the directory were changed, the image is made from the directory, and abr says so and how to have the file used"
 else
-    fail "ramdisk directory: both changed was not refused ($(cat rd_e7.log))"
+    fail "ramdisk directory: both changed ($(cat rd_e7.log))"
 fi
-"$ABR" repack rd_e7 -o rd_e7t.img --ramdisk-from tree >/dev/null 2>&1 && "$ABR" unpack rd_e7t.img -o rd_e7t_re >/dev/null 2>&1
-"$ABR" repack rd_e7 -o rd_e7c.img --ramdisk-from cpio >/dev/null 2>&1 && "$ABR" unpack rd_e7c.img -o rd_e7c_re >/dev/null 2>&1
-if rd_same_tree rd_e7/ramdisk rd_e7t_re/ramdisk && cmp -s rd_e7c_re/ramdisk.cpio rd_e7/ramdisk.cpio && rd_differ rd_e7t.img rd_e7c.img; then
-    pass "ramdisk directory: --ramdisk-from tree builds from the directory, --ramdisk-from cpio takes ramdisk.cpio"
+rm -rf rd_e7c_in && cp -a rd_e7 rd_e7c_in && rm -rf rd_e7c_in/ramdisk
+"$ABR" unpack -i rd_e7.img -o rd_e7t_re >/dev/null 2>&1
+"$ABR" pack -i rd_e7c_in -o rd_e7c.img >/dev/null 2>&1 && "$ABR" unpack -i rd_e7c.img -o rd_e7c_re >/dev/null 2>&1
+if rd_same_tree rd_e7/ramdisk rd_e7t_re/ramdisk && cmp -s rd_e7c_re/ramdisk.cpio rd_e7/ramdisk.cpio && rd_differ rd_e7.img rd_e7c.img; then
+    pass "ramdisk directory: the directory is used when both changed; with the directory deleted, ramdisk.cpio is"
 else
-    fail "ramdisk directory: --ramdisk-from"
-fi
-if ! "$ABR" repack rd_e7 -o rd_e7x.img --ramdisk-from both >/dev/null 2>rd_e7x.err && grep -q "'tree' or 'cpio'" rd_e7x.err; then
-    pass "ramdisk directory: --ramdisk-from with anything but tree or cpio is refused"
-else
-    fail "ramdisk directory: --ramdisk-from with a wrong value"
+    fail "ramdisk directory: which of the two is used"
 fi
 # The directory is deleted by hand: the archive file is what is left.
-rm -rf rd_e7d && cp -a rd_base rd_e7d && rm -rf rd_e7d/ramdisk && "$ABR" repack rd_e7d -o rd_e7d.img >/dev/null 2>&1
+rm -rf rd_e7d && cp -a rd_base rd_e7d && rm -rf rd_e7d/ramdisk && "$ABR" pack -i rd_e7d -o rd_e7d.img >/dev/null 2>&1
 if cmp -s rd_e7d.img rdimg_mkbootfs.img; then
     pass "ramdisk directory: a directory that was removed is not missed (ramdisk.cpio is used)"
 else
     fail "ramdisk directory: a removed directory"
 fi
 
-# ---- --tree-only and --no-tree
-rm -rf rd_to && "$ABR" unpack rdimg_mkbootfs.img -o rd_to --tree-only >rd_to.log 2>&1
-"$ABR" repack rd_to -o rd_to.img >/dev/null 2>&1
+# ---- ramdisk.cpio deleted by hand: the directory is what the image is made from
+rm -rf rd_to && "$ABR" unpack -i rdimg_mkbootfs.img -o rd_to >rd_to.log 2>&1 && rm -f rd_to/ramdisk.cpio
+"$ABR" pack -i rd_to -o rd_to.img >/dev/null 2>&1
 if [ ! -e rd_to/ramdisk.cpio ] && [ -d rd_to/ramdisk ] && cmp -s rd_to.img rdimg_mkbootfs.img; then
-    pass "unpack --tree-only: no ramdisk.cpio, and the untouched directory still repacks to the identical image"
+    pass "ramdisk.cpio deleted: the untouched directory still repacks to the identical image"
 else
-    fail "unpack --tree-only"
+    fail "ramdisk.cpio deleted"
 fi
 printf 'x\n' >>rd_to/ramdisk/init.rc
 if rd_repack_unpack rd_to rd_to2 && [ "$(changed_lines rd_base/ramdisk.cpio rd_to2_re/ramdisk.cpio)" = 2 ]; then
-    pass "unpack --tree-only: an edit of the directory works without the archive file"
+    pass "ramdisk.cpio deleted: an edit of the directory works without the archive file"
 else
-    fail "unpack --tree-only: editing"
+    fail "ramdisk.cpio deleted: editing"
 fi
-rm -rf rd_to3 && "$ABR" unpack rdimg_hardlink.img -o rd_to3 --tree-only >rd_to3.log 2>&1
+rm -rf rd_to3 && "$ABR" unpack -i rdimg_hardlink.img -o rd_to3 >rd_to3.log 2>&1
 if [ -f rd_to3/ramdisk.cpio ] && cmp -s rd_to3/ramdisk.cpio rdimg_hardlink.cpio; then
-    pass "unpack --tree-only: an archive that cannot be a directory keeps its ramdisk.cpio"
+    pass "unpack: an archive that cannot be a directory keeps its ramdisk.cpio"
 else
-    fail "unpack --tree-only: a refused archive lost its file"
+    fail "unpack: a refused archive lost its file"
 fi
-rm -rf rd_nt && "$ABR" unpack rdimg_mkbootfs.img -o rd_nt --no-tree >rd_nt.log 2>&1
-"$ABR" repack rd_nt -o rd_nt.img >/dev/null 2>&1
-if [ ! -e rd_nt/ramdisk ] && [ ! -e rd_nt/ramdisk.meta ] && ! grep -q _tree rd_nt/manifest.txt && cmp -s rd_nt.img rdimg_mkbootfs.img; then
-    pass "unpack --no-tree: only ramdisk.cpio, as before"
+# The options of the first command line (the ones that chose the ramdisk, held the keys and set the threads) are gone: every one is refused by
+# name, at unpack and at pack, and nothing is made.
+rd_old_bad=""
+for rd_old_opt in "--tree-only" "--no-tree" "--ramdisk-from tree" "--avb-key k.pem" "--avb1-key k.pem" "--avb1-cert c.pem" "--chromeos-key k" "--chromeos-keyblock b" "-j2" "--threads=2" "--tre"; do
+    for rd_old_cmd in unpack pack; do
+        # shellcheck disable=SC2086
+        if "$ABR" $rd_old_cmd -i rdimg_mkbootfs.img -o rd_old_out $rd_old_opt >/dev/null 2>rd_old.err; then
+            rd_old_bad="$rd_old_bad [$rd_old_cmd accepted: $rd_old_opt]"
+        elif ! grep -q "unknown option" rd_old.err; then
+            rd_old_bad="$rd_old_bad [$rd_old_cmd: no explanation for: $rd_old_opt]"
+        fi
+    done
+done
+if [ -z "$rd_old_bad" ] && [ ! -e rd_old_out ]; then
+    pass "the options of the first command line are refused as unknown options, and nothing is made"
 else
-    fail "unpack --no-tree"
-fi
-if ! "$ABR" unpack rdimg_mkbootfs.img -o rd_bad --no-tree --tree-only >/dev/null 2>&1 && ! "$ABR" unpack rdimg_mkbootfs.img -o rd_bad2 --tre >/dev/null 2>&1; then
-    pass "unpack: contradicting or unknown options are refused"
-else
-    fail "unpack: options"
+    fail "an old option is not refused properly:$rd_old_bad"
 fi
 
 # ---- somebody else's ramdisk/ is not touched; an earlier unpack's is replaced
 rm -rf rd_alien && mkdir -p rd_alien/ramdisk && printf 'precious\n' >rd_alien/ramdisk/mine.txt
-"$ABR" unpack rdimg_mkbootfs.img -o rd_alien >rd_alien.log 2>&1
-"$ABR" repack rd_alien -o rd_alien.img >/dev/null 2>&1
+"$ABR" unpack -i rdimg_mkbootfs.img -o rd_alien >rd_alien.log 2>&1
+"$ABR" pack -i rd_alien -o rd_alien.img >/dev/null 2>&1
 if [ "$(cat rd_alien/ramdisk/mine.txt)" = "precious" ] && ! grep -q _tree rd_alien/manifest.txt && grep -q "is not an empty directory" rd_alien.log &&
     cmp -s rd_alien.img rdimg_mkbootfs.img; then
     pass "unpack: a ramdisk/ that is not from an earlier unpack is left alone (the ramdisk stays a file, with a message)"
 else
     fail "unpack: a foreign ramdisk/ was touched or ignored silently ($(cat rd_alien.log))"
 fi
-rm -rf rd_empty && mkdir -p rd_empty/ramdisk && "$ABR" unpack rdimg_mkbootfs.img -o rd_empty >/dev/null 2>&1
+rm -rf rd_empty && mkdir -p rd_empty/ramdisk && "$ABR" unpack -i rdimg_mkbootfs.img -o rd_empty >/dev/null 2>&1
 grep -q _tree rd_empty/manifest.txt && pass "unpack: an empty ramdisk/ is no obstacle" || fail "unpack: an empty ramdisk/ was treated as foreign"
 rm -rf rd_again && cp -a rd_base rd_again && printf 'junk\n' >rd_again/ramdisk/leftover && printf 'junk\n' >>rd_again/ramdisk/init.rc
-"$ABR" unpack rdimg_mkbootfs.img -o rd_again >/dev/null 2>&1
+"$ABR" unpack -i rdimg_mkbootfs.img -o rd_again >/dev/null 2>&1
 if [ ! -e rd_again/ramdisk/leftover ] && rd_same_tree rd_base/ramdisk rd_again/ramdisk && cmp -s rd_base/ramdisk.meta rd_again/ramdisk.meta; then
     pass "unpack: unpacking again over an earlier unpack replaces the directory (no leftovers, no old edits)"
 else
     fail "unpack: unpacking over an earlier unpack"
 fi
-rm -rf rd_gone && cp -a rd_base rd_gone && "$ABR" unpack rdimg_mkbootfs.img -o rd_gone --no-tree >/dev/null 2>&1
-if [ ! -e rd_gone/ramdisk ] && [ ! -e rd_gone/ramdisk.meta ]; then
-    pass "unpack --no-tree over an earlier unpack removes its directory (it would be a trap, the repack would ignore it)"
-else
-    fail "unpack --no-tree left the old directory behind"
-fi
-rm -rf rd_refused && cp -a rd_base rd_refused && "$ABR" unpack rdimg_hardlink.img -o rd_refused >/dev/null 2>&1
+rm -rf rd_refused && cp -a rd_base rd_refused && "$ABR" unpack -i rdimg_hardlink.img -o rd_refused >/dev/null 2>&1
 if [ ! -e rd_refused/ramdisk ] && [ ! -e rd_refused/ramdisk.meta ] && ! grep -q _tree rd_refused/manifest.txt; then
     pass "unpack: an archive that cannot be a directory does not leave the directory of an earlier unpack behind"
 else
@@ -2040,14 +2075,14 @@ rd_done "ramdisk symlinks: real links, Cygwin link files (ASCII, UTF-8 beyond th
 # A link file that cannot be read stops the repack, with the file's name and the reason.
 rm -rf rd_l2 && cp -a rd_base rd_l2 && printf '!<symlink>\377\376\000\334\0\0' >rd_l2/ramdisk/badlink
 rm -f rd_l2.img
-if ! "$ABR" repack rd_l2 -o rd_l2.img >rd_l2.log 2>&1 && grep -q "the link file 'badlink' cannot be read" rd_l2.log && [ ! -s rd_l2.img ]; then
+if ! "$ABR" pack -i rd_l2 -o rd_l2.img >rd_l2.log 2>&1 && grep -q "the link file 'badlink' cannot be read" rd_l2.log && [ ! -s rd_l2.img ]; then
     pass "ramdisk symlinks: a link file with broken UTF-16 stops the repack and names the file (nothing is written)"
 else
     fail "ramdisk symlinks: a broken link file ($(cat rd_l2.log))"
 fi
 rm -rf rd_l3 && cp -a rd_base rd_l3 && printf '!<symlink>\377\376\0\0' >rd_l3/ramdisk/emptylink
 rm -f rd_l3.img
-if ! "$ABR" repack rd_l3 -o rd_l3.img >rd_l3.log 2>&1 && grep -q "the link file 'emptylink' cannot be read: it has no target" rd_l3.log && [ ! -s rd_l3.img ]; then
+if ! "$ABR" pack -i rd_l3 -o rd_l3.img >rd_l3.log 2>&1 && grep -q "the link file 'emptylink' cannot be read: it has no target" rd_l3.log && [ ! -s rd_l3.img ]; then
     pass "ramdisk symlinks: a link file without a target stops the repack"
 else
     fail "ramdisk symlinks: an empty link file ($(cat rd_l3.log))"
@@ -2061,14 +2096,14 @@ for l in etc sbin/ueventd; do
     rm "rd_l4/ramdisk/$l"
     rd_cyg "rd_l4/ramdisk/$l" "$t"
 done
-"$ABR" repack rd_l4 -o rd_l4.img >/dev/null 2>&1
+"$ABR" pack -i rd_l4 -o rd_l4.img >/dev/null 2>&1
 rm -rf rd_l5 && cp -a rd_base rd_l5
 for l in etc sbin/ueventd; do
     t="$(rd_link "rd_l5/ramdisk/$l")"
     rm "rd_l5/ramdisk/$l"
     printf '%s\n' "$t" >"rd_l5/ramdisk/$l"
 done
-"$ABR" repack rd_l5 -o rd_l5.img >/dev/null 2>&1
+"$ABR" pack -i rd_l5 -o rd_l5.img >/dev/null 2>&1
 if cmp -s rd_l4.img rdimg_mkbootfs.img && cmp -s rd_l5.img rdimg_mkbootfs.img; then
     pass "ramdisk symlinks: a tree whose links became Cygwin link files (Windows) or text files (git without symlinks) repacks to the identical image"
 else
@@ -2176,13 +2211,13 @@ rd_ck "it is the first directory now" rd_same_tree rd_volumes2/ramdisk.vol2 rd_m
 rd_ck "and it was said" grep -q "ramdisk/: the directory is not there, so that archive is left out of the ramdisk" rd_m7o.rlog
 rd_done "ramdisk volumes: deleting ramdisk/ (the first) leaves the first archive out; what is left is the second archive"
 rm -rf rd_m8 && cp -a rd_volumes2 rd_m8 && rm -rf rd_m8/ramdisk rd_m8/ramdisk.vol2
-"$ABR" repack rd_m8 -o rd_m8.img >rd_m8.log 2>&1
+"$ABR" pack -i rd_m8 -o rd_m8.img >rd_m8.log 2>&1
 rd_ck "every directory gone: ramdisk.cpio is used, the image is the original" cmp -s rd_m8.img rdimg_volumes2.img
 rd_done "ramdisk volumes: with every directory deleted the repack takes ramdisk.cpio, as with one directory"
 
 # A directory beyond the last one is not part of the ramdisk: a warning, and it is left alone.
 rm -rf rd_m9 && cp -a rd_volumes2 rd_m9 && mkdir rd_m9/ramdisk.vol3 && printf 'x\n' >rd_m9/ramdisk.vol3/x
-"$ABR" repack rd_m9 -o rd_m9.img >rd_m9.log 2>&1
+"$ABR" pack -i rd_m9 -o rd_m9.img >rd_m9.log 2>&1
 rd_ck "warned" grep -q "ramdisk.vol3/ is not part of this ramdisk (the unpack had 2 archives) and is ignored" rd_m9.log
 rd_ck "the image is the original" cmp -s rd_m9.img rdimg_volumes2.img
 rd_ck "the directory is left in place" test -f rd_m9/ramdisk.vol3/x
@@ -2190,17 +2225,18 @@ rd_done "ramdisk volumes: a ramdisk.vol3/ that the unpack did not make is warned
 
 # Both the archive file and a directory changed: say which, as with one.
 rm -rf rd_m10 && cp -a rd_volumes2 rd_m10 && python3 "$RDG" owners rd_m10/ramdisk.cpio && printf 'k\n' >>rd_m10/ramdisk.vol2/.backup/.magisk
-if ! "$ABR" repack rd_m10 -o rd_m10.img >rd_m10.log 2>&1 && grep -q "ramdisk-from" rd_m10.log; then
-    pass "ramdisk volumes: ramdisk.cpio and a volume's directory both changed: repack stops and says how to choose"
+if "$ABR" pack -i rd_m10 -o rd_m10.img >rd_m10.log 2>&1 && grep -q "cannot merge" rd_m10.log && [ -s rd_m10.img ]; then
+    pass "ramdisk volumes: ramdisk.cpio and a volume's directory both changed: the image is made from the directories, and abr says so"
 else
-    fail "ramdisk volumes: both changed was not refused ($(cat rd_m10.log))"
+    fail "ramdisk volumes: both changed ($(cat rd_m10.log))"
 fi
-"$ABR" repack rd_m10 -o rd_m10t.img --ramdisk-from tree >/dev/null 2>&1 && "$ABR" unpack rd_m10t.img -o rd_m10t_re >/dev/null 2>&1
-"$ABR" repack rd_m10 -o rd_m10c.img --ramdisk-from cpio >/dev/null 2>&1 && "$ABR" unpack rd_m10c.img -o rd_m10c_re >/dev/null 2>&1
+rm -rf rd_m10c_in && cp -a rd_m10 rd_m10c_in && rm -rf rd_m10c_in/ramdisk rd_m10c_in/ramdisk.vol2
+"$ABR" unpack -i rd_m10.img -o rd_m10t_re >/dev/null 2>&1
+"$ABR" pack -i rd_m10c_in -o rd_m10c.img >/dev/null 2>&1 && "$ABR" unpack -i rd_m10c.img -o rd_m10c_re >/dev/null 2>&1
 if rd_same_tree rd_m10/ramdisk.vol2 rd_m10t_re/ramdisk.vol2 && cmp -s rd_m10c_re/ramdisk.cpio rd_m10/ramdisk.cpio; then
-    pass "ramdisk volumes: --ramdisk-from tree builds all the archives from their directories, --ramdisk-from cpio takes ramdisk.cpio"
+    pass "ramdisk volumes: the directories are used when both changed; with every directory deleted, ramdisk.cpio is"
 else
-    fail "ramdisk volumes: --ramdisk-from"
+    fail "ramdisk volumes: which of the two is used"
 fi
 
 # Three archives of three kinds: the middle one, written like GNU cpio does, is edited.
@@ -2229,29 +2265,22 @@ rd_ck "GNU cpio agrees with both" rd_oracle rd_m12o_re
 rd_done "ramdisk volumes: archives with no fill between them (padded together at the end) are rebuilt the same way when the first one grows$RD_GNU"
 
 # ---- unpacking again, or differently, over a directory of an earlier unpack
-rm -rf rd_u1 && cp -a rd_volumes3 rd_u1 && "$ABR" unpack rdimg_volumes2.img -o rd_u1 >/dev/null 2>&1
+rm -rf rd_u1 && cp -a rd_volumes3 rd_u1 && "$ABR" unpack -i rdimg_volumes2.img -o rd_u1 >/dev/null 2>&1
 rd_ck "the third archive's directory is gone" test ! -e rd_u1/ramdisk.vol3
 rd_ck "... and its metadata" test ! -e rd_u1/ramdisk.vol3.meta
 rd_ck "the second is the one of this image" rd_same_tree rd_volumes2/ramdisk.vol2 rd_u1/ramdisk.vol2
 rd_ck "the first is too" rd_same_tree rd_volumes2/ramdisk rd_u1/ramdisk
 rd_ck "the manifest says two" grep -qx "ramdisk_tree_volumes=2" rd_u1/manifest.txt
-"$ABR" repack rd_u1 -o rd_u1.img >/dev/null 2>&1
+"$ABR" pack -i rd_u1 -o rd_u1.img >/dev/null 2>&1
 rd_ck "and it repacks to the image" cmp -s rd_u1.img rdimg_volumes2.img
 rd_done "unpack: over an earlier unpack with three archives, an image with two replaces two directories and removes the third (and its metadata)"
-rm -rf rd_u2 && cp -a rd_volumes3 rd_u2 && "$ABR" unpack rdimg_mkbootfs.img -o rd_u2 >/dev/null 2>&1
+rm -rf rd_u2 && cp -a rd_volumes3 rd_u2 && "$ABR" unpack -i rdimg_mkbootfs.img -o rd_u2 >/dev/null 2>&1
 rd_ck "no volume directories" test ! -e rd_u2/ramdisk.vol2 -a ! -e rd_u2/ramdisk.vol3
 rd_ck "no volume metadata" test ! -e rd_u2/ramdisk.vol2.meta -a ! -e rd_u2/ramdisk.vol3.meta
 rd_ck "no volumes in the manifest" test -z "$(grep _tree_volumes rd_u2/manifest.txt)"
 rd_ck "the one directory is the new one" rd_same_tree rd_mkbootfs/ramdisk rd_u2/ramdisk
 rd_done "unpack: over an earlier unpack with three archives, an image with one leaves one directory"
-rm -rf rd_u3 && cp -a rd_volumes3 rd_u3 && "$ABR" unpack rdimg_volumes3.img -o rd_u3 --no-tree >/dev/null 2>&1
-rd_ck "no directory" test ! -e rd_u3/ramdisk -a ! -e rd_u3/ramdisk.vol2 -a ! -e rd_u3/ramdisk.vol3
-rd_ck "no metadata" test ! -e rd_u3/ramdisk.meta -a ! -e rd_u3/ramdisk.vol2.meta -a ! -e rd_u3/ramdisk.vol3.meta
-rd_ck "no tree in the manifest" test -z "$(grep _tree rd_u3/manifest.txt)"
-"$ABR" repack rd_u3 -o rd_u3.img >/dev/null 2>&1
-rd_ck "the image is the original" cmp -s rd_u3.img rdimg_volumes3.img
-rd_done "unpack --no-tree: removes the directories and metadata of every archive of an earlier unpack"
-rm -rf rd_u4 && cp -a rd_volumes3 rd_u4 && "$ABR" unpack rdimg_hardlink.img -o rd_u4 >/dev/null 2>&1
+rm -rf rd_u4 && cp -a rd_volumes3 rd_u4 && "$ABR" unpack -i rdimg_hardlink.img -o rd_u4 >/dev/null 2>&1
 rd_ck "no directory" test ! -e rd_u4/ramdisk -a ! -e rd_u4/ramdisk.vol2 -a ! -e rd_u4/ramdisk.vol3
 rd_ck "no metadata" test ! -e rd_u4/ramdisk.meta -a ! -e rd_u4/ramdisk.vol2.meta -a ! -e rd_u4/ramdisk.vol3.meta
 rd_ck "no tree in the manifest" test -z "$(grep _tree rd_u4/manifest.txt)"
@@ -2259,8 +2288,8 @@ rd_done "unpack: an archive that cannot be a directory removes the directories o
 
 # Somebody else's ramdisk.vol2/ stops the whole directory (an archive half in a directory would be a trap).
 rm -rf rd_u5 && mkdir -p rd_u5/ramdisk.vol2 && printf 'precious\n' >rd_u5/ramdisk.vol2/mine.txt
-"$ABR" unpack rdimg_volumes2.img -o rd_u5 >rd_u5.log 2>&1
-"$ABR" repack rd_u5 -o rd_u5.img >/dev/null 2>&1
+"$ABR" unpack -i rdimg_volumes2.img -o rd_u5 >rd_u5.log 2>&1
+"$ABR" pack -i rd_u5 -o rd_u5.img >/dev/null 2>&1
 rd_ck "mine.txt is untouched" test "$(cat rd_u5/ramdisk.vol2/mine.txt)" = "precious"
 rd_ck "the first archive got no directory either" test ! -e rd_u5/ramdisk -a ! -e rd_u5/ramdisk.meta
 rd_ck "no tree in the manifest" test -z "$(grep _tree rd_u5/manifest.txt)"
@@ -2268,20 +2297,20 @@ rd_ck "said why, naming the directory" grep -q "ramdisk.vol2 exists and is not a
 rd_ck "ramdisk.cpio is there" cmp -s rd_u5/ramdisk.cpio rdimg_volumes2.cpio
 rd_ck "the image is the original" cmp -s rd_u5.img rdimg_volumes2.img
 rd_done "unpack: a ramdisk.vol2/ that is not from an earlier unpack is left alone, and then no archive of the ramdisk becomes a directory (the ramdisk stays a file, with a message)"
-rm -rf rd_u6 && mkdir -p rd_u6/ramdisk.vol3 && "$ABR" unpack rdimg_volumes2.img -o rd_u6 >/dev/null 2>&1
+rm -rf rd_u6 && mkdir -p rd_u6/ramdisk.vol3 && "$ABR" unpack -i rdimg_volumes2.img -o rd_u6 >/dev/null 2>&1
 rd_ck "an empty directory is no obstacle" grep -qx "ramdisk_tree_volumes=2" rd_u6/manifest.txt
 rd_done "unpack: an empty ramdisk.vol3/ beyond the archives is nothing to be afraid of"
 
-# --tree-only with volumes: no archive file, and the directories are enough.
-rm -rf rd_to2 && "$ABR" unpack rdimg_volumes2.img -o rd_to2 --tree-only >rd_to2.log 2>&1
-"$ABR" repack rd_to2 -o rd_to2.img >/dev/null 2>&1
+# ramdisk.cpio deleted, with volumes: no archive file, and the directories are enough.
+rm -rf rd_to2 && "$ABR" unpack -i rdimg_volumes2.img -o rd_to2 >rd_to2.log 2>&1 && rm -f rd_to2/ramdisk.cpio
+"$ABR" pack -i rd_to2 -o rd_to2.img >/dev/null 2>&1
 rd_ck "no ramdisk.cpio" test ! -e rd_to2/ramdisk.cpio
 rd_ck "both directories and metadata" test -d rd_to2/ramdisk -a -d rd_to2/ramdisk.vol2 -a -f rd_to2/ramdisk.meta -a -f rd_to2/ramdisk.vol2.meta
 rd_ck "the untouched directories repack to the identical image" cmp -s rd_to2.img rdimg_volumes2.img
 printf 'x\n' >rd_to2/ramdisk.vol2/overlay.d/x
 rd_ck "an edit works without the archive file" rd_repack_unpack rd_to2 rd_to2e
 rd_ck "and is in the second archive" test -f rd_to2e_re/ramdisk.vol2/overlay.d/x
-rd_done "unpack --tree-only: an image with two archives needs only the directories and the metadata"
+rd_done "ramdisk.cpio deleted: an image with two archives needs only the directories and the metadata"
 
 # ---- vendor_boot: every ramdisk fragment is a ramdisk of its own, with its directory (ramdisk0/, ramdisk1/ ...)
 # and, when a fragment is several archives one after the other, ramdisk0.vol2/ ... as well.
@@ -2293,7 +2322,7 @@ python3 "$MKBOOTIMG" >/dev/null --header_version 4 --dtb rd_v.dtb --vendor_cmdli
     --ramdisk_type dlkm --ramdisk_name dlkm_frag --board_id0 7 --vendor_ramdisk_fragment rd_frag1.zst \
     --vendor_boot rd_vb.img
 rd_unpack rd_vb.img rd_vbu
-"$ABR" repack rd_vbu -o rd_vb.out >/dev/null 2>&1
+"$ABR" pack -i rd_vbu -o rd_vb.out >/dev/null 2>&1
 rd_ck "a directory for each fragment" test -d rd_vbu/ramdisk0 -a -d rd_vbu/ramdisk1
 rd_ck "...and its metadata" test -f rd_vbu/ramdisk0.meta -a -f rd_vbu/ramdisk1.meta
 rd_ck "the manifest" grep -qx "ramdisk1_tree=ramdisk1" rd_vbu/manifest.txt
@@ -2315,13 +2344,13 @@ rd_ck "type survives" grep -qx "ramdisk1_type=dlkm" rd_vbeo_re/manifest.txt
 rd_ck "GNU cpio, second fragment" rd_oracle rd_vbeo_re ramdisk1
 rd_ck "GNU cpio, first fragment" rd_oracle rd_vbeo_re ramdisk0
 rd_done "ramdisk directory: editing one vendor_boot fragment's directory rebuilds that fragment only (the other keeps its exact compressed bytes, names and types survive)$RD_GNU"
-for j in 1 2 4 8; do "$ABR" -j$j repack rd_vbe -o rd_vbe.j$j.img >/dev/null 2>&1; done
+for j in 1 2 4 8; do env ABR_THREADS=$j "$ABR" pack -i rd_vbe -o rd_vbe.j$j.img >/dev/null 2>&1; done
 if cmp -s rd_vbe.j1.img rd_vbe.j2.img && cmp -s rd_vbe.j1.img rd_vbe.j4.img && cmp -s rd_vbe.j1.img rd_vbe.j8.img && cmp -s rd_vbe.j1.img rd_vbeo.img; then
     pass "ramdisk directory: repacking from edited directories gives the same bytes with 1, 2, 4 and 8 threads"
 else
     fail "ramdisk directory: the result depends on the number of threads"
 fi
-rm -rf rd_tj1 rd_tj4 && "$ABR" -j1 unpack rd_vb.img -o rd_tj1 >/dev/null 2>&1 && "$ABR" -j4 unpack rd_vb.img -o rd_tj4 >/dev/null 2>&1
+rm -rf rd_tj1 rd_tj4 && env ABR_THREADS=1 "$ABR" unpack -i rd_vb.img -o rd_tj1 >/dev/null 2>&1 && env ABR_THREADS=4 "$ABR" unpack -i rd_vb.img -o rd_tj4 >/dev/null 2>&1
 if diff -r --no-dereference -x manifest.txt rd_tj1 rd_tj4 >/dev/null && diff <(tail -n +2 rd_tj1/manifest.txt) <(tail -n +2 rd_tj4/manifest.txt) >/dev/null; then
     pass "ramdisk directory: unpacking gives the same directories and manifest with 1 and 4 threads"
 else
@@ -2337,7 +2366,7 @@ python3 "$MKBOOTIMG" >/dev/null --header_version 4 --dtb rd_v.dtb --vendor_cmdli
     --ramdisk_type dlkm --ramdisk_name dlkm_frag --board_id0 7 --vendor_ramdisk_fragment rd_fragv1.zst \
     --vendor_boot rd_vv.img
 rd_unpack rd_vv.img rd_vvu
-"$ABR" repack rd_vvu -o rd_vv.out >/dev/null 2>&1
+"$ABR" pack -i rd_vvu -o rd_vv.out >/dev/null 2>&1
 rd_ck "volumes of the first fragment" grep -qx "ramdisk0_tree_volumes=2" rd_vvu/manifest.txt
 rd_ck "volumes of the second" grep -qx "ramdisk1_tree_volumes=3" rd_vvu/manifest.txt
 rd_ck "directories" test -d rd_vvu/ramdisk0 -a -d rd_vvu/ramdisk0.vol2 -a -d rd_vvu/ramdisk1 -a -d rd_vvu/ramdisk1.vol2 -a -d rd_vvu/ramdisk1.vol3
@@ -2364,7 +2393,7 @@ rd_ck "the volumes are still there" grep -qx "ramdisk1_tree_volumes=3" rd_vveo_r
 rd_ck "the edits" test "$(cat rd_vveo_re/ramdisk0.vol2/.backup/.magisk)" = "KEEPVERITY=false"
 rd_ck "GNU cpio, both fragments" rd_oracle_frags rd_vveo_re ramdisk0 ramdisk1
 rd_done "ramdisk directory: edits in the second archive of one fragment and the third of another rebuild those archives only$RD_GNU"
-for j in 1 2 4 8; do "$ABR" -j$j repack rd_vve -o rd_vve.j$j.img >/dev/null 2>&1; done
+for j in 1 2 4 8; do env ABR_THREADS=$j "$ABR" pack -i rd_vve -o rd_vve.j$j.img >/dev/null 2>&1; done
 if cmp -s rd_vve.j1.img rd_vve.j2.img && cmp -s rd_vve.j1.img rd_vve.j4.img && cmp -s rd_vve.j1.img rd_vve.j8.img && cmp -s rd_vve.j1.img rd_vveo.img; then
     pass "ramdisk directory: fragments of several archives repack to the same bytes with 1, 2, 4 and 8 threads"
 else
@@ -2381,7 +2410,7 @@ rd_ck "fragment 1's second archive is the same" cmp -s rd_vv1s.1.cpio rd_vvl1s.1
 rd_ck "and it has no third" test ! -e rd_vvl1s.2.cpio
 rd_ck "it was said, with the name of the directory" grep -q "ramdisk1.vol3/: the directory is not there, so that archive is left out of the ramdisk" rd_vvlo.rlog
 rd_done "ramdisk directory: deleting ramdisk1.vol3/ of a vendor_boot leaves that archive out of fragment 1 and touches nothing else"
-rm -rf rd_vvj1 rd_vvj4 && "$ABR" -j1 unpack rd_vv.img -o rd_vvj1 >/dev/null 2>&1 && "$ABR" -j4 unpack rd_vv.img -o rd_vvj4 >/dev/null 2>&1
+rm -rf rd_vvj1 rd_vvj4 && env ABR_THREADS=1 "$ABR" unpack -i rd_vv.img -o rd_vvj1 >/dev/null 2>&1 && env ABR_THREADS=4 "$ABR" unpack -i rd_vv.img -o rd_vvj4 >/dev/null 2>&1
 if diff -r --no-dereference -x manifest.txt rd_vvj1 rd_vvj4 >/dev/null && diff <(tail -n +2 rd_vvj1/manifest.txt) <(tail -n +2 rd_vvj4/manifest.txt) >/dev/null; then
     pass "ramdisk directory: unpacking fragments of several archives gives the same directories with 1 and 4 threads"
 else
@@ -2415,6 +2444,10 @@ open("fit_rd.cpio", "wb").write(g.mkbootfs(g.tree(files)))
 PYEOF
 
 fit_size() { if [ -f "$1" ]; then wc -c <"$1" | tr -d ' '; else echo 0; fi; }
+# unpack records the level a stream was made with (ramdisk_level=19) and pack compresses an edited ramdisk at that level again, so an
+# edit of an image made at the densest level fits at once. The tests of the second try are about the build that does not know the
+# level (an image made by a program whose levels abr cannot tell): they take the record out of the manifest of the unpacked directory.
+fit_forget_level() { sed -i -e '/^ramdisk[0-9]*_level=/d' -e '/^ramdisk[0-9]*_level_basis=/d' "$1/manifest.txt"; }
 fit_log_count() { grep -c -- "$1" "$2"; }  # how many lines of the log say it (grep -c exits 1 on 0: only the count is used)
 fit_avb_ok() {  # <image> <partition name> <size>: the size of the partition, abr's and avbtool's verdicts on the descriptor
     local d rc
@@ -2423,7 +2456,7 @@ fit_avb_ok() {  # <image> <partition name> <size>: the size of the partition, ab
     python3 "$AVBTOOL" verify_image --image "$d/$2.img" >"$d/out" 2>&1
     rc=$?
     rm -rf "$d"
-    [ $rc -eq 0 ] && [ "$(fit_size "$1")" = "$3" ] && said "hash check:   OK" "$ABR" info "$1"
+    [ $rc -eq 0 ] && [ "$(fit_size "$1")" = "$3" ] && said "hash check:   OK" "$ABR" info -i "$1"
 }
 fit_zstd_reads() {  # <image> <expected plain ramdisk>: the real zstd decodes the ramdisk (true where it is not installed)
     command -v zstd >/dev/null 2>&1 || return 0
@@ -2436,8 +2469,8 @@ fit_zstd_reads() {  # <image> <expected plain ramdisk>: the real zstd decodes th
 thr_dir zstd fit_rd.cpio fit_dense
 echo "ramdisk_level=19" >>fit_dense/manifest.txt
 thr_dir zstd fit_rd.cpio fit_usual
-"$ABR" repack fit_dense -o fit_dense.img >/dev/null 2>&1
-"$ABR" repack fit_usual -o fit_usual.img >/dev/null 2>&1
+"$ABR" pack -i fit_dense -o fit_dense.img >/dev/null 2>&1
+"$ABR" pack -i fit_usual -o fit_usual.img >/dev/null 2>&1
 fit_dense_size=$(fit_size fit_dense.img)
 fit_usual_size=$(fit_size fit_usual.img)
 # avbtool keeps 64 KiB for the vbmeta blob and one block for the footer: the smallest partition it
@@ -2452,8 +2485,10 @@ if python3 "$AVBTOOL" version >/dev/null 2>&1; then
     cp fit_dense.img fit_avb.img
     python3 "$AVBTOOL" add_hash_footer --image fit_avb.img --partition_size "$fit_part" --partition_name boot >/dev/null 2>&1
     rd_unpack fit_avb.img fit_avb_u
+    cp -a fit_avb_u fit_avb_lvl
+    fit_forget_level fit_avb_u
     printf 'abr test\n' >fit_avb_u/ramdisk/abr_test_file
-    "$ABR" -j4 repack fit_avb_u -o fit_avb_j4.img >fit_avb_j4.log 2>&1
+    env ABR_THREADS=4 "$ABR" pack -i fit_avb_u -o fit_avb_j4.img >fit_avb_j4.log 2>&1
     fit_rc=$?
     rd_ck "the repack worked" test "$fit_rc" = 0
     rd_ck "the image is the size of the partition" test "$(fit_size fit_avb_j4.img)" = "$fit_part"
@@ -2467,21 +2502,35 @@ if python3 "$AVBTOOL" version >/dev/null 2>&1; then
     rd_ck "nothing else in the directory changed" rd_same_tree_x fit_avb_u/ramdisk fit_avb_re/ramdisk abr_test_file
     rd_ck "GNU cpio agrees with the directory" rd_oracle fit_avb_re
     rd_ck "the real zstd reads the ramdisk" fit_zstd_reads fit_avb_j4.img fit_avb_re/ramdisk.cpio
-    "$ABR" -j1 repack fit_avb_u -o fit_avb_j1.img >/dev/null 2>&1
+    env ABR_THREADS=1 "$ABR" pack -i fit_avb_u -o fit_avb_j1.img >/dev/null 2>&1
     rd_ck "-j1 and -j4 give the same bytes" cmp -s fit_avb_j1.img fit_avb_j4.img
     rd_done "dense boot v4 with a tight AVB hash footer: an edit that does not fit at the usual level is compressed again and fits"
 
+    # With the level that unpack recorded in the manifest the same edit fits at once: the ramdisk is made at level 19 again, and nothing is
+    # said about a second try.
+    rd_ck "unpack recorded the level the ramdisk was made at" grep -q '^ramdisk_level=19$' fit_avb_lvl/manifest.txt
+    printf 'abr test\n' >fit_avb_lvl/ramdisk/abr_test_file
+    "$ABR" pack -i fit_avb_lvl -o fit_avb_lvl.img >fit_avb_lvl.log 2>&1
+    fit_rc=$?
+    rd_ck "the repack worked" test "$fit_rc" = 0
+    rd_ck "the image is the size of the partition, abr's hash check and avbtool's verify_image accept it" fit_avb_ok fit_avb_lvl.img boot "$fit_part"
+    rd_ck "no second try is announced" test "$(fit_log_count 'densely\|compressing what was edited again' fit_avb_lvl.log)" = 0
+    rd_ck "the table says the ramdisk is zstd at level 19" test "$(fit_log_count 'zstd -> ramdisk.cpio + ramdisk/ ([0-9]* bytes, level 19)' fit_avb_lvl.log)" = 1
+    rd_ck "the file is in the image" test "$("$ABR" unpack -i fit_avb_lvl.img -o fit_avb_lvl_re >/dev/null 2>&1; cat fit_avb_lvl_re/ramdisk/abr_test_file 2>/dev/null)" = "abr test"
+    rd_done "dense boot v4 with a tight AVB hash footer: the level that unpack recorded is used again, an edit fits at once and no second try is announced"
+
     # An untouched image is replayed byte for byte, and says nothing about any of this.
     rd_unpack fit_avb.img fit_avb_same
-    "$ABR" repack fit_avb_same -o fit_avb_same.img >fit_avb_same.log 2>&1
+    "$ABR" pack -i fit_avb_same -o fit_avb_same.img >fit_avb_same.log 2>&1
     rd_ck "an untouched repack is identical" cmp -s fit_avb.img fit_avb_same.img
     rd_ck "and says nothing about a second try" test "$(fit_log_count 'densely' fit_avb_same.log)" = 0
     rd_done "dense boot v4 with a tight AVB hash footer: an untouched repack is identical and no second try is announced"
 
     # More than the partition holds at any setting: refused, the error says both tries were made.
     rd_unpack fit_avb.img fit_big_u
+    fit_forget_level fit_big_u
     cp fit_noise.bin fit_big_u/ramdisk/noise.bin
-    "$ABR" repack fit_big_u -o fit_big.img >fit_big.log 2>&1
+    "$ABR" pack -i fit_big_u -o fit_big.img >fit_big.log 2>&1
     fit_rc=$?
     rd_ck "refused" test "$fit_rc" -ne 0
     rd_ck "no image is left behind" test ! -e fit_big.img
@@ -2491,13 +2540,13 @@ if python3 "$AVBTOOL" version >/dev/null 2>&1; then
 
     # A codec with no denser setting (lz4 legacy is at its densest by default): no second try, no word about one.
     thr_dir lz4_legacy fit_rd.cpio fit_lz4
-    "$ABR" repack fit_lz4 -o fit_lz4.img >/dev/null 2>&1
+    "$ABR" pack -i fit_lz4 -o fit_lz4.img >/dev/null 2>&1
     fit_lz4_part=$(($(fit_size fit_lz4.img) + 69632 + 4096))
     cp fit_lz4.img fit_lz4_avb.img
     python3 "$AVBTOOL" add_hash_footer --image fit_lz4_avb.img --partition_size "$fit_lz4_part" --partition_name boot >/dev/null 2>&1
     rd_unpack fit_lz4_avb.img fit_lz4_u
     cp fit_noise.bin fit_lz4_u/ramdisk/noise.bin
-    "$ABR" repack fit_lz4_u -o fit_lz4_big.img >fit_lz4_big.log 2>&1
+    "$ABR" pack -i fit_lz4_u -o fit_lz4_big.img >fit_lz4_big.log 2>&1
     fit_rc=$?
     rd_ck "refused" test "$fit_rc" -ne 0
     rd_ck "no image is left behind" test ! -e fit_lz4_big.img
@@ -2505,7 +2554,7 @@ if python3 "$AVBTOOL" version >/dev/null 2>&1; then
     rd_ck "no talk of a denser compression" test "$(fit_log_count 'densely\|again' fit_lz4_big.log)" = 0
     printf 'abr test\n' >fit_lz4_u/ramdisk/abr_test_file
     rm -f fit_lz4_u/ramdisk/noise.bin
-    "$ABR" repack fit_lz4_u -o fit_lz4_ok.img >fit_lz4_ok.log 2>&1
+    "$ABR" pack -i fit_lz4_u -o fit_lz4_ok.img >fit_lz4_ok.log 2>&1
     rd_ck "a small edit fits" fit_avb_ok fit_lz4_ok.img boot "$fit_lz4_part"
     rd_ck "and needs no second try" test "$(fit_log_count 'densely\|again' fit_lz4_ok.log)" = 0
     rd_done "lz4_legacy ramdisk in a tight AVB partition: an edit that does not fit is refused as before, without a second try"
@@ -2524,9 +2573,10 @@ open("fit_pad.size", "w").write(str(pad))
 PYEOF
 fit_pad=$(cat fit_pad.size)
 rd_unpack fit_pad.img fit_pad_u
+fit_forget_level fit_pad_u
 rd_ck "the padding is in the manifest" grep -q "^pad_to=$fit_pad\$" fit_pad_u/manifest.txt
 printf 'abr test\n' >fit_pad_u/ramdisk/abr_test_file
-"$ABR" repack fit_pad_u -o fit_pad_out.img >fit_pad_out.log 2>&1
+"$ABR" pack -i fit_pad_u -o fit_pad_out.img >fit_pad_out.log 2>&1
 fit_rc=$?
 rd_ck "the repack worked" test "$fit_rc" = 0
 rd_ck "the image is the size of the partition" test "$(fit_size fit_pad_out.img)" = "$fit_pad"
@@ -2538,8 +2588,9 @@ rd_ck "nothing else in the directory changed" rd_same_tree_x fit_pad_u/ramdisk f
 rd_done "dense boot v4 padded to its partition size: an edit that does not fit at the usual level is compressed again and fits"
 
 rd_unpack fit_pad.img fit_padbig_u
+fit_forget_level fit_padbig_u
 cp fit_noise.bin fit_padbig_u/ramdisk/noise.bin
-"$ABR" repack fit_padbig_u -o fit_padbig.img >fit_padbig.log 2>&1
+"$ABR" pack -i fit_padbig_u -o fit_padbig.img >fit_padbig.log 2>&1
 fit_rc=$?
 rd_ck "written all the same (the padding cannot be kept)" test "$fit_rc" = 0
 rd_ck "bigger than the partition" test "$(fit_size fit_padbig.img)" -gt "$fit_pad"
@@ -2548,12 +2599,12 @@ rd_ck "one warning, about the size" test "$(fit_log_count '^warning: rebuilt ima
 rd_done "dense boot v4 padded to its partition size: an edit that does not fit at any setting is written with a warning, as before"
 
 thr_dir lz4_legacy fit_rd.cpio fit_lz4p
-"$ABR" repack fit_lz4p -o fit_lz4p.img >/dev/null 2>&1
+"$ABR" pack -i fit_lz4p -o fit_lz4p.img >/dev/null 2>&1
 python3 -c 'import sys; open("fit_lz4pad.img", "wb").write(open("fit_lz4p.img", "rb").read() + b"\0" * 8192)'
 
 rd_unpack fit_lz4pad.img fit_lz4pad_u
 cp fit_noise.bin fit_lz4pad_u/ramdisk/noise.bin
-"$ABR" repack fit_lz4pad_u -o fit_lz4pad_out.img >fit_lz4pad_out.log 2>&1
+"$ABR" pack -i fit_lz4pad_u -o fit_lz4pad_out.img >fit_lz4pad_out.log 2>&1
 fit_rc=$?
 rd_ck "written all the same" test "$fit_rc" = 0
 rd_ck "bigger than the partition" test "$(fit_size fit_lz4pad_out.img)" -gt "$(fit_size fit_lz4pad.img)"
@@ -2568,8 +2619,8 @@ if python3 "$AVBTOOL" version >/dev/null 2>&1; then
     sed -i 's/^ramdisk0_compression=.*/ramdisk0_compression=zstd/' fit_vb/manifest.txt
     cp -a fit_vb fit_vb_dense
     echo "ramdisk0_level=19" >>fit_vb_dense/manifest.txt
-    "$ABR" repack fit_vb_dense -o fit_vb_dense.img >/dev/null 2>&1
-    "$ABR" repack fit_vb -o fit_vb_usual.img >/dev/null 2>&1
+    "$ABR" pack -i fit_vb_dense -o fit_vb_dense.img >/dev/null 2>&1
+    "$ABR" pack -i fit_vb -o fit_vb_usual.img >/dev/null 2>&1
     fit_vb_part=$((($(fit_size fit_vb_dense.img) + 4095) / 4096 * 4096 + 69632 + 4096))
     if [ "$(fit_size fit_vb_usual.img)" -le $((fit_vb_part + 4096)) ]; then
         fail "fixture for the fit tests: vendor_boot at the usual level is not clearly bigger than at the dense one"
@@ -2577,8 +2628,9 @@ if python3 "$AVBTOOL" version >/dev/null 2>&1; then
     cp fit_vb_dense.img fit_vb_avb.img
     python3 "$AVBTOOL" add_hash_footer --image fit_vb_avb.img --partition_size "$fit_vb_part" --partition_name vendor_boot >/dev/null 2>&1
     rd_unpack fit_vb_avb.img fit_vb_u
+    fit_forget_level fit_vb_u
     printf 'abr test\n' >fit_vb_u/ramdisk0/abr_test_file
-    "$ABR" repack fit_vb_u -o fit_vb_out.img >fit_vb_out.log 2>&1
+    "$ABR" pack -i fit_vb_u -o fit_vb_out.img >fit_vb_out.log 2>&1
     fit_rc=$?
     rd_ck "the repack worked" test "$fit_rc" = 0
     rd_ck "the image is the size of the partition, abr's hash check and avbtool's verify_image accept it" fit_avb_ok fit_vb_out.img vendor_boot "$fit_vb_part"
@@ -2587,8 +2639,8 @@ if python3 "$AVBTOOL" version >/dev/null 2>&1; then
     rd_unpack fit_vb_out.img fit_vb_re
     rd_ck "the file is in fragment 0" test "$(cat fit_vb_re/ramdisk0/abr_test_file 2>/dev/null)" = "abr test"
     rd_ck "fragment 1 is the same as it was" cmp -s fit_vb_u/ramdisk1.cpio fit_vb_re/ramdisk1.cpio
-    "$ABR" -j1 repack fit_vb_u -o fit_vb_j1.img >/dev/null 2>&1
-    "$ABR" -j4 repack fit_vb_u -o fit_vb_j4.img >/dev/null 2>&1
+    env ABR_THREADS=1 "$ABR" pack -i fit_vb_u -o fit_vb_j1.img >/dev/null 2>&1
+    env ABR_THREADS=4 "$ABR" pack -i fit_vb_u -o fit_vb_j4.img >/dev/null 2>&1
     rd_ck "-j1 and -j4 give the same bytes" cmp -s fit_vb_j1.img fit_vb_j4.img
     rd_done "dense vendor_boot v4 with a tight AVB hash footer: an edit to fragment 0 is compressed again and fits"
 fi
@@ -2616,7 +2668,7 @@ for vec in empty:00000000 digits:889a9615 ff:f45d7ebb ramp:be63b112; do
     krnl_want="${vec##*:}"
     python3 "$KT" make "krnl_v_$krnl_name.bin" "krnl_v_$krnl_name.img"
     rd_ck "the CRC of the $krnl_name payload, as rkcrc wrote it" test "$(python3 "$KT" crc "krnl_v_$krnl_name.bin")" = "$krnl_want"
-    rd_ck "abr reads the image of the $krnl_name payload, its CRC is the payload's" said "crc: .*0x$krnl_want (matches the payload)" "$ABR" info "krnl_v_$krnl_name.img"
+    rd_ck "abr reads the image of the $krnl_name payload, its CRC is the payload's" said "crc: .*0x$krnl_want (matches the payload)" "$ABR" info -i "krnl_v_$krnl_name.img"
 done
 rd_done "KRNL: the CRC is Rockchip's (polynomial 0x04C10DB7): the values rkcrc wrote are what the independent tool and abr compute"
 
@@ -2638,16 +2690,16 @@ rd_ck "unpacked as krnl" grep -q '^type=krnl$' krnl_u/manifest.txt
 rd_ck "ramdisk.cpio is the archive" cmp -s krnl_u/ramdisk.cpio krnl_rd.cpio
 rd_ck "and there is a directory" test -d krnl_u/ramdisk
 rd_ck "GNU cpio agrees with it" rd_oracle krnl_u
-rd_ck "the CRC is the payload's" said "(matches the payload)" "$ABR" info krnl_rd.img
-"$ABR" repack krnl_u -o krnl_back.img >krnl_back.log 2>&1
+rd_ck "the CRC is the payload's" said "(matches the payload)" "$ABR" info -i krnl_rd.img
+"$ABR" pack -i krnl_u -o krnl_back.img >krnl_back.log 2>&1
 rd_ck "an untouched repack is identical" cmp -s krnl_rd.img krnl_back.img
 rd_ck "and the real rkcrc writes the same image" krnl_ref krnl_rd.gz krnl_back.img
 rd_done "KRNL image with a gzip cpio ramdisk: unpack gives ramdisk.cpio and ramdisk/ (GNU cpio agrees), an untouched repack is identical"
 
 # Edit the directory: the CRC is made afresh, the payload is what the real tools read.
 printf 'abr test\n' >krnl_u/ramdisk/abr_test_file
-"$ABR" -j1 repack krnl_u -o krnl_e1.img >krnl_e1.log 2>&1
-"$ABR" -j4 repack krnl_u -o krnl_e4.img >krnl_e4.log 2>&1
+env ABR_THREADS=1 "$ABR" pack -i krnl_u -o krnl_e1.img >krnl_e1.log 2>&1
+env ABR_THREADS=4 "$ABR" pack -i krnl_u -o krnl_e4.img >krnl_e4.log 2>&1
 rd_ck "-j1 and -j4 give the same bytes" cmp -s krnl_e1.img krnl_e4.img
 rd_ck "the size field and the CRC are right (read by krnl_tool.py)" python3 "$KT" payload krnl_e4.img krnl_e4.gz
 gzip -dc <krnl_e4.gz >krnl_e4.cpio 2>/dev/null
@@ -2662,7 +2714,7 @@ rd_done "KRNL: a file put into ramdisk/ is in the repacked image, the CRC is rig
 # Edit ramdisk.cpio instead.
 rd_unpack krnl_rd.img krnl_u2
 printf 'abr-edit' >>krnl_u2/ramdisk.cpio
-"$ABR" repack krnl_u2 -o krnl_e2.img >/dev/null 2>&1
+"$ABR" pack -i krnl_u2 -o krnl_e2.img >/dev/null 2>&1
 rd_ck "the size field and the CRC are right" python3 "$KT" payload krnl_e2.img krnl_e2.gz
 gzip -dc <krnl_e2.gz >krnl_e2.cpio 2>/dev/null
 rd_ck "the archive is the edited one" cmp -s krnl_e2.cpio krnl_u2/ramdisk.cpio
@@ -2673,10 +2725,10 @@ rd_done "KRNL: an edited ramdisk.cpio is compressed again, the CRC is right"
 rd_unpack krnl_kernel.img krnl_k
 rd_ck "the payload is kernel" cmp -s krnl_k/kernel krnl_kernel.bin
 rd_ck "there is no ramdisk" test ! -e krnl_k/ramdisk.cpio -a ! -e krnl_k/ramdisk
-"$ABR" repack krnl_k -o krnl_k_back.img >/dev/null 2>&1
+"$ABR" pack -i krnl_k -o krnl_k_back.img >/dev/null 2>&1
 rd_ck "an untouched repack is identical" cmp -s krnl_kernel.img krnl_k_back.img
 printf 'x' >>krnl_k/kernel
-"$ABR" repack krnl_k -o krnl_k_edit.img >/dev/null 2>&1
+"$ABR" pack -i krnl_k -o krnl_k_edit.img >/dev/null 2>&1
 rd_ck "an edit: the payload is the edited kernel, the CRC is right" python3 "$KT" payload krnl_k_edit.img krnl_k_edit.bin
 rd_ck "(the same bytes)" cmp -s krnl_k_edit.bin krnl_k/kernel
 rd_ck "and the real rkcrc writes the same image" krnl_ref krnl_k_edit.bin krnl_k_edit.img
@@ -2685,7 +2737,7 @@ python3 "$KT" make krnl_kernel.gz krnl_kernelgz.img
 rd_unpack krnl_kernelgz.img krnl_kg
 rd_ck "a gzip-compressed kernel is unpacked" cmp -s krnl_kg/kernel krnl_kernel.bin
 rd_ck "and said to be gzip" grep -q '^kernel_compression=gzip$' krnl_kg/manifest.txt
-"$ABR" repack krnl_kg -o krnl_kg_back.img >/dev/null 2>&1
+"$ABR" pack -i krnl_kg -o krnl_kg_back.img >/dev/null 2>&1
 rd_ck "an untouched repack is identical" cmp -s krnl_kernelgz.img krnl_kg_back.img
 rd_done "KRNL image with a kernel (plain and gzip): kernel is the payload, an untouched repack is identical, an edit gets a right CRC"
 
@@ -2694,11 +2746,11 @@ rd_done "KRNL image with a kernel (plain and gzip): kernel is the payload, an un
 python3 "$KT" make krnl_rd.gz krnl_badcrc.img --crc 0x12345678
 rd_unpack krnl_badcrc.img krnl_bad
 rd_ck "said at unpack" grep -q 'is not the CRC of its payload' krnl_bad.log
-rd_ck "and by info" said "does NOT match the payload" "$ABR" info krnl_badcrc.img
-"$ABR" repack krnl_bad -o krnl_bad_back.img >/dev/null 2>&1
+rd_ck "and by info" said "does NOT match the payload" "$ABR" info -i krnl_badcrc.img
+"$ABR" pack -i krnl_bad -o krnl_bad_back.img >/dev/null 2>&1
 rd_ck "an untouched repack is identical (the CRC it had)" cmp -s krnl_badcrc.img krnl_bad_back.img
 printf 'abr test\n' >krnl_bad/ramdisk/abr_test_file
-"$ABR" repack krnl_bad -o krnl_bad_edit.img >/dev/null 2>&1
+"$ABR" pack -i krnl_bad -o krnl_bad_edit.img >/dev/null 2>&1
 rd_ck "an edit: the CRC is right now" python3 "$KT" payload krnl_bad_edit.img krnl_bad_edit.gz
 rd_done "KRNL image with a wrong CRC: reported, kept while the payload is untouched, right after an edit"
 
@@ -2706,10 +2758,10 @@ rd_done "KRNL image with a wrong CRC: reported, kept while the payload is untouc
 python3 "$KT" make krnl_rd.gz krnl_part.img --size 262144
 rd_unpack krnl_part.img krnl_p
 rd_ck "the fill is in the manifest" grep -q '^pad_to=262144$' krnl_p/manifest.txt
-"$ABR" repack krnl_p -o krnl_p_back.img >/dev/null 2>&1
+"$ABR" pack -i krnl_p -o krnl_p_back.img >/dev/null 2>&1
 rd_ck "an untouched repack is identical" cmp -s krnl_part.img krnl_p_back.img
 printf 'abr test\n' >krnl_p/ramdisk/abr_test_file
-"$ABR" repack krnl_p -o krnl_p_edit.img >/dev/null 2>&1
+"$ABR" pack -i krnl_p -o krnl_p_edit.img >/dev/null 2>&1
 rd_ck "an edit keeps the size of the partition" test "$(wc -c <krnl_p_edit.img | tr -d ' ')" = 262144
 rd_ck "and the CRC is right" python3 "$KT" payload krnl_p_edit.img krnl_p_edit.gz
 rd_done "KRNL image padded to its partition size: the fill is kept, also after an edit"
@@ -2717,14 +2769,14 @@ rd_done "KRNL image padded to its partition size: the fill is kept, also after a
 # Not an image: a cut-short file is refused, and no directory is left behind.
 head -c 5000 krnl_rd.img >krnl_cut.img
 rm -rf krnl_cut
-"$ABR" unpack krnl_cut.img -o krnl_cut >krnl_cut.out 2>&1
+"$ABR" unpack -i krnl_cut.img -o krnl_cut >krnl_cut.out 2>&1
 krnl_rc=$?
 rd_ck "refused" test "$krnl_rc" -ne 0
 rd_ck "with the reason" grep -q 'cut short' krnl_cut.out
 rd_ck "no directory is left behind" test ! -e krnl_cut
 mkdir -p krnl_cut2
 printf 'mine' >krnl_cut2/keep.txt
-"$ABR" unpack krnl_cut.img -o krnl_cut2 >/dev/null 2>&1
+"$ABR" unpack -i krnl_cut.img -o krnl_cut2 >/dev/null 2>&1
 rd_ck "a directory that was there is not removed" test "$(cat krnl_cut2/keep.txt)" = "mine"
 rd_done "KRNL image cut short: refused with a reason, a directory the failed unpack made is removed, one that was there stays"
 
@@ -2767,8 +2819,8 @@ rd_ck "AIK's unpatching commands run" amo_aik_unpatch amo.img amo_unpatched.img 
 rd_ck "they give the boot image the patch was put on" cmp -s amo_unpatched.img amo_plain.img
 rd_ck "and the microloader" cmp -s amo_ml_back.bin amo_ml.bin
 rd_ck "identify names the patch" said "AMONET header" "$ABR" identify amo.img
-rd_ck "info says what it is and still reads the header at 1024" said "header_version: 0" "$ABR" info amo.img
-rd_ck "info names the wrapper" said "wrapper: AMONET patch" "$ABR" info amo.img
+rd_ck "info says what it is and still reads the header at 1024" said "header_version: 0" "$ABR" info -i amo.img
+rd_ck "info names the wrapper" said "wrapper: AMONET patch" "$ABR" info -i amo.img
 rd_done "AMONET: the images of the tests are made and unmade by AIK's own dd/truncate/cat commands; identify and info see the patch"
 
 rd_unpack amo.img amo_u
@@ -2784,19 +2836,19 @@ rd_unpack amo_unpatched.img amo_u0
 rd_ck "the same image without the patch has the same manifest, but for the patch" \
     test "$(grep -v '^#\|^has_amonet\|^amonet_' amo_u/manifest.txt)" = "$(grep -v '^#' amo_u0/manifest.txt)"
 rd_ck "and the same files" diff -r --no-dereference -x manifest.txt -x microloader.bin amo_u amo_u0
-"$ABR" repack amo_u -o amo_back.img >amo_back.log 2>&1
+"$ABR" pack -i amo_u -o amo_back.img >amo_back.log 2>&1
 rd_ck "an untouched repack is identical" cmp -s amo.img amo_back.img
 rd_done "AMONET image: unpacked under the patch (microloader.bin; the boot image as AIK's unpatching leaves it), an untouched repack is identical"
 
 # An edit: the image is what AIK's patching makes of the plain repack.
 printf 'abr test\n' >amo_u/ramdisk/abr_test_file
-"$ABR" -j1 repack amo_u -o amo_e1.img >amo_e1.log 2>&1
-"$ABR" -j4 repack amo_u -o amo_e4.img >amo_e4.log 2>&1
+env ABR_THREADS=1 "$ABR" pack -i amo_u -o amo_e1.img >amo_e1.log 2>&1
+env ABR_THREADS=4 "$ABR" pack -i amo_u -o amo_e4.img >amo_e4.log 2>&1
 rd_ck "-j1 and -j4 give the same bytes" cmp -s amo_e1.img amo_e4.img
 rm -rf amo_up
 cp -r amo_u amo_up
 sed 's/^has_amonet=true$/has_amonet=false/' amo_u/manifest.txt >amo_up/manifest.txt
-"$ABR" repack amo_up -o amo_e_plain.img >/dev/null 2>&1
+"$ABR" pack -i amo_up -o amo_e_plain.img >/dev/null 2>&1
 rd_ck "the plain repack (patch left out) starts with ANDROID!" test "$(head -c 8 amo_e_plain.img)" = "ANDROID!"
 amo_aik_patch amo_e_plain.img amo_ml.bin amo_e_expect.img
 rd_ck "the edited image is what AIK's patching makes of it" cmp -s amo_e4.img amo_e_expect.img
@@ -2811,7 +2863,7 @@ rd_unpack amo_plain.img amo_p
 rd_ck "an ordinary image has no patch" test "$(grep -c '^has_amonet' amo_p/manifest.txt)" = 0
 cp amo_ml.bin amo_p/microloader.bin
 printf 'has_amonet=true\namonet_microloader_file=microloader.bin\n' >>amo_p/manifest.txt
-"$ABR" repack amo_p -o amo_p.img >/dev/null 2>&1
+"$ABR" pack -i amo_p -o amo_p.img >/dev/null 2>&1
 rd_ck "the image the manifest makes is the patched one AIK makes" cmp -s amo_p.img amo.img
 rd_done "AMONET: has_amonet=true and a microloader.bin turn the unpack of an ordinary image into the patched image AIK makes"
 
@@ -2819,7 +2871,7 @@ rd_done "AMONET: has_amonet=true and a microloader.bin turn the unpack of an ord
 rm -rf amo_v2
 cp -r amo_u amo_v2
 sed 's/^header_version=0$/header_version=2/' amo_u/manifest.txt >amo_v2/manifest.txt
-"$ABR" repack amo_v2 -o amo_v2.img >amo_v2.log 2>&1
+"$ABR" pack -i amo_v2 -o amo_v2.img >amo_v2.log 2>&1
 amo_rc=$?
 rd_ck "a header longer than 1024 bytes is refused" test "$amo_rc" -ne 0
 rd_ck "with the reason" grep -q 'would overwrite' amo_v2.log
@@ -2827,16 +2879,16 @@ rd_ck "and the way out" grep -q 'has_amonet=false' amo_v2.log
 rd_ck "no image is written" test ! -e amo_v2.img
 sed 's/^has_amonet=true$/has_amonet=false/' amo_v2/manifest.txt >amo_v2/manifest.new
 mv -f amo_v2/manifest.new amo_v2/manifest.txt
-"$ABR" repack amo_v2 -o amo_v2.img >/dev/null 2>&1
+"$ABR" pack -i amo_v2 -o amo_v2.img >/dev/null 2>&1
 rd_ck "the way out works: an image that starts with ANDROID!" test "$(head -c 8 amo_v2.img 2>/dev/null)" = "ANDROID!"
 rm -rf amo_nm
 cp -r amo_u amo_nm
 rm -f amo_nm/microloader.bin
-"$ABR" repack amo_nm -o amo_nm.img >amo_nm.log 2>&1
+"$ABR" pack -i amo_nm -o amo_nm.img >amo_nm.log 2>&1
 amo_rc=$?
 rd_ck "a microloader that is not there is refused" test "$amo_rc" -ne 0
 head -c 1000 amo_ml.bin >amo_nm/microloader.bin
-"$ABR" repack amo_nm -o amo_nm.img >amo_nm.log 2>&1
+"$ABR" pack -i amo_nm -o amo_nm.img >amo_nm.log 2>&1
 amo_rc=$?
 rd_ck "a microloader of 1000 bytes is refused" test "$amo_rc" -ne 0
 rd_ck "with the reason" grep -q 'exactly 1024 bytes' amo_nm.log
@@ -2845,22 +2897,22 @@ rd_ck "with the reason" grep -q 'exactly 1024 bytes' amo_nm.log
 rm -f amo_nm.img
 for amo_ml_case in zeros noise; do
     if [ "$amo_ml_case" = zeros ]; then head -c 1024 /dev/zero >amo_nm/microloader.bin; else head -c 1024 /dev/urandom | tr 'm' 'M' >amo_nm/microloader.bin; fi
-    "$ABR" repack amo_nm -o amo_nm.img >amo_nm.log 2>&1
+    "$ABR" pack -i amo_nm -o amo_nm.img >amo_nm.log 2>&1
     amo_rc=$?
     rd_ck "a microloader of 1024 bytes ($amo_ml_case) that has not the word that tells the patch is refused" test "$amo_rc" -ne 0
     rd_ck "with the reason, and the way out ($amo_ml_case)" grep -q 'the word "microloader".*has_amonet=false' amo_nm.log
     rd_ck "and no image is written ($amo_ml_case)" test ! -e amo_nm.img
 done
 { head -c 200 /dev/zero; printf 'microloader'; head -c 813 /dev/zero; } >amo_nm/microloader.bin
-"$ABR" repack amo_nm -o amo_nm.img >amo_nm.log 2>&1
+"$ABR" pack -i amo_nm -o amo_nm.img >amo_nm.log 2>&1
 rd_ck "the word anywhere behind byte 96 is enough" test -s amo_nm.img
 rm -rf amo_nm_u
-"$ABR" unpack amo_nm.img -o amo_nm_u >amo_nm_u.log 2>&1
+"$ABR" unpack -i amo_nm.img -o amo_nm_u >amo_nm_u.log 2>&1
 rd_ck "and the image is unpacked as the patched one it is" grep -q '^has_amonet=true$' amo_nm_u/manifest.txt
 rd_ck "with that microloader" cmp -s amo_nm_u/microloader.bin amo_nm/microloader.bin
 head -c 1500 amo.img >amo_cut.img
 rm -rf amo_cut
-"$ABR" unpack amo_cut.img -o amo_cut >amo_cut.out 2>&1
+"$ABR" unpack -i amo_cut.img -o amo_cut >amo_cut.out 2>&1
 amo_rc=$?
 rd_ck "a patched image cut short is refused" test "$amo_rc" -ne 0
 rd_ck "with the reason" grep -q 'cut short' amo_cut.out
@@ -2872,10 +2924,10 @@ cp amo.img amo_part.img
 truncate -s 1048576 amo_part.img
 rd_unpack amo_part.img amo_pp
 rd_ck "the fill is in the manifest" grep -q '^pad_to=1048576$' amo_pp/manifest.txt
-"$ABR" repack amo_pp -o amo_pp_back.img >/dev/null 2>&1
+"$ABR" pack -i amo_pp -o amo_pp_back.img >/dev/null 2>&1
 rd_ck "an untouched repack is identical" cmp -s amo_part.img amo_pp_back.img
 printf 'abr test\n' >amo_pp/ramdisk/abr_test_file
-"$ABR" repack amo_pp -o amo_pp_edit.img >/dev/null 2>&1
+"$ABR" pack -i amo_pp -o amo_pp_edit.img >/dev/null 2>&1
 rd_ck "an edit keeps the size of the partition" test "$(wc -c <amo_pp_edit.img | tr -d ' ')" = 1048576
 head -c 1024 amo_pp_edit.img >amo_pp_edit.ml
 rd_ck "and the microloader" cmp -s amo_pp_edit.ml amo_ml.bin
@@ -2892,7 +2944,7 @@ rd_unpack amo_dhtb.img amo_d
 rd_ck "both wrappers are in the manifest" grep -q '^has_dhtb=true$' amo_d/manifest.txt
 rd_ck "(the patch)" grep -q '^has_amonet=true$' amo_d/manifest.txt
 rd_ck "and are named" grep -q 'unpacked dhtb-wrapped amonet-patched boot' amo_d.log
-"$ABR" repack amo_d -o amo_d_back.img >/dev/null 2>&1
+"$ABR" pack -i amo_d -o amo_d_back.img >/dev/null 2>&1
 rd_ck "an untouched repack is identical" cmp -s amo_dhtb.img amo_d_back.img
 rd_done "AMONET under a DHTB wrapper: both are taken off and put back, the round trip is exact"
 
@@ -2941,8 +2993,8 @@ python3 -I "$BTL" make blob_aik.img --secure 0:0 LNX=amo_plain.img
 rd_ck "the blob the independent tool writes is what blobpack and AIK's 28 bytes make" blob_ref_make amo_plain.img LNX blob_aik.img
 rd_ck "blobunpack finds the boot image in its partition" blob_ref_extract blob_aik.img LNX amo_plain.img
 rd_ck "identify: BLOB signing" said "BLOB signing" "$ABR" identify blob_aik.img
-rd_ck "info names the wrapper and the partition" said "wrapper: ASUS blob (signed header, partition LNX" "$ABR" info blob_aik.img
-rd_ck "and still reads the boot image inside" said "header_version: 0" "$ABR" info blob_aik.img
+rd_ck "info names the wrapper and the partition" said "wrapper: ASUS blob (signed header, partition LNX" "$ABR" info -i blob_aik.img
+rd_ck "and still reads the boot image inside" said "header_version: 0" "$ABR" info -i blob_aik.img
 rd_done "BLOB: the signed blob Android Image Kitchen makes (28 bytes + blobpack's blob) is what the independent tool writes; identify and info see the wrapper"
 
 # A blob with a boot image in its only partition (AIK's case): the blob is a wrapper, the directory is the image's.
@@ -2955,18 +3007,18 @@ rd_unpack amo_plain.img blob_u0
 rd_ck "the boot image alone unpacks to the same files" rd_same_tree_x blob_u blob_u0 manifest.txt
 rd_ck "and the same manifest, but for the blob" \
     test "$(grep -v '^#\|^has_blob\|^blob_' blob_u/manifest.txt)" = "$(grep -v '^#' blob_u0/manifest.txt)"
-"$ABR" repack blob_u -o blob_back.img >blob_back.log 2>&1
+"$ABR" pack -i blob_u -o blob_back.img >blob_back.log 2>&1
 rd_ck "an untouched repack is identical" cmp -s blob_aik.img blob_back.img
 rd_done "BLOB around a boot image (AIK's case): unpacked as that image with has_blob=true, an untouched repack is identical"
 
 # An edit: the blob is what the independent tool (and blobpack) make of the plain repack.
 printf 'abr test\n' >blob_u/ramdisk/abr_test_file
 head -c 9000 /dev/urandom >blob_u/ramdisk/blob_big_file  # more than a page, so the blob grows
-"$ABR" repack blob_u -o blob_e.img >blob_e.log 2>&1
+"$ABR" pack -i blob_u -o blob_e.img >blob_e.log 2>&1
 rm -rf blob_up
 cp -r blob_u blob_up
 sed 's/^has_blob=true$/has_blob=false/' blob_u/manifest.txt >blob_up/manifest.txt
-"$ABR" repack blob_up -o blob_e_plain.img >/dev/null 2>&1
+"$ABR" pack -i blob_up -o blob_e_plain.img >/dev/null 2>&1
 rd_ck "the plain repack (blob left out) is a boot image" test "$(head -c 8 blob_e_plain.img)" = "ANDROID!"
 rd_ck "and the blob is bigger than the one before" test "$(blob_size blob_e.img)" -gt "$(blob_size blob_aik.img)"
 python3 -I "$BTL" make blob_e_expect.img --secure 0:0 LNX=blob_e_plain.img
@@ -2985,11 +3037,11 @@ rd_unpack blob_sig.img blob_s
 rd_ck "unpacked as the boot image inside" grep -q '^type=boot$' blob_s/manifest.txt
 rd_ck "siglen is in the manifest" grep -q '^blob_secure_siglen=0x100$' blob_s/manifest.txt
 rd_ck "the signature is a file" cmp -s blob_s/blob_tail.bin blob_sig.bin
-"$ABR" repack blob_s -o blob_s_back.img >blob_s_back.log 2>&1
+"$ABR" pack -i blob_s -o blob_s_back.img >blob_s_back.log 2>&1
 rd_ck "an untouched repack says nothing about the signature" test "$(grep -c 'signature' blob_s_back.log)" = 0
 rd_ck "and is identical, signature included" cmp -s blob_sig.img blob_s_back.img
 head -c 9000 /dev/urandom >blob_s/ramdisk/blob_big_file
-"$ABR" repack blob_s -o blob_s_edit.img >blob_s_edit.log 2>&1
+"$ABR" pack -i blob_s -o blob_s_edit.img >blob_s_edit.log 2>&1
 rd_ck "an edit: the blob is one the independent reader takes" python3 -I "$BTL" list blob_s_edit.img
 rd_ck "datalen follows the length of the blob" blob_datalen_is_blob_length blob_s_edit.img
 rd_ck "siglen is as it was" said "siglen=256" python3 -I "$BTL" list blob_s_edit.img
@@ -3002,7 +3054,7 @@ python3 -I "$BTL" make blob_bare.img LNX=amo_plain.img
 rd_ck "identify names it" said "MSM-RADIO-UPDATE blob" "$ABR" identify blob_bare.img
 rd_unpack blob_bare.img blob_b
 rd_ck "unpacked as the boot image inside, with no signed header" grep -q '^blob_secure=false$' blob_b/manifest.txt
-"$ABR" repack blob_b -o blob_b_back.img >/dev/null 2>&1
+"$ABR" pack -i blob_b -o blob_b_back.img >/dev/null 2>&1
 rd_ck "an untouched repack is identical" cmp -s blob_bare.img blob_b_back.img
 rd_ck "blobunpack reads it too" blob_ref_extract blob_bare.img LNX amo_plain.img
 rd_done "BLOB without the signing header: recognised, unpacked, an untouched repack is identical"
@@ -3015,11 +3067,11 @@ rd_ck "a file for each partition" test -f blob_m/part0_EBT.bin -a -f blob_m/part
 rd_ck "(EBT)" cmp -s blob_m/part0_EBT.bin blob_ebt.bin
 rd_ck "(LNX)" cmp -s blob_m/part1_LNX.bin amo_plain.img
 rd_ck "(APP)" cmp -s blob_m/part2_APP.bin blob_app.bin
-rd_ck "info lists them, and says which one is an image" said "\[1\] LNX: $(blob_size amo_plain.img) bytes, version 1, boot" "$ABR" info blob_multi.img
-"$ABR" repack blob_m -o blob_m_back.img >/dev/null 2>&1
+rd_ck "info lists them, and says which one is an image" said "\[1\] LNX: $(blob_size amo_plain.img) bytes, version 1, boot" "$ABR" info -i blob_multi.img
+"$ABR" pack -i blob_m -o blob_m_back.img >/dev/null 2>&1
 rd_ck "an untouched repack is identical" cmp -s blob_multi.img blob_m_back.img
 head -c 3000 /dev/urandom >blob_m/part0_EBT.bin  # another size: the offsets after it move
-"$ABR" repack blob_m -o blob_m_e.img >/dev/null 2>&1
+"$ABR" pack -i blob_m -o blob_m_e.img >/dev/null 2>&1
 rd_ck "an edit: the layout is the one blobpack writes (the independent reader)" python3 -I "$BTL" list blob_m_e.img
 python3 -I "$BTL" make blob_m_expect.img --secure 0:0 EBT=blob_m/part0_EBT.bin LNX=amo_plain.img APP=blob_app.bin
 rd_ck "and the independent tool makes the same file" cmp -s blob_m_e.img blob_m_expect.img
@@ -3028,13 +3080,13 @@ rd_ck "and the last" blob_ref_extract blob_m_e.img APP blob_app.bin
 python3 -I "$BTL" make blob_sos.img SOS=blob_app.bin
 rd_unpack blob_sos.img blob_sos
 rd_ck "one partition that is no image: a directory of its own" grep -q '^type=blob$' blob_sos/manifest.txt
-"$ABR" repack blob_sos -o blob_sos_back.img >/dev/null 2>&1
+"$ABR" pack -i blob_sos -o blob_sos_back.img >/dev/null 2>&1
 rd_ck "an untouched repack is identical" cmp -s blob_sos.img blob_sos_back.img
 python3 -I "$BTL" make blob_odd.img 0x61006200=blob_app.bin 0x01020304@7=blob_ebt.bin
 rd_unpack blob_odd.img blob_o
 rd_ck "names that are no words are kept as hex" grep -q '^blob_part0_name_hex=61006200$' blob_o/manifest.txt
 rd_ck "(and the version of a partition)" grep -q '^blob_part1_version=7$' blob_o/manifest.txt
-"$ABR" repack blob_o -o blob_o_back.img >/dev/null 2>&1
+"$ABR" pack -i blob_o -o blob_o_back.img >/dev/null 2>&1
 rd_ck "an untouched repack is identical" cmp -s blob_odd.img blob_o_back.img
 rd_done "BLOB with several partitions (or one that is no image): type=blob, a file per partition, an edit moves the offsets the way blobpack lays them out"
 
@@ -3044,7 +3096,7 @@ rd_unpack blob_amo.img blob_a
 rd_ck "both wrappers are in the manifest" grep -q '^has_blob=true$' blob_a/manifest.txt
 rd_ck "(the patch)" grep -q '^has_amonet=true$' blob_a/manifest.txt
 rd_ck "and are named" grep -q 'unpacked blob-wrapped amonet-patched boot' blob_a.log
-"$ABR" repack blob_a -o blob_a_back.img >/dev/null 2>&1
+"$ABR" pack -i blob_a -o blob_a_back.img >/dev/null 2>&1
 rd_ck "an untouched repack is identical" cmp -s blob_amo.img blob_a_back.img
 python3 -I - <<'PYEOF'
 import hashlib, struct
@@ -3054,14 +3106,14 @@ open("blob_dhtb.img", "wb").write(header + b"\x00" * (512 - len(header)) + paylo
 PYEOF
 rd_unpack blob_dhtb.img blob_d
 rd_ck "three wrappers, named in the order they come off" grep -q 'unpacked dhtb-wrapped blob-wrapped amonet-patched boot' blob_d.log
-"$ABR" repack blob_d -o blob_d_back.img >/dev/null 2>&1
+"$ABR" pack -i blob_d -o blob_d_back.img >/dev/null 2>&1
 rd_ck "an untouched repack is identical" cmp -s blob_dhtb.img blob_d_back.img
 rd_done "BLOB around an AMONET-patched image (and under DHTB): the wrappers are taken off and put back in order, the round trip is exact"
 
 # What is not read is refused with a reason, and leaves nothing behind.
 head -c "$(($(blob_size blob_aik.img) / 2))" blob_aik.img >blob_cut.img
 rm -rf blob_cut
-"$ABR" unpack blob_cut.img -o blob_cut >blob_cut.out 2>&1
+"$ABR" unpack -i blob_cut.img -o blob_cut >blob_cut.out 2>&1
 blob_rc=$?
 rd_ck "a blob cut short is refused" test "$blob_rc" -ne 0
 rd_ck "with the reason" grep -q 'cut short' blob_cut.out
@@ -3076,7 +3128,7 @@ d[28 + offset:28 + offset] = b"\xde\xad\xbe\xef"  # four bytes between the table
 open("blob_gap.img", "wb").write(bytes(d))
 PYEOF
 rm -rf blob_gap
-"$ABR" unpack blob_gap.img -o blob_gap >blob_gap.out 2>&1
+"$ABR" unpack -i blob_gap.img -o blob_gap >blob_gap.out 2>&1
 blob_rc=$?
 rd_ck "a blob with a gap before its data is refused" test "$blob_rc" -ne 0
 rd_ck "with the reason" grep -q 'where blobpack puts it' blob_gap.out
@@ -3085,7 +3137,7 @@ rd_ck "and no directory is left behind" test ! -e blob_gap
 printf -- '-SIGNED-BY-SIGNBLOB-\0\0\0\0\0\0\0\0' >blob_nothing.img
 head -c 4000 /dev/zero >>blob_nothing.img
 rm -rf blob_nothing
-"$ABR" unpack blob_nothing.img -o blob_nothing >blob_nothing.out 2>&1
+"$ABR" unpack -i blob_nothing.img -o blob_nothing >blob_nothing.out 2>&1
 blob_rc=$?
 rd_ck "the signing header with no blob behind it is refused" test "$blob_rc" -ne 0
 rd_ck "with the reason" grep -q 'no "MSM-RADIO-UPDATE" blob behind it' blob_nothing.out
@@ -3182,7 +3234,7 @@ osip_sectors_ok() {  # <image without a fill>: the header's sector count is the 
 osip_refuse() {  # <name> <unpack dir> <pattern>: repack of that (damaged) directory is refused with that reason and writes no image
     local out rc
     rm -f "osip_rf_$1.img"
-    out="$("$ABR" repack "$2" -o "osip_rf_$1.img" 2>&1)"
+    out="$("$ABR" pack -i "$2" -o "osip_rf_$1.img" 2>&1)"
     rc=$?
     [ "$rc" -ne 0 ] && [ ! -e "osip_rf_$1.img" ] && grep -q -- "$3" <<<"$out"
 }
@@ -3209,17 +3261,17 @@ for v in $OSIP_VARIANTS; do
     rd_ck "$n: and a directory" test -f "osip_u_$n/ramdisk/init.rc"
     rd_ck "$n: header, signature, bootstub, kernel and ramdisk are what the image holds" osip_agree "osip_$n.img" "osip_u_$n"
     rd_ck "$n: unpack says an untouched repack is exact" grep -q 'reproduces this image byte-for-byte' "osip_u_$n.log"
-    "$ABR" repack "osip_u_$n" -o "osip_r_$n.img" >"osip_r_$n.log" 2>&1
+    "$ABR" pack -i "osip_u_$n" -o "osip_r_$n.img" >"osip_r_$n.log" 2>&1
     rd_ck "$n: an untouched repack is identical" cmp -s "osip_$n.img" "osip_r_$n.img"
 done
-rd_ck "info: the header and its checksum" said "header: *512 bytes, boot (unsigned), [0-9]* sectors, checksum OK" "$ABR" info osip_u4.img
-rd_ck "info: a signed image" said "header: *512 bytes, boot (signed), [0-9]* sectors, checksum OK" "$ABR" info osip_s480.img
-rd_ck "info: its signature" said "signature: *480 bytes" "$ABR" info osip_s480.img
-rd_ck "info: the bootstub" said "bootstub: *8192 bytes" "$ABR" info osip_u8.img
-rd_ck "info: the kernel" said "kernel: *600000 bytes" "$ABR" info osip_u4.img
-rd_ck "info: the ramdisk" said "ramdisk: *[0-9]* bytes (gzip)" "$ABR" info osip_u4.img
-rd_ck "info: the cmdline" said "cmdline: *$OSIP_CMD" "$ABR" info osip_u4.img
-rd_ck "info: no header" said "header: *none" "$ABR" info osip_h4.img
+rd_ck "info: the header and its checksum" said "header: *512 bytes, boot (unsigned), [0-9]* sectors, checksum OK" "$ABR" info -i osip_u4.img
+rd_ck "info: a signed image" said "header: *512 bytes, boot (signed), [0-9]* sectors, checksum OK" "$ABR" info -i osip_s480.img
+rd_ck "info: its signature" said "signature: *480 bytes" "$ABR" info -i osip_s480.img
+rd_ck "info: the bootstub" said "bootstub: *8192 bytes" "$ABR" info -i osip_u8.img
+rd_ck "info: the kernel" said "kernel: *600000 bytes" "$ABR" info -i osip_u4.img
+rd_ck "info: the ramdisk" said "ramdisk: *[0-9]* bytes (gzip)" "$ABR" info -i osip_u4.img
+rd_ck "info: the cmdline" said "cmdline: *$OSIP_CMD" "$ABR" info -i osip_u4.img
+rd_ck "info: no header" said "header: *none" "$ABR" info -i osip_h4.img
 rd_done "OSIP: images with a header (unsigned, a signature of 480, 728 or 1024 bytes, a bootstub of 4096 or 8192) and without one, as mboot packs them: the independent tool makes the same bytes, identify and info see them, the pieces are those mboot reads, an untouched repack is identical"
 
 # An edit: the ramdisk is built from the directory, the sizes in the header follow, and the result is what mboot
@@ -3259,7 +3311,7 @@ for v in hs1024:1024 hs728_8:728; do
     rd_ck "$n: the size of the signature" grep -q "^osip_signature_size=$size\$" "osip_u_$n/manifest.txt"
     rd_ck "$n: the signature is the first bytes of the image" test "$(head -c "$size" "osip_$n.img" | cmp -s - "osip_u_$n/osip_sig.bin" && echo same)" = same
     rd_ck "$n: no header" test ! -e "osip_u_$n/osip_header.bin"
-    "$ABR" repack "osip_u_$n" -o "osip_r_$n.img" >/dev/null 2>&1
+    "$ABR" pack -i "osip_u_$n" -o "osip_r_$n.img" >/dev/null 2>&1
     rd_ck "$n: an untouched repack is identical" cmp -s "osip_$n.img" "osip_r_$n.img"
     rm -rf "osip_e_$n"
     cp -a "osip_u_$n" "osip_e_$n"
@@ -3277,7 +3329,7 @@ rd_done "OSIP: a signed image without a header (the layout comes from the bootst
 rm -rf osip_nosig
 cp -a osip_u_s480 osip_nosig
 sed -i '/^osip_signature_file=/d' osip_nosig/manifest.txt
-"$ABR" repack osip_nosig -o osip_nosig.img >osip_nosig.log 2>&1
+"$ABR" pack -i osip_nosig -o osip_nosig.img >osip_nosig.log 2>&1
 osip_make osip_nosig_ref.img s none 4
 rd_ck "no signature: the image is the pieces without it, as the independent tool packs them" cmp -s osip_nosig.img osip_nosig_ref.img
 rd_ck "(and mboot)" osip_mboot_make osip_nosig.img s none 4
@@ -3289,7 +3341,7 @@ rm -rf osip_addsig
 cp -a osip_u_u4 osip_addsig
 cp osip_sig480.bin osip_addsig/osip_sig.bin
 printf 'osip_signature_file=osip_sig.bin\n' >>osip_addsig/manifest.txt
-"$ABR" repack osip_addsig -o osip_addsig.img >osip_addsig.log 2>&1
+"$ABR" pack -i osip_addsig -o osip_addsig.img >osip_addsig.log 2>&1
 osip_make osip_addsig_ref.img u 480 4
 rd_ck "a signature put in: the image is the pieces with it, as the independent tool packs them" cmp -s osip_addsig.img osip_addsig_ref.img
 rd_ck "(and mboot)" osip_mboot_make osip_addsig.img u 480 4
@@ -3297,7 +3349,7 @@ rd_ck "the mark of a signed image is behind the parameter" test "$(od -An -tx1 -
 rd_ck "it is a fixed point of mboot" osip_fixpoint osip_addsig.img
 rd_ck "the header is kept as mboot keeps it, and the repack says so" grep -q 'still says "boot (unsigned)"' osip_addsig.log
 rd_ck "a signature that was not there is not a stale one" test -z "$(grep 'describes the ORIGINAL' osip_addsig.log)"
-rd_ck "the new signature is read back" said "signature: *480 bytes" "$ABR" info osip_addsig.img
+rd_ck "the new signature is read back" said "signature: *480 bytes" "$ABR" info -i osip_addsig.img
 rd_done "OSIP: taking the signature away (unsigned bit, mark, sector count and checksum follow) and putting one in give what mboot packs of the same pieces"
 
 # An image inside a partition: the fill behind the image proper (and the padding up to a whole sector) is the
@@ -3312,8 +3364,8 @@ for k in ff:'\377' 00:'\000'; do
     fillchar="${k#*:}"
     rd_ck "$f: identify" said "OSIP bootimg, boot (unsigned)" "$ABR" identify "osip_part_$f.img"
     rd_unpack "osip_part_$f.img" "osip_pu_$f"
-    rd_ck "$f: info says the fill" said "padding:" "$ABR" info "osip_part_$f.img"
-    "$ABR" repack "osip_pu_$f" -o "osip_pr_$f.img" >/dev/null 2>&1
+    rd_ck "$f: info says the fill" said "padding:" "$ABR" info -i "osip_part_$f.img"
+    "$ABR" pack -i "osip_pu_$f" -o "osip_pr_$f.img" >/dev/null 2>&1
     rd_ck "$f: an untouched repack is identical" cmp -s "osip_part_$f.img" "osip_pr_$f.img"
     rm -rf "osip_pe_$f"
     cp -a "osip_pu_$f" "osip_pe_$f"
@@ -3327,7 +3379,7 @@ done
 rm -rf osip_pe_big
 cp -a osip_pu_ff osip_pe_big
 head -c 3000000 /dev/urandom >osip_pe_big/ramdisk/osip_huge_file
-"$ABR" repack osip_pe_big -o osip_pe_big.img >osip_pe_big.rlog 2>&1
+"$ABR" pack -i osip_pe_big -o osip_pe_big.img >osip_pe_big.rlog 2>&1
 rd_ck "an edit that outgrows the partition is built and the size is said" grep -q 'larger than the original' osip_pe_big.rlog
 rd_done "OSIP: an image in a partition (0xFF or 0x00 fill): an untouched repack is identical, an edit keeps the size of the partition and the fill, one that outgrows it is said"
 
@@ -3342,14 +3394,14 @@ for k in sp:"init=/init quiet" nl:'"console=ttyS0\tquiet"'; do
     rd_unpack "osip_$f.img" "osip_cu_$f"
     rd_ck "$f: the manifest has the text without the white space at its ends" osip_cmd_is "osip_cu_$f" "$text"
     rd_ck "$f: the block is a file of its own" grep -q '^osip_cmdline_file=osip_cmdline.bin$' "osip_cu_$f/manifest.txt"
-    "$ABR" repack "osip_cu_$f" -o "osip_cr_$f.img" >/dev/null 2>&1
+    "$ABR" pack -i "osip_cu_$f" -o "osip_cr_$f.img" >/dev/null 2>&1
     rd_ck "$f: an untouched repack is identical" cmp -s "osip_$f.img" "osip_cr_$f.img"
 done
 rd_ck "the plain cmdline has no file of its own" test ! -e osip_u_u4/osip_cmdline.bin
 rm -rf osip_ce
 cp -a osip_cu_sp osip_ce
 sed -i 's/^cmdline=.*/cmdline=init=\/init quiet debug/' osip_ce/manifest.txt
-"$ABR" repack osip_ce -o osip_ce.img >/dev/null 2>&1
+"$ABR" pack -i osip_ce -o osip_ce.img >/dev/null 2>&1
 rd_ck "an edited cmdline is what the image has" test "$(python3 -I "$OTL" list osip_ce.img | sed -n 's/^cmdline //p')" = "init=/init quiet debug"
 rd_ck "(its size did not change: neither did the header)" test "$(head -c 512 osip_ce.img | cmp -s - osip_cu_sp/osip_header.bin && echo same)" = same
 rd_ck "mboot reads it" osip_fixpoint osip_ce.img
@@ -3376,23 +3428,23 @@ open("osip_badsec.img", "wb").write(bytes(e))
 PYEOF
 for k in badck badsec; do
     rd_unpack "osip_$k.img" "osip_hu_$k"
-    "$ABR" repack "osip_hu_$k" -o "osip_hr_$k.img" >/dev/null 2>&1
+    "$ABR" pack -i "osip_hu_$k" -o "osip_hr_$k.img" >/dev/null 2>&1
     rd_ck "$k: an untouched repack is identical" cmp -s "osip_$k.img" "osip_hr_$k.img"
     rd_ck "$k: the independent tool finds it wrong" test "$(python3 -I "$OTL" check "osip_$k.img" >/dev/null 2>&1; echo $?)" = 1
     rm -rf "osip_he_$k"
     cp -a "osip_hu_$k" "osip_he_$k"
     sed -i 's/^cmdline=.*/cmdline=init=\/init quiet debug and a longer one/' "osip_he_$k/manifest.txt"
-    "$ABR" repack "osip_he_$k" -o "osip_he_$k.img" >/dev/null 2>&1
+    "$ABR" pack -i "osip_he_$k" -o "osip_he_$k.img" >/dev/null 2>&1
     rd_ck "$k: an edit that keeps the size leaves the header alone" test "$(head -c 512 "osip_he_$k.img" | cmp -s - <(head -c 512 "osip_$k.img") && echo same)" = same
     rm -rf "osip_hs_$k"
     cp -a "osip_hu_$k" "osip_hs_$k"
     osip_add_files "osip_hs_$k"
-    "$ABR" repack "osip_hs_$k" -o "osip_hs_$k.img" >/dev/null 2>&1
+    "$ABR" pack -i "osip_hs_$k" -o "osip_hs_$k.img" >/dev/null 2>&1
     rd_ck "$k: one that changes it gets a header mboot makes" python3 -I "$OTL" check "osip_hs_$k.img"
 done
-rd_ck "info says the checksum is wrong" said "checksum WRONG" "$ABR" info osip_badck.img
-rd_ck "info says what the header counts and what the image has" said "[0-9]* sectors (the image has [0-9]*)" "$ABR" info osip_badsec.img
-rd_ck "unpack notes a checksum that is wrong" said "checksum in the OSIP header" "$ABR" unpack osip_badck.img -o osip_hu_badck2
+rd_ck "info says the checksum is wrong" said "checksum WRONG" "$ABR" info -i osip_badck.img
+rd_ck "info says what the header counts and what the image has" said "[0-9]* sectors (the image has [0-9]*)" "$ABR" info -i osip_badsec.img
+rd_ck "unpack notes a checksum that is wrong" said "checksum in the OSIP header" "$ABR" unpack -i osip_badck.img -o osip_hu_badck2
 rd_done "OSIP: a header with a wrong checksum or sector count is kept as it is by an untouched repack and by one that keeps the size; a changed size makes it right"
 
 # Where mboot's guess at the layout (four letters = the cmdline) is wrong: the layout that fits the image info is taken.
@@ -3402,7 +3454,7 @@ for n in 480 728 1024; do
     rd_unpack "osip_sa$n.img" "osip_u_sa$n"
     rd_ck "a$n: the signature is $n bytes, though it starts like a cmdline" grep -q "^osip_signature_size=$n\$" "osip_u_sa$n/manifest.txt"
     rd_ck "a$n: the cmdline" osip_cmd_is "osip_u_sa$n" "$OSIP_CMD"
-    "$ABR" repack "osip_u_sa$n" -o "osip_r_sa$n.img" >/dev/null 2>&1
+    "$ABR" pack -i "osip_u_sa$n" -o "osip_r_sa$n.img" >/dev/null 2>&1
     rd_ck "a$n: an untouched repack is identical" cmp -s "osip_sa$n.img" "osip_r_sa$n.img"
     rm -rf "osip_e_sa$n"
     cp -a "osip_u_sa$n" "osip_e_sa$n"
@@ -3422,7 +3474,7 @@ head -c 200000 osip_h4.img >osip_cut3.img     # no header, cut
 python3 -I "$OTL" header osip_hdr_only.img    # a header and nothing else
 for k in cut cut2 cut3 hdr_only; do
     rm -rf "osip_$k.dir"
-    "$ABR" unpack "osip_$k.img" -o "osip_$k.dir" >"osip_$k.out" 2>&1
+    "$ABR" unpack -i "osip_$k.img" -o "osip_$k.dir" >"osip_$k.out" 2>&1
     rc=$?
     rd_ck "$k: refused" test "$rc" -ne 0
     rd_ck "$k: with the reason" grep -q 'cut short' "osip_$k.out"
@@ -3511,7 +3563,7 @@ loki_check() {  # <image> <plain image> <target>: the independent reader: the im
 loki_plain_of() {  # <unpack dir> <out>: what the directory builds without the patch (has_loki=false in a copy)
     rm -rf "$1.nolk" && cp -a "$1" "$1.nolk" || return 1
     sed -i 's/^has_loki=true$/has_loki=false/' "$1.nolk/manifest.txt" || return 1
-    "$ABR" repack "$1.nolk" -o "$2" >"$2.log" 2>&1
+    "$ABR" pack -i "$1.nolk" -o "$2" >"$2.log" 2>&1
 }
 loki_offset() { case "$1" in e) echo 0 ;; f) echo 4 ;; a | d) echo 8 ;; *) echo 12 ;; esac; }  # check_sigs & 15 of the synthetic targets
 loki_block() {  # <target> <plain image's name>: the size of the block (512 bytes, a page for the targets whose table says so)
@@ -3552,14 +3604,14 @@ loki_same_patch() {  # <dir> <dir>: the patch is the same: the block, and what t
 loki_refuse() {  # <name> <image> <pattern>: unpack of that image is refused with that reason and leaves no directory
     local out rc
     rm -rf "loki_rf_$1"
-    out="$("$ABR" unpack "$2" -o "loki_rf_$1" 2>&1)"
+    out="$("$ABR" unpack -i "$2" -o "loki_rf_$1" 2>&1)"
     rc=$?
     [ "$rc" -ne 0 ] && [ ! -e "loki_rf_$1" ] && grep -q -- "$3" <<<"$out"
 }
 loki_refuse_repack() {  # <name> <dir> <pattern>: repack of that directory is refused with that reason and writes no image
     local out rc
     rm -f "loki_rr_$1.img"
-    out="$("$ABR" repack "$2" -o "loki_rr_$1.img" 2>&1)"
+    out="$("$ABR" pack -i "$2" -o "loki_rr_$1.img" 2>&1)"
     rc=$?
     [ "$rc" -ne 0 ] && [ ! -e "loki_rr_$1.img" ] && grep -q -- "$3" <<<"$out"
 }
@@ -3594,9 +3646,9 @@ for v in $LOKI_VARIANTS; do
     if [ "$t" != d ]; then
         rd_ck "$n: and what the real loki_tool unlok takes it off to" loki_real_unlok_is "loki_$n.img" "loki_plainb_$n.img"
     fi
-    "$ABR" repack "loki_u_$n" -o "loki_r_$n.img" >/dev/null 2>&1
+    "$ABR" pack -i "loki_u_$n" -o "loki_r_$n.img" >/dev/null 2>&1
     rd_ck "$n: an untouched repack is identical" cmp -s "loki_$n.img" "loki_r_$n.img"
-    rd_ck "$n: info says there is a patch" said "wrapper: LOKI patch ($k, build" "$ABR" info "loki_$n.img"
+    rd_ck "$n: info says there is a patch" said "wrapper: LOKI patch ($k, build" "$ABR" info -i "loki_$n.img"
 done
 rd_done "LOKI: images of every shape loki_tool makes (six targets, boot and recovery, with and without a device tree, 2048 and 4096 byte pages, a block of 512 bytes or of a page, whole-page sizes, a long cmdline): the independent tool makes the same bytes, identify and info see the patch, the directory is the plain image's plus the patch, without the patch it builds what loki_tool unlok writes, an untouched repack is identical"
 
@@ -3614,7 +3666,7 @@ for v in $LOKI_VARIANTS; do
     rd_ck "$n: the independent reader finds it is loki_tool's patch of what the directory builds without it" loki_check "loki_xr_$n.img" "loki_xp_$n.img" "$t"
     rd_ck "$n: the real loki_tool patches that image into the very same bytes" loki_real_patch_is "loki_xr_$n.img" "$t" "$k" "loki_xp_$n.img"
     rd_ck "$n: the patch (block, type, build, where the code is) is as it was" loki_same_patch "loki_u_$n" "loki_xr_${n}_re"
-    rd_ck "$n: unpacked again it is a fixed point" "$ABR" repack "loki_xr_${n}_re" -o "loki_xr2_$n.img"
+    rd_ck "$n: unpacked again it is a fixed point" "$ABR" pack -i "loki_xr_${n}_re" -o "loki_xr2_$n.img"
     rd_ck "$n: ... the same bytes" cmp -s "loki_xr_$n.img" "loki_xr2_$n.img"
 done
 rd_done "LOKI: an edited ramdisk (or kernel) lands in the image; the result is loki_tool's patch of what the directory builds without it (the independent reader, and the real loki_tool where it is at hand); the block and the rest of the patch stay; repacking what that gives is the same image"
@@ -3627,7 +3679,7 @@ for v in b_dt:b:boot:dt e_nodt:e:boot:nodt f_4k_r:f:recovery:p4k; do
     sed -i -e 's/^kernel_addr=.*/kernel_addr=0x10008000/' -e 's/^ramdisk_addr=.*/ramdisk_addr=0x11000000/' \
         -e 's/^cmdline=.*/cmdline=quiet loglevel=7 androidboot.test=1/' -e 's/^board_name=.*/board_name=other/' "loki_h_$n/manifest.txt"
     head -c 7000 /dev/urandom >>"loki_h_$n/kernel"       # the padded kernel grows by pages: kernel_size, the ramdisk's load address
-    rd_ck "$n: repack" "$ABR" repack "loki_h_$n" -o "loki_hr_$n.img"
+    rd_ck "$n: repack" "$ABR" pack -i "loki_h_$n" -o "loki_hr_$n.img"
     loki_plain_of "loki_h_$n" "loki_hp_$n.img"
     rd_ck "$n: the image is loki_tool's patch of the plain one (the original ramdisk address is in the patch code)" loki_check "loki_hr_$n.img" "loki_hp_$n.img" "$t"
     rd_ck "$n: the real loki_tool makes the same bytes" loki_real_patch_is "loki_hr_$n.img" "$t" "$k" "loki_hp_$n.img"
@@ -3668,7 +3720,7 @@ tail -c 3000 loki_t_data.img >loki_t_data.tail
 for x in data ff zero; do
     rd_ck "$x: identify" said "LOKI header" "$ABR" identify "loki_t_$x.img"
     rd_unpack "loki_t_$x.img" "loki_tu_$x"
-    "$ABR" repack "loki_tu_$x" -o "loki_tr_$x.img" >/dev/null 2>&1
+    "$ABR" pack -i "loki_tu_$x" -o "loki_tr_$x.img" >/dev/null 2>&1
     rd_ck "$x: an untouched repack is identical" cmp -s "loki_t_$x.img" "loki_tr_$x.img"
     loki_copy "loki_tu_$x" "loki_tx_$x"
     loki_edit "loki_tx_$x"
@@ -3680,7 +3732,7 @@ done
 tail -c 3000 loki_txr_data.img >loki_txr_data.tail
 rd_ck "data: the tail is a file of its own" cmp -s loki_t_data.tail loki_tu_data/loki_tail.bin
 rd_ck "data: and follows the edited image" cmp -s loki_t_data.tail loki_txr_data.tail
-rd_ck "info says what follows" said "3000 bytes follow the image" "$ABR" info loki_t_data.img
+rd_ck "info says what follows" said "3000 bytes follow the image" "$ABR" info -i loki_t_data.img
 for x in ff zero; do
     rd_ck "$x: the fill is not a file, it is a size" test ! -e "loki_tu_$x/loki_tail.bin"
     rd_ck "$x: the size of the partition" grep -q '^loki_pad_to=1048576$' "loki_tu_$x/manifest.txt"
@@ -3692,7 +3744,7 @@ rd_ck "ff: the fill goes on behind the edited image" test "$(tail -c 400000 loki
 rd_ck "zero: the fill goes on behind the edited image" test "$(tail -c 400000 loki_txr_zero.img | tr -d '\000' | wc -c | tr -d ' ')" = 0
 loki_copy loki_tu_ff loki_tx_big
 head -c 3000000 /dev/urandom >loki_tx_big/ramdisk/loki_huge_file
-"$ABR" repack loki_tx_big -o loki_tx_big.img >loki_tx_big.rlog 2>&1
+"$ABR" pack -i loki_tx_big -o loki_tx_big.img >loki_tx_big.rlog 2>&1
 rd_ck "an edit that outgrows the partition is built and the size is said" grep -q 'larger than the original' loki_tx_big.rlog
 rd_done "LOKI: what follows the image (data, or 0xFF / 0x00 fill up to the partition's size) is kept, an untouched repack is identical, an edit keeps the size and the fill, one that outgrows it is said"
 
@@ -3726,7 +3778,7 @@ make("at0", lambda d: move_code(d, 0))
 PYEOF
 for x in ra hex full space type junk at15 at0; do
     rd_unpack "loki_odd_$x.img" "loki_ou_$x"
-    "$ABR" repack "loki_ou_$x" -o "loki_orr_$x.img" >/dev/null 2>&1
+    "$ABR" pack -i "loki_ou_$x" -o "loki_orr_$x.img" >/dev/null 2>&1
     rd_ck "$x: an untouched repack is identical" cmp -s "loki_odd_$x.img" "loki_orr_$x.img"
 done
 rd_ck "a load address in the LOKI header that is not the padded kernel's end is kept" grep -q '^loki_hdr_ramdisk_addr=0x12345678$' loki_ou_ra/manifest.txt
@@ -3746,7 +3798,7 @@ rd_done "LOKI: fields other than loki_tool writes (a load address in the LOKI he
 # image is refused, with the way out (has_loki=false) named.
 loki_copy loki_u_b_dt loki_m_type
 sed -i 's/^loki_recovery=0$/loki_recovery=1/' loki_m_type/manifest.txt
-"$ABR" repack loki_m_type -o loki_m_type.img >/dev/null 2>&1
+"$ABR" pack -i loki_m_type -o loki_m_type.img >/dev/null 2>&1
 loki_plain_of loki_m_type loki_m_type_p.img
 rd_ck "a boot image made a recovery one: the image says it" said "recovery 1," python3 -I "$LKT" list loki_m_type.img
 rd_ck "(identify too)" said "LOKI header (recovery)" "$ABR" identify loki_m_type.img
@@ -3791,7 +3843,7 @@ rd_unpack loki_blob.img loki_bu
 rd_ck "both wrappers are in the manifest" grep -q '^has_blob=true$' loki_bu/manifest.txt
 rd_ck "(the patch)" grep -q '^has_loki=true$' loki_bu/manifest.txt
 rd_ck "and are named in the order they come off" grep -q 'unpacked blob-wrapped loki-patched boot' loki_bu.log
-"$ABR" repack loki_bu -o loki_bu_back.img >/dev/null 2>&1
+"$ABR" pack -i loki_bu -o loki_bu_back.img >/dev/null 2>&1
 rd_ck "an untouched repack is identical" cmp -s loki_blob.img loki_bu_back.img
 python3 -I - <<'PYEOF'
 import hashlib, struct
@@ -3801,7 +3853,7 @@ open("loki_dhtb.img", "wb").write(header + b"\x00" * (512 - len(header)) + paylo
 PYEOF
 rd_unpack loki_dhtb.img loki_du
 rd_ck "three wrappers, named in the order they come off" grep -q 'unpacked dhtb-wrapped blob-wrapped loki-patched boot' loki_du.log
-"$ABR" repack loki_du -o loki_du_back.img >/dev/null 2>&1
+"$ABR" pack -i loki_du -o loki_du_back.img >/dev/null 2>&1
 rd_ck "an untouched repack is identical" cmp -s loki_dhtb.img loki_du_back.img
 loki_copy loki_du loki_dux
 loki_edit loki_dux
@@ -3837,7 +3889,7 @@ make("cutdt", lambda d: None, cut=len(good) - 1)
 PYEOF
 loki_refuse_info() {  # <image> <pattern>: info refuses the image with that reason
     local out rc
-    out="$("$ABR" info "$1" 2>&1)"
+    out="$("$ABR" info -i "$1" 2>&1)"
     rc=$?
     [ "$rc" -ne 0 ] && grep -q -- "$2" <<<"$out"
 }
@@ -3949,28 +4001,46 @@ cros_edit_is_in() { [ "$(cat "$1/ramdisk/abr_test_file" 2>/dev/null)" = "abr tes
 cros_plain_of() {  # <unpack dir> <out>: what the directory builds without the blob (has_chromeos=false in a copy)
     rm -rf "$1.noc" && cp -a "$1" "$1.noc" || return 1
     sed -i 's/^has_chromeos=true$/has_chromeos=false/' "$1.noc/manifest.txt" || return 1
-    "$ABR" repack "$1.noc" -o "$2" >"$2.log" 2>&1
+    "$ABR" pack -i "$1.noc" -o "$2" >"$2.log" 2>&1
 }
-cros_repack() {  # <dir> <out> <name of the key> [options]: repack (log: <out>.rlog); the key of a keyblock that is not the developer's is given
+# cros_pack <dir> <out> [--chromeos-key <.vbprivk>] [--chromeos-keyblock <keyblock>]: `abr pack` of a copy of <dir> (<out>.dir) that has the key and the
+# keyblock in keys/, where a person puts them (the first command line had these two options). What abr says is what this says.
+cros_pack() {
+    local d="$1" out="$2" key="" kb=""
+    shift 2
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --chromeos-key) key="$2" ;;
+            --chromeos-keyblock) kb="$2" ;;
+            *) echo "cros_pack: there is no option $1" >&2; return 2 ;;
+        esac
+        shift 2
+    done
+    rm -rf "$out.dir" && cp -a "$d" "$out.dir" || return 1
+    [ -z "$key" ] || put_key "$out.dir" chromeos.vbprivk "$key" || return 1
+    [ -z "$kb" ] || put_key "$out.dir" chromeos.keyblock "$kb" || return 1
+    "$ABR" pack -i "$out.dir" -o "$out"
+}
+cros_repack() {  # <dir> <out> <name of the key> [options of cros_pack]: repack (log: <out>.rlog); the key of a keyblock that is not the developer's is given
     local d="$1" out="$2" k="$3"
     shift 3
     local o=()
     [ "$k" = dev ] || o=(--chromeos-key "$(cros_kp "$k")")
     rm -f "$out"
-    "$ABR" repack "$d" -o "$out" ${o[@]+"${o[@]}"} "$@" >"$out.rlog" 2>&1
+    cros_pack "$d" "$out" ${o[@]+"${o[@]}"} "$@" >"$out.rlog" 2>&1
 }
 cros_refuse() {  # <name> <blob> <pattern>: unpack of that blob is refused with that reason and leaves no directory
     local out rc
     rm -rf "cros_rf_$1"
-    out="$("$ABR" unpack "$2" -o "cros_rf_$1" 2>&1)"
+    out="$("$ABR" unpack -i "$2" -o "cros_rf_$1" 2>&1)"
     rc=$?
     [ "$rc" -ne 0 ] && [ ! -e "cros_rf_$1" ] && grep -q -- "$3" <<<"$out"
 }
-cros_refuse_repack() {  # <name> <dir> <pattern> [options]: repack of that directory is refused with that reason and writes no blob
+cros_refuse_repack() {  # <name> <dir> <pattern> [options of cros_pack]: repack of that directory is refused with that reason and writes no blob
     local out rc name="$1" d="$2" pat="$3"
     shift 3
     rm -f "cros_rr_$name.blob"
-    out="$("$ABR" repack "$d" -o "cros_rr_$name.blob" "$@" 2>&1)"
+    out="$(cros_pack "$d" "cros_rr_$name.blob" "$@" 2>&1)"
     rc=$?
     [ "$rc" -ne 0 ] && [ ! -e "cros_rr_$name.blob" ] && grep -q -- "$pat" <<<"$out"
 }
@@ -4009,9 +4079,9 @@ for v in $CROS_VARIANTS; do
     rd_ck "$n: and its reader finds both signatures good" cros verify "cros_$n.blob"
     rd_ck "$n: futility verifies it" cros_fut_verify "cros_$n.blob"
     rd_ck "$n: identify" said "CHROMEOS" "$ABR" identify "cros_$n.blob"
-    rd_ck "$n: info names the preamble" said "vboot preamble 2.$m," "$ABR" info "cros_$n.blob"
-    rd_ck "$n: and the data key ($(cros_algname "$a"))" said "data key $(cros_algname "$a")" "$ABR" info "cros_$n.blob"
-    rd_ck "$n: and finds both signatures good" said "signatures valid" "$ABR" info "cros_$n.blob"
+    rd_ck "$n: info names the preamble" said "vboot preamble 2.$m," "$ABR" info -i "cros_$n.blob"
+    rd_ck "$n: and the data key ($(cros_algname "$a"))" said "data key $(cros_algname "$a")" "$ABR" info -i "cros_$n.blob"
+    rd_ck "$n: and finds both signatures good" said "signatures valid" "$ABR" info -i "cros_$n.blob"
     rd_unpack "cros_$n.blob" "cros_u_$n"
     rd_ck "$n: unpack says what it took off" grep -q 'unpacked chromeos-wrapped boot' "cros_u_$n.log"
     rd_ck "$n: and that an untouched repack is identical" grep -q 'reproduces this image byte-for-byte' "cros_u_$n.log"
@@ -4020,7 +4090,7 @@ for v in $CROS_VARIANTS; do
     rd_ck "$n: the keyblock is a file, as it was" cmp -s "cros_u_$n/chromeos_keyblock.bin" "$kb"
     rd_ck "$n: nothing follows the blob" test ! -e "cros_u_$n/chromeos_tail.bin"
     rd_ck "$n: the rest of the directory is what the plain image gives" diff -r --no-dereference -x manifest.txt -x 'chromeos_*' "cros_pu_$p" "cros_u_$n"
-    "$ABR" repack "cros_u_$n" -o "cros_r_$n.blob" >/dev/null 2>&1
+    "$ABR" pack -i "cros_u_$n" -o "cros_r_$n.blob" >/dev/null 2>&1
     rd_ck "$n: an untouched repack is identical" cmp -s "cros_$n.blob" "cros_r_$n.blob"
 done
 rd_done "ChromeOS: blobs of every kind the independent tool makes (preambles 2.0, 2.1, 2.2; RSA of 1024, 2048, 3072 and 4096 bits, exponent 65537 and 3, SHA-1, SHA-256, SHA-512; the kernel padded to 4096 or not): futility verifies them, identify and info see them, the directory is the plain image's plus the blob, an untouched repack is identical -- whoever signed it"
@@ -4044,7 +4114,7 @@ for v in $CROS_VARIANTS; do
     rd_unpack "cros_xr_$n.blob" "cros_xr_${n}_re"
     rd_ck "$n: the edit is in the image" cros_edit_is_in "cros_xr_${n}_re"
     rd_ck "$n: the blob grew" test "$(cros_size "cros_xr_$n.blob")" -gt "$(cros_size "cros_$n.blob")"
-    rd_ck "$n: unpacked again it is a fixed point" "$ABR" repack "cros_xr_${n}_re" -o "cros_xr2_$n.blob"
+    rd_ck "$n: unpacked again it is a fixed point" "$ABR" pack -i "cros_xr_${n}_re" -o "cros_xr2_$n.blob"
     rd_ck "$n: ... the same bytes" cmp -s "cros_xr_$n.blob" "cros_xr2_$n.blob"
 done
 rd_done "ChromeOS: an edited ramdisk lands in the image; the blob is the independent tool's of what the directory builds without it (the keyblock, the preamble's version and the algorithm as they were), futility verifies it and hands out the same kernel; repacking what that gives is the same blob"
@@ -4064,9 +4134,9 @@ rd_ck "the independent tool makes the blob (every field set)" cros make cros_F.b
     --bootloader cros_bl.bin --bootloader-size 8192 --pad 131072 --tail cros_tail.bin
 rd_ck "its reader finds both signatures good" cros verify cros_F.blob
 rd_ck "futility verifies it (every field, a verification block of 128 KiB)" cros_fut_verify cros_F.blob 131072
-rd_ck "info: the preamble, the version of the kernel, the flags, the load address" said "vboot preamble 2.2, kernel version 7, flags 0x3, loaded at 0x2000000;" "$ABR" info cros_F.blob
-rd_ck "info: the sizes of the fields" said "config $(cros_size cros_cfg.txt) bytes, bootloader 8192 bytes;" "$ABR" info cros_F.blob
-rd_ck "info: what follows the blob" said "; 5000 bytes follow the blob)" "$ABR" info cros_F.blob
+rd_ck "info: the preamble, the version of the kernel, the flags, the load address" said "vboot preamble 2.2, kernel version 7, flags 0x3, loaded at 0x2000000;" "$ABR" info -i cros_F.blob
+rd_ck "info: the sizes of the fields" said "config $(cros_size cros_cfg.txt) bytes, bootloader 8192 bytes;" "$ABR" info -i cros_F.blob
+rd_ck "info: what follows the blob" said "; 5000 bytes follow the blob)" "$ABR" info -i cros_F.blob
 rd_unpack cros_F.blob cros_u_F
 rd_ck "unpack names the blob" grep -q 'unpacked chromeos-wrapped boot' cros_u_F.log
 for kv in chromeos_preamble_version=2.2 chromeos_kernel_version=7 chromeos_flags=0x3 chromeos_body_load_address=0x2000000 \
@@ -4077,7 +4147,7 @@ rd_ck "the config is a file" cmp -s cros_u_F/chromeos_config.txt cros_cfg.txt
 rd_ck "the params are a file" cmp -s cros_u_F/chromeos_params.bin cros_params.bin
 rd_ck "the bootloader is a file (without the zeros of its field)" cmp -s cros_u_F/chromeos_bootloader.bin cros_bl.bin
 rd_ck "what follows the blob is a file" cmp -s cros_u_F/chromeos_tail.bin cros_tail.bin
-"$ABR" repack cros_u_F -o cros_r_F.blob >/dev/null 2>&1
+"$ABR" pack -i cros_u_F -o cros_r_F.blob >/dev/null 2>&1
 rd_ck "an untouched repack is identical" cmp -s cros_F.blob cros_r_F.blob
 # every field changed, the bootloader grown past the size of its field (it grows to 12288), the tail replaced, an edit in the ramdisk
 cros_copy cros_u_F cros_x_F
@@ -4093,7 +4163,7 @@ cp cros_params2.bin cros_x_F/chromeos_params.bin
 cp cros_bl2.bin cros_x_F/chromeos_bootloader.bin
 cp cros_tail2.bin cros_x_F/chromeos_tail.bin
 cros_edit cros_x_F
-"$ABR" repack cros_x_F -o cros_xr_F.blob >cros_xr_F.rlog 2>&1
+"$ABR" pack -i cros_x_F -o cros_xr_F.blob >cros_xr_F.rlog 2>&1
 cros_plain_of cros_x_F cros_xp_F.img
 rd_ck "an edit with every field changed: the independent tool makes the blob of what the directory builds without it" cros make cros_xe_F.blob --kernel cros_xp_F.img \
     --keyblock "$CROS_KB" --key "$CROS_KP" --minor 2 --kernel-version 9 --flags 5 --load 0x3000000 --bootloader-address 0x3002000 --config cros_cfg2.txt \
@@ -4108,7 +4178,7 @@ rd_ck "and the edit is in the image" cros_edit_is_in cros_xr_F_re
 # nothing the signatures cover changed (the tail only): they are kept, and the log does not say they were made again
 cros_copy cros_u_F cros_t_F
 cp cros_tail2.bin cros_t_F/chromeos_tail.bin
-"$ABR" repack cros_t_F -o cros_tr_F.blob >cros_tr_F.rlog 2>&1
+"$ABR" pack -i cros_t_F -o cros_tr_F.blob >cros_tr_F.rlog 2>&1
 rd_ck "only the tail changed: the blob is the original with the new tail" cros make cros_te_F.blob --kernel cros_plain_pad.img --keyblock "$CROS_KB" --key "$CROS_KP" --minor 2 \
     --kernel-version 7 --flags 3 --load 0x2000000 --bootloader-address 0x2002000 --config cros_cfg.txt --params cros_params.bin --bootloader cros_bl.bin \
     --bootloader-size 8192 --pad 131072 --tail cros_tail2.bin
@@ -4122,7 +4192,7 @@ rd_ck "the independent tool makes a dump" cros make cros_Z.blob --kernel cros_pl
 rd_unpack cros_Z.blob cros_u_Z
 rd_ck "unpack keeps the size of the partition" grep -q "^chromeos_pad_to=$CROS_DUMP\$" cros_u_Z/manifest.txt
 rd_ck "and no tail file (it is all zeros)" test ! -e cros_u_Z/chromeos_tail.bin
-"$ABR" repack cros_u_Z -o cros_r_Z.blob >/dev/null 2>&1
+"$ABR" pack -i cros_u_Z -o cros_r_Z.blob >/dev/null 2>&1
 rd_ck "an untouched repack is identical" cmp -s cros_Z.blob cros_r_Z.blob
 cros_copy cros_u_Z cros_x_Z
 cros_edit cros_x_Z
@@ -4140,7 +4210,7 @@ cros kernel cros_dev22.blob cros_dev22_kernel.bin
 rd_ck "without the blob the directory builds the kernel field of the blob (the plain image, zeros up to 4096)" cmp -s cros_dev22_plain.img cros_dev22_kernel.bin
 cros_copy cros_pu_pad cros_fr
 printf 'has_chromeos=true\n' >>cros_fr/manifest.txt
-"$ABR" repack cros_fr -o cros_fr.blob >cros_fr.rlog 2>&1
+"$ABR" pack -i cros_fr -o cros_fr.blob >cros_fr.rlog 2>&1
 printf ' ' >cros_sp
 rd_ck "a plain image with has_chromeos=true: the independent tool makes the blob of Android Image Kitchen's command line (version 1, flags 1, a space for the config and the bootloader, the developer keys)" \
     cros make cros_fr_e.blob --kernel cros_plain_pad.img --keyblock "$CROS_KB" --key "$CROS_KP" --kernel-version 1 --flags 1 --config cros_sp --bootloader cros_sp
@@ -4150,13 +4220,15 @@ rd_ck "abr says what it signed with" grep -q 'the ChromeOS kernel blob is signed
 rd_ck "its reader finds both signatures good" cros verify cros_fr.blob
 rd_unpack cros_fr.blob cros_u_fr
 rd_ck "unpacked again it is the plain image, with a blob around it" diff -r --no-dereference -x manifest.txt -x 'chromeos_*' cros_pu_pad cros_u_fr
-"$ABR" repack cros_u_fr -o cros_r_fr.blob >/dev/null 2>&1
+"$ABR" pack -i cros_u_fr -o cros_r_fr.blob >/dev/null 2>&1
 rd_ck "and an untouched repack is identical" cmp -s cros_fr.blob cros_r_fr.blob
 # with keys of one's own (a key and the keyblock for it): the blob is signed under that keyblock
 cros_copy cros_pu_pad cros_fr2
 printf 'has_chromeos=true\n' >>cros_fr2/manifest.txt
-"$ABR" repack cros_fr2 -o cros_fr2.blob --chromeos-key "$CK/k2048.vbprivk" --chromeos-keyblock "$CK/k2048.keyblock" >cros_fr2.rlog 2>&1
-rd_ck "with --chromeos-key and --chromeos-keyblock the independent tool makes the same blob under that keyblock" cros make cros_fr2_e.blob --kernel cros_plain_pad.img --keyblock "$CK/k2048.keyblock" \
+put_key cros_fr2 chromeos.vbprivk "$CK/k2048.vbprivk"
+put_key cros_fr2 chromeos.keyblock "$CK/k2048.keyblock"
+"$ABR" pack -i cros_fr2 -o cros_fr2.blob >cros_fr2.rlog 2>&1
+rd_ck "with keys/chromeos.vbprivk and keys/chromeos.keyblock the independent tool makes the same blob under that keyblock" cros make cros_fr2_e.blob --kernel cros_plain_pad.img --keyblock "$CK/k2048.keyblock" \
     --key "$CK/k2048.vbprivk" --kernel-version 1 --flags 1 --config cros_sp --bootloader cros_sp
 rd_ck "... the same bytes" cmp -s cros_fr2.blob cros_fr2_e.blob
 rd_ck "abr says it is signed under the keyblock given" grep -q 'is signed under the keyblock given' cros_fr2.rlog
@@ -4175,7 +4247,7 @@ done
 rd_ck "the independent tool makes a 2.1 blob with a vmlinuz header address" cros make cros_V.blob --kernel cros_plain_pad.img --keyblock "$CROS_KB" --key "$CROS_KP" --minor 1 --vmlinuz-header-address 0x1234000
 rd_unpack cros_V.blob cros_u_V
 rd_ck "the manifest has the address" grep -q '^chromeos_vmlinuz_header_address=0x1234000$' cros_u_V/manifest.txt
-"$ABR" repack cros_u_V -o cros_r_V.blob >/dev/null 2>&1
+"$ABR" pack -i cros_u_V -o cros_r_V.blob >/dev/null 2>&1
 rd_ck "and an untouched repack is identical" cmp -s cros_V.blob cros_r_V.blob
 cros_copy cros_u_V cros_x_V
 sed -i 's/^chromeos_vmlinuz_header_address=.*/chromeos_vmlinuz_header_address=0x5678000/' cros_x_V/manifest.txt
@@ -4208,18 +4280,18 @@ rd_done "ChromeOS: what the manifest cannot say (no version, a version abr does 
 
 # Whose keyblock it is. A blob under somebody else's keyblock (one abr has no key for) comes back as it was while nothing
 # it covers changes -- whoever signed it. Edited, it is signed with the developer key under the developer keyblock, with a
-# warning (that is what Android Image Kitchen does, always), or with the key given (--chromeos-key) under the keyblock it has,
-# or under another one (--chromeos-keyblock). abr never signs under a keyblock whose key it does not have.
+# warning (that is what Android Image Kitchen does, always), or with the key given (keys/chromeos.vbprivk) under the keyblock it has,
+# or under another one (keys/chromeos.keyblock). abr never signs under a keyblock whose key it does not have.
 rd_ck "an edit of a blob under somebody else's keyblock, no key given: abr signs under the developer keyblock" cros_repack cros_x_a8 cros_sw_a8.blob dev
 rd_ck "... and warns that the keyblock is somebody else's, and what it did instead" grep -q "its keyblock is somebody else's: abr has no key for it" cros_sw_a8.blob.rlog
-rd_ck "... and that --chromeos-key and --chromeos-keyblock sign with keys of one's own" grep -q -- "--chromeos-key and --chromeos-keyblock sign with keys of your own" cros_sw_a8.blob.rlog
+rd_ck "... and that keys/chromeos.vbprivk and keys/chromeos.keyblock sign with keys of one's own" grep -q -- "keys/chromeos.vbprivk and keys/chromeos.keyblock sign with keys of your own" cros_sw_a8.blob.rlog
 rd_ck "the independent tool makes the same blob under the developer keyblock" cros make cros_sw_a8_e.blob --kernel cros_xp_a8.img --keyblock "$CROS_KB" --key "$CROS_KP" --minor 2
 rd_ck "... the same bytes" cmp -s cros_sw_a8.blob cros_sw_a8_e.blob
 rd_ck "its reader finds both signatures good" cros verify cros_sw_a8.blob
 rd_ck "futility verifies it" cros_fut_verify cros_sw_a8.blob
-rd_ck "info calls the data key the developer key" said "(the developer key of vboot_reference)" "$ABR" info cros_sw_a8.blob
+rd_ck "info calls the data key the developer key" said "(the developer key of vboot_reference)" "$ABR" info -i cros_sw_a8.blob
 rd_unpack cros_sw_a8.blob cros_sw_a8_u
-"$ABR" repack cros_sw_a8_u -o cros_sw_a8_r.blob >/dev/null 2>&1
+"$ABR" pack -i cros_sw_a8_u -o cros_sw_a8_r.blob >/dev/null 2>&1
 rd_ck "what that gives is a fixed point: unpacked and repacked it is the same blob" cmp -s cros_sw_a8.blob cros_sw_a8_r.blob
 cros_copy cros_sw_a8_u cros_sw_a8_x
 cros_edit cros_sw_a8_x
@@ -4227,24 +4299,24 @@ rd_ck "and an edit of it is signed with the developer key, without a warning (th
 rd_ck "... no warning" test -z "$(grep -i 'somebody else' cros_sw_a8_xr.blob.rlog)"
 rd_ck "... and its reader finds both signatures good" cros verify cros_sw_a8_xr.blob
 # a key and a keyblock of one's own
-rd_ck "an edit with --chromeos-key and --chromeos-keyblock of one's own" cros_repack cros_x_a8 cros_nk_a8x.blob dev --chromeos-key "$CK/k2048.vbprivk" --chromeos-keyblock "$CK/k2048.keyblock"
-rd_ck "... abr says it is signed under the keyblock given" grep -q 'is signed under the keyblock given (--chromeos-keyblock)' cros_nk_a8x.blob.rlog
+rd_ck "an edit with keys/chromeos.vbprivk and keys/chromeos.keyblock of one's own" cros_repack cros_x_a8 cros_nk_a8x.blob dev --chromeos-key "$CK/k2048.vbprivk" --chromeos-keyblock "$CK/k2048.keyblock"
+rd_ck "... abr says it is signed under the keyblock given" grep -q 'is signed under the keyblock given (keys/chromeos.keyblock)' cros_nk_a8x.blob.rlog
 rd_ck "the independent tool makes the same blob" cros make cros_nk_a8x_e.blob --kernel cros_xp_a8.img --keyblock "$CK/k2048.keyblock" --key "$CK/k2048.vbprivk" --minor 2
 rd_ck "... the same bytes" cmp -s cros_nk_a8x.blob cros_nk_a8x_e.blob
 rd_ck "futility verifies it" cros_fut_verify cros_nk_a8x.blob
-rd_ck "info names the data key of the new keyblock" said "data key RSA-2048/SHA-512;" "$ABR" info cros_nk_a8x.blob
+rd_ck "info names the data key of the new keyblock" said "data key RSA-2048/SHA-512;" "$ABR" info -i cros_nk_a8x.blob
 # the same, the blob untouched: only the keyblock and the signatures change, and futility --repack does that very thing
 rd_ck "an untouched blob under another keyblock" cros_repack cros_u_a8 cros_nk_a8.blob dev --chromeos-key "$CK/k2048.vbprivk" --chromeos-keyblock "$CK/k2048.keyblock"
 rd_ck "the independent tool makes the same blob of the same kernel" cros make cros_nk_a8_e.blob --kernel cros_plain_al.img --keyblock "$CK/k2048.keyblock" --key "$CK/k2048.vbprivk" --minor 2
 rd_ck "... the same bytes" cmp -s cros_nk_a8.blob cros_nk_a8_e.blob
 rd_ck "futility --repack signs the body of the old blob under that keyblock into the very same blob" cros_fut_repack_is cros_nk_a8.blob cros_a8.blob "$CK/k2048.keyblock" "$CK/k2048.vbprivk"
-"$ABR" repack cros_u_a8 -o cros_nk_a8d.blob --chromeos-key "$CROS_KP" --chromeos-keyblock "$CROS_KB" >/dev/null 2>&1
+cros_pack cros_u_a8 cros_nk_a8d.blob --chromeos-key "$CROS_KP" --chromeos-keyblock "$CROS_KB" >/dev/null 2>&1
 rd_ck "and into the developer's, too (abr: the developer key and keyblock given)" cros_fut_repack_is cros_nk_a8d.blob cros_a8.blob "$CROS_KB" "$CROS_KP"
 rd_ck "its reader finds both signatures good" cros verify cros_nk_a8d.blob
 # the key given for the keyblock the blob has (and the developer key, given explicitly, is the developer key abr has)
 rd_ck "the developer key given explicitly is the same as the one abr has" cros_repack cros_x_dev22 cros_dk_dev22.blob dev --chromeos-key "$CROS_KP"
 rd_ck "... the same bytes" cmp -s cros_xr_dev22.blob cros_dk_dev22.blob
-rd_ck "... and abr says it was the key given" grep -q 'they are made again, with the key given (--chromeos-key)' cros_dk_dev22.blob.rlog
+rd_ck "... and abr says it was the key given" grep -q 'they are made again, with the key given (keys/chromeos.vbprivk)' cros_dk_dev22.blob.rlog
 # nothing changed: the signatures are the original's whatever is given
 rd_ck "untouched, with the key of the blob's keyblock given: identical" cros_repack cros_u_a8 cros_kp_a8.blob a8 --chromeos-key "$CK/k4096.vbprivk"
 rd_ck "... the same bytes" cmp -s cros_a8.blob cros_kp_a8.blob
@@ -4257,8 +4329,8 @@ rd_done "ChromeOS: a blob under somebody else's keyblock is kept as it was while
 
 # What abr refuses: a key that is not the keyblock's, a keyblock without its key, files that are no keys, files that are no keyblocks.
 rd_ck "the key given is not the data key of the blob's keyblock" cros_refuse_repack wrongkey cros_x_a8 'is not the data key of the keyblock (the blob' --chromeos-key "$CK/k2048b.vbprivk"
-rd_ck "a keyblock without its key" cros_refuse_repack kbonly cros_x_a8 'has a data key of which abr has no key: pass the key with --chromeos-key' --chromeos-keyblock "$CK/k2048.keyblock"
-rd_ck "a key that is not the data key of the keyblock given" cros_refuse_repack wrongkb cros_x_a8 'is not the data key of the keyblock (the one given with --chromeos-keyblock)' \
+rd_ck "a keyblock without its key" cros_refuse_repack kbonly cros_x_a8 'has a data key of which abr has no key: put the key in keys/chromeos.vbprivk' --chromeos-keyblock "$CK/k2048.keyblock"
+rd_ck "a key that is not the data key of the keyblock given" cros_refuse_repack wrongkb cros_x_a8 'is not the data key of the keyblock (the one given as keys/chromeos.keyblock)' \
     --chromeos-key "$CK/k2048b.vbprivk" --chromeos-keyblock "$CK/k2048.keyblock"
 printf 'short' >cros_badkey_short
 head -c 300 /dev/zero | tr '\0' 'k' >cros_badkey_text
@@ -4282,16 +4354,14 @@ PYEOF
 for r in "short:too short" "text:which abr does not know (0 to 17)" "alg99:names algorithm 99, which abr does not know" \
          "size:names RSA-4096/SHA-512, a key of 4096 bits, and holds one of 2048" "der:does not hold an RSA key behind its algorithm word" \
          "cut:does not hold an RSA key behind its algorithm word"; do
-    rd_ck "--chromeos-key ${r%%:*}: refused, says why" cros_refuse_repack "key_${r%%:*}" cros_x_a8 "${r#*:}" --chromeos-key "cros_badkey_${r%%:*}"
+    rd_ck "keys/chromeos.vbprivk ${r%%:*}: refused, says why" cros_refuse_repack "key_${r%%:*}" cros_x_a8 "${r#*:}" --chromeos-key "cros_badkey_${r%%:*}"
 done
-rd_ck "--chromeos-key that is no file" cros_refuse_repack key_gone cros_x_a8 'cros_no_such_key' --chromeos-key cros_no_such_key
 KB2048=$(cros_size "$CK/k2048.keyblock")
 for r in "text:is not a keyblock (it does not start with \"CHROMEOS\")" "short:is cut short" "size:says it is $KB2048 bytes; the file has $((KB2048 + 1))" \
          "outside:lies outside of it"; do
-    rd_ck "--chromeos-keyblock ${r%%:*}: refused, says why" cros_refuse_repack "kb_${r%%:*}" cros_x_a8 "${r#*:}" --chromeos-key "$CK/k2048.vbprivk" --chromeos-keyblock "cros_badkb_${r%%:*}"
+    rd_ck "keys/chromeos.keyblock ${r%%:*}: refused, says why" cros_refuse_repack "kb_${r%%:*}" cros_x_a8 "${r#*:}" --chromeos-key "$CK/k2048.vbprivk" --chromeos-keyblock "cros_badkb_${r%%:*}"
 done
-rd_ck "--chromeos-keyblock that is no file" cros_refuse_repack kb_gone cros_x_a8 'cros_no_such_kb' --chromeos-key "$CK/k2048.vbprivk" --chromeos-keyblock cros_no_such_kb
-rd_done "ChromeOS: a key that is not the keyblock's, a keyblock without its key, files that are no keys (too short, text, an algorithm that does not exist, a key of another size than its algorithm's, no DER, cut) or no keyblocks (text, cut, a size that is not the file's, a data key outside of it, no file) are refused with the reason, and no blob is written"
+rd_done "ChromeOS: a key that is not the keyblock's, a keyblock without its key, files that are no keys (too short, text, an algorithm that does not exist, a key of another size than its algorithm's, no DER, cut) or no keyblocks (text, cut, a size that is not the file's, a data key outside of it) are refused with the reason, and no blob is written"
 
 # A blob that is not laid out the way futility writes it is refused with the reason, and leaves no directory: abr does not
 # read it wrongly, and does not lose what it cannot keep. (identify goes by the keyblock's "CHROMEOS" and still names it.)
@@ -4313,7 +4383,7 @@ for kind in "short-keyblock:its keyblock does not fit" "short-preamble:and the p
 done
 cros_info_refuses() {  # <blob> <pattern>
     local out rc
-    out="$("$ABR" info "$1" 2>&1)"
+    out="$("$ABR" info -i "$1" 2>&1)"
     rc=$?
     [ "$rc" -ne 0 ] && grep -q -- "$2" <<<"$out"
 }
@@ -4333,9 +4403,9 @@ for kind in "body-byte:body signature NOT valid, preamble signature valid" "body
     cros corrupt cros_dev22.blob "cros_sg_$x.blob" "$x"
     rd_ck "$x: the independent reader finds a signature bad" cros_verify_fails "cros_sg_$x.blob"
     rd_ck "$x: futility finds it bad, too" cros_fut_rejects "cros_sg_$x.blob"
-    rd_ck "$x: info says what is bad ($msg)" said "$msg" "$ABR" info "cros_sg_$x.blob"
+    rd_ck "$x: info says what is bad ($msg)" said "$msg" "$ABR" info -i "cros_sg_$x.blob"
     rd_unpack "cros_sg_$x.blob" "cros_sg_u_$x"
-    "$ABR" repack "cros_sg_u_$x" -o "cros_sg_r_$x.blob" >/dev/null 2>&1
+    "$ABR" pack -i "cros_sg_u_$x" -o "cros_sg_r_$x.blob" >/dev/null 2>&1
     rd_ck "$x: an untouched repack is identical (the bad signature is kept)" cmp -s "cros_sg_$x.blob" "cros_sg_r_$x.blob"
     cros_copy "cros_sg_u_$x" "cros_sg_x_$x"
     cros_edit "cros_sg_x_$x"
@@ -4347,9 +4417,9 @@ for kind in "kb-algorithm:data key algorithm 99;" "kb-arrsize:data key RSA-2048/
     x="${kind%%:*}"
     msg="${kind#*:}"
     cros corrupt cros_dev22.blob "cros_kd_$x.blob" "$x"
-    rd_ck "$x: info says the data key ($msg) and that the signatures are not checked" said "$msg.*signatures not checked" "$ABR" info "cros_kd_$x.blob"
+    rd_ck "$x: info says the data key ($msg) and that the signatures are not checked" said "$msg.*signatures not checked" "$ABR" info -i "cros_kd_$x.blob"
     rd_unpack "cros_kd_$x.blob" "cros_kd_u_$x"
-    "$ABR" repack "cros_kd_u_$x" -o "cros_kd_r_$x.blob" >/dev/null 2>&1
+    "$ABR" pack -i "cros_kd_u_$x" -o "cros_kd_r_$x.blob" >/dev/null 2>&1
     rd_ck "$x: an untouched repack is identical (the keyblock is kept as it is, whatever it says)" cmp -s "cros_kd_$x.blob" "cros_kd_r_$x.blob"
     cros_copy "cros_kd_u_$x" "cros_kd_x_$x"
     cros_edit "cros_kd_x_$x"
@@ -4375,7 +4445,7 @@ if cros_fut; then
         rd_ck "$k: futility --pack makes the very same blob" cros_fut_pack_is "cros_G_$k.blob" cros_plain_pad.img "$kb" "$kp" --version 7 --flags 0x3 --kloadaddr 0x2000000 \
             --config cros_cfg.txt --bootloader cros_bl.bin --pad 131072
         rd_unpack "cros_G_$k.blob" "cros_G_u_$k"
-        "$ABR" repack "cros_G_u_$k" -o "cros_G_r_$k.blob" >/dev/null 2>&1
+        "$ABR" pack -i "cros_G_u_$k" -o "cros_G_r_$k.blob" >/dev/null 2>&1
         rd_ck "$k: an untouched repack is identical" cmp -s "cros_G_$k.blob" "cros_G_r_$k.blob"
         cros_copy "cros_G_u_$k" "cros_G_x_$k"
         cros_edit "cros_G_x_$k"
@@ -4405,8 +4475,8 @@ rd_ck "unpack names both wrappers, in the order they come off" grep -q 'unpacked
 rd_ck "and says an untouched repack is identical" grep -q 'reproduces this image byte-for-byte' cros_u_chain.log
 rd_ck "both are in the manifest" grep -q '^has_chromeos=true$' cros_u_chain/manifest.txt
 rd_ck "(the DHTB header)" grep -q '^has_dhtb=true$' cros_u_chain/manifest.txt
-rd_ck "info names both" said "wrapper: ChromeOS kernel blob" "$ABR" info cros_chain.blob
-"$ABR" repack cros_u_chain -o cros_r_chain.blob >/dev/null 2>&1
+rd_ck "info names both" said "wrapper: ChromeOS kernel blob" "$ABR" info -i cros_chain.blob
+"$ABR" pack -i cros_u_chain -o cros_r_chain.blob >/dev/null 2>&1
 rd_ck "an untouched repack is identical" cmp -s cros_chain.blob cros_r_chain.blob
 cros_copy cros_u_chain cros_x_chain
 cros_edit cros_x_chain
@@ -4434,15 +4504,15 @@ rd_done "ChromeOS: around a DHTB header (two wrappers): both come off in order, 
 head -c 100000 /dev/urandom >cros_rnd.bin
 rd_ck "the independent tool makes a blob of random bytes" cros make cros_C.blob --kernel cros_rnd.bin --keyblock "$CROS_KB" --key "$CROS_KP" --minor 2 --kernel-version 3 --config cros_cfg.txt
 rd_ck "identify" said "CHROMEOS" "$ABR" identify cros_C.blob
-rd_ck "info says what the blob is (a kernel of 102400 bytes: the 100000 and the zeros up to 4096)" said "blob:           vboot preamble 2.2, kernel version 3," "$ABR" info cros_C.blob
-rd_ck "... and the sizes" said "kernel 102400 bytes, config $(cros_size cros_cfg.txt) bytes" "$ABR" info cros_C.blob
+rd_ck "info says what the blob is (a kernel of 102400 bytes: the 100000 and the zeros up to 4096)" said "blob:           vboot preamble 2.2, kernel version 3," "$ABR" info -i cros_C.blob
+rd_ck "... and the sizes" said "kernel 102400 bytes, config $(cros_size cros_cfg.txt) bytes" "$ABR" info -i cros_C.blob
 rd_unpack cros_C.blob cros_u_C
 rd_ck "the manifest is of a container" grep -q '^type=chromeos$' cros_u_C/manifest.txt
 rd_ck "the kernel is a file (the kernel field as it is, zeros and all)" test "$(cros_size cros_u_C/chromeos_kernel.bin)" = 102400
 rd_ck "... that starts with the bytes" cmp -s -n 100000 cros_u_C/chromeos_kernel.bin cros_rnd.bin
 rd_ck "the command line is a file" cmp -s cros_u_C/chromeos_config.txt cros_cfg.txt
 rd_ck "the version of the kernel is in the manifest" grep -q '^chromeos_kernel_version=3$' cros_u_C/manifest.txt
-"$ABR" repack cros_u_C -o cros_r_C.blob >/dev/null 2>&1
+"$ABR" pack -i cros_u_C -o cros_r_C.blob >/dev/null 2>&1
 rd_ck "an untouched repack is identical" cmp -s cros_C.blob cros_r_C.blob
 cros_copy cros_u_C cros_x_C
 head -c 5000 /dev/urandom >>cros_x_C/chromeos_kernel.bin
@@ -4543,17 +4613,17 @@ while IFS=$'\t' read -r sin_status sin_name sin_pat; do
             rd_ck "$sin_name: the check says it is the image inside the SIN that comes back" rd_has_text "$sin_u.log" "reproduces the image inside the SIN byte-for-byte"
             rd_unpack "$sin_want" "$sin_u.plain"
             rd_ck "$sin_name: the directory is the one of the plain image" sin_tree_is_plain "$sin_u" "$sin_u.plain"
-            "$ABR" repack "$sin_u" -o "$sin_u.img" >"$sin_u.rlog" 2>&1
+            "$ABR" pack -i "$sin_u" -o "$sin_u.img" >"$sin_u.rlog" 2>&1
             rd_ck "$sin_name: a repack writes the image inside" cmp -s "$sin_u.img" "$sin_want"
             rd_ck "$sin_name: ... and no container" sin_not_sin "$sin_u.img"
-            rd_ck "$sin_name: info shows the container ($sin_pat)" sin_says "$sin_pat" "$ABR" info "$sin_f"
+            rd_ck "$sin_name: info shows the container ($sin_pat)" sin_says "$sin_pat" "$ABR" info -i "$sin_f"
             rd_ck "$sin_name: identify names the signature of the file" sin_says "SINv" "$ABR" identify "$sin_f"
             rd_ck "$sin_name: the independent reader makes the same image" sin_reader "$sin_f" "$sin_want"
             sin_dump_ok && rd_ck "$sin_name: sony_dump makes the same image" sin_dump_makes "$sin_f" "$sin_want"
             ;;
         nonboot | refuse)
             rm -rf "$sin_u"
-            rd_ck "$sin_name: unpack is refused with the reason ($sin_pat)" sin_refuses "$sin_pat" "$ABR" unpack "$sin_f" -o "$sin_u"
+            rd_ck "$sin_name: unpack is refused with the reason ($sin_pat)" sin_refuses "$sin_pat" "$ABR" unpack -i "$sin_f" -o "$sin_u"
             rd_ck "$sin_name: no directory is left" test ! -e "$sin_u"
             ;;
     esac
@@ -4568,9 +4638,9 @@ sin_edit() {  # <case> : append to the kernel of the unpacked container, repack,
     f="$(ls "$d/kernel" "$d/segment0_kernel.bin" 2>/dev/null | head -n 1)"
     [ -n "$f" ] || return 1
     printf 'abr test' >>"$f"
-    "$ABR" repack "$d" -o "$d.img" >"$d.rlog" 2>&1 || return 1
+    "$ABR" pack -i "$d" -o "$d.img" >"$d.rlog" 2>&1 || return 1
     sin_not_sin "$d.img" || return 1
-    "$ABR" unpack "$d.img" -o "${d}_re" >"${d}_re.log" 2>&1 || return 1
+    "$ABR" unpack -i "$d.img" -o "${d}_re" >"${d}_re.log" 2>&1 || return 1
     cmp -s "$f" "${d}_re/$(basename "$f")" || return 1
     ! grep -q 'sin-wrapped' "${d}_re.log"
 }
@@ -4581,21 +4651,21 @@ rd_done "Sony SIN: what is edited in the directory of a container lands in the p
 
 # ---- the same directory, whatever the number of threads decoding the parts of the 18 MiB container
 rm -rf sin_t1 sin_t4
-ABR_THREADS=1 "$ABR" unpack sin_k/c/v3_mmcf_big_aosp.sin -o sin_t1 >/dev/null 2>&1
-ABR_THREADS=4 "$ABR" unpack sin_k/c/v3_mmcf_big_aosp.sin -o sin_t4 >/dev/null 2>&1
+ABR_THREADS=1 "$ABR" unpack -i sin_k/c/v3_mmcf_big_aosp.sin -o sin_t1 >/dev/null 2>&1
+ABR_THREADS=4 "$ABR" unpack -i sin_k/c/v3_mmcf_big_aosp.sin -o sin_t4 >/dev/null 2>&1
 rd_ck "one thread unpacks it" test -f sin_t1/manifest.txt
 rd_ck "four threads unpack it" test -f sin_t4/manifest.txt
 rd_ck "the directories are the same" sin_tree_is_plain sin_t1 sin_t4
-rd_ck "and the image inside is what a repack writes" sh -c "'$ABR' repack sin_t4 -o sin_t4.img >/dev/null 2>&1 && cmp -s sin_t4.img sin_k/c/v3_mmcf_big_aosp.expect"
+rd_ck "and the image inside is what a repack writes" sh -c "'$ABR' pack -i sin_t4 -o sin_t4.img >/dev/null 2>&1 && cmp -s sin_t4.img sin_k/c/v3_mmcf_big_aosp.expect"
 rd_done "Sony SIN: the parts of a container are decoded on as many threads as there are, and the result is the same for one"
 
 # ---- notes: a part that starts before the end of the image is put at the end, as sony_dump does -- and the unpack says so
 rm -rf sin_n1
-"$ABR" unpack sin_k/c/v3_mmcf_append_elf.sin -o sin_n1 >sin_n1.log 2>&1
+"$ABR" unpack -i sin_k/c/v3_mmcf_append_elf.sin -o sin_n1 >sin_n1.log 2>&1
 rd_ck "the unpack says where the part went" rd_has_text sin_n1.log "it is put at the end, as sony_dump does"
 rd_ck "and what the repack is" rd_has_text sin_n1.log "the container is not kept, a repack writes the plain elf_boot image"
-rd_ck "info says it as well" sin_says "it is put at the end, as sony_dump does" "$ABR" info sin_k/c/v3_mmcf_append_elf.sin
-rd_ck "a container that is as it should be has no such note" sh -c "! '$ABR' info sin_k/c/v3_mmcf_mixed_elf.sin 2>&1 | grep -q 'note:'"
+rd_ck "info says it as well" sin_says "it is put at the end, as sony_dump does" "$ABR" info -i sin_k/c/v3_mmcf_append_elf.sin
+rd_ck "a container that is as it should be has no such note" sh -c "! '$ABR' info -i sin_k/c/v3_mmcf_mixed_elf.sin 2>&1 | grep -q 'note:'"
 rd_done "Sony SIN: the unpack tells what it did that is not plain (a part put at the end) and what a repack will write"
 
 # ---- a container around an image that is wrapped (DHTB, here): the container is not kept, the wrapper is
@@ -4612,7 +4682,7 @@ rd_ck "both layers are named" rd_has_text sin_d.log "unpacked sin-wrapped dhtb-w
 rd_ck "the DHTB wrapper is in the manifest" grep -q '^has_dhtb=true$' sin_d/manifest.txt
 rd_ck "the container is not (nothing of it is kept)" sh -c "! grep -q '^sin' sin_d/manifest.txt"
 rd_ck "the round trip is checked against what the container held" rd_has_text sin_d.log "reproduces the image inside the SIN byte-for-byte"
-"$ABR" repack sin_d -o sin_d.img >/dev/null 2>&1
+"$ABR" pack -i sin_d -o sin_d.img >/dev/null 2>&1
 rd_ck "a repack writes the DHTB-wrapped image that was inside" cmp -s sin_d.img sin_k/dhtb.img
 rd_done "Sony SIN: around a DHTB-wrapped image only the container comes off; the DHTB header stays and is written again"
 
@@ -4676,7 +4746,7 @@ elf_edit_kernel() {  # <case>: 8 bytes more in the kernel: the image is what the
     rm -rf "$d" "$d.img" "$d.expect"
     cp -a "elf_u_$en" "$d" || return 1
     printf 'abr test' >>"$d/kernel"
-    "$ABR" repack "$d" -o "$d.img" >"$d.rlog" 2>&1 || return 1
+    "$ABR" pack -i "$d" -o "$d.img" >"$d.rlog" 2>&1 || return 1
     elft rebuild "elf_k/c/$en.json" "elf_k/c/$en.img" "$d.expect" --kernel "$d/kernel" || return 1
     cmp -s "$d.img" "$d.expect" && ! cmp -s "$d.img" "elf_k/c/$en.img"
 }
@@ -4685,10 +4755,10 @@ elf_edit_ramdisk() {  # <case>: a file put into ramdisk/ lands in the image; the
     rm -rf "$d" "$d.img" "$d.expect" "${d}_re"
     cp -a "elf_u_$en" "$d" || return 1
     printf 'abr test\n' >"$d/ramdisk/abr_test_file"
-    "$ABR" repack "$d" -o "$d.img" >"$d.rlog" 2>&1 || return 1
+    "$ABR" pack -i "$d" -o "$d.img" >"$d.rlog" 2>&1 || return 1
     elft rebuild "elf_k/c/$en.json" "$d.img" "$d.expect" || return 1  # the segments of this image in the layout of the original
     cmp -s "$d.img" "$d.expect" || return 1
-    "$ABR" unpack "$d.img" -o "${d}_re" >/dev/null 2>&1 || return 1
+    "$ABR" unpack -i "$d.img" -o "${d}_re" >/dev/null 2>&1 || return 1
     [ "$(cat "${d}_re/ramdisk/abr_test_file")" = "abr test" ] || return 1
     rd_same_tree_x "elf_u_$en/ramdisk" "${d}_re/ramdisk" abr_test_file
 }
@@ -4697,7 +4767,7 @@ elf_edit_addr() {  # <case>: the first segment gets another address in the manif
     rm -rf "$d" "$d.img" "$d.expect"
     cp -a "elf_u_$en" "$d" || return 1
     sed -i 's/^segment0_addr=.*/segment0_addr=0x80300000/' "$d/manifest.txt"
-    "$ABR" repack "$d" -o "$d.img" >"$d.rlog" 2>&1 || return 1
+    "$ABR" pack -i "$d" -o "$d.img" >"$d.rlog" 2>&1 || return 1
     elft rebuild "elf_k/c/$en.json" "elf_k/c/$en.img" "$d.expect" --addr0 80300000 || return 1
     cmp -s "$d.img" "$d.expect" && ! cmp -s "$d.img" "elf_k/c/$en.img"
 }
@@ -4726,7 +4796,7 @@ while IFS=$'\t' read -r en el eo ed; do
     elf_name="ELF bootimg"
     case "$en" in entry_abi) elf_name="ELF (ARM)" ;; esac  # (the magic file of AIK calls an ELF a boot image only when its OS/ABI byte is 0x61)
     rd_ck "$en: identify names it" elf_says "$elf_name" "$ABR" identify "$ei"
-    rd_ck "$en: info: the format, the class and the number of segments" sh -c "'$ABR' info '$ei' >'$eu.info' 2>&1 && grep -q -F 'format: elf_boot' '$eu.info' && grep -q -F 'class:    $elf_cls' '$eu.info' && grep -q -F 'segments: $elf_segs' '$eu.info'"
+    rd_ck "$en: info: the format, the class and the number of segments" sh -c "'$ABR' info -i '$ei' >'$eu.info' 2>&1 && grep -q -F 'format: elf_boot' '$eu.info' && grep -q -F 'class:    $elf_cls' '$eu.info' && grep -q -F 'segments: $elf_segs' '$eu.info'"
     rd_ck "$en: the segments are what the independent reader finds" elf_parts_match "$ei" "$eu"
     if [ -f "$eu/ramdisk.cpio" ]; then
         rd_ck "$en: the ramdisk is a directory" test -d "$eu/ramdisk"
@@ -4736,11 +4806,11 @@ while IFS=$'\t' read -r en el eo ed; do
     fi
     case "$el" in
         elftool)
-            rd_ck "$en: info: the layout is elftool's" elf_says "layout:   elftool's (data from byte 4096" "$ABR" info "$ei"
+            rd_ck "$en: info: the layout is elftool's" elf_says "layout:   elftool's (data from byte 4096" "$ABR" info -i "$ei"
             rd_ck "$en: nothing of the layout is kept" sh -c "! grep -q '^elf_layout' '$eu/manifest.txt' && test ! -e '$eu/.abr_raw/elf_layout.bin'"
             ;;
         kept)
-            rd_ck "$en: info: the layout is kept as found" elf_says "layout:   kept as found" "$ABR" info "$ei"
+            rd_ck "$en: info: the layout is kept as found" elf_says "layout:   kept as found" "$ABR" info -i "$ei"
             rd_ck "$en: the unpack says why" rd_has_text "$eu.log" "is not laid out the way elftool lays an image out"
             rd_ck "$en: the manifest and .abr_raw/elf_layout.bin have it" sh -c "grep -q '^elf_layout=kept\$' '$eu/manifest.txt' && test -s '$eu/.abr_raw/elf_layout.bin'"
             ;;
@@ -4759,7 +4829,7 @@ while IFS=$'\t' read -r en el eo ed; do
             rd_ck "$en: an empty segment is no file" test ! -e "$eu/ramdisk.cpio"
             ;;
     esac
-    "$ABR" repack "$eu" -o "$eu.out" >"$eu.rlog" 2>&1
+    "$ABR" pack -i "$eu" -o "$eu.out" >"$eu.rlog" 2>&1
     rd_ck "$en: an untouched repack is the image" cmp -s "$ei" "$eu.out"
     rd_ck "$en: an edited kernel: the image the independent writer makes of the same layout" elf_edit_kernel "$en"
     if [ -d "$eu/ramdisk" ]; then
@@ -4780,15 +4850,15 @@ done <elf_k/c/index.txt
 rm -rf elf_big elf_big.img elf_big_k elf_big_k.img elf_big64 elf_big64.img
 cp -a elf_u_elftool3 elf_big
 sed -i 's/^segment0_addr=.*/segment0_addr=0x100000000/' elf_big/manifest.txt
-rd_ck "ELF32 in elftool's layout: an address beyond 32 bits is refused with the reason" elf_refuses "does not fit an ELF32 image" "$ABR" repack elf_big -o elf_big.img
+rd_ck "ELF32 in elftool's layout: an address beyond 32 bits is refused with the reason" elf_refuses "does not fit an ELF32 image" "$ABR" pack -i elf_big -o elf_big.img
 rd_ck "... and no file is left" test ! -e elf_big.img
 cp -a elf_u_start8k elf_big_k
 sed -i 's/^segment0_addr=.*/segment0_addr=0x100000000/' elf_big_k/manifest.txt
-rd_ck "ELF32 in a layout that is kept: the same" elf_refuses "does not fit an ELF32" "$ABR" repack elf_big_k -o elf_big_k.img
+rd_ck "ELF32 in a layout that is kept: the same" elf_refuses "does not fit an ELF32" "$ABR" pack -i elf_big_k -o elf_big_k.img
 rd_ck "... and no file is left" test ! -e elf_big_k.img
 cp -a elf_u_elf64 elf_big64
 sed -i 's/^segment0_addr=.*/segment0_addr=0x100000000/' elf_big64/manifest.txt
-"$ABR" repack elf_big64 -o elf_big64.img >/dev/null 2>&1
+"$ABR" pack -i elf_big64 -o elf_big64.img >/dev/null 2>&1
 rd_ck "ELF64: the address is taken" elf_says "kernel flags=0x00000000 offset=4096 address=0x100000000 " elft list elf_big64.img
 rd_done "Sony ELF: an address beyond 32 bits is refused for an ELF32 header (elftool's layout and a kept one: with the reason, no file left) and written into an ELF64 one"
 
@@ -4804,12 +4874,12 @@ elf_fallback() {  # <case> <label> <text of the warning> <damage function>: the 
     rm -rf "$d" "$d.img" "$d.expect"
     cp -a "elf_u_$en" "$d" || return 1
     "$damage" "$d" || return 1
-    "$ABR" repack "$d" -o "$d.img" >"$d.rlog" 2>&1 || return 1
+    "$ABR" pack -i "$d" -o "$d.img" >"$d.rlog" 2>&1 || return 1
     grep -q -F -- "$text" "$d.rlog" || return 1
     grep -q -F -- "the image is written in elftool's layout" "$d.rlog" || return 1
     if [ "$damage" = elf_dmg_count ]; then  # two segments are written, in elftool's layout
         [ "$(elft list "$d.img" | tail -n +2 | wc -l | tr -d ' ')" = 2 ] || return 1
-        elf_says "layout:   elftool's" "$ABR" info "$d.img"
+        elf_says "layout:   elftool's" "$ABR" info -i "$d.img"
     else
         elft rebuild "elf_k/c/$en.json" "elf_k/c/$en.img" "$d.expect" --canonical || return 1
         cmp -s "$d.img" "$d.expect"
@@ -4821,15 +4891,15 @@ rd_ck "the sizes in the manifest are not the file's" elf_fallback pads_tail size
 rd_ck "the order names a segment that is not there" elf_fallback pads_tail order "the layout kept for this image is damaged (the order of its segments)" elf_dmg_order
 rd_ck "the order names a segment twice" elf_fallback pads_tail twice "the layout kept for this image is damaged (the order of its segments)" elf_dmg_twice
 rd_ck "the number of segments is not the one of the layout" elf_fallback pads_tail count "has 3 program headers, the image has 2 segments" elf_dmg_count
-rd_ck "an elftool layout needs no file: a manifest that says nothing of it is as good" sh -c "! grep -q '^elf_layout' elf_u_elftool3/manifest.txt && '$ABR' repack elf_u_elftool3 -o elf_fb_none.img >/dev/null 2>&1 && cmp -s elf_fb_none.img elf_k/c/elftool3.img"
+rd_ck "an elftool layout needs no file: a manifest that says nothing of it is as good" sh -c "! grep -q '^elf_layout' elf_u_elftool3/manifest.txt && '$ABR' pack -i elf_u_elftool3 -o elf_fb_none.img >/dev/null 2>&1 && cmp -s elf_fb_none.img elf_k/c/elftool3.img"
 # a segment that had no data in the image gets some: no layout has room for it
 rm -rf elf_gain elf_gain.img
 cp -a elf_u_empty_kept elf_gain
 printf 'hello' >elf_gain/ramdisk.cpio
 printf 'ramdisk_file=ramdisk.cpio\nramdisk_compression=none\n' >>elf_gain/manifest.txt
-"$ABR" repack elf_gain -o elf_gain.img >elf_gain.rlog 2>&1
+"$ABR" pack -i elf_gain -o elf_gain.img >elf_gain.rlog 2>&1
 rd_ck "a segment that had no data and has some: the repack says so" rd_has_text elf_gain.rlog "had no data in the image that was unpacked and has some now; the image is written in elftool's layout"
-rd_ck "... the data is in the image (and the layout is elftool's)" sh -c "'$ABR' info elf_gain.img >elf_gain.info 2>&1 && grep -q -F 'ramdisk (flags=0x80000000) addr=0x81800000 size=5 (none)' elf_gain.info && grep -q -F \"layout:   elftool's\" elf_gain.info"
+rd_ck "... the data is in the image (and the layout is elftool's)" sh -c "'$ABR' info -i elf_gain.img >elf_gain.info 2>&1 && grep -q -F 'ramdisk (flags=0x80000000) addr=0x81800000 size=5 (none)' elf_gain.info && grep -q -F \"layout:   elftool's\" elf_gain.info"
 rd_done "Sony ELF: a layout that cannot be used for the repack (the file gone, cut short, sizes that do not fit, an order naming a segment that is not there or one twice, another number of segments, a segment that had no data and has some) is said in a warning and the image is written in elftool's layout of the same segments"
 
 # ---- manifest.txt: values that are not plain text, and the names of files --------------------------------------
@@ -4868,18 +4938,20 @@ for mf_hv in 0 4; do
         python3 "$MKBOOTIMG" >/dev/null 2>&1 --header_version $mf_hv --kernel mf_kernel.bin --ramdisk mf_ramdisk.bin \
             --cmdline "$mf_cl" --output mf_in.img || { mf_bad="$mf_bad [v$mf_hv #$mf_n: mkbootimg]"; continue; }
         rm -rf mf_dir
-        "$ABR" unpack mf_in.img -o mf_dir >mf_dir.log 2>&1 || { mf_bad="$mf_bad [v$mf_hv #$mf_n: unpack]"; continue; }
-        "$ABR" repack mf_dir -o mf_out.img >mf_out.log 2>&1 || { mf_bad="$mf_bad [v$mf_hv #$mf_n: repack]"; continue; }
+        "$ABR" unpack -i mf_in.img -o mf_dir >mf_dir.log 2>&1 || { mf_bad="$mf_bad [v$mf_hv #$mf_n: unpack]"; continue; }
+        "$ABR" pack -i mf_dir -o mf_out.img >mf_out.log 2>&1 || { mf_bad="$mf_bad [v$mf_hv #$mf_n: repack]"; continue; }
         cmp -s mf_in.img mf_out.img || mf_bad="$mf_bad [v$mf_hv #$mf_n: the repack is not the image]"
         grep -q -i "warning" mf_dir.log mf_out.log && mf_bad="$mf_bad [v$mf_hv #$mf_n: a warning]"
         # one line more or less than the others, or a line that is neither a comment nor key=value, is what a line break
         # in the command line would have made; and the keys that name files are the two of this image and name them in the directory
         [ -z "$mf_lines" ] && mf_lines=$(wc -l <mf_dir/manifest.txt)
         [ "$(wc -l <mf_dir/manifest.txt)" = "$mf_lines" ] || mf_bad="$mf_bad [v$mf_hv #$mf_n: the manifest has other lines]"
-        grep -q -v -E '^(#|[a-z0-9_]+=)' mf_dir/manifest.txt && mf_bad="$mf_bad [v$mf_hv #$mf_n: a line of the manifest is not key=value]"
+        # (the blank line in front of the comment and the layout_ lines at the end is not a line of a value; a line break that a value
+        # could have made as a line of its own is caught by the count of the lines above)
+        grep -q -v -E '^(#|[a-z0-9_]+=|$)' mf_dir/manifest.txt && mf_bad="$mf_bad [v$mf_hv #$mf_n: a line of the manifest is not key=value]"
         [ "$(grep -c -E '^(kernel|ramdisk)_file=[a-z.]+$' mf_dir/manifest.txt)" = 2 ] || mf_bad="$mf_bad [v$mf_hv #$mf_n: the keys that name files]"
         # what `info` shows of it has no control character (a terminal would obey one), and a plain command line is shown as it is
-        "$ABR" info mf_in.img >mf_info.txt 2>&1
+        "$ABR" info -i mf_in.img >mf_info.txt 2>&1
         sed 's/\r$//' mf_info.txt | tr -d '\n' | LC_ALL=C grep -q '[[:cntrl:]]' && mf_bad="$mf_bad [v$mf_hv #$mf_n: info prints a control character]"
         grep -q '^cmdline:  ' mf_info.txt || mf_bad="$mf_bad [v$mf_hv #$mf_n: info has no cmdline]"
     done
@@ -4888,8 +4960,8 @@ printf 'console=ttyS0,115200 androidboot.hardware=plain' >mf_plain.txt
 python3 "$MKBOOTIMG" >/dev/null 2>&1 --header_version 0 --kernel mf_kernel.bin --ramdisk mf_ramdisk.bin \
     --cmdline "$(cat mf_plain.txt)" --output mf_in.img
 rm -rf mf_dir
-"$ABR" unpack mf_in.img -o mf_dir >/dev/null 2>&1
-mf_info=$("$ABR" info mf_in.img 2>&1)  # not `info | grep -q`: grep quitting at its match could SIGPIPE abr (see `said`)
+"$ABR" unpack -i mf_in.img -o mf_dir >/dev/null 2>&1
+mf_info=$("$ABR" info -i mf_in.img 2>&1)  # not `info | grep -q`: grep quitting at its match could SIGPIPE abr (see `said`)
 grep -q -x -F "cmdline:        $(cat mf_plain.txt)" <<<"$mf_info" || mf_bad="$mf_bad [a plain command line is shown as it is]"
 grep -q -x "cmdline=$(cat mf_plain.txt)" mf_dir/manifest.txt || mf_bad="$mf_bad [a plain command line is written as it is]"
 # the manifest of an earlier version, and what a person writes: white space around, CRLF, comments, no quotes
@@ -4898,15 +4970,15 @@ grep -q -x "cmdline=$(cat mf_plain.txt)" mf_dir/manifest.txt || mf_bad="$mf_bad 
     sed -e 's/^cmdline=.*/  cmdline = console=ttyS0 hand-written   /' -e 's/$/\r/' mf_dir/manifest.txt
 } >mf_hand.txt
 cp mf_hand.txt mf_dir/manifest.txt
-"$ABR" repack mf_dir -o mf_hand.img >mf_hand.log 2>&1 || mf_bad="$mf_bad [a manifest written by hand: repack]"
-mf_info=$("$ABR" info mf_hand.img 2>&1)
+"$ABR" pack -i mf_dir -o mf_hand.img >mf_hand.log 2>&1 || mf_bad="$mf_bad [a manifest written by hand: repack]"
+mf_info=$("$ABR" info -i mf_hand.img 2>&1)
 grep -q -x -F "cmdline:        console=ttyS0 hand-written" <<<"$mf_info" || mf_bad="$mf_bad [a manifest written by hand: the command line]"
 # a quoted value that is wrong: an error that says where
 rm -rf mf_dir
-"$ABR" unpack mf_in.img -o mf_dir >/dev/null 2>&1
+"$ABR" unpack -i mf_in.img -o mf_dir >/dev/null 2>&1
 printf 'cmdline="never closed\n' >>mf_dir/manifest.txt
 rm -f mf_syn.img
-if "$ABR" repack mf_dir -o mf_syn.img >mf_syn.log 2>&1 || [ -e mf_syn.img ] || ! grep -q "not closed" mf_syn.log || ! grep -q "line " mf_syn.log; then
+if "$ABR" pack -i mf_dir -o mf_syn.img >mf_syn.log 2>&1 || [ -e mf_syn.img ] || ! grep -q "not closed" mf_syn.log || ! grep -q "line " mf_syn.log; then
     mf_bad="$mf_bad [a quoted value that is not closed: $(head -c 200 mf_syn.log)]"
 fi
 [ -z "$mf_bad" ] &&
@@ -4919,8 +4991,8 @@ mf_checked=0
 for mf_img in boot_v2.img vendor_boot_v4.img vbmeta_signed.img dtbo_built.img v2.dtb blob_multi.img elf_big64.img cros_dev22.blob; do
     if [ ! -f "$mf_img" ]; then mf_names_bad="$mf_names_bad [$mf_img is not there]"; continue; fi
     rm -rf mf_nm
-    "$ABR" unpack "$mf_img" -o mf_nm >/dev/null 2>&1 || { mf_names_bad="$mf_names_bad [$mf_img: unpack]"; continue; }
-    "$ABR" repack mf_nm -o mf_nm_ok.img >/dev/null 2>&1 || { mf_names_bad="$mf_names_bad [$mf_img: repack of the unchanged directory]"; continue; }
+    "$ABR" unpack -i "$mf_img" -o mf_nm >/dev/null 2>&1 || { mf_names_bad="$mf_names_bad [$mf_img: unpack]"; continue; }
+    "$ABR" pack -i mf_nm -o mf_nm_ok.img >/dev/null 2>&1 || { mf_names_bad="$mf_names_bad [$mf_img: repack of the unchanged directory]"; continue; }
     mf_first=1
     for mf_key in $(grep -o -E '^[a-z0-9_]+_(file|tree)=' mf_nm/manifest.txt | tr -d '='); do
         mf_values=('../escape.bin' '/etc/hostname')
@@ -4932,7 +5004,7 @@ for mf_img in boot_v2.img vendor_boot_v4.img vbmeta_signed.img dtbo_built.img v2
             cp -r mf_nm mf_nm_bad
             K="$mf_key" V="$mf_v" awk 'BEGIN { FS = "="; k = ENVIRON["K"]; v = ENVIRON["V"] } $1 == k { print k "=" v; next } { print }' mf_nm/manifest.txt >mf_nm_bad/manifest.txt
             mf_checked=$((mf_checked + 1))
-            if "$ABR" repack mf_nm_bad -o mf_nm_bad.img >mf_nm_bad.log 2>&1; then
+            if "$ABR" pack -i mf_nm_bad -o mf_nm_bad.img >mf_nm_bad.log 2>&1; then
                 mf_names_bad="$mf_names_bad [$mf_img: $mf_key=$mf_v was taken]"
             elif [ -e mf_nm_bad.img ]; then
                 mf_names_bad="$mf_names_bad [$mf_img: $mf_key=$mf_v: an image was written]"
@@ -4969,7 +5041,7 @@ rp_report() {  # <what the checks show>: one PASS or FAIL for the checks since t
 }
 rp_fresh() {  # <image> <dir>: a fresh unpack of the image
     rm -rf "$2"
-    "$ABR" unpack "$1" -o "$2" >/dev/null 2>&1
+    "$ABR" unpack -i "$1" -o "$2" >/dev/null 2>&1
 }
 rp_set() {  # <dir> <key> <value>: the manifest with the value of the key replaced (the key added when it is not there), the value as it is
     K="$2" V="$3" python3 -I - "$1/manifest.txt" <<'PYEOF'
@@ -5006,7 +5078,7 @@ rp_refused() {  # <dir> <label> <text the message has>: repack of <dir> is refus
     local d="$1" label="$2" want="$3"
     rm -f "$rp_run" rp_run.log
     rp_n=$((rp_n + 1))
-    if timeout 120 "$ABR" repack "$d" -o "$rp_run" >rp_run.log 2>&1; then
+    if timeout 120 "$ABR" pack -i "$d" -o "$rp_run" >rp_run.log 2>&1; then
         rp_bad="$rp_bad [$label: taken]"
     elif [ -e "$rp_run" ]; then
         rp_bad="$rp_bad [$label: an image was written]"
@@ -5019,7 +5091,7 @@ rp_refused() {  # <dir> <label> <text the message has>: repack of <dir> is refus
 rp_made() {  # <dir> <label>: repack of <dir> works (the image is rp_run.img)
     rm -f "$rp_run" rp_run.log
     rp_n=$((rp_n + 1))
-    if ! timeout 120 "$ABR" repack "$1" -o "$rp_run" >rp_run.log 2>&1 || [ ! -s "$rp_run" ]; then
+    if ! timeout 120 "$ABR" pack -i "$1" -o "$rp_run" >rp_run.log 2>&1 || [ ! -s "$rp_run" ]; then
         rp_bad="$rp_bad [$2: refused: $(head -c 160 rp_run.log)]"
         return 1
     fi
@@ -5048,7 +5120,7 @@ for rp_case in '0xFFFFFFFF:0xffffffff' '4294967295:0xffffffff' '010:0xa' '0X1000
     rm -rf rp_try rp_try_re
     cp -a rp_dir rp_try
     rp_set rp_try kernel_addr "${rp_case%%:*}"
-    if rp_made rp_try "kernel_addr=${rp_case%%:*}" && "$ABR" unpack "$rp_run" -o rp_try_re >/dev/null 2>&1; then
+    if rp_made rp_try "kernel_addr=${rp_case%%:*}" && "$ABR" unpack -i "$rp_run" -o rp_try_re >/dev/null 2>&1; then
         grep -q -x -F "kernel_addr=${rp_case#*:}" rp_try_re/manifest.txt ||
             rp_bad="$rp_bad [kernel_addr=${rp_case%%:*} came back as: $(grep '^kernel_addr=' rp_try_re/manifest.txt)]"
     fi
@@ -5096,7 +5168,7 @@ for rp_v in 512 2048 4096 65536; do
         rm -rf rp_try rp_try_re
         cp -a "$rp_d" rp_try
         rp_set rp_try page_size "$rp_v"
-        if rp_made rp_try "$rp_what page_size=$rp_v" && "$ABR" unpack "$rp_run" -o rp_try_re >/dev/null 2>&1; then
+        if rp_made rp_try "$rp_what page_size=$rp_v" && "$ABR" unpack -i "$rp_run" -o rp_try_re >/dev/null 2>&1; then
             grep -q -x "page_size=$rp_v" rp_try_re/manifest.txt || rp_bad="$rp_bad [$rp_what page_size=$rp_v came back as: $(grep '^page_size=' rp_try_re/manifest.txt)]"
         fi
     done
@@ -5125,7 +5197,7 @@ for rp_v in true TRUE True yes Yes YES 1; do
     rm -rf rp_try rp_try_re
     cp -a rp_dir rp_try
     rp_set rp_try acpio "$rp_v"
-    if rp_made rp_try "acpio=$rp_v" && "$ABR" unpack "$rp_run" -o rp_try_re >/dev/null 2>&1; then
+    if rp_made rp_try "acpio=$rp_v" && "$ABR" unpack -i "$rp_run" -o rp_try_re >/dev/null 2>&1; then
         grep -q -x 'acpio=true' rp_try_re/manifest.txt || rp_bad="$rp_bad [acpio=$rp_v did not make an ACPIO image]"
     fi
 done
@@ -5172,7 +5244,7 @@ rm rp_nf/manifest.txt
 mkdir rp_nf/manifest.txt
 rp_refused rp_nf "a directory where the manifest is" "is a directory"
 rm -f rp_run.img rp_nf_img.log
-if timeout 60 "$ABR" info rp_dir >rp_nf_img.log 2>&1 || ! grep -q -F "is a directory" rp_nf_img.log; then
+if timeout 60 "$ABR" info -i rp_dir >rp_nf_img.log 2>&1 || ! grep -q -F "is a directory" rp_nf_img.log; then
     rp_bad="$rp_bad [info of a directory: $(head -c 160 rp_nf_img.log)]"
 fi
 rp_n=$((rp_n + 1))
@@ -5207,7 +5279,7 @@ rp_report "files that are not files (a directory or a fifo where the kernel or t
 rp_fresh boot_v2.img rp_dir
 rm -rf rp_odir rp_odir.log
 rp_n=$((rp_n + 1))
-if timeout 60 "$ABR" repack rp_dir -o rp_odir/ >rp_odir.log 2>&1 || ! grep -q -F "is not the name of a file" rp_odir.log || [ -e rp_odir ]; then
+if timeout 60 "$ABR" pack -i rp_dir -o rp_odir/ >rp_odir.log 2>&1 || ! grep -q -F "is not the name of a file" rp_odir.log || [ -e rp_odir ]; then
     rp_bad="$rp_bad [-o dir/: $(head -c 160 rp_odir.log)] [$(ls -d rp_odir 2>&1)]"
 fi
 rp_report "name of the output that ends in a slash is refused, and no directory is made for it"
@@ -5226,7 +5298,7 @@ if [ -f rp_dir/.abr_raw/kernel.raw ]; then
     rm -rf rp_try rp_try_re
     cp -a rp_dir rp_try
     rm rp_try/.abr_raw/kernel.raw
-    if rp_made rp_try "the raw copy of the kernel is gone" && "$ABR" unpack "$rp_run" -o rp_try_re >/dev/null 2>&1; then
+    if rp_made rp_try "the raw copy of the kernel is gone" && "$ABR" unpack -i "$rp_run" -o rp_try_re >/dev/null 2>&1; then
         cmp -s rp_try_re/kernel rp_dir/kernel || rp_bad="$rp_bad [the raw copy is gone: the kernel is another]"
     fi
     rm -rf rp_try rp_try_re
@@ -5243,7 +5315,7 @@ rp_esc_ck() {  # <dir> <label> [<more arguments of repack>]: repack of <dir> say
     shift 2
     rp_n=$((rp_n + 1))
     rm -f rp_esc.img rp_esc.log
-    ABR_UNFILTERED_OUTPUT=1 timeout 120 "$ABR" repack "$d" -o rp_esc.img "$@" >rp_esc.log 2>&1
+    ABR_UNFILTERED_OUTPUT=1 timeout 120 "$ABR" pack -i "$d" -o rp_esc.img "$@" >rp_esc.log 2>&1
     [ -s rp_esc.log ] || { rp_bad="$rp_bad [$label: no message]"; return; }
     rp_clean rp_esc.log || rp_bad="$rp_bad [$label: a control character in: $(head -c 160 rp_esc.log | od -c | head -3)]"
 }
@@ -5258,14 +5330,17 @@ done
 printf -- '-----BEGIN RSA PRIVATE KEY-----\nAAAA\x8b\x1b[2JBBBB\n-----END RSA PRIVATE KEY-----\n' >rp_badkey.pem
 rp_fresh a1_v1.img rp_dir
 printf x >>rp_dir/kernel
-rp_esc_ck rp_dir "--avb1-key: a PEM with a byte that is not base64" --avb1-key rp_badkey.pem
+put_key rp_dir avb1.pk8 rp_badkey.pem
+rp_esc_ck rp_dir "keys/avb1.pk8: a PEM with a byte that is not base64"
 # the label of a PEM block is text of the file as well (found by the sixth campaign of fuzz_repack.py): a control byte in it, and no
 # END line for it; and a label that is as long as the file is cut in the message
 printf -- '-----BEGIN EC PRIV\x0bATE KEY-----\nAAAA\n-----END EC PRIVATE KEY-----\n' >rp_badkey2.pem
-rp_esc_ck rp_dir "--avb1-key: a PEM whose label has a control byte and has no END line" --avb1-key rp_badkey2.pem
+put_key rp_dir avb1.pk8 rp_badkey2.pem
+rp_esc_ck rp_dir "keys/avb1.pk8: a PEM whose label has a control byte and has no END line"
 grep -q -F 'no matching END line' rp_esc.log || rp_bad="$rp_bad [a PEM label with a control byte: the message is not the one about the END line]"
 { printf -- '-----BEGIN '; head -c 100000 /dev/zero | tr '\0' 'x'; printf -- '-----\nAAAA\n'; } >rp_badkey3.pem
-rp_esc_ck rp_dir "--avb1-key: a PEM whose label is 100000 bytes long" --avb1-key rp_badkey3.pem
+put_key rp_dir avb1.pk8 rp_badkey3.pem
+rp_esc_ck rp_dir "keys/avb1.pk8: a PEM whose label is 100000 bytes long"
 [ "$(wc -c <rp_esc.log)" -lt 1000 ] || rp_bad="$rp_bad [a PEM whose label is 100000 bytes long: the message is $(wc -c <rp_esc.log) bytes]"
 if [ "$RD_WINE" = 0 ]; then
     # a name of a file that is not UTF-8
@@ -5310,13 +5385,13 @@ d[j + 1] = 0x1b  # (the target "/<ESC>oot")
 open(sys.argv[2], "wb").write(bytes(d))
 PYEOF
 rp_n=$((rp_n + 1))
-ABR_UNFILTERED_OUTPUT=1 "$ABR" info rp_cert.img >rp_cert_info.txt 2>&1
+ABR_UNFILTERED_OUTPUT=1 "$ABR" info -i rp_cert.img >rp_cert_info.txt 2>&1
 rp_clean rp_cert_info.txt || rp_bad="$rp_bad [info: a control byte in the certificate or the target is printed as it is]"
 grep -q -F 'ST=Ca\x1bifornia' rp_cert_info.txt || rp_bad="$rp_bad [info: the subject is not said, with the byte as an escape]"
 grep -q -F 'target "/\x1boot"' rp_cert_info.txt || rp_bad="$rp_bad [info: the target is not said, with the byte as an escape]"
 rm -rf rp_cert_u
 rp_n=$((rp_n + 1))
-ABR_UNFILTERED_OUTPUT=1 "$ABR" unpack rp_cert.img -o rp_cert_u >rp_cert_u.log 2>&1 || rp_bad="$rp_bad [unpack of the image with the odd subject failed: $(head -c 150 rp_cert_u.log)]"
+ABR_UNFILTERED_OUTPUT=1 "$ABR" unpack -i rp_cert.img -o rp_cert_u >rp_cert_u.log 2>&1 || rp_bad="$rp_bad [unpack of the image with the odd subject failed: $(head -c 150 rp_cert_u.log)]"
 rp_clean rp_cert_u.log || rp_bad="$rp_bad [unpack: a control byte in the certificate or the target is printed as it is]"
 printf x >>rp_cert_u/kernel
 rp_esc_ck rp_cert_u "a boot signature by a certificate whose subject has a control byte, the kernel edited"
@@ -5337,7 +5412,7 @@ rp_elf_name() {  # <label> <key> <value>: the unpack of elftool3.img with that v
     rm -rf rp_en rp_en.img rp_en.log
     cp -a elf_u_elftool3 rp_en
     rp_set rp_en "$key" "$val"
-    if ABR_UNFILTERED_OUTPUT=1 timeout 60 "$ABR" repack rp_en -o rp_en.img >rp_en.log 2>&1; then
+    if ABR_UNFILTERED_OUTPUT=1 timeout 60 "$ABR" pack -i rp_en -o rp_en.img >rp_en.log 2>&1; then
         rp_bad="$rp_bad [$label: written all the same]"
         return
     fi
@@ -5363,7 +5438,7 @@ cp -a elf_u_elftool3 rp_en
 sed -i -e "s/^segment0_prefix=kernel\$/segment0_prefix=$rp_k64/" -e "s/^kernel_/${rp_k64}_/" rp_en/manifest.txt
 sed -i -e 's/^segment2_prefix=cmdline$/segment2_prefix=Cmd_Line_9/' -e 's/^cmdline_/Cmd_Line_9_/' rp_en/manifest.txt
 rp_n=$((rp_n + 1))
-if "$ABR" repack rp_en -o rp_en.img >rp_en.log 2>&1; then
+if "$ABR" pack -i rp_en -o rp_en.img >rp_en.log 2>&1; then
     cmp -s rp_en.img elf_k/c/elftool3.img || rp_bad="$rp_bad [a prefix of 64 letters and one with upper case, digits and underscores: the image is not the one that was unpacked]"
 else
     rp_bad="$rp_bad [a prefix of 64 letters and one with upper case, digits and underscores: refused: $(head -c 150 rp_en.log)]"
@@ -5378,7 +5453,7 @@ rp_report "names of an ELF segment (the prefix and the role in manifest.txt) tha
 # (<prefix>_compression=none) and that begins like a stream of a codec is decompressed once before it is written: unpack does that to
 # every image, and an image that abr refuses to unpack is not one to write (found by tests/tools/fuzz_repack.py: a damaged stream put
 # in as a file made `repack` write such an image). The name of a compression that abr does not know is not "none". And the text of a
-# directory, or of an archive, comes into no message as it is (the ASan job of CI found the --ramdisk-from tree warning).
+# directory, or of an archive, comes into no message as it is (the ASan job of CI found the warning about a ramdisk file with no directory).
 cs_mk() {  # <codec> <file> <out>: the stream of that codec of the file, made by the tool of the codec (not abr); fails when the tool is not there
     case "$1" in
         gzip) command -v gzip >/dev/null && gzip -9 -c "$2" >"$3" ;;
@@ -5408,7 +5483,9 @@ w("bad.lz4", bytes.fromhex("04224d18") + bytes.fromhex("640000") + b"\x00" * 16)
 w("bad.lz4_legacy", bytes.fromhex("02214c18") + struct.pack("<I", 16) + b"\xff" * 16)
 w("bad.zstd", bytes.fromhex("28b52ffd") + b"\xff" * 8)
 w("bad.xz", bytes.fromhex("fd377a585a00") + b"\xff" * 20)
-w("bad.lzma", bytes.fromhex("5d00008000") + b"\xff" * 8 + b"\x01" * 24)
+# (the fourteen bytes that name a stream of "LZMA alone": the properties, a dictionary, no size, and the zero byte a range coder begins with;
+# data with another byte there is not taken for a stream at all, see lzma_alone_params())
+w("bad.lzma", bytes.fromhex("5d00008000") + b"\xff" * 8 + b"\x00" + b"\xff" * 24)
 w("bad.bzip2", b"BZh9" + bytes.fromhex("314159265359") + b"\xff" * 24)
 lzop = bytes([0x89, 0x4c, 0x5a, 0x4f, 0x00, 0x0d, 0x0a, 0x1a, 0x0a]) + struct.pack(">HHH", 0x1040, 0x2080, 0x0940) + bytes([1, 5])
 lzop += struct.pack(">IIII", 0x03000001, 0x81a4, 0, 0) + bytes([0]) + struct.pack(">I", 0) + struct.pack(">III", 1000, 500, 0) + b"\xff" * 500
@@ -5433,7 +5510,7 @@ for cs_c in $cs_codecs; do
     rp_n=$((rp_n + 1))
     python3 "$MKBOOTIMG" >/dev/null --header_version 0 --kernel kernel.gz --ramdisk "cs/bad.$cs_c" -o "cs/img_bad.img"
     rm -rf cs/d_bad
-    if timeout 120 "$ABR" unpack cs/img_bad.img -o cs/d_bad >cs/unpack.log 2>&1; then
+    if timeout 120 "$ABR" unpack -i cs/img_bad.img -o cs/d_bad >cs/unpack.log 2>&1; then
         rp_bad="$rp_bad [$cs_c: a damaged stream was unpacked]"
     elif ! grep -q -F -- "ramdisk.cpio: $cs_c stream cannot be decompressed: " cs/unpack.log; then
         rp_bad="$rp_bad [$cs_c: said: $(head -c 160 cs/unpack.log)]"
@@ -5466,7 +5543,7 @@ for cs_c in $cs_codecs; do
     rp_set rp_dir kernel_compression none
     if rp_made rp_dir "a whole $cs_c stream, kernel_compression=none"; then
         rm -rf rp_re
-        "$ABR" unpack "$rp_run" -o rp_re >/dev/null 2>&1
+        "$ABR" unpack -i "$rp_run" -o rp_re >/dev/null 2>&1
         grep -q "^kernel_compression=$cs_c\$" rp_re/manifest.txt && cmp -s rp_re/kernel cs/plain ||
             rp_bad="$rp_bad [$cs_c: the image says $(grep '^kernel_compression=' rp_re/manifest.txt)]"
     fi
@@ -5476,7 +5553,7 @@ cp cs/plain rp_dir/kernel
 rp_set rp_dir kernel_compression none
 if rp_made rp_dir "plain data, kernel_compression=none"; then
     rm -rf rp_re
-    "$ABR" unpack "$rp_run" -o rp_re >/dev/null 2>&1
+    "$ABR" unpack -i "$rp_run" -o rp_re >/dev/null 2>&1
     grep -q '^kernel_compression=none$' rp_re/manifest.txt && cmp -s rp_re/kernel cs/plain || rp_bad="$rp_bad [plain data: the image says $(grep '^kernel_compression=' rp_re/manifest.txt)]"
 fi
 rp_report "a whole stream of each codec that goes into the image as it is (kernel_compression=none) is taken, and the image unpacks it as that codec; plain data stays plain"
@@ -5488,7 +5565,7 @@ for cs_v in gzp GZIP gz zst lz4_frame bzip xz2 '""'; do
     rp_set rp_dir kernel_compression "$cs_v"
     cs_shown="${cs_v#\"}"
     cs_shown="${cs_shown%\"}"
-    rp_refused rp_dir "kernel_compression=$cs_v" "manifest.txt: kernel_compression=$cs_shown is none of the compressions abr knows (none, gzip, lz4_legacy, lz4, zstd, xz, lzma, bzip2, lzo)"
+    rp_refused rp_dir "kernel_compression=$cs_v" "manifest.txt: kernel_compression=$cs_shown is none of the compressions abr knows (none, gzip, lz4_legacy, lz4, zstd, xz, lzma, bzip2, lzo, zlib)"
 done
 rp_fresh boot_v2.img rp_dir
 cp cs/plain rp_dir/kernel
@@ -5501,11 +5578,23 @@ for cs_v in none gzip lz4_legacy lz4 zstd xz lzma bzip2 lzo; do
     rp_set rp_dir kernel_compression "$cs_v"
     if rp_made rp_dir "kernel_compression=$cs_v"; then
         rm -rf rp_re
-        "$ABR" unpack "$rp_run" -o rp_re >/dev/null 2>&1
+        "$ABR" unpack -i "$rp_run" -o rp_re >/dev/null 2>&1
         grep -q "^kernel_compression=$cs_v\$" rp_re/manifest.txt && cmp -s rp_re/kernel cs/plain || rp_bad="$rp_bad [$cs_v: the image says $(grep '^kernel_compression=' rp_re/manifest.txt)]"
     fi
 done
-rp_report "a name of a compression that is none of the nine (a typo, another case, an empty name, escape sequences) is refused with the key, the name and the nine; each of the nine is taken, and is what the image says"
+# zlib is the tenth name: pack makes the stream, and unpack cannot tell a zlib stream by its content (it starts with two bytes that any data may
+# start with), so the image holds the stream and its kernel comes back as a file of those bytes, which the real zlib reads
+rp_fresh boot_v2.img rp_dir
+cp cs/plain rp_dir/kernel
+rp_set rp_dir kernel_compression zlib
+if rp_made rp_dir "kernel_compression=zlib"; then
+    rm -rf rp_re
+    "$ABR" unpack -i "$rp_run" -o rp_re >/dev/null 2>&1
+    grep -q '^kernel_compression=none$' rp_re/manifest.txt &&
+        python3 -c 'import sys, zlib; sys.exit(0 if zlib.decompress(open(sys.argv[1], "rb").read()) == open(sys.argv[2], "rb").read() else 1)' rp_re/kernel cs/plain ||
+        rp_bad="$rp_bad [zlib: the image says $(grep '^kernel_compression=' rp_re/manifest.txt), or its kernel is not a zlib stream of the data]"
+fi
+rp_report "a name of a compression that is none of the ten (a typo, another case, an empty name, escape sequences) is refused with the key, the name and the ten; each of the nine that a stream shows is taken, and is what the image says; zlib, which a stream does not show, is taken and comes back as the stream"
 
 # bombs: a gzip of 1.1 GB of zeros (1.1 MB), a zstd frame of run-length blocks (33 KB), a zstd header that declares a terabyte. The limit
 # is 1 GiB, the message says so, and the memory is not that of the old build (it unpacked the gzip into 3.7 GB). Not under wine or an emulator.
@@ -5523,7 +5612,7 @@ PYEOF
         rp_n=$((rp_n + 1))
         python3 "$MKBOOTIMG" >/dev/null --header_version 0 --kernel kernel.gz --ramdisk "cs/bomb.$cs_c" -o cs/img_bomb.img
         rm -rf cs/d_bomb
-        if timeout 300 "$ABR" unpack cs/img_bomb.img -o cs/d_bomb >cs/unpack.log 2>&1; then
+        if timeout 300 "$ABR" unpack -i cs/img_bomb.img -o cs/d_bomb >cs/unpack.log 2>&1; then
             rp_bad="$rp_bad [bomb.$cs_c: unpacked into $(du -sk cs/d_bomb | cut -f1) KB]"
         elif ! grep -q -F -- "stream cannot be decompressed: it would be more than 1024 MiB decompressed, and no component of the family is that big" cs/unpack.log; then
             rp_bad="$rp_bad [bomb.$cs_c: said: $(head -c 160 cs/unpack.log)]"
@@ -5534,7 +5623,7 @@ PYEOF
     done
     rp_n=$((rp_n + 1))
     python3 "$MKBOOTIMG" >/dev/null --header_version 0 --kernel kernel.gz --ramdisk cs/lie.zst -o cs/img_lie.img
-    if timeout 60 "$ABR" unpack cs/img_lie.img -o cs/d_lie >cs/unpack.log 2>&1; then
+    if timeout 60 "$ABR" unpack -i cs/img_lie.img -o cs/d_lie >cs/unpack.log 2>&1; then
         rp_bad="$rp_bad [lie.zst: unpacked]"
     elif ! grep -q -F -- "ramdisk.cpio: zstd stream cannot be decompressed: it would be more than 1024 MiB decompressed" cs/unpack.log; then
         rp_bad="$rp_bad [lie.zst: said: $(head -c 160 cs/unpack.log)]"
@@ -5565,7 +5654,7 @@ for cs_c in crc_wrong newc_check; do
     rp_n=$((rp_n + 1))
     python3 "$MKBOOTIMG" >/dev/null --header_version 0 --kernel kernel.gz --ramdisk "cs/$cs_c.cpio" -o cs/img_cpio.img
     rm -rf cs/d_cpio
-    ABR_UNFILTERED_OUTPUT=1 timeout 120 "$ABR" unpack cs/img_cpio.img -o cs/d_cpio >cs/unpack.log 2>&1
+    ABR_UNFILTERED_OUTPUT=1 timeout 120 "$ABR" unpack -i cs/img_cpio.img -o cs/d_cpio >cs/unpack.log 2>&1
     if ! grep -q -F 'stays a file only' cs/unpack.log; then
         rp_bad="$rp_bad [$cs_c: not the note that the ramdisk stays a file: $(head -c 160 cs/unpack.log)]"
     elif ! rp_clean cs/unpack.log; then
@@ -5594,7 +5683,7 @@ dtc -I dts -O dtb -o dt_big.dtb dt_big.dts 2>/dev/null
 for dt_img in dt_zero dt_ff dt_trailer dt_trailer_zero; do
     rp_n=$((rp_n + 1))
     rm -rf rp_dtd
-    if ! "$ABR" unpack "$dt_img.dtb" -o rp_dtd >rp_dt.log 2>&1; then
+    if ! "$ABR" unpack -i "$dt_img.dtb" -o rp_dtd >rp_dt.log 2>&1; then
         rp_bad="$rp_bad [$dt_img: unpack: $(head -c 160 rp_dt.log)]"
         continue
     fi
@@ -5607,10 +5696,10 @@ for dt_img in dt_zero dt_ff dt_trailer dt_trailer_zero; do
         dt_trailer_zero) cmp -s rp_dtd/tail.bin dt_trailer.bin && grep -q '^pad_byte=0x0$' rp_dtd/manifest.txt || rp_bad="$rp_bad [$dt_img: trailer and fill]" ;;
     esac
     case "$dt_img" in
-        dt_zero|dt_ff|dt_trailer_zero) said "padding: *0x.. fill up to $(wc -c <"$dt_img.dtb" | tr -d ' ') bytes" "$ABR" info "$dt_img.dtb" || rp_bad="$rp_bad [$dt_img: info does not name the fill]" ;;
+        dt_zero|dt_ff|dt_trailer_zero) said "padding: *0x.. fill up to $(wc -c <"$dt_img.dtb" | tr -d ' ') bytes" "$ABR" info -i "$dt_img.dtb" || rp_bad="$rp_bad [$dt_img: info does not name the fill]" ;;
     esac
     case "$dt_img" in
-        dt_trailer|dt_trailer_zero) said "trailing: *$(wc -c <dt_trailer.bin | tr -d ' ') bytes after the image" "$ABR" info "$dt_img.dtb" || rp_bad="$rp_bad [$dt_img: info does not name the trailer]" ;;
+        dt_trailer|dt_trailer_zero) said "trailing: *$(wc -c <dt_trailer.bin | tr -d ' ') bytes after the image" "$ABR" info -i "$dt_img.dtb" || rp_bad="$rp_bad [$dt_img: info does not name the trailer]" ;;
     esac
 done
 # an edit of a blob: the image is as long as it was (the fill is made up again), the blob is the new one
@@ -5624,7 +5713,7 @@ fi
 rp_fresh dt_trailer.dtb rp_dtd
 cp dt_big.dtb rp_dtd/blob0.dtb
 rp_n=$((rp_n + 1))
-"$ABR" repack rp_dtd -o "$rp_run" >rp_dt.log 2>&1 && grep -q "kept as they were" rp_dt.log || rp_bad="$rp_bad [an edit with a trailer behind: no warning: $(head -c 160 rp_dt.log)]"
+"$ABR" pack -i rp_dtd -o "$rp_run" >rp_dt.log 2>&1 && grep -q "kept as they were" rp_dt.log || rp_bad="$rp_bad [an edit with a trailer behind: no warning: $(head -c 160 rp_dt.log)]"
 rp_report "dtb files with something behind the last blob (zero fill, 0xFF fill, a trailer, a trailer and fill) come back byte for byte, are said to, keep it as a fill (padded up to the old size after an edit) or a file; a trailer behind an edited blob is warned of"
 
 rp_fresh dt_zero.dtb rp_dtd
@@ -5668,7 +5757,7 @@ dt_unpack_refused() {  # <file> <label> <text the message has>: unpack of the fi
     local f="$1" label="$2" want="$3"
     rm -rf rp_dtu rp_dtu.log
     rp_n=$((rp_n + 1))
-    if timeout 60 "$ABR" unpack "$f" -o rp_dtu >rp_dtu.log 2>&1; then
+    if timeout 60 "$ABR" unpack -i "$f" -o rp_dtu >rp_dtu.log 2>&1; then
         rp_bad="$rp_bad [$label: taken]"
     elif [ -e rp_dtu ]; then
         rp_bad="$rp_bad [$label: a directory is left behind]"
@@ -5702,7 +5791,7 @@ rp_refused rp_try "a header of zeros" 'the OSIP header does not start with "$OS$
 if rp_made rp_try "a header with the magic and noise behind it"; then
     said "OSIP bootimg" "$ABR" identify "$rp_run" || rp_bad="$rp_bad [a header with the magic: not known for an OSIP image]"
     rm -rf rp_try_re
-    "$ABR" unpack "$rp_run" -o rp_try_re >/dev/null 2>&1 || rp_bad="$rp_bad [a header with the magic: the image is not unpacked again]"
+    "$ABR" unpack -i "$rp_run" -o rp_try_re >/dev/null 2>&1 || rp_bad="$rp_bad [a header with the magic: the image is not unpacked again]"
 fi
 rp_fresh osip_h4.img rp_osd
 rm -rf rp_try
@@ -5812,15 +5901,14 @@ PYEOF
     printf x >"rp_try/$rp_odd/new_file"
     rp_esc_ck rp_try "a ramdisk directory with a C1 control in its name, changed: the note that the ramdisk is built from it"
     grep -q -F 'is built from the directory' rp_esc.log || rp_bad="$rp_bad [the odd ramdisk directory, changed: not the note that the ramdisk is built from it]"
-    # the name of the file of the ramdisk is text of the manifest as well: --ramdisk-from tree names the file that has no directory
-    # (found by the ASan job of CI with tests/tools/fuzz_repack.py: the name was printed as it was)
+    # the name of the file of the ramdisk is text of the manifest as well (found by the ASan job of CI with tests/tools/fuzz_repack.py: the
+    # name was printed as it was)
     rp_fresh boot_v2.img rp_try
     mv rp_try/ramdisk.cpio "rp_try/$rp_odd.cpio"
     mv rp_try/.abr_raw/ramdisk.cpio.raw "rp_try/.abr_raw/$rp_odd.cpio.raw"
     rp_set rp_try ramdisk_file '"ramdisk\xc2\x9b2J\xc2\x85x\xff.cpio"'
-    rp_esc_ck rp_try "a ramdisk file with a C1 control in its name, --ramdisk-from tree where there is no directory" --ramdisk-from tree
-    grep -q -F 'has no directory in this unpack' rp_esc.log || rp_bad="$rp_bad [the odd ramdisk file, --ramdisk-from tree: not the warning that it has no directory]"
-    rp_report "the name of the ramdisk directory with a C1 control and a byte that is not UTF-8 in it (the manifest says so, and the directory is called that) comes into no message as it is: the cpio and the directory both changed, a tail of 1 GiB, a ramdisk.meta that is wrong, the note that the ramdisk is built from the directory -- and neither does the name of a ramdisk file that --ramdisk-from tree finds no directory for"
+    rp_esc_ck rp_try "a ramdisk file with a C1 control in its name"
+    rp_report "the name of the ramdisk directory with a C1 control and a byte that is not UTF-8 in it (the manifest says so, and the directory is called that) comes into no message as it is: the cpio and the directory both changed, a tail of 1 GiB, a ramdisk.meta that is wrong, the note that the ramdisk is built from the directory -- and neither does the name of a ramdisk file"
 elif [ "$RD_WINE" = 0 ]; then
     fail "repack: the name of the ramdisk directory with a C1 control in it: rdimg_mkbootfs.img has no ramdisk.meta"
 fi
@@ -5846,7 +5934,7 @@ for rp_case in "14:14.0.0:2024-5:2024-05" "14.0:14.0.0:2024-05:2024-05" "127.127
     cp -a rp_dir rp_try
     rp_set rp_try os_version "$rp_in"
     rp_set rp_try os_patch_level "$rp_pin"
-    if rp_made rp_try "os_version=$rp_in os_patch_level=$rp_pin" && "$ABR" unpack "$rp_run" -o rp_try_re >/dev/null 2>&1; then
+    if rp_made rp_try "os_version=$rp_in os_patch_level=$rp_pin" && "$ABR" unpack -i "$rp_run" -o rp_try_re >/dev/null 2>&1; then
         grep -q "^os_version=$rp_out\$" rp_try_re/manifest.txt && grep -q "^os_patch_level=$rp_pout\$" rp_try_re/manifest.txt ||
             rp_bad="$rp_bad [os_version=$rp_in os_patch_level=$rp_pin: the image says $(grep -E '^os_(version|patch_level)=' rp_try_re/manifest.txt | tr '\n' ' ')]"
     fi
@@ -5880,7 +5968,7 @@ rp_over() {  # <dir> <label> <output> <text the message has> [<more arguments of
     rm -rf rp_over_before
     cp -a "$d" rp_over_before
     rp_n=$((rp_n + 1))
-    if timeout 120 "$ABR" repack "$d" -o "$o" "$@" >rp_over.log 2>&1; then
+    if timeout 120 "$ABR" pack -i "$d" -o "$o" "$@" >rp_over.log 2>&1; then
         rp_bad="$rp_bad [$label: taken]"
     elif ! grep -q -F -- "$want" rp_over.log; then
         rp_bad="$rp_bad [$label: said: $(head -c 160 rp_over.log)]"
@@ -5892,7 +5980,7 @@ rp_fresh boot_v2.img rp_dir
 for rp_o in manifest.txt kernel ramdisk.cpio; do
     rm -rf rp_try
     cp -a rp_dir rp_try
-    rp_over rp_try "-o $rp_o (a file the repack reads)" "rp_try/$rp_o" "is a file this repack has read"
+    rp_over rp_try "-o $rp_o (a file the repack reads)" "rp_try/$rp_o" "is a file this pack has read"
 done
 rd_image mkbootfs >/dev/null 2>&1
 rp_fresh rdimg_mkbootfs.img rp_rd
@@ -5900,7 +5988,7 @@ rp_f=$(cd rp_rd && find ramdisk -type f | head -1)
 if [ -n "$rp_f" ]; then
     rm -rf rp_try
     cp -a rp_rd rp_try
-    rp_over rp_try "-o a file of the ramdisk directory" "rp_try/$rp_f" "is a file this repack has read" --ramdisk-from tree
+    rp_over rp_try "-o a file of the ramdisk directory" "rp_try/$rp_f" "is a file this pack has read"
 else
     rp_bad="$rp_bad [rdimg_mkbootfs.img: no file in the ramdisk directory]"
 fi
@@ -5909,20 +5997,20 @@ if [ "$RD_WINE" = 0 ]; then
     cp -a rp_dir rp_try
     rm rp_try/ramdisk.cpio
     ln -s manifest.txt rp_try/ramdisk.cpio
-    rp_over rp_try "-o a link (the ramdisk) that leads to the manifest" "rp_try/ramdisk.cpio" "is a file this repack has read"
+    rp_over rp_try "-o a link (the ramdisk) that leads to the manifest" "rp_try/ramdisk.cpio" "is a file this pack has read"
     rm -rf rp_try
     cp -a rp_dir rp_try
     ln rp_try/kernel rp_try/kernel_copy
-    rp_over rp_try "-o a hard link to the kernel" "rp_try/kernel_copy" "is a file this repack has read"
+    rp_over rp_try "-o a hard link to the kernel" "rp_try/kernel_copy" "is a file this pack has read"
     rm -rf rp_try
     cp -a rp_dir rp_try
     ln -s kernel rp_try/the_kernel
-    rp_over rp_try "-o a symbolic link to the kernel" "rp_try/the_kernel" "is a file this repack has read"
+    rp_over rp_try "-o a symbolic link to the kernel" "rp_try/the_kernel" "is a file this pack has read"
 fi
 rp_fresh vbmeta_signed.img rp_vb
-cp avb_test_key.pem rp_key.pem
+put_key rp_vb avb_key.pem avb_test_key.pem
 rp_n=$((rp_n + 1))
-if timeout 120 "$ABR" repack rp_vb -o rp_key.pem --avb-key rp_key.pem >rp_over.log 2>&1 || ! grep -q -F "is a file this repack has read" rp_over.log || ! cmp -s rp_key.pem avb_test_key.pem; then
+if timeout 120 "$ABR" pack -i rp_vb -o rp_vb/keys/avb_key.pem >rp_over.log 2>&1 || ! grep -q -F "is a file this pack has read" rp_over.log || ! cmp -s rp_vb/keys/avb_key.pem avb_test_key.pem; then
     rp_bad="$rp_bad [-o the key that signs: $(head -c 160 rp_over.log)]"
 fi
 # a file next to them is fine, and again over the image that was made before
@@ -5930,7 +6018,7 @@ rm -rf rp_try
 cp -a rp_dir rp_try
 rp_made_to() {  # <dir> <output> <label>: repack of <dir> -o <output> works
     rp_n=$((rp_n + 1))
-    if ! timeout 120 "$ABR" repack "$1" -o "$2" >rp_over.log 2>&1 || [ ! -s "$2" ]; then
+    if ! timeout 120 "$ABR" pack -i "$1" -o "$2" >rp_over.log 2>&1 || [ ! -s "$2" ]; then
         rp_bad="$rp_bad [$3: refused: $(head -c 160 rp_over.log)]"
         return 1
     fi
@@ -5957,7 +6045,7 @@ if [ -f rp_dir/manifest.txt ]; then
         cp -a rp_dir rp_try
         rp_set rp_try "${rp_case%%=*}" "${rp_case#*=}"
         if rp_made rp_try "a PXA header with $rp_case"; then
-            "$ABR" unpack "$rp_run" -o rp_try_re >/dev/null 2>&1 && grep -q '^pxa=true$' rp_try_re/manifest.txt ||
+            "$ABR" unpack -i "$rp_run" -o rp_try_re >/dev/null 2>&1 && grep -q '^pxa=true$' rp_try_re/manifest.txt ||
                 rp_bad="$rp_bad [a PXA header with $rp_case: unpack does not take what was written for a PXA image]"
         fi
     done
@@ -5978,7 +6066,7 @@ if [ -n "$rp_dtf" ] && [ -f "rp_dir/$rp_dtf" ]; then
         cp -a rp_dir rp_try
         head -c "$rp_len" /dev/urandom >"rp_try/$rp_dtf"
         if rp_made rp_try "a CAF device tree of $rp_len bytes"; then
-            "$ABR" unpack "$rp_run" -o rp_try_re >/dev/null 2>&1 && [ "$(wc -c <"rp_try_re/$rp_dtf")" -eq "$rp_len" ] ||
+            "$ABR" unpack -i "$rp_run" -o rp_try_re >/dev/null 2>&1 && [ "$(wc -c <"rp_try_re/$rp_dtf")" -eq "$rp_len" ] ||
                 rp_bad="$rp_bad [a CAF device tree of $rp_len bytes: it does not come back]"
         fi
     done
@@ -6008,7 +6096,7 @@ for ps_case in boot_v2.img:36:boot vendor_boot_v4.img:12:vendor_boot; do
         ps_n=$((ps_n + 1))
         ps_patch "$ps_file" ps_bad.img "$ps_off" "$ps_v"
         rm -rf ps_bad_dir
-        if "$ABR" unpack ps_bad.img -o ps_bad_dir >ps_bad.log 2>&1; then
+        if "$ABR" unpack -i ps_bad.img -o ps_bad_dir >ps_bad.log 2>&1; then
             ps_bad="$ps_bad [$ps_what $ps_v was taken]"
         elif ! grep -q "not a flash page size" ps_bad.log; then
             ps_bad="$ps_bad [$ps_what $ps_v: $(head -c 120 ps_bad.log)]"
@@ -6031,7 +6119,7 @@ ix_shown='"x\x1b[2Jy\x07z"'          # (what `info` must say of it)
 ix_expect() {  # <image> <what it is> <text that `info` must say>...: `info` of the image says each text and prints no control character
     local img="$1" what="$2" t
     shift 2
-    "$ABR" info "$img" >ix_info.txt 2>&1 || { ix_bad="$ix_bad [$what: info failed: $(head -c 100 ix_info.txt)]"; return; }
+    "$ABR" info -i "$img" >ix_info.txt 2>&1 || { ix_bad="$ix_bad [$what: info failed: $(head -c 100 ix_info.txt)]"; return; }
     # (a carriage return before a line break is how a Windows program ends a line; one inside a line is a control character)
     if sed 's/\r$//' ix_info.txt | tr -d '\n' | LC_ALL=C grep -q '[[:cntrl:]]'; then ix_bad="$ix_bad [$what: info prints a control character]"; fi
     for t in "$@"; do
@@ -6072,14 +6160,14 @@ for i, payload in enumerate(d):
     manifest += ["descriptor%d_tag=%d" % (i, i), "descriptor%d_file=d%d.bin" % (i, i)]       # (the tags are the order above: 0 to 4)
 open("ix_vbmeta/manifest.txt", "w").write("\n".join(manifest) + "\n")
 PYEOF
-"$ABR" repack ix_vbmeta -o ix_vbmeta.img >ix_vbmeta.log 2>&1 || ix_bad="$ix_bad [vbmeta: repack: $(head -c 150 ix_vbmeta.log)]"
+"$ABR" pack -i ix_vbmeta -o ix_vbmeta.img >ix_vbmeta.log 2>&1 || ix_bad="$ix_bad [vbmeta: repack: $(head -c 150 ix_vbmeta.log)]"
 ix_expect ix_vbmeta.img "vbmeta" "release:    $ix_shown" "property: $ix_shown" "hashtree: partition=$ix_shown algo=$ix_shown image_size=8192" \
-    "hash: partition=$ix_shown algo=$ix_shown image_size=4096" "kernel_cmdline: $ix_shown" "chain_partition: $ix_shown (pubkey 8B)"
+    "hash: partition=$ix_shown algo=$ix_shown image_size=4096" "kernel_cmdline: $ix_shown" "chain_partition: $ix_shown (rollback index location 1, pubkey 8B)"
 # OSIP (a command line with a tab and a line break: the one the OSIP tests made), ChromeOS (the configuration of a blob around a kernel abr does not unpack)
 ix_expect osip_nl.img "OSIP" 'cmdline:        "console=ttyS0\tquiet\n"'
 rm -rf ix_cros
-"$ABR" unpack cros_C.blob -o ix_cros >/dev/null 2>&1 && printf 'x\033[2Jy\007z' >ix_cros/chromeos_config.txt &&
-    "$ABR" repack ix_cros -o ix_cros.blob >/dev/null 2>&1 || ix_bad="$ix_bad [ChromeOS: the blob with the text could not be made]"
+"$ABR" unpack -i cros_C.blob -o ix_cros >/dev/null 2>&1 && printf 'x\033[2Jy\007z' >ix_cros/chromeos_config.txt &&
+    "$ABR" pack -i ix_cros -o ix_cros.blob >/dev/null 2>&1 || ix_bad="$ix_bad [ChromeOS: the blob with the text could not be made]"
 ix_expect ix_cros.blob "ChromeOS" "cmdline:        $ix_shown"
 [ -z "$ix_bad" ] && [ "$ix_n" -eq 12 ] &&
     pass "info: an escape sequence and a bell in the command line, a name, a partition, a release or a configuration of a vendor_boot v3 and v4, uImage, vbmeta (release, property, hash, hashtree, kernel command line and chain partition descriptors), OSIP and ChromeOS image are written as escapes in quotes ($ix_n lines), and no control character is printed" ||
@@ -6115,20 +6203,20 @@ for of_case in $'no\x1b[2Jsuch.img'@'no\x1b[2Jsuch.img' $'no\x07such.img'@'no\x0
     done
 done
 [ "$of_rawn" -ge 1 ] || of_bad="$of_bad [none of the $of_n messages had the raw name without the filter: the filter was not tried]"
-"$ABR" repack $'no\x1b' -o of_out.img >of_out.txt 2>&1 && of_bad="$of_bad [repack: a directory that is not there was taken]"
+"$ABR" pack -i $'no\x1b' -o of_out.img >of_out.txt 2>&1 && of_bad="$of_bad [repack: a directory that is not there was taken]"
 grep -q -F -- 'no\x1b' of_out.txt || of_bad="$of_bad [repack: the message does not have the escape: $(head -c 120 of_out.txt)]"
 # the messages of what worked are on stdout (a C1 control is a name that Windows has too: U+009B is no character that it refuses)
 rm -rf of_dir
-"$ABR" unpack boot_v2.img -o $'of_dir\xc2\x9bx' 2>of_err.txt >of_out.txt || of_bad="$of_bad [unpack into a directory with a C1 control in its name: $(head -c 120 of_err.txt)]"
+"$ABR" unpack -i boot_v2.img -o $'of_dir\xc2\x9bx' 2>of_err.txt >of_out.txt || of_bad="$of_bad [unpack into a directory with a C1 control in its name: $(head -c 120 of_err.txt)]"
 grep -q -F -- 'of_dir\xc2\x9bx' of_out.txt || of_bad="$of_bad [unpack: stdout does not have the escape: $(head -c 120 of_out.txt)]"
-"$ABR" repack $'of_dir\xc2\x9bx' -o $'of_re\xc2\x9b.img' 2>of_err.txt >of_out.txt || of_bad="$of_bad [repack: $(head -c 120 of_err.txt)]"
+"$ABR" pack -i $'of_dir\xc2\x9bx' -o $'of_re\xc2\x9b.img' 2>of_err.txt >of_out.txt || of_bad="$of_bad [repack: $(head -c 120 of_err.txt)]"
 grep -q -F -- 'of_re\xc2\x9b.img' of_out.txt || of_bad="$of_bad [repack: stdout does not have the escape: $(head -c 120 of_out.txt)]"
-ABR_UNFILTERED_OUTPUT=1 "$ABR" repack $'of_dir\xc2\x9bx' -o $'of_re\xc2\x9b.img' 2>/dev/null >of_raw.txt
+ABR_UNFILTERED_OUTPUT=1 "$ABR" pack -i $'of_dir\xc2\x9bx' -o $'of_re\xc2\x9b.img' 2>/dev/null >of_raw.txt
 grep -q -F -- $'of_re\xc2\x9b.img' of_raw.txt || of_bad="$of_bad [repack: without the filter stdout has no raw name]"
 rm -rf $'of_dir\xc2\x9bx' $'of_re\xc2\x9b.img'
 # "0" and nothing are not a request to turn the filter off
 for of_val in 0 ""; do
-    ABR_UNFILTERED_OUTPUT="$of_val" "$ABR" info $'no\x1b[2Jsuch.img' >of_out.txt 2>&1
+    ABR_UNFILTERED_OUTPUT="$of_val" "$ABR" info -i $'no\x1b[2Jsuch.img' >of_out.txt 2>&1
     grep -q -F -- 'no\x1b[2Jsuch.img' of_out.txt || of_bad="$of_bad [ABR_UNFILTERED_OUTPUT=\"$of_val\" turned the filter off]"
 done
 [ -z "$of_bad" ] &&
@@ -6145,12 +6233,12 @@ roundtrip_check fx/boot_v2_tails.img "boot v2 (bytes behind the NUL of the board
 expect_line rt_tl_v2 "board_name_tail=OLDNAME" "boot v2: what is behind the board name is in the manifest, as text"
 expect_line rt_tl_v2 "cmdline_tail=115200 androidboot.selinux=permissive" "boot v2: the rest of the old command line is in the manifest, readable"
 expect_line rt_tl_v2 "extra_cmdline_tail_hex=$(printf 'ff%.0s' $(seq 30))" "boot v2: bytes that are no text are in the manifest as hex"
-if said "field tails:    board_name 7, cmdline 37, extra_cmdline 30" "$ABR" info fx/boot_v2_tails.img; then
+if said "field tails:    board_name 7, cmdline 37, extra_cmdline 30" "$ABR" info -i fx/boot_v2_tails.img; then
     pass "info says how many bytes sit behind the end of the text of each field"
 else
     fail "info does not say what sits behind the end of the text of the fields"
 fi
-if said "bytes behind the NUL that ends the text of a header field (board_name 7, cmdline 37, extra_cmdline 30) are kept" "$ABR" unpack fx/boot_v2_tails.img -o tl_say; then
+if said "bytes behind the NUL that ends the text of a header field (board_name 7, cmdline 37, extra_cmdline 30) are kept" "$ABR" unpack -i fx/boot_v2_tails.img -o tl_say; then
     pass "unpack says that it keeps them"
 else
     fail "unpack does not say that it keeps the bytes behind the end of the text of a field"
@@ -6159,7 +6247,7 @@ roundtrip_check fx/boot_v0_longcmd_tails.img "boot v0 (a command line cut at 511
 expect_line rt_tl_long "cmdline_split=511" "boot v0: the cut of the long command line is still recorded"
 expect_line rt_tl_long "extra_cmdline_tail=LEFTOVER" "boot v0: the bytes behind the second field's text are kept next to the cut"
 expect_line rt_tl_long "board_name_tail_hex=0102" "boot v0: bytes with a value below 0x20 are hex"
-if said "field tails:    board_name 2, extra_cmdline 8 (" "$ABR" info fx/boot_v0_longcmd_tails.img; then
+if said "field tails:    board_name 2, extra_cmdline 8 (" "$ABR" info -i fx/boot_v0_longcmd_tails.img; then
     pass "info lists the fields that have such bytes, and only those"
 else
     fail "info does not list just the fields that have bytes behind the end of their text"
@@ -6177,24 +6265,24 @@ roundtrip_check fx/vendor_boot_v4_tails.img "vendor_boot v4 (the same, and behin
 expect_line rt_tl_vb4 "board_name_tail=zz" "vendor_boot v4: the bytes behind the board name"
 expect_line rt_tl_vb4 "ramdisk0_name_tail=old" "vendor_boot v4: the bytes behind the name of the first vendor ramdisk"
 expect_line rt_tl_vb4 "ramdisk1_name_tail_hex=deadbeef" "vendor_boot v4: the bytes behind the name of the second one"
-if said "field tails:    board_name 2, cmdline 37" "$ABR" info fx/vendor_boot_v4_tails.img; then
+if said "field tails:    board_name 2, cmdline 37" "$ABR" info -i fx/vendor_boot_v4_tails.img; then
     pass "info says what sits behind the end of the text of the fields of a vendor_boot header"
 else
     fail "info does not say what sits behind the end of the text of the fields of a vendor_boot header"
 fi
-if said "(board_name 2, cmdline 37, ramdisk0_name 3, ramdisk1_name 4) are kept in manifest.txt" "$ABR" unpack fx/vendor_boot_v4_tails.img -o tl_say_vb; then
+if said "(board_name 2, cmdline 37, ramdisk0_name 3, ramdisk1_name 4) are kept in manifest.txt" "$ABR" unpack -i fx/vendor_boot_v4_tails.img -o tl_say_vb; then
     pass "unpack of a vendor_boot says which fields have such bytes, the names of the vendor ramdisks among them"
 else
     fail "unpack of a vendor_boot does not say which fields have bytes behind the end of their text"
 fi
 roundtrip_check fx/uimage_tails.img "U-Boot legacy image (bytes behind the NUL of the name; the header CRC covers them)" tl_ui
 expect_line rt_tl_ui "name_tail=old-name" "uImage: the bytes behind the name"
-if said "name tail:   name 8" "$ABR" info fx/uimage_tails.img; then
+if said "name tail:   name 8" "$ABR" info -i fx/uimage_tails.img; then
     pass "info says what sits behind the end of the name of a uImage"
 else
     fail "info does not say what sits behind the end of the name of a uImage"
 fi
-if said "(name 8) are kept in manifest.txt" "$ABR" unpack fx/uimage_tails.img -o tl_say_ui; then
+if said "(name 8) are kept in manifest.txt" "$ABR" unpack -i fx/uimage_tails.img -o tl_say_ui; then
     pass "unpack of a uImage says that it keeps them"
 else
     fail "unpack of a uImage does not say that it keeps the bytes behind the end of the name"
@@ -6223,9 +6311,9 @@ fi
 tl_edit() {  # <fixture> <sed script for manifest.txt> <the image that is expected> <label>
     local d="tl_ed_$3"
     rm -rf "$d" "$d.img"
-    "$ABR" unpack "fx/$1.img" -o "$d" >/dev/null 2>&1 || { fail "$4 (unpack)"; return; }
+    "$ABR" unpack -i "fx/$1.img" -o "$d" >/dev/null 2>&1 || { fail "$4 (unpack)"; return; }
     sed -i "$2" "$d/manifest.txt"
-    "$ABR" repack "$d" -o "$d.img" >/dev/null 2>&1 || { fail "$4 (repack)"; return; }
+    "$ABR" pack -i "$d" -o "$d.img" >/dev/null 2>&1 || { fail "$4 (repack)"; return; }
     check "fx/$3.img" "$d.img" "$4"
 }
 tl_edit boot_v2_tails 's/^cmdline=.*/cmdline=con/' boot_v2_tails_short "boot v2: a shorter command line; what was behind the old one is behind the new one"
@@ -6244,7 +6332,8 @@ cp vbmeta_signed/descriptor0.bin vbmeta_tails/
     echo "release_string_tail=OLD RELEASE"
     echo "reserved=$(python3 -c 'print(bytes(range(1, 81)).hex())')"
 } >vbmeta_tails/manifest.txt
-"$ABR" repack vbmeta_tails -o vbmeta_tails.img --avb-key avb_test_key.pem >/dev/null 2>&1
+put_key vbmeta_tails avb_key.pem avb_test_key.pem
+"$ABR" pack -i vbmeta_tails -o vbmeta_tails.img >/dev/null 2>&1
 if python3 - <<'PYEOF'
 import hashlib, struct, sys
 d = open("vbmeta_tails.img", "rb").read()
@@ -6277,7 +6366,7 @@ for tl_n in 2 100; do
     mkdir "vbmeta_res$tl_n"
     cp vbmeta_unsigned/descriptor0.bin "vbmeta_res$tl_n/"
     { cat vbmeta_unsigned/manifest.txt; echo "reserved=$(python3 -c "print(bytes(range(1, $tl_n + 1)).hex())")"; } >"vbmeta_res$tl_n/manifest.txt"
-    "$ABR" repack "vbmeta_res$tl_n" -o "vbmeta_res$tl_n.img" >/dev/null 2>&1
+    "$ABR" pack -i "vbmeta_res$tl_n" -o "vbmeta_res$tl_n.img" >/dev/null 2>&1
 done
 if python3 - <<'PYEOF'
 import sys
@@ -6294,12 +6383,12 @@ fi
 roundtrip_check vbmeta_tails.img "vbmeta (RSA-signed, bytes behind the release string and in the reserved area: a passthrough repack keeps the signature valid)" tl_vbm
 expect_line rt_tl_vbm "release_string_tail=OLD RELEASE" "vbmeta: the bytes behind the release string"
 expect_line rt_tl_vbm "reserved=$(python3 -c 'print(bytes(range(1, 81)).hex())')" "vbmeta: the reserved bytes"
-if said "unmodeled:  release_string 11, reserved 80" "$ABR" info vbmeta_tails.img; then
+if said "unmodeled:  release_string 11, reserved 80" "$ABR" info -i vbmeta_tails.img; then
     pass "info says that the header has bytes beyond what it models"
 else
     fail "info does not say that the vbmeta header has bytes beyond what it models"
 fi
-if said "the header holds bytes that nothing models (release_string 11, reserved 80): kept in manifest.txt" "$ABR" unpack vbmeta_tails.img -o tl_say_vm; then
+if said "the header holds bytes that nothing models (release_string 11, reserved 80): kept in manifest.txt" "$ABR" unpack -i vbmeta_tails.img -o tl_say_vm; then
     pass "unpack of a vbmeta says that it keeps them, and that the hash and the signature cover them"
 else
     fail "unpack of a vbmeta does not say that it keeps the bytes of the header that nothing models"
@@ -6361,27 +6450,27 @@ padding_case vendor_boot_v4_padding "vendor_boot v4 (ramdisk section, dtb, ramdi
 padding_case vendor_boot_v4_padding_notable "vendor_boot v4 without a ramdisk table (ramdisk, dtb)" vbnt
 expect_key rt_pd_hdr header_padding_file "boot v2: the header page's bytes are kept as before, next to those of the components"
 expect_line rt_pd_v2 "kernel_padding_file=kernel_padding.bin" "boot v2: the manifest names the file of the kernel's padding"
-if said "hash check:   OK" "$ABR" info fx/boot_v2_padding_avbfooter.img; then
+if said "hash check:   OK" "$ABR" info -i fx/boot_v2_padding_avbfooter.img; then
     pass "AVB footer: the digest covers the padding, so the hash check of the image with such padding is OK"
 else
     fail "AVB footer: the hash check of an image whose padding holds bytes is not OK"
 fi
-if said "bytes that are not zero in the padding behind a component (kernel 720, ramdisk 1402, dtb 848) are kept in" "$ABR" unpack fx/boot_v2_dirty_padding.img -o pd_say; then
+if said "bytes that are not zero in the padding behind a component (kernel 720, ramdisk 1402, dtb 848) are kept in" "$ABR" unpack -i fx/boot_v2_dirty_padding.img -o pd_say; then
     pass "unpack says which components have bytes in their padding, and how many"
 else
     fail "unpack does not say that it keeps the bytes in the padding"
 fi
-if said "section padding: kernel 720, ramdisk 1402, dtb 848 (" "$ABR" info fx/boot_v2_dirty_padding.img; then
+if said "section padding: kernel 720, ramdisk 1402, dtb 848 (" "$ABR" info -i fx/boot_v2_dirty_padding.img; then
     pass "info lists the components that have bytes in their padding"
 else
     fail "info does not list the bytes in the padding of the components"
 fi
-if said "bytes that are not zero in the padding behind a section (ramdisk 14, dtb 3296, table 1, bootconfig 17) are kept in" "$ABR" unpack fx/vendor_boot_v4_padding.img -o pd_say_vb; then
+if said "bytes that are not zero in the padding behind a section (ramdisk 14, dtb 3296, table 1, bootconfig 17) are kept in" "$ABR" unpack -i fx/vendor_boot_v4_padding.img -o pd_say_vb; then
     pass "unpack of a vendor_boot says which of its sections have bytes in their padding"
 else
     fail "unpack of a vendor_boot does not say that it keeps the bytes in the padding"
 fi
-if said "section padding: ramdisk 14, dtb 3296, table 1, bootconfig 17 (" "$ABR" info fx/vendor_boot_v4_padding.img; then
+if said "section padding: ramdisk 14, dtb 3296, table 1, bootconfig 17 (" "$ABR" info -i fx/vendor_boot_v4_padding.img; then
     pass "info of a vendor_boot lists the sections that have bytes in their padding"
 else
     fail "info of a vendor_boot does not list the bytes in the padding of its sections"
@@ -6408,10 +6497,10 @@ fi
 pd_edit() {  # <fixture> <the image that is expected> <label> <sed script for manifest.txt or ""> [<file of fx/ to copy into the directory> <its name there>]
     local d="pd_ed_$2"
     rm -rf "$d" "$d.img"
-    "$ABR" unpack "fx/$1.img" -o "$d" >/dev/null 2>&1 || { fail "$3 (unpack)"; return; }
+    "$ABR" unpack -i "fx/$1.img" -o "$d" >/dev/null 2>&1 || { fail "$3 (unpack)"; return; }
     [ -n "$4" ] && sed -i "$4" "$d/manifest.txt"
     [ -n "${5:-}" ] && cp "fx/$5" "$d/$6"
-    "$ABR" repack "$d" -o "$d.img" >/dev/null 2>&1 || { fail "$3 (repack)"; return; }
+    "$ABR" pack -i "$d" -o "$d.img" >/dev/null 2>&1 || { fail "$3 (repack)"; return; }
     check "fx/$2.img" "$d.img" "$3"
 }
 pd_edit boot_v2_padding boot_v2_padding_ksmaller "boot v2: a smaller kernel -- the bytes that were behind the old one all fit behind the new one" "" pad_kernel_smaller.bin kernel
@@ -6425,10 +6514,10 @@ pd_edit vendor_boot_v4_padding vendor_boot_v4_padding_clean "vendor_boot v4: eve
 # An edit of the image inside an AVB footer: the digest is made over the rebuilt image, padding included, so the check is still OK and
 # the bytes of the padding are still there.
 rm -rf pd_avb_ed pd_avb_ed.img
-"$ABR" unpack fx/boot_v2_padding_avbfooter.img -o pd_avb_ed >/dev/null 2>&1
+"$ABR" unpack -i fx/boot_v2_padding_avbfooter.img -o pd_avb_ed >/dev/null 2>&1
 head -c 3000 /dev/urandom >pd_avb_ed/ramdisk.cpio
-if "$ABR" repack pd_avb_ed -o pd_avb_ed.img >/dev/null 2>&1 && said "hash check:   OK" "$ABR" info pd_avb_ed.img &&
-    said "section padding: kernel 7," "$ABR" info pd_avb_ed.img; then
+if "$ABR" pack -i pd_avb_ed -o pd_avb_ed.img >/dev/null 2>&1 && said "hash check:   OK" "$ABR" info -i pd_avb_ed.img &&
+    said "section padding: kernel 7," "$ABR" info -i pd_avb_ed.img; then
     pass "AVB footer: after an edit the digest is made over the image with its padding, and the padding is still there"
 else
     fail "AVB footer: an edit of an image with bytes in its padding does not leave a footer that checks out, or loses them"
@@ -6436,9 +6525,9 @@ fi
 
 # The file of a padding is named by the manifest like any other: a name outside the directory is refused, and nothing is written.
 rm -rf pd_bad pd_bad.img
-"$ABR" unpack fx/boot_v2_padding.img -o pd_bad >/dev/null 2>&1
+"$ABR" unpack -i fx/boot_v2_padding.img -o pd_bad >/dev/null 2>&1
 sed -i 's/^kernel_padding_file=.*/kernel_padding_file=..\/escape.bin/' pd_bad/manifest.txt
-if "$ABR" repack pd_bad -o pd_bad.img >pd_bad.out 2>&1; then
+if "$ABR" pack -i pd_bad -o pd_bad.img >pd_bad.out 2>&1; then
     fail "repack took a kernel_padding_file that lies outside the directory of the manifest"
 elif grep -q "kernel_padding_file" pd_bad.out && [ ! -e pd_bad.img ]; then
     pass "a kernel_padding_file outside the directory of the manifest is refused with its key, and nothing is written"
@@ -6467,30 +6556,30 @@ if cmp -s <(head -c $((64 + 5000 + 64)) fx/uimage_trailer_filled.img | tail -c 6
 else
     fail "uImage: a trailer and fill behind it are not kept as a trailer and a fill"
 fi
-"$ABR" repack rt_ui_trl -o rt_ui_trl.again >/dev/null 2>rt_ui_trl.again.err
+"$ABR" pack -i rt_ui_trl -o rt_ui_trl.again >/dev/null 2>rt_ui_trl.again.err
 if cmp -s fx/uimage_trailer.img rt_ui_trl.again && ! grep -q "kept as they were" rt_ui_trl.again.err; then
     pass "an unedited uImage with a trailer repacks without a stale-signature warning"
 else
     fail "an unedited uImage with a trailer repacked with a warning about its trailer, or not as it was"
 fi
-"$ABR" unpack fx/uimage_tails.img -o ui_plain >ui_plain.out 2>&1
+"$ABR" unpack -i fx/uimage_tails.img -o ui_plain >ui_plain.out 2>&1
 if ! grep -qE '^(tail_file|pad_to|pad_byte|prefix_file|core_sha256)=' ui_plain/manifest.txt && ! grep -q "after the uImage" ui_plain.out; then
     pass "a uImage with nothing behind it has no tail, no fill and no hash in its manifest, and unpack says nothing of them"
 else
     fail "a uImage with nothing behind it got keys, or a note, for what is behind the image"
 fi
-if said "reproduces this image byte-for-byte" "$ABR" unpack fx/uimage_trailer_filled.img -o ui_say; then
+if said "reproduces this image byte-for-byte" "$ABR" unpack -i fx/uimage_trailer_filled.img -o ui_say; then
     pass "unpack of a uImage with a trailer and fill behind it: its self-check confirms the round trip"
 else
     fail "unpack of a uImage with a trailer and fill behind it does not confirm the round trip"
 fi
-if said "64 bytes after the uImage are kept verbatim" "$ABR" unpack fx/uimage_trailer.img -o ui_say2; then
+if said "64 bytes after the uImage are kept verbatim" "$ABR" unpack -i fx/uimage_trailer.img -o ui_say2; then
     pass "unpack says that it keeps the trailer behind a uImage"
 else
     fail "unpack does not say that it keeps the bytes behind a uImage"
 fi
-if said "trailing:       64 bytes after the image" "$ABR" info fx/uimage_trailer.img &&
-    said "padding:        0xff fill up to 16384 bytes" "$ABR" info fx/uimage_filled.img; then
+if said "trailing:       64 bytes after the image" "$ABR" info -i fx/uimage_trailer.img &&
+    said "padding:        0xff fill up to 16384 bytes" "$ABR" info -i fx/uimage_filled.img; then
     pass "info of a uImage lists the trailer and the fill behind it"
 else
     fail "info of a uImage does not list what is behind the image"
@@ -6501,9 +6590,9 @@ fi
 ui_edit() {  # <fixture> <the image that is expected> <label>
     local d="ui_ed_$2"
     rm -rf "$d" "$d.img"
-    "$ABR" unpack "fx/$1.img" -o "$d" >/dev/null 2>&1 || { fail "$3 (unpack)"; return; }
+    "$ABR" unpack -i "fx/$1.img" -o "$d" >/dev/null 2>&1 || { fail "$3 (unpack)"; return; }
     cp fx/uimage_kernel_smaller.bin "$d/data.bin"
-    "$ABR" repack "$d" -o "$d.img" >"$d.log" 2>&1 || { fail "$3 (repack)"; return; }
+    "$ABR" pack -i "$d" -o "$d.img" >"$d.log" 2>&1 || { fail "$3 (repack)"; return; }
     check "fx/$2.img" "$d.img" "$3"
 }
 ui_edit uimage_filled uimage_filled_smaller "uImage with fill: a smaller payload, and the fill goes up to the same size again"
@@ -6553,7 +6642,7 @@ PYEOF
         ui_made=$((ui_made + 1))
         rp_n=$((rp_n + 1))
         rm -rf ui_nm_d
-        if ! "$ABR" unpack ui_nm.img -o ui_nm_d >ui_nm.log 2>&1; then
+        if ! "$ABR" unpack -i ui_nm.img -o ui_nm_d >ui_nm.log 2>&1; then
             rp_bad="$rp_bad [$ui_key=$ui_name: unpack: $(head -c 120 ui_nm.log)]"
             continue
         fi
@@ -6581,7 +6670,7 @@ open("ui_nm_odd.img", "wb").write(bytes(hdr) + data)
 PYEOF
 rm -rf ui_nm_odd_d
 rp_n=$((rp_n + 1))
-if "$ABR" unpack ui_nm_odd.img -o ui_nm_odd_d >ui_nm.log 2>&1; then
+if "$ABR" unpack -i ui_nm_odd.img -o ui_nm_odd_d >ui_nm.log 2>&1; then
     for ui_line in os=99 arch=77 image_type=99 compression=66; do
         grep -q -x -- "$ui_line" ui_nm_odd_d/manifest.txt || rp_bad="$rp_bad [odd values: the manifest has no $ui_line: $(grep -E '^(os|arch|image_type|compression)=' ui_nm_odd_d/manifest.txt | tr '\n' ' ' | head -c 120)]"
     done
@@ -6591,7 +6680,7 @@ if "$ABR" unpack ui_nm_odd.img -o ui_nm_odd_d >ui_nm.log 2>&1; then
     if rp_made ui_nm_odd_d "odd values"; then
         cmp -s "$rp_run" ui_nm_odd.img || rp_bad="$rp_bad [odd values: the repack is not the image]"
     fi
-    "$ABR" info ui_nm_odd.img >ui_nm_info.log 2>&1
+    "$ABR" info -i ui_nm_odd.img >ui_nm_info.log 2>&1
     grep -q 'os/arch: *99/77' ui_nm_info.log && grep -q 'type: *99' ui_nm_info.log && grep -q 'compression: *66' ui_nm_info.log && ! grep -q -i unknown ui_nm_info.log ||
         rp_bad="$rp_bad [odd values: info: $(grep -E 'os/arch|type|compression' ui_nm_info.log | tr '\n' ' ' | head -c 160)]"
 else
@@ -6599,7 +6688,7 @@ else
 fi
 # the same bytes by another way of writing the value: a name in any case, a number in decimal or hex, the names that older abr wrote
 rm -rf ui_nm_v
-"$ABR" unpack uimage_plain.img -o ui_nm_v >/dev/null 2>&1
+"$ABR" unpack -i uimage_plain.img -o ui_nm_v >/dev/null 2>&1
 for ui_case in "os=Linux" "os=LINUX" "os=5" "os=0x5" "os=0X05" "arch=ARM64" "arch=22" "arch=0x16" "image_type=KERNEL" "image_type=2" "compression=None" "compression=0"; do
     rm -rf ui_nm_w
     cp -a ui_nm_v ui_nm_w
@@ -6627,7 +6716,7 @@ rm -rf ui_nm_w
 cp -a ui_nm_v ui_nm_w
 rp_set ui_nm_w os linuxx
 rp_n=$((rp_n + 1))
-"$ABR" repack ui_nm_w -o "$rp_run" >rp_run.log 2>&1
+"$ABR" pack -i ui_nm_w -o "$rp_run" >rp_run.log 2>&1
 grep -q -F "4_4bsd, " rp_run.log && grep -q -F "vxworks) and no number up to 255" rp_run.log || rp_bad="$rp_bad [the refusal does not list the names: $(head -c 160 rp_run.log)]"
 rp_report "checks of a uImage whose values have no name or are written another way: the numbers are kept as numbers and come back byte for byte, info says them, a name in any case or a number in decimal or hex is the same value, the names an older abr wrote are read, and a name that is none of the table's (or a number above 255) is refused with the names that are known"
 
@@ -6741,7 +6830,7 @@ for fit_lay in "inline:" "E:-E" "EB8:-E -B 8" "EB1000:-E -B 0x1000" "Ep800:-E -p
     fit_made=$((fit_made + 1))
     rp_n=$((rp_n + 1))
     rm -rf "fit_d_$fit_name"
-    if ! "$ABR" unpack "fit_$fit_name.itb" -o "fit_d_$fit_name" >fit_un.log 2>&1; then
+    if ! "$ABR" unpack -i "fit_$fit_name.itb" -o "fit_d_$fit_name" >fit_un.log 2>&1; then
         rp_bad="$rp_bad [$fit_name: unpack: $(head -c 160 fit_un.log)]"
         continue
     fi
@@ -6758,7 +6847,7 @@ for fit_lay in "inline:" "E:-E" "EB8:-E -B 8" "EB1000:-E -B 0x1000" "Ep800:-E -p
     fit_ck "$fit_name: fit_tool verify (the file mkimage made)" python3 -I "$FIT_TOOL" verify "fit_$fit_name.itb"
     # identify and info
     [ "$("$ABR" identify "fit_$fit_name.itb" 2>&1)" = "fit_$fit_name.itb: U-Boot FIT image (flattened image tree)" ] || rp_bad="$rp_bad [$fit_name: identify: $("$ABR" identify "fit_$fit_name.itb" 2>&1 | head -c 120)]"
-    "$ABR" info "fit_$fit_name.itb" >fit_info.log 2>&1
+    "$ABR" info -i "fit_$fit_name.itb" >fit_info.log 2>&1
     grep -q '^format: fit$' fit_info.log && grep -q '^images: *3$' fit_info.log && grep -q 'kernel-1: 3000 bytes' fit_info.log ||
         rp_bad="$rp_bad [$fit_name: info: $(head -c 200 fit_info.log)]"
     case "$fit_name" in
@@ -6810,7 +6899,7 @@ head -c $((131072 - $(wc -c <fit_EB8.itb))) /dev/zero >>fit_fill.itb
 for fit_img in fit_tail fit_fill; do
     rp_n=$((rp_n + 1))
     rm -rf "fit_d_$fit_img"
-    if ! "$ABR" unpack "$fit_img.itb" -o "fit_d_$fit_img" >fit_un.log 2>&1; then
+    if ! "$ABR" unpack -i "$fit_img.itb" -o "fit_d_$fit_img" >fit_un.log 2>&1; then
         rp_bad="$rp_bad [$fit_img: unpack: $(head -c 160 fit_un.log)]"
         continue
     fi
@@ -6962,7 +7051,7 @@ if [ -f fit_EB8.itb ]; then
     rp_fresh fit_EB8.itb fit_t_its
     fit_edit fit_t_its/fit.its 'compression = "none";' 'compression = "gzip";'
     rp_n=$((rp_n + 1))
-    "$ABR" repack fit_t_its -o "$rp_run" >rp_run.log 2>&1 && grep -q -F "says compression = gzip in fit.its, and its data goes into the image as none" rp_run.log ||
+    "$ABR" pack -i fit_t_its -o "$rp_run" >rp_run.log 2>&1 && grep -q -F "says compression = gzip in fit.its, and its data goes into the image as none" rp_run.log ||
         rp_bad="$rp_bad [compression = gzip over data that is not: no warning: $(head -c 200 rp_run.log)]"
 fi
 fit_extra_text='		extra-1 {
@@ -7075,7 +7164,7 @@ for fit_lay in "inline:" "EB8:-E -B 8"; do
     fit_signed=$((fit_signed + 1))
     rp_n=$((rp_n + 1))
     rm -rf "fit_sd_$fit_name"
-    if ! "$ABR" unpack "fit_signed_$fit_name.itb" -o "fit_sd_$fit_name" >fit_un.log 2>&1; then
+    if ! "$ABR" unpack -i "fit_signed_$fit_name.itb" -o "fit_sd_$fit_name" >fit_un.log 2>&1; then
         rp_bad="$rp_bad [$fit_name: unpack: $(head -c 160 fit_un.log)]"
         continue
     fi
@@ -7087,7 +7176,7 @@ for fit_lay in "inline:" "EB8:-E -B 8"; do
         cmp -s "$rp_run" "fit_signed_$fit_name.itb" || rp_bad="$rp_bad [$fit_name: the untouched directory is not the signed FIT]"
         grep -q '^warning' rp_run.log && rp_bad="$rp_bad [$fit_name: an untouched signed FIT is warned of: $(grep '^warning' rp_run.log | head -c 160)]"
     fi
-    "$ABR" info "fit_signed_$fit_name.itb" >fit_info.log 2>&1
+    "$ABR" info -i "fit_signed_$fit_name.itb" >fit_info.log 2>&1
     grep -q '^signatures: *1 ' fit_info.log && grep -q '(signed)' fit_info.log || rp_bad="$rp_bad [$fit_name: info does not say the FIT is signed: $(head -c 200 fit_info.log)]"
     # a new kernel: the signature is not made again, and the repack says which it is
     cp fit_kernel2.bin "fit_sd_$fit_name/kernel_1"
@@ -7110,7 +7199,7 @@ for fit_lay in "inline:" "EB8:-E -B 8"; do
     rp_fresh "fit_signed_$fit_name.itb" "fit_sd2_$fit_name"
     fit_edit "fit_sd2_$fit_name/fit.its" 'description = "kernel";' 'description = "the kernel";'
     rp_n=$((rp_n + 1))
-    "$ABR" repack "fit_sd2_$fit_name" -o "$rp_run" >rp_run.log 2>&1 && grep -q -F "fit.its was edited and the FIT has signatures (/configurations/conf-1/signature-1)" rp_run.log ||
+    "$ABR" pack -i "fit_sd2_$fit_name" -o "$rp_run" >rp_run.log 2>&1 && grep -q -F "fit.its was edited and the FIT has signatures (/configurations/conf-1/signature-1)" rp_run.log ||
         rp_bad="$rp_bad [$fit_name: fit.its edited in a signed FIT: $(head -c 240 rp_run.log)]"
 done
 if [ "$fit_signed" -gt 0 ]; then
@@ -7141,7 +7230,7 @@ done
 for fit_n in fit_both fit_noimages fit_nodata; do
     rp_n=$((rp_n + 1))
     rm -rf "fit_d_$fit_n"
-    if ! "$ABR" unpack "$fit_n.itb" -o "fit_d_$fit_n" >fit_un.log 2>&1; then
+    if ! "$ABR" unpack -i "$fit_n.itb" -o "fit_d_$fit_n" >fit_un.log 2>&1; then
         rp_bad="$rp_bad [$fit_n: unpack: $(head -c 160 fit_un.log)]"
         continue
     fi
@@ -7154,7 +7243,7 @@ for fit_n in fit_both fit_noimages fit_nodata; do
             grep -q '^type=dtb$' "fit_d_$fit_n/manifest.txt" || rp_bad="$rp_bad [$fit_n: not unpacked as a dtb]"
             grep -q -F "this is a U-Boot FIT image, but abr cannot put it back as one (the image kernel-1 has \`data\` and also data-size, data-offset or data-position)" fit_un.log ||
                 rp_bad="$rp_bad [$fit_n: the unpack does not say why it is no FIT: $(head -c 240 fit_un.log)]"
-            "$ABR" info "$fit_n.itb" >fit_info.log 2>&1
+            "$ABR" info -i "$fit_n.itb" >fit_info.log 2>&1
             grep -q '^unpack: *as a plain device tree, because ' fit_info.log || rp_bad="$rp_bad [$fit_n: info does not say why it is a plain device tree: $(head -c 300 fit_info.log)]"
             ;;
         fit_noimages)
@@ -7235,7 +7324,7 @@ PYEOF
     cp -a "$fit_dir" fit_try
     rm fit_try/.abr_raw/fit_strings.bin
     rp_n=$((rp_n + 1))
-    "$ABR" repack fit_try -o "$rp_run" >rp_run.log 2>&1 && grep -q -F "fit_strings.bin is not there: the strings of the tree are written in the order of their first use" rp_run.log ||
+    "$ABR" pack -i fit_try -o "$rp_run" >rp_run.log 2>&1 && grep -q -F "fit_strings.bin is not there: the strings of the tree are written in the order of their first use" rp_run.log ||
         rp_bad="$rp_bad [the strings of the tree are gone: $(head -c 200 rp_run.log)]"
     python3 -I "$FIT_TOOL" verify "$rp_run" >/dev/null 2>&1 || rp_bad="$rp_bad [the strings of the tree are gone: the FIT that was made is not right]"
 else
@@ -7250,7 +7339,7 @@ if python3 -I "$CROS_TOOL" devkeys "$REPO_ROOT/src/legacy/chromeos_devkeys.cpp" 
     python3 -I "$CROS_TOOL" make fit_cros.blob --kernel fit_EB8.itb --keyblock fit_cros/kernel.keyblock --key fit_cros/kernel_data_key.vbprivk >/dev/null 2>&1; then
     rp_n=$((rp_n + 1))
     rm -rf fit_d_cros
-    if "$ABR" unpack fit_cros.blob -o fit_d_cros >fit_un.log 2>&1; then
+    if "$ABR" unpack -i fit_cros.blob -o fit_d_cros >fit_un.log 2>&1; then
         grep -q '^type=fit$' fit_d_cros/manifest.txt && grep -q '^has_chromeos=true$' fit_d_cros/manifest.txt ||
             rp_bad="$rp_bad [the FIT in a ChromeOS blob is not unpacked as a FIT inside the wrapper: $(head -c 200 fit_un.log)]"
         grep -q -F "reproduces this image byte-for-byte" fit_un.log || rp_bad="$rp_bad [the FIT in a ChromeOS blob: unpack does not say it is exact]"
@@ -7288,21 +7377,21 @@ U8_OUT="$U8_ROOT/результат-ü-😀.img"
 mkdir -p "$U8_ROOT"
 cp boot_v2.img "$U8_IMG"
 rd_fails=""
-rd_ck "unpack of an image whose name is not ASCII into a directory whose name is not" "$ABR" unpack "$U8_IMG" -o "$U8_DIR"
+rd_ck "unpack of an image whose name is not ASCII into a directory whose name is not" "$ABR" unpack -i "$U8_IMG" -o "$U8_DIR"
 rd_ck "the directory has the name it was given" test -f "$U8_DIR/manifest.txt"
 rd_ck "and nothing is left under a '?' name" test "$(find . -name '*\?*' | wc -l)" = 0
 rd_ck "the manifest's first lines name the directory as it was given" grep -q -F -- "$U8_DIR" "$U8_DIR/manifest.txt"
-rd_ck "repack into a file whose name is not ASCII" "$ABR" repack "$U8_DIR" -o "$U8_OUT"
+rd_ck "repack into a file whose name is not ASCII" "$ABR" pack -i "$U8_DIR" -o "$U8_OUT"
 rd_ck "... is the image it came from" cmp -s "$U8_IMG" "$U8_OUT"
-rd_ck "info names the file as it is" said "file:   $U8_IMG " "$ABR" info "$U8_IMG"
+rd_ck "info names the file as it is" said "file:   $U8_IMG " "$ABR" info -i "$U8_IMG"
 rd_ck "identify names it, too" said "^$U8_IMG: " "$ABR" identify "$U8_IMG"
 rd_ck "identify -b says what it is" said "AOSP" "$ABR" identify -b "$U8_IMG"
 # a file name that only the manifest knows
 U8_FILE="ядро-ü-日本-😀.bin"
 rd_ck "a kernel file with a name that is not ASCII (and its raw twin): moved there" sh -c "mv '$U8_DIR/kernel' '$U8_DIR/$U8_FILE' && mv '$U8_DIR/.abr_raw/kernel.raw' '$U8_DIR/.abr_raw/$U8_FILE.raw' && sed -i 's/^kernel_file=.*/kernel_file=$U8_FILE/' '$U8_DIR/manifest.txt'"
-rd_ck "repacked from the manifest's name" "$ABR" repack "$U8_DIR" -o "$U8_ROOT/из-манифеста.img"
+rd_ck "repacked from the manifest's name" "$ABR" pack -i "$U8_DIR" -o "$U8_ROOT/из-манифеста.img"
 rd_ck "... the same image" cmp -s "$U8_IMG" "$U8_ROOT/из-манифеста.img"
-rd_ck "a name that is not there is named as it was written" said "ядро-ü-日本-😀.bin" sh -c "rm '$U8_DIR/$U8_FILE' '$U8_DIR/.abr_raw/$U8_FILE.raw'; ! '$ABR' repack '$U8_DIR' -o '$U8_ROOT/нет.img' 2>&1; true"
+rd_ck "a name that is not there is named as it was written" said "ядро-ü-日本-😀.bin" sh -c "rm '$U8_DIR/$U8_FILE' '$U8_DIR/.abr_raw/$U8_FILE.raw'; ! '$ABR' pack -i '$U8_DIR' -o '$U8_ROOT/нет.img' 2>&1; true"
 rd_done "paths that are not ASCII: the image, the directory, the output file and a name of the manifest (Cyrillic, an accent, Chinese, an emoji) come through the command line and the messages as they are"
 
 # ---- images of your own: ABR_REAL_IMAGES=<directory> tests/run_tests.sh <abr> checks every file of it the way
@@ -7316,11 +7405,11 @@ if [ -n "${ABR_REAL_IMAGES:-}" ] && [ -d "$ABR_REAL_IMAGES" ]; then
         rb="$(basename "$img")"
         rw="real_$(printf '%s' "$rb" | tr -c 'A-Za-z0-9_.-' '_')"
         rm -rf "$rw" "$rw.out" "$rw.edit" "$rw.edit.img" "$rw.edit_re"
-        if ! "$ABR" unpack "$img" -o "$rw" >"$rw.log" 2>&1; then
+        if ! "$ABR" unpack -i "$img" -o "$rw" >"$rw.log" 2>&1; then
             echo "note: $rb is not an image abr unpacks ($(tail -n 1 "$rw.log"))"
             continue
         fi
-        "$ABR" repack "$rw" -o "$rw.out" >/dev/null 2>&1
+        "$ABR" pack -i "$rw" -o "$rw.out" >/dev/null 2>&1
         rd_ck "untouched repack is identical" cmp -s "$img" "$rw.out"
         prefixes="$(sed -n 's/^\(ramdisk[0-9]*\)_tree=.*/\1/p;s/^ramdisk_tree=.*/ramdisk/p' "$rw/manifest.txt")"
         for p in $prefixes; do
@@ -7331,7 +7420,7 @@ if [ -n "${ABR_REAL_IMAGES:-}" ] && [ -d "$ABR_REAL_IMAGES" ]; then
         if [ -n "$prefixes" ]; then
             first="$(sed -n '1p' <<<"$prefixes")"
             cp -a "$rw" "$rw.edit" && printf 'abr test\n' >"$rw.edit/$first/abr_test_file"
-            "$ABR" repack "$rw.edit" -o "$rw.edit.img" >/dev/null 2>&1 && "$ABR" unpack "$rw.edit.img" -o "$rw.edit_re" >/dev/null 2>&1
+            "$ABR" pack -i "$rw.edit" -o "$rw.edit.img" >/dev/null 2>&1 && "$ABR" unpack -i "$rw.edit.img" -o "$rw.edit_re" >/dev/null 2>&1
             rd_ck "$first: a file put into the directory is in the image" test "$(cat "$rw.edit_re/$first/abr_test_file" 2>/dev/null)" = "abr test"
             rd_ck "$first: nothing else changed" rd_same_tree_x "$rw/$first" "$rw.edit_re/$first" abr_test_file
         fi
@@ -7339,15 +7428,15 @@ if [ -n "${ABR_REAL_IMAGES:-}" ] && [ -d "$ABR_REAL_IMAGES" ]; then
         # an untouched repack is identical, the signatures are good, and an edit lands in the image and is signed afresh.
         if cros make "$rw.chromeos" --kernel "$img" --keyblock "$CK/kernel.keyblock" --key "$CK/kernel_data_key.vbprivk" >/dev/null 2>&1; then
             rm -rf "$rw.cu" "$rw.cu.edit" "$rw.cu.edit_re"
-            "$ABR" unpack "$rw.chromeos" -o "$rw.cu" >"$rw.cu.log" 2>&1
+            "$ABR" unpack -i "$rw.chromeos" -o "$rw.cu" >"$rw.cu.log" 2>&1
             rd_ck "in a ChromeOS blob: unpack" test -d "$rw.cu"
             rd_ck "in a ChromeOS blob: the blob is named" grep -q 'chromeos-wrapped' "$rw.cu.log"
-            "$ABR" repack "$rw.cu" -o "$rw.chromeos.out" >/dev/null 2>&1
+            "$ABR" pack -i "$rw.cu" -o "$rw.chromeos.out" >/dev/null 2>&1
             rd_ck "in a ChromeOS blob: an untouched repack is identical" cmp -s "$rw.chromeos" "$rw.chromeos.out"
             rd_ck "in a ChromeOS blob: the signatures of the original are good" cros verify "$rw.chromeos"
             if [ -n "$prefixes" ]; then
                 cp -a "$rw.cu" "$rw.cu.edit" && printf 'abr test\n' >"$rw.cu.edit/$(sed -n '1p' <<<"$prefixes")/abr_test_file"
-                "$ABR" repack "$rw.cu.edit" -o "$rw.cu.edit.blob" >/dev/null 2>&1 && "$ABR" unpack "$rw.cu.edit.blob" -o "$rw.cu.edit_re" >/dev/null 2>&1
+                "$ABR" pack -i "$rw.cu.edit" -o "$rw.cu.edit.blob" >/dev/null 2>&1 && "$ABR" unpack -i "$rw.cu.edit.blob" -o "$rw.cu.edit_re" >/dev/null 2>&1
                 rd_ck "in a ChromeOS blob: an edit lands in the image" test "$(cat "$rw.cu.edit_re/$(sed -n '1p' <<<"$prefixes")/abr_test_file" 2>/dev/null)" = "abr test"
                 rd_ck "in a ChromeOS blob: the blob is signed afresh, and good" cros verify "$rw.cu.edit.blob"
                 rd_ck "in a ChromeOS blob: futility verifies it" cros_fut_verify "$rw.cu.edit.blob"
@@ -7361,10 +7450,10 @@ if [ -n "${ABR_REAL_IMAGES:-}" ] && [ -d "$ABR_REAL_IMAGES" ]; then
             sin_mm="${sin_v#*:}"
             rm -rf "$rw.su" "$rw.sin" "$rw.sin.out"
             if sint wrap "$img" "$rw.sin" --version "$sin_ver" ${sin_mm:+--mmcf "$sin_mm"} >/dev/null 2>&1; then
-                "$ABR" unpack "$rw.sin" -o "$rw.su" >"$rw.su.log" 2>&1
+                "$ABR" unpack -i "$rw.sin" -o "$rw.su" >"$rw.su.log" 2>&1
                 rd_ck "in a Sony SIN v$sin_ver${sin_mm:+ ($sin_mm)}: unpack" test -d "$rw.su"
                 rd_ck "in a Sony SIN v$sin_ver${sin_mm:+ ($sin_mm)}: the container is named" grep -q 'sin-wrapped' "$rw.su.log"
-                "$ABR" repack "$rw.su" -o "$rw.sin.out" >/dev/null 2>&1
+                "$ABR" pack -i "$rw.su" -o "$rw.sin.out" >/dev/null 2>&1
                 rd_ck "in a Sony SIN v$sin_ver${sin_mm:+ ($sin_mm)}: an untouched repack is the image that was inside" cmp -s "$img" "$rw.sin.out"
             fi
             rm -rf "$rw.su" "$rw.sin" "$rw.sin.out"
@@ -7400,7 +7489,7 @@ for kind in blob:SIGNBLOB chromeos:ChromeOS sin2:Sony osip:OSIP; do
     sample="${kind%%:*}"
     word="${kind##*:}"
     rm -rf id_out
-    out="$("$ABR" unpack "idsamples/$sample" -o id_out 2>&1)"
+    out="$("$ABR" unpack -i "idsamples/$sample" -o id_out 2>&1)"
     rc=$?
     if [ $rc -ne 0 ] && grep -q -- "$word" <<<"$out" && [ ! -e id_out ]; then
         pass "unpack: a $sample image is named in the refusal, and no output directory is left behind"
@@ -7410,10 +7499,136 @@ for kind in blob:SIGNBLOB chromeos:ChromeOS sin2:Sony osip:OSIP; do
 done
 
 # =========================================================================
+# The live drivers: Python programs that make images with writers of their own (tests/tools/mk_*.py), run abr on them and judge what
+# abr writes with readers written beside those writers, not with abr's own code. A driver prints one FAIL line for every check that does
+# not hold and a last line with the counts; its exit status says whether there is one. What needs Pillow (the pictures of a logo, the
+# splash partitions, the PNG judge) or `cryptography` (the certificates of an MBN) is a SKIP note without it, and a failure in a run that
+# requires the judge (ABR_REQUIRE_ORACLES=pillow,cryptography).
+# =========================================================================
+# Under wine every run of abr is a process of its own and costs a few tenths of a second: fewer damaged images of each sample.
+[ "$RD_WINE" = 1 ] && export ABR_LIVE_MUTANTS=6
+have_pillow() { python3 -c 'import PIL.Image' 2>/dev/null; }
+have_cryptography() { python3 -c 'import cryptography.x509' 2>/dev/null; }
+
+live_driver() {  # live_driver <what> <log> <command...>: the command is a driver, its last line says what it checked
+    local what="$1" log="$2"
+    shift 2
+    if "$@" >"$log" 2>&1; then
+        pass "$what ($(tail -n 1 "$log"))"
+    else
+        fail "$what: $(grep -E '^FAIL|Traceback|Error' "$log" | head -n 5 | tr '\n' ' ')"
+        head -n 60 "$log"
+    fi
+}
+
+live_make() {  # live_make <what> <log> <command...>: a generator; its failure is a failure of the suite, not of abr
+    local what="$1" log="$2"
+    shift 2
+    if "$@" >"$log" 2>&1; then
+        return 0
+    fi
+    fail "$what: the generator did not run: $(tail -n 3 "$log" | tr '\n' ' ')"
+    return 1
+}
+
+# ---- the picture partitions: Qualcomm SPLASH!!, OPLUS, Xiaomi, Motorola; and the RLE24 coder against its transcription of logo_gen.py
+if have_pillow; then
+    rm -rf lv_splash_gen lv_splash_work lv_rle_work
+    if live_make "splash partitions" lv_splash_gen.log python3 -I "$TOOLS/mk_splash.py" gen lv_splash_gen; then
+        live_driver "splash partitions: info, unpack, untouched repack, edited pictures, damaged images, judged by the decoders of mk_splash.py" \
+            lv_splash.log python3 -I "$TOOLS/splash_live.py" "$ABR" lv_splash_gen lv_splash_work
+    fi
+    live_driver "RLE24: what abr writes is what logo_gen.py writes" lv_rle.log python3 -I "$TOOLS/rle_parity.py" "$ABR" lv_rle_work
+else
+    echo "SKIP: splash partitions and the RLE24 comparison (Pillow is not installed)"
+fi
+
+# ---- Qualcomm secure boot images (MBN, flat and ELF)
+if have_cryptography; then
+    rm -rf lv_mbn_gen lv_mbn_work
+    if live_make "MBN" lv_mbn_gen.log python3 -I "$TOOLS/mk_mbn.py" make lv_mbn_gen; then
+        live_driver "MBN: info, unpack, untouched pack, a changed code or segment (sizes and the table of hashes made again), refusals, damaged images" \
+            lv_mbn.log python3 -I "$TOOLS/mbn_live.py" "$ABR" lv_mbn_gen lv_mbn_work
+    fi
+else
+    echo "SKIP: MBN images (the python package 'cryptography' is not installed; mk_mbn.py needs it for the certificates)"
+fi
+
+# ---- MediaTek: the containers (md1img, logo, ...), the preloader, boot images whose kernel and ramdisk carry the MediaTek header
+rm -rf lv_mtk_cont lv_mtk_gfh lv_mtk_boot lv_mtk_work
+if live_make "MediaTek containers" lv_mtk_make.log python3 -I "$TOOLS/mk_mtk.py" make lv_mtk_cont \
+    && live_make "MediaTek preloaders" lv_mtk_gfh.log python3 -I "$TOOLS/mk_gfh.py" lv_mtk_gfh \
+    && live_make "MediaTek boot images" lv_mtk_bootmake.log python3 -I "$TOOLS/mk_mtk.py" boot lv_mtk_boot "$MKBOOTIMG"; then
+    live_driver "MediaTek: containers, preloaders, MediaTek headers in boot images, cut-short streams, damaged images" \
+        lv_mtk.log python3 -I "$TOOLS/mtk_live.py" "$ABR" lv_mtk_cont lv_mtk_gfh lv_mtk_boot lv_mtk_work
+fi
+have_pillow || echo "note: the pictures of a logo were not compared (Pillow is not installed)"
+
+# ---- QCDT: tables of device trees made by dtc from sources written by the driver, and the table of a real image when there is one
+lv_real_qcdt="-"
+[ -n "${ABR_REAL_IMAGES:-}" ] && [ -f "$ABR_REAL_IMAGES/boot_lk2nd.img" ] && lv_real_qcdt="$ABR_REAL_IMAGES/boot_lk2nd.img"
+# the real dtbTool (the Code Aurora Forum's, built by .github/scripts/build_oracles.sh) judges the tables abr makes: qcdt_live.py has it make the table of
+# every folder abr packs, and the two must be the same bytes (ABR_DTBTOOL, or a dtbTool on the PATH)
+export ABR_DTBTOOL="${ABR_DTBTOOL:-$(command -v dtbTool 2>/dev/null || command -v dtbtool 2>/dev/null || true)}"
+rm -rf lv_qcdt_work
+live_driver "QCDT: tables from folders of trees (versions 1 to 3, page sizes, forced versions; the real dtbTool makes the same tables where it is built), edits, refusals, a table in a boot image, a real table, damaged tables" \
+    lv_qcdt.log python3 -I "$TOOLS/qcdt_live.py" "$ABR" lv_qcdt_work "$lv_real_qcdt"
+[ "$lv_real_qcdt" = "-" ] && echo "note: no real QCDT was tried (ABR_REAL_IMAGES has no boot_lk2nd.img)"
+
+# ---- dtb: trees that are not back to back, and an AVB footer on a dtb partition
+if [ -f "$AVBTOOL" ] && command -v openssl >/dev/null 2>&1; then
+    rm -rf lv_dtb_work
+    live_driver "dtb: trees at multiples of an alignment, gaps, a trailer, an AVB footer (unsigned, signed, signed with another key), damaged images" \
+        lv_dtb.log python3 -I "$TOOLS/dtb_live.py" "$ABR" "$AVBTOOL" lv_dtb_work
+else
+    echo "SKIP: dtb gaps and AVB footers (avbtool or openssl not usable)"
+fi
+
+# ---- PNG: abr's reader and writer against Pillow (and ImageMagick where it is)
+if have_pillow && [ -x "$UNIT" ]; then
+    rm -rf lv_png_work
+    live_driver "PNG: abr encodes and Pillow decodes, Pillow encodes every colour type and bit depth and abr decodes" \
+        lv_png.log python3 -I "$TOOLS/png_oracle.py" "$UNIT" lv_png_work
+else
+    echo "SKIP: the PNG comparison with Pillow (Pillow or abr_unit_tests is not there)"
+fi
+
+# ---- file systems and partition tables are told apart from images abr opens, and explained
+rm -rf lv_fat
+if live_make "FAT and GPT samples" lv_fat_make.log python3 -I "$TOOLS/mk_fatboot.py" lv_fat; then
+    for want in "fat12.img|FAT12 file system image of 1440 KiB" "fat16.img|FAT16 file system image of 64 MiB" \
+                "fat16_4k.img|FAT16 file system image of 78 MiB" "fat32.img|FAT32 file system image of 512 MiB" \
+                "gpt512.img|GUID partition table" "gpt4k.img|GUID partition table"; do
+        sample="${want%%|*}"
+        phrase="${want#*|}"
+        rm -rf lv_fat_out
+        info="$("$ABR" info -i "lv_fat/$sample" 2>&1)"
+        out="$("$ABR" unpack -i "lv_fat/$sample" -o lv_fat_out 2>&1)"
+        rc=$?
+        if [ $rc -ne 0 ] && [ ! -e lv_fat_out ] && grep -q -- "$phrase" <<<"$info" && grep -q -- "$phrase" <<<"$out" \
+            && grep -q "Filesystems are out of scope\|does not read partitio" <<<"$out"; then
+            pass "$sample: info and unpack say what it is ($phrase), unpack is refused and leaves no directory"
+        else
+            fail "$sample: should be told as '$phrase' and refused without a directory (rc=$rc: $out)"
+        fi
+    done
+    for sample in not_fat_cluster3 not_fat_mbr not_fat_media not_fat_no_reserved not_fat_total zeros; do
+        rm -rf lv_fat_out
+        out="$("$ABR" unpack -i "lv_fat/$sample.img" -o lv_fat_out 2>&1)"
+        rc=$?
+        if [ $rc -ne 0 ] && [ ! -e lv_fat_out ] && grep -q "unrecognized image format" <<<"$out" && ! grep -qi "FAT1\|FAT3\|file system" <<<"$out"; then
+            pass "$sample: bytes that look like a boot sector but are not a FAT volume are not called one"
+        else
+            fail "$sample: should be unrecognized, not taken for a file system (rc=$rc: $out)"
+        fi
+    done
+fi
+
+# =========================================================================
 # Judges that have to be there. A judge that is not (rkcrc, mboot, sony_dump, ...) is a note in its section and the
 # comparisons with it are skipped, which is right on a machine that has not got it and wrong in a run that is meant to have
 # them all (the CI): a skipped comparison passes unseen. ABR_REQUIRE_ORACLES=<names, separated by commas> makes the absence
-# of the named judges a failure: futility, cpio, rkcrc, blobtools, mboot, loki, pxa, sony_dump, elftool, dumpimage. A name that is not
+# of the named judges a failure: futility, cpio, rkcrc, blobtools, mboot, loki, pxa, sony_dump, elftool, dtbtool, dumpimage, pillow, cryptography. A name that is not
 # on this list is a failure too (a misspelt name would otherwise check nothing).
 # =========================================================================
 oracle_have() {
@@ -7427,7 +7642,10 @@ oracle_have() {
         pxa) [ -n "${PXA_MKBOOTIMG:-}" ] && [ -x "$PXA_MKBOOTIMG" ] && [ -n "${PXA_UNPACKBOOTIMG:-}" ] && [ -x "$PXA_UNPACKBOOTIMG" ] ;;
         sony_dump) [ -n "${SIN_DUMP:-}" ] && [ -x "$SIN_DUMP" ] ;;
         elftool) elf_tool_ok ;;
+        dtbtool) [ -n "${ABR_DTBTOOL:-}" ] && [ -x "$ABR_DTBTOOL" ] && command -v dtc >/dev/null 2>&1 ;;
         dumpimage) [ "$FIT_DUMPIMAGE" = 1 ] ;;
+        pillow) have_pillow ;;
+        cryptography) have_cryptography ;;
         *) return 2 ;;
     esac
 }
@@ -7441,7 +7659,7 @@ if [ -n "${ABR_REQUIRE_ORACLES:-}" ]; then
         oracle_have "$oracle"
         case $? in
             0) pass "the judge '$oracle' is there (ABR_REQUIRE_ORACLES)" ;;
-            2) fail "ABR_REQUIRE_ORACLES names '$oracle', which is not a judge of this suite (futility, cpio, rkcrc, blobtools, mboot, loki, pxa, sony_dump, elftool, dumpimage)" ;;
+            2) fail "ABR_REQUIRE_ORACLES names '$oracle', which is not a judge of this suite (futility, cpio, rkcrc, blobtools, mboot, loki, pxa, sony_dump, elftool, dtbtool, dumpimage, pillow, cryptography)" ;;
             *) fail "the judge '$oracle' is required (ABR_REQUIRE_ORACLES) and is not there: its comparisons were skipped" ;;
         esac
     done

@@ -3,7 +3,7 @@
 
 Takes images (the seeds), damages them the ways images are damaged -- a size field that is too big, a cut-off file, a
 flipped bit, a block taken out or doubled, a piece of another image spliced in -- and runs abr on each damaged copy:
-`identify`, `info`, `unpack`, and `repack` of what `unpack` wrote. What is judged is not what abr says but how it
+`identify`, `info -i`, `unpack -i -o`, and `pack -i -o` of what `unpack` wrote. What is judged is not what abr says but how it
 behaves. A damaged image may be refused (exit status 1 and a message) or taken; it must never crash, hang, run out of
 memory or stop for a reason that is not the image's (an exception of the standard library that nobody meant to
 reach), never print a control character (an escape sequence in a name or a command line that an image holds would be
@@ -321,10 +321,14 @@ class Runner:
         # abr's output passes a filter that writes control characters as escapes; without it a message that took text out of an image
         # and did not escape it shows (that is a finding too: the filter is the last line of defence, not the first)
         self.env["ABR_UNFILTERED_OUTPUT"] = "0" if args.filtered else "1"
+        # (nothing draws on a terminal here, and the thread count is the environment's: `threads` of run() is ABR_THREADS)
+        self.env["NO_COLOR"] = "1"
+        self.env["ABR_PROGRESS"] = "0"
         self.max_file = args.max_output_mb << 20
 
     def run(self, argv, cwd):
-        """-> (status or None for a timeout, stderr bytes, seconds, stdout bytes)"""
+        """-> (status or None for a timeout, stderr bytes, seconds, stdout bytes). The entries of `argv` that come first and look like NAME=value
+        are environment variables of the run, as in `env NAME=value abr ...`: ABR_THREADS=2 is the number of threads."""
         # AddressSanitizer's runtime sometimes fails to start ("setrlimit() failed 1", once in some thousand runs, and not again
         # when the same command is run again): none of abr has run, nothing is written, so the run is made again, and a start that
         # fails three times in a row is a finding.
@@ -336,12 +340,19 @@ class Runner:
 
     def run_once(self, argv, cwd):
         t0 = time.time()
+        env = dict(self.env)
+        n = 0
+        while n < len(argv) and ENV_ENTRY.fullmatch(argv[n]):
+            name, _, value = argv[n].partition("=")
+            env[name] = value
+            n += 1
+        argv = argv[n:]
         proc = subprocess.Popen(
             [self.abr] + argv,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            env=self.env,
+            env=env,
             cwd=cwd,
             start_new_session=True,
         )
@@ -358,6 +369,17 @@ class Runner:
             os.killpg(proc.pid, signal.SIGKILL)
             out, err = proc.communicate()
             return None, err, time.time() - t0, out
+
+
+ENV_ENTRY = re.compile(r"[A-Z][A-Z0-9_]*=.*", re.S)
+
+
+def command_text(argv):
+    """The command line of `argv` as a shell takes it: the environment entries first, then abr."""
+    n = 0
+    while n < len(argv) and ENV_ENTRY.fullmatch(argv[n]):
+        n += 1
+    return " ".join(list(argv[:n]) + ["abr"] + list(argv[n:]))
 
 
 def terminal_trouble(command, text):
@@ -442,11 +464,30 @@ class Findings:
             with open(os.path.join(self.dir, stem + ".bin"), "wb") as f:
                 f.write(mutant)
             with open(os.path.join(self.dir, stem + ".txt"), "w") as f:
-                f.write(f"class:     {cls}\nsignature: {sig}\ncommand:   {command}   (abr {' '.join(argv)})\nstatus:    {status}\n")
+                f.write(f"class:     {cls}\nsignature: {sig}\ncommand:   {command}   ({command_text(argv)})\nstatus:    {status}\n")
                 f.write(f"origin:    {origin}\n\n--- stderr (first 8000 bytes) ---\n")
                 f.write(err[:8000].decode(errors="replace"))
             entry[1].append(stem)
             return True
+
+
+def thin_ramdisk(out_dir, keep):
+    """What an unpack leaves for a ramdisk is its archive (ramdisk.cpio) and its directory (ramdisk/, ramdisk.vol2/ ...): `keep` is "tree"
+    (the archives that have a directory are deleted), "cpio" (the directories are) or None (nothing is)."""
+    if keep is None:
+        return
+    try:
+        names = os.listdir(out_dir)
+    except OSError:
+        return
+    for name in names:
+        full = os.path.join(out_dir, name)
+        if os.path.islink(full):
+            continue
+        if keep == "cpio" and os.path.isdir(full) and name.startswith("ramdisk"):
+            shutil.rmtree(full, ignore_errors=True)
+        elif keep == "tree" and name.endswith(".cpio") and os.path.isfile(full) and os.path.isdir(os.path.join(out_dir, name[:-5])):
+            os.remove(full)
 
 
 class Campaign:
@@ -480,14 +521,9 @@ class Campaign:
         return data
 
     def commands_for(self, rng, workdir, mutant_path):
-        """The command lines for one damaged image; `repack` follows an `unpack` that worked."""
+        """The command line for one damaged image (the number of threads is ABR_THREADS); `pack` follows an `unpack` that worked."""
         threads = rng.choice(("1", "1", "1", "2", "3"))
-        unpack = ["-j", threads, "unpack", mutant_path, "-o", os.path.join(workdir, "out")]
-        mode = rng.random()
-        if mode < 0.2:
-            unpack.append("--no-tree")
-        elif mode < 0.4:
-            unpack.append("--tree-only")
+        unpack = [f"ABR_THREADS={threads}", "unpack", "-i", mutant_path, "-o", os.path.join(workdir, "out")]
         return threads, unpack
 
     def one(self, index, iteration):
@@ -513,7 +549,7 @@ class Campaign:
 
     def judge(self, workdir, mutant_path, mutant, rng, origin):
         threads, unpack = self.commands_for(rng, workdir, mutant_path)
-        plan = [("identify", ["identify", mutant_path]), ("info", ["-j", threads, "info", mutant_path]), ("unpack", unpack)]
+        plan = [("identify", ["identify", mutant_path]), ("info", [f"ABR_THREADS={threads}", "info", "-i", mutant_path]), ("unpack", unpack)]
         unpacked_ok = False
         unpack_said = b""
         fmt = "?"
@@ -544,17 +580,19 @@ class Campaign:
             return
         out_dir = os.path.join(workdir, "out")
         repacked = os.path.join(workdir, "re.img")
-        argv = ["-j", threads, "repack", out_dir, "-o", repacked]
-        if rng.random() < 0.2:
-            argv += ["--ramdisk-from", "cpio"]
+        argv = [f"ABR_THREADS={threads}", "pack", "-i", out_dir, "-o", repacked]
+        # what an unpack leaves of a ramdisk is the archive and its directory; a fifth of the packs have one of the two deleted first
+        # (the one that is left is what the image is made from), as a person chooses the one to edit
+        mode = rng.random()
+        thin_ramdisk(out_dir, "tree" if mode < 0.2 else "cpio" if mode < 0.4 else None)
         status, err, secs, out = self.runner.run(argv, workdir)
         with self.stats_lock:
             self.runs += 1
             if secs > self.slowest[0]:
-                self.slowest = (secs, f"repack {origin[:120]}")
-        verdict = classify("repack", status, err, out)
+                self.slowest = (secs, f"pack {origin[:120]}")
+        verdict = classify("pack", status, err, out)
         if verdict:
-            self.findings.add(verdict[0], verdict[1], "repack", status, report_of(verdict, err, out), mutant, origin, argv)
+            self.findings.add(verdict[0], verdict[1], "pack", status, report_of(verdict, err, out), mutant, origin, argv)
             return
         if status == 0 and os.path.exists(repacked):
             with open(repacked, "rb") as f:
@@ -568,12 +606,22 @@ class Campaign:
                 if not said_something and not self.args.no_silent:
                     first = next((i for i in range(min(len(again), len(mutant))) if again[i] != mutant[i]), min(len(again), len(mutant)))
                     self.findings.add("silent-roundtrip", f"{fmt}: unpack said nothing, and the repack is not the image",
-                                      "repack", 0, b"sizes %d/%d, first difference at %d\n" % (len(mutant), len(again), first), mutant, origin, argv)
+                                      "pack", 0, b"sizes %d/%d, first difference at %d\n" % (len(mutant), len(again), first), mutant, origin, argv)
                 if self.args.report_roundtrip:
                     first = next((i for i in range(min(len(again), len(mutant))) if again[i] != mutant[i]), min(len(again), len(mutant)))
                     said = unpack_said.decode(errors="replace").strip().replace("\n", " | ")[:300] or "(unpack said nothing)"
                     self.findings.add("roundtrip", f"sizes {len(mutant)}/{len(again)}, first difference at {first}; unpack said: {said}",
-                                      "repack", 0, b"", mutant, origin, argv)
+                                      "pack", 0, b"", mutant, origin, argv)
+
+
+def info_knows(abr, path):
+    """`identify` is a table of signatures (that of Android Image Kitchen): it has nothing for the formats that have no signature of the kind -- the picture
+    partitions, the MediaTek preloader, a flat MBN. `info` reads those, and what it names is an image to damage."""
+    r = subprocess.run([abr, "info", "-i", path], capture_output=True, text=True, env=dict(os.environ, NO_COLOR="1"), timeout=60)
+    for line in r.stdout.splitlines():
+        if line.startswith("format:"):
+            return line.split(":", 1)[1].strip() not in ("", "unknown")
+    return False
 
 
 def find_seeds(paths, abr, max_size, min_size, include_unknown):
@@ -603,7 +651,7 @@ def find_seeds(paths, abr, max_size, min_size, include_unknown):
             continue
         if not include_unknown:
             label = subprocess.run([abr, "identify", "-b", path], capture_output=True).stdout.strip()
-            if label == b"data":
+            if label == b"data" and not info_knows(abr, path):
                 continue
         with open(path, "rb") as f:
             sha = hashlib.sha1(f.read()).hexdigest()
@@ -621,13 +669,13 @@ def repro(args):
         path = os.path.abspath(args.repro)
         for name, argv in (
             ("identify", ["identify", path]),
-            ("info", ["info", path]),
-            ("unpack", ["unpack", path, "-o", os.path.join(work, "out")]),
-            ("repack", ["repack", os.path.join(work, "out"), "-o", os.path.join(work, "re.img")]),
+            ("info", ["info", "-i", path]),
+            ("unpack", ["unpack", "-i", path, "-o", os.path.join(work, "out")]),
+            ("pack", ["pack", "-i", os.path.join(work, "out"), "-o", os.path.join(work, "re.img")]),
         ):
             status, err, secs, out = runner.run(argv, work)
             verdict = classify(name, status, err, out)
-            print(f"== abr {' '.join(argv[:1])}: status {status}, {secs:.1f} s, verdict {verdict}")
+            print(f"== {command_text(argv[:1])}: status {status}, {secs:.1f} s, verdict {verdict}")
             sys.stdout.write((report_of(verdict, err, out) if verdict else err)[:6000].decode(errors="replace"))
             if status not in (0,):
                 break
