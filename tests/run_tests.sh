@@ -7507,8 +7507,10 @@ done
 # =========================================================================
 # Under wine every run of abr is a process of its own and costs a few tenths of a second: fewer damaged images of each sample.
 [ "$RD_WINE" = 1 ] && export ABR_LIVE_MUTANTS=6
-have_pillow() { python3 -c 'import PIL.Image' 2>/dev/null; }
-have_cryptography() { python3 -c 'import cryptography.x509' 2>/dev/null; }
+# (the drivers run as `python3 -I`, which does not look into the user's site directory: a package that `pip install --user` put there is not theirs,
+# so it is asked for the way they ask for it)
+have_pillow() { python3 -I -c 'import PIL.Image' 2>/dev/null; }
+have_cryptography() { python3 -I -c 'import cryptography.x509' 2>/dev/null; }
 
 live_driver() {  # live_driver <what> <log> <command...>: the command is a driver, its last line says what it checked
     local what="$1" log="$2"

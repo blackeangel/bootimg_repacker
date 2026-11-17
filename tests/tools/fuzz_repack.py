@@ -143,9 +143,35 @@ def rm_rf(path):
     subprocess.run(["rm", "-rf", "--", path], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+LAYOUT_LINE = re.compile(rb"^(layout_|# layout)")  # (what write_manifest_block of abr takes out of manifest.txt before it writes the block of the image it made)
+
+
+def manifest_text_digest(path, size):
+    """The digest of manifest.txt without the lines `pack` writes about the image it made (the comment "# layout of ..." and the
+    layout_* keys, whatever is behind the word): they are information that `pack` brings up to date in the folder it reads, so they are not part of what has to stay as it
+    was. A blank line before them is not either (`pack` puts one where there is none). None where the file cannot be read or is too big."""
+    if size > (64 << 20):
+        return None
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+    kept = [ln for ln in data.split(b"\n") if not LAYOUT_LINE.match(ln)]
+    return hashlib.sha256(b"\n".join(kept).rstrip(b"\n")).hexdigest()
+
+
 def snapshot(root):
-    """{relative path: (type, size, mtime ns, inode, permission bits)} of a tree, without following links."""
+    """{relative path: (type, size, mtime ns, inode, permission bits)} of a tree, without following links. For manifest.txt (and a file that is
+    the same file as it, a hard link) the size and the inode are 0 and the digest of its text without the layout lines stands where the time is."""
     snap = {}
+    manifest_inode = None
+    try:
+        mst = os.lstat(os.path.join(root, "manifest.txt"))
+        if stat.S_ISREG(mst.st_mode):
+            manifest_inode = mst.st_ino
+    except OSError:
+        pass
     stack = [""]
     while stack:
         rel = stack.pop()
@@ -160,6 +186,10 @@ def snapshot(root):
                         snap[r] = ("?",)
                         continue
                     snap[r] = (stat.S_IFMT(st.st_mode), st.st_size, st.st_mtime_ns, st.st_ino, st.st_mode & 0o7777)
+                    if manifest_inode is not None and stat.S_ISREG(st.st_mode) and st.st_ino == manifest_inode:
+                        digest = manifest_text_digest(os.path.join(root, r), st.st_size)
+                        if digest is not None:
+                            snap[r] = (stat.S_IFMT(st.st_mode), 0, digest, 0, st.st_mode & 0o7777)  # (the digest stands where the time is)
                     if stat.S_ISDIR(st.st_mode):
                         stack.append(r)
         except OSError:
@@ -1842,6 +1872,25 @@ class Campaign:
         tail += ctx.extra
         with self.lock:
             self.mutants += 1
+        # `pack` brings the layout lines of manifest.txt up to date, in the folder it reads. A mutant that reads manifest.txt as data (kernel_file=manifest.txt,
+        # or a file that is a hard link to it) is not the same input for the next run then: the text is put back, in place, between the runs.
+        manifest_path = os.path.join(d, "manifest.txt")
+        manifest_text = None
+        if os.path.isfile(manifest_path) and not os.path.islink(manifest_path):
+            try:
+                manifest_text = read_file(manifest_path)
+            except OSError:
+                pass
+
+        def restore_manifest():
+            if manifest_text is not None and os.path.isfile(manifest_path) and not os.path.islink(manifest_path):
+                try:
+                    with open(manifest_path, "r+b") as mf:
+                        mf.truncate(0)
+                        mf.write(manifest_text)
+                except OSError:
+                    pass
+
         reference = None
         if ctx.out is not None:
             ref = os.path.join(ctx.work, "ref.img")
@@ -1850,6 +1899,7 @@ class Campaign:
                 reference = read_file(ref)
             if os.path.lexists(ref):
                 os.unlink(ref)
+            restore_manifest()
         existed = bool(out_path) and os.path.lexists(out_path)
         before = snapshot(d)
         argv = [f"ABR_THREADS={threads}"] + base + ["-o", out] + tail
@@ -1863,7 +1913,7 @@ class Campaign:
         if inside and out_path != d:
             changed = [k for k in changed if k != os.path.relpath(out_path, d)]
         if changed and out_path != d:
-            self.report(ctx, "input-changed", "repack changed the directory it reads", "repack", status,
+            self.report(ctx, "input-changed", "repack changed the directory it reads (other than the layout lines of manifest.txt)", "repack", status,
                         ("changed: " + ", ".join(changed[:20])).encode() + b"\n" + err, origin, argv)
             return
         with self.lock:
@@ -1922,6 +1972,7 @@ class Campaign:
         other = "1" if threads != "1" else "3"
         out2 = os.path.join(ctx.work, "re2.img")
         argv2 = [f"ABR_THREADS={other}"] + base + ["-o", out2] + tail
+        restore_manifest()
         st2, er2, _, ou2 = self.run(ctx, "pack-again", argv2, origin)
         if st2 != 0 or not os.path.isfile(out2) or read_file(out2) != image:
             cls = fz.classify("pack", st2, er2, ou2)

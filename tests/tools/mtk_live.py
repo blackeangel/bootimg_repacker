@@ -331,7 +331,13 @@ with live.section('3. boot images with the MediaTek header'):
     f = untouched(BOOT, "boot_cut.img", "boot")
     out = live.fresh("boot_cut.u2")
     rc, text = live.run("unpack", "-i", os.path.join(BOOT, "boot_cut.img"), "-o", out)
-    live.check(text.count("is cut short") == 2 and "kernel (gzip)" in text and "ramdisk.cpio (gzip)" in text, "boot_cut: unpack says of the kernel and of the ramdisk that the stream is cut short", text[-600:])
+    # (two warnings, one for each stream. A note about the cpio archive -- "ramdisk.cpio stays a file only: the archive is cut short at offset N" --
+    # is a third mention when the cut falls where a record of the archive is left without its end, and that depends on how the compressor of the
+    # machine that made the sample laid out the stream: 594 bytes of the archive come out of the stream of zlib-ng, which some Pythons use, and
+    # 613 of the stream of zlib; so the note is not counted)
+    cut_warnings = [ln for ln in text.splitlines() if ln.startswith("warning:") and "is cut short" in ln]
+    live.check(len(cut_warnings) == 2 and any("kernel (gzip)" in ln for ln in cut_warnings) and any("ramdisk.cpio (gzip)" in ln for ln in cut_warnings),
+               "boot_cut: unpack says of the kernel and of the ramdisk that the stream is cut short", "\n".join(cut_warnings) or text[-600:])
     k_blob, r_blob, page = aosp0(os.path.join(BOOT, "boot_cut.img"))
     manifest_set(f, "cmdline", "bootopt=64S3,32N2,32N2 changed=1")
     new = live.fresh("boot_cut.cmdline")
