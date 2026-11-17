@@ -5223,7 +5223,7 @@ void report_layout(Fmt f, const Bytes& image, const Wrappers& wrap, const fs::pa
         annotate_layout(*l, m, dir);
         std::cout << "layout of " << name << " (" << l->format << ", " << l->size << " bytes"
                   << (wrap.recorded() || wrap.sin ? "; offsets are those of the plain image inside its wrapper" : "") << "):\n"
-                  << layout::render(*l);
+                  << layout::render(*l, "  ", static_cast<unsigned>(console::columns(1)));
         layout::write_manifest_block(manifest_file, *l, what);
     } catch (const std::exception& e) {
         warn(std::string("could not work out where the parts of the image are: ") + e.what());
@@ -5636,7 +5636,7 @@ void print_info(const fs::path& path) {
             annotate_streams(*l, data);
             std::cout << "layout (" << l->format << ", " << l->size << " bytes"
                       << (wrap.recorded() || wrap.sin ? "; offsets are those of the plain image inside its wrapper" : "") << "):\n"
-                      << layout::render(*l);
+                      << layout::render(*l, "  ", static_cast<unsigned>(console::columns(1)));
         }
 }
 
@@ -6074,50 +6074,78 @@ struct UsageError : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
-void usage(std::ostream& os) {
-    os <<
-        "abr " << kVersion << " -- Android Boot Repacker\n"
-        "\n"
-        "  abr unpack -i <input.img>    [-o <output_folder>]   take an image apart into a folder\n"
-        "  abr pack   -i <input_folder> [-o <output_image>]    build the image again of a folder that unpack made\n"
-        "  abr info   -i <input.img>                           show all there is to know about an image, without unpacking it\n"
-        "  abr help                                            show this help\n"
-        "  abr version                                         show the version (1.YYYYMMDD.NumberBuild)\n"
-        "\n"
-        "Without -o the output is made beside the input and named after it: `unpack -i dir/boot.img` makes the folder dir/boot,\n"
-        "`pack -i dir/boot` makes the image dir/boot.img (dir/boot_new.img when that file is there already: the image a folder came\n"
-        "from is not written over unless -o names it). A folder that `unpack` made is not unpacked into again unless -o names it.\n"
-        "\n"
-        "What an image is -- its format, what it is wrapped in -- abr finds out from the image itself. A ramdisk is unpacked twice:\n"
-        "ramdisk.cpio (exactly what the image held) and, when it can be one, the folder ramdisk/ with ramdisk.meta (owners, modes,\n"
-        "order). Edit either; pack takes the one that changed (the folder, when both did).\n"
-        "A folder of device trees (files that end in .dtb) and no manifest.txt is packed as a Qualcomm device tree table (QCDT, what\n"
-        "dtbTool makes); a manifest.txt of `type=qcdt` with `page_size=` and `table_version=` (1, 2 or 3) says how.\n"
-        "What pack has to sign again (an AVB 2.0 hash footer or vbmeta, the boot signature of old boot images, a ChromeOS kernel blob)\n"
-        "it signs with the public test keys that are built into abr (the AVB project's, AOSP's verity key, vboot's developer keys): with\n"
-        "the one the image was signed with when it was one of them, else with the one of the right size, and says so. Keys of your own\n"
-        "go in the folder keys/ of the unpacked folder and win: avb_key.pem (AVB 2.0), avb1.pk8 and avb1.x509.pem (the boot signature\n"
-        "of old boot images), chromeos.vbprivk and chromeos.keyblock (a ChromeOS kernel blob). A signature that is untouched is kept.\n"
-        "ABR_THREADS=N limits the number of threads (the result never depends on it).\n"
-        "\n"
-        "Supported: boot.img/init_boot.img/boot-debug.img/boot-test-harness.img,\n"
-        "recovery.img/recovery-two-step.img (header v0-v4), vendor_boot.img/\n"
-        "vendor_boot-debug.img/vendor_kernel_boot.img (header v3-v4), dtbo.img,\n"
-        "raw dtb, Qualcomm device tree tables (QCDT: a dt.img, or the dt of a boot image), vbmeta.img/\n"
-        "vbmeta_system.img (AVB), U-Boot legacy uImage and FIT image, Sony ELF\n"
-        "boot images, Rockchip KRNL (kernel.img / boot.img), ASUS blobs (\"MSM-RADIO-UPDATE\",\n"
-        "signed with the SIGNBLOB header or not), Intel OSIP boot images, ChromeOS kernel blobs\n"
-        "(the vboot format of a Chromebook's kernel partition); firmware partitions: MediaTek images with the 0x58881688\n"
-        "header (md1img/modem, lk, tee, scp, sspm, logo) and the MediaTek preloader (GFH), Qualcomm secure boot images (MBN: a flat\n"
-        "file with header version 3, 5, 6 or 7 or an SBL header, or an ELF with a hash segment -- sbl1/xbl, tz, rpm, aboot, ...), and the\n"
-        "picture partitions of phones (splash, logo: Qualcomm's \"SPLASH!!\" image, the \"SPLASH LOGO!\" image of OPPO/realme/OnePlus, the\n"
-        "\"LOGO!!!!\" image of Xiaomi, Motorola's MotoLogo): every picture becomes a file, a PNG where its pixels are coded (RLE24, MotoRun).\n"
-        "A signature of a firmware image cannot be made again: it is kept as it is, and a warning says when what it was made for changed.\n"
-        "Also transparently handled: a trailing AVB hash footer on boot/\n"
-        "vendor_boot/dtbo; a DHTB wrapper (with SEAndroid footer/padding) around\n"
-        "any of them; a ChromeOS kernel blob or an ASUS blob around one image; the LOKI patch (loki_tool) of a\n"
-        "boot or recovery image; the AMONET patch of Amazon's Fire tablets; a MediaTek\n"
-        "(MTK) sub-header on the kernel and/or ramdisk.\n";
+// The help, made for a screen `columns` wide (0: none -- a pipe, a file: the text is 100 characters wide). The paragraphs are broken at
+// the width, the commands are a table when there is room and a list, each with what it does under it, when there is not.
+void usage(std::ostream& os, int columns) {
+    const size_t width = columns > 0 ? std::clamp<size_t>(static_cast<size_t>(columns) - 1, 24, 100) : 100;
+    const auto paragraph = [&](const std::string& text) {
+        for (const std::string& line : console::wrap(text, width)) os << line << "\n";
+    };
+    os << "abr " << kVersion << " -- Android Boot Repacker\n\n";
+
+    struct Command {
+        std::string usage, what;
+    };
+    const std::vector<Command> commands = {
+        {"abr unpack -i <input.img>    [-o <output_folder>]", "take an image apart into a folder"},
+        {"abr pack   -i <input_folder> [-o <output_image>]", "build the image again of a folder that unpack made"},
+        {"abr info   -i <input.img>", "show all there is to know about an image, without unpacking it"},
+        {"abr help", "show this help"},
+        {"abr version", "show the version (1.YYYYMMDD.NumberBuild)"},
+    };
+    size_t cell = 0;
+    for (const Command& c : commands) cell = std::max(cell, c.usage.size());
+    const bool beside = width >= 2 + cell + 2 + 30;
+    for (const Command& c : commands) {
+        if (beside) {
+            const std::vector<std::string> what = console::wrap(c.what, width - (2 + cell + 2));
+            os << "  " << c.usage << std::string(cell - c.usage.size() + 2, ' ') << what.front() << "\n";
+            for (size_t k = 1; k < what.size(); ++k) os << std::string(2 + cell + 2, ' ') << what[k] << "\n";
+        } else {
+            std::string one;  // (the blanks that line the options up in the table are not wanted in a list)
+            for (const char ch : c.usage)
+                if (ch != ' ' || one.empty() || one.back() != ' ') one += ch;
+            for (const std::string& line : console::wrap(one, width, 2, 6)) os << line << "\n";
+            for (const std::string& line : console::wrap(c.what, width, 6, 6)) os << line << "\n";
+        }
+    }
+    os << "\n";
+
+    paragraph("Without -o the output is made beside the input and named after it: `unpack -i dir/boot.img` makes the folder dir/boot, "
+              "`pack -i dir/boot` makes the image dir/boot.img (dir/boot_new.img when that file is there already: the image a folder came "
+              "from is not written over unless -o names it). A folder that `unpack` made is not unpacked into again unless -o names it.");
+    os << "\n";
+    paragraph("What an image is -- its format, what it is wrapped in -- abr finds out from the image itself. A ramdisk is unpacked twice: "
+              "ramdisk.cpio (exactly what the image held) and, when it can be one, the folder ramdisk/ with ramdisk.meta (owners, modes, "
+              "order). Edit either; pack takes the one that changed (the folder, when both did).");
+    os << "\n";
+    paragraph("A folder of device trees (files that end in .dtb) and no manifest.txt is packed as a Qualcomm device tree table (QCDT, what "
+              "dtbTool makes); a manifest.txt of `type=qcdt` with `page_size=` and `table_version=` (1, 2 or 3) says how.");
+    os << "\n";
+    paragraph("What pack has to sign again (an AVB 2.0 hash footer or vbmeta, the boot signature of old boot images, a ChromeOS kernel blob) "
+              "it signs with the public test keys that are built into abr (the AVB project's, AOSP's verity key, vboot's developer keys): with "
+              "the one the image was signed with when it was one of them, else with the one of the right size, and says so. Keys of your own "
+              "go in the folder keys/ of the unpacked folder and win: avb_key.pem (AVB 2.0), avb1.pk8 and avb1.x509.pem (the boot signature "
+              "of old boot images), chromeos.vbprivk and chromeos.keyblock (a ChromeOS kernel blob). A signature that is untouched is kept.");
+    os << "\n";
+    paragraph("ABR_THREADS=N limits the number of threads (the result never depends on it). NO_COLOR=1 draws the progress bar without "
+              "colours, ABR_PROGRESS=never without the bar; what a command says while the bar is there comes out when it is over.");
+    os << "\n";
+    paragraph("Supported: boot.img/init_boot.img/boot-debug.img/boot-test-harness.img, recovery.img/recovery-two-step.img (header v0-v4), "
+              "vendor_boot.img/vendor_boot-debug.img/vendor_kernel_boot.img (header v3-v4), dtbo.img, raw dtb, Qualcomm device tree tables "
+              "(QCDT: a dt.img, or the dt of a boot image), vbmeta.img/vbmeta_system.img (AVB), U-Boot legacy uImage and FIT image, Sony ELF "
+              "boot images, Rockchip KRNL (kernel.img / boot.img), ASUS blobs (\"MSM-RADIO-UPDATE\", signed with the SIGNBLOB header or not), "
+              "Intel OSIP boot images, ChromeOS kernel blobs (the vboot format of a Chromebook's kernel partition); firmware partitions: "
+              "MediaTek images with the 0x58881688 header (md1img/modem, lk, tee, scp, sspm, logo) and the MediaTek preloader (GFH), Qualcomm "
+              "secure boot images (MBN: a flat file with header version 3, 5, 6 or 7 or an SBL header, or an ELF with a hash segment -- "
+              "sbl1/xbl, tz, rpm, aboot, ...), and the picture partitions of phones (splash, logo: Qualcomm's \"SPLASH!!\" image, the "
+              "\"SPLASH LOGO!\" image of OPPO/realme/OnePlus, the \"LOGO!!!!\" image of Xiaomi, Motorola's MotoLogo): every picture becomes "
+              "a file, a PNG where its pixels are coded (RLE24, MotoRun). A signature of a firmware image cannot be made again: it is kept "
+              "as it is, and a warning says when what it was made for changed.");
+    os << "\n";
+    paragraph("Also transparently handled: a trailing AVB hash footer on boot/vendor_boot/dtbo; a DHTB wrapper (with SEAndroid "
+              "footer/padding) around any of them; a ChromeOS kernel blob or an ASUS blob around one image; the LOKI patch (loki_tool) of a "
+              "boot or recovery image; the AMONET patch of Amazon's Fire tablets; a MediaTek (MTK) sub-header on the kernel and/or ramdisk.");
 }
 
 struct IoArgs {
@@ -6223,14 +6251,14 @@ int main(int argc, char** argv) {
         // (UTF-8 on Windows, too: the C runtime's argv would hold '?' for every character outside the ANSI code page)
         std::vector<std::string> args = command_line_utf8(argc, argv);
         if (args.empty()) {
-            usage(std::cerr);
+            usage(std::cerr, console::columns(2));
             return 1;
         }
         const std::string cmd = args.front();
         args.erase(args.begin());
 
         if (cmd == "help" || cmd == "-h" || cmd == "--help") {
-            usage(std::cout);
+            usage(std::cout, console::columns(1));
             return 0;
         }
         if (cmd == "version" || cmd == "-V" || cmd == "--version") {
@@ -6238,7 +6266,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (std::find_if(args.begin(), args.end(), [](const std::string& a) { return a == "-h" || a == "--help"; }) != args.end()) {
-            usage(std::cout);
+            usage(std::cout, console::columns(1));
             return 0;
         }
 

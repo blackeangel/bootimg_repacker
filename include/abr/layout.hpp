@@ -138,8 +138,11 @@ void around(Layout& l, const Bytes& whole, size_t host_size, size_t core_off, si
 // ----------------------------------------------------------------------------------------------------- the text --
 
 // The table `unpack`, `pack` and `info` print, one line per region: offset (hex), size (decimal), the name, and what is known of
-// the part. Every line starts with `indent`.
-std::string render(const Layout& l, const std::string& indent = "  ");
+// the part. Every line starts with `indent`. For a screen `columns` wide (0: none, a pipe or a file) the lines of that table are
+// used when none is wider than the screen leaves room for (the last column is left alone); on a narrower one -- a phone's, 56
+// columns -- every region is its numbers and its name on one line and what is known of the part under them, indented, in lines of
+// their own (console::wrap), so that nothing is torn apart by the terminal: the column of offsets and sizes stays a column.
+std::string render(const Layout& l, const std::string& indent = "  ", unsigned columns = 0);
 
 // The lines of the layout block of a manifest, as (key, value): `layout_<name>_offset`, `layout_<name>_size` for every region, and for
 // a stream `layout_<name>_unpacked_size`. <name> is the key of the region, or its name made into letters, digits and underscores

@@ -7,10 +7,12 @@
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <string_view>
 #include <vector>
 
 #include "abr/boot_image.hpp"
 #include "abr/compression.hpp"
+#include "abr/console.hpp"
 #include "abr/dtbo.hpp"
 #include "abr/envelope.hpp"
 #include "abr/legacy/blob.hpp"
@@ -914,7 +916,17 @@ std::string slug(const std::string& name) {
 
 }  // namespace
 
-std::string render(const Layout& l, const std::string& indent) {
+namespace {
+
+size_t characters_of(std::string_view s) {
+    size_t n = 0;
+    for (const char c : s) n += (static_cast<unsigned char>(c) & 0xc0) != 0x80;
+    return n;
+}
+
+}  // namespace
+
+std::string render(const Layout& l, const std::string& indent, unsigned columns) {
     // The names and the notes are made of what the image holds (the name of a picture, of a section, of a ramdisk, the subject of a
     // certificate): what a terminal would act on in them is written as \xNN, here and for every part at once, whatever put it there.
     std::vector<std::string> names, notes;
@@ -939,9 +951,12 @@ std::string render(const Layout& l, const std::string& indent) {
     for (uint64_t v = top >> 32; v; v >>= 4) ++hex_w;
 
     std::string out;
+    size_t widest = 0;
     char buf[64];
     std::snprintf(buf, sizeof buf, "%-*s", hex_w + 2, "offset");
-    out += indent + buf + "  " + std::string(size_w > 4 ? size_w - 4 : 0, ' ') + "size  part\n";
+    const std::string head = indent + buf + "  " + std::string(size_w > 4 ? size_w - 4 : 0, ' ') + "size  part";
+    out += head + "\n";
+    widest = characters_of(head);
     for (size_t i = 0; i < l.regions.size(); ++i) {
         const Region& r = l.regions[i];
         std::snprintf(buf, sizeof buf, "0x%0*" PRIx64, hex_w, r.offset);
@@ -956,9 +971,38 @@ std::string render(const Layout& l, const std::string& indent) {
         std::snprintf(size, sizeof size, "%*" PRIu64, static_cast<int>(size_w), r.size);
         std::string line = indent + buf + "  " + size + "  " + name;
         if (!what.empty()) line += std::string(name_w - name.size(), ' ') + "  " + what;
+        widest = std::max(widest, characters_of(line));
         out += line + "\n";
     }
-    return out;
+    if (columns == 0 || widest + 1 <= columns) return out;
+
+    // The screen is narrower than the table: the numbers and the name of a region on a line, what is known of it under them.
+    const size_t usable = columns - 1;
+    const size_t lead = indent.size() + static_cast<size_t>(hex_w) + 2 + 2 + size_w;  // (up to the end of the size)
+    const bool beside = usable >= lead + 2 + 14;  // (room for the name beside the numbers)
+    std::string narrow = head + "\n";
+    for (size_t i = 0; i < l.regions.size(); ++i) {
+        const Region& r = l.regions[i];
+        std::snprintf(buf, sizeof buf, "0x%0*" PRIx64, hex_w, r.offset);
+        char size[32];
+        std::snprintf(size, sizeof size, "%*" PRIu64, static_cast<int>(size_w), r.size);
+        const std::string numbers = indent + buf + "  " + size;
+        const size_t pad = r.depth * 2;
+        if (beside) {
+            const std::vector<std::string> lines = console::wrap(names[i], usable - (lead + 2), pad, pad + 2);
+            narrow += numbers + "  " + lines.front() + "\n";
+            for (size_t k = 1; k < lines.size(); ++k) narrow += std::string(lead + 2, ' ') + lines[k] + "\n";
+        } else {
+            narrow += numbers + "\n";
+            const size_t at = indent.size() + 2 + pad;
+            for (const std::string& line : console::wrap(names[i], usable, at, at + 2)) narrow += line + "\n";
+        }
+        if (!notes[i].empty()) {
+            const size_t at = indent.size() + pad + 4;
+            for (const std::string& line : console::wrap(notes[i], usable, at, at, true)) narrow += line + "\n";
+        }
+    }
+    return narrow;
 }
 
 std::vector<std::pair<std::string, std::string>> manifest_lines(const Layout& l) {

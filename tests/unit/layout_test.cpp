@@ -23,6 +23,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -1328,6 +1329,96 @@ void test_text_of_images() {
     }
 }
 
+// The table for a screen that is too narrow for it: nothing is lost, the offsets and the sizes stay a column, nothing is wider than the
+// screen, nothing a terminal would act on comes out.
+void test_text_narrow() {
+    layout::Layout l;
+    l.format = "boot image";
+    l.size = 6ull << 30;  // (an offset that needs nine hex digits)
+    l.add("header", "", 0, 4096, 0, "header version 4, 2128 bytes, page size 4096");
+    layout::Region& frag = l.add("ramdisk fragment 0", "ramdisk0", 4096, 22564936, 1, "platform");
+    frag.codec = "zstd";
+    frag.file = "ramdisk0.cpio + ramdisk0/";
+    frag.unpacked = 97479936;
+    frag.level = 19;
+    l.add("descriptor 0", "", 30000000, 208, 3, "hash: partition=vendor_boot algo=sha256 image_size=61710336 digest=32B; file avb_descriptor0.bin");
+    l.add("a name that is much longer than the room beside the numbers of any narrow screen", "", 31000000, 1, 2, "n");
+    l.add("caf\xc3\xa9 \xe2\x82\xac\xe2\x82\xac\xe2\x82\xac", "", 32000000, 9, 0, "one \xe2\x82\xac two \xe2\x82\xac three");
+    l.add("padding", "", 33000000, 4294967296ull, 0, "");
+    l.add("tail", "", 5000000000ull, 100, 0, "a/very/long/word/that/has/no/blanks/in/it/and/does/not/fit/on/any/line/of/a/narrow/screen.bin");
+    l.add("\x1b[2Jevil\x07", "", 5000000100ull, 5, 0, "\x1b[31mred\xc2\x9b" "31m");
+
+    const std::string wide = layout::render(l);
+    EXPECT(layout::render(l, "  ", 0) == wide);  // (no screen: the table of a pipe, as it always was)
+    size_t widest = 0;
+    {
+        std::istringstream in(wide);
+        for (std::string line; std::getline(in, line);) {
+            size_t n = 0;
+            for (const char c : line) n += (static_cast<unsigned char>(c) & 0xc0) != 0x80;
+            widest = std::max(widest, n);
+        }
+    }
+    EXPECT(widest > 60);
+    EXPECT(layout::render(l, "  ", static_cast<unsigned>(widest + 1)) == wide);  // (it fits: the same table)
+    EXPECT(layout::render(l, "  ", 1000) == wide);
+
+    const auto squeeze = [](const std::string& s) {
+        std::string out;
+        for (const char c : s)
+            if (c != ' ' && c != '\n') out += c;
+        return out;
+    };
+    for (const unsigned columns : {40u, 44u, 48u, 56u, 64u, 72u, 80u, 100u, 120u, 160u}) {
+        const std::string text = layout::render(l, "  ", columns);
+        EXPECT(terminal_clean(text));
+        std::vector<std::string> lines;
+        {
+            std::istringstream in(text);
+            for (std::string line; std::getline(in, line);) lines.push_back(line);
+        }
+        // not wider than the screen leaves room for (the last column is left alone), and no blank at the end of a line
+        for (const std::string& line : lines) {
+            size_t n = 0;
+            for (const char c : line) n += (static_cast<unsigned char>(c) & 0xc0) != 0x80;
+            EXPECT(n + 1 <= columns);
+            EXPECT(line.empty() || line.back() != ' ');
+        }
+        // one line of numbers for every region, in the order of the regions: the offset, and the size in the column of sizes
+        std::vector<size_t> at;
+        for (size_t i = 0; i < lines.size(); ++i)
+            if (lines[i].rfind("  0x", 0) == 0) at.push_back(i);
+        EXPECT(at.size() == l.regions.size());
+        if (at.size() != l.regions.size()) continue;
+        std::string rest, expected;
+        for (size_t r = 0; r < at.size(); ++r) {
+            const layout::Region& reg = l.regions[r];
+            char numbers[96];
+            std::snprintf(numbers, sizeof numbers, "  0x%09llx  %10llu", static_cast<unsigned long long>(reg.offset),
+                          static_cast<unsigned long long>(reg.size));
+            EXPECT(lines[at[r]].compare(0, std::strlen(numbers), numbers) == 0);
+            // nothing is lost: what follows the numbers, on that line and under it, is the name and the notes of the region, in order
+            std::string tail = lines[at[r]].substr(std::min(lines[at[r]].size(), std::strlen(numbers)));
+            const size_t end = r + 1 < at.size() ? at[r + 1] : lines.size();
+            for (size_t k = at[r] + 1; k < end; ++k) tail += "\n" + lines[k];
+            rest += squeeze(tail);
+            expected += squeeze(textquote::escape_for_terminal(reg.name));
+            std::string what = textquote::escape_for_terminal(reg.note);
+            std::string s;
+            if (!reg.file.empty()) {
+                s = reg.codec.empty() ? "file " + reg.file : reg.codec + " -> " + reg.file;
+                if (!reg.codec.empty()) s += " (" + std::to_string(reg.unpacked) + " bytes, level " + std::to_string(reg.level) + ")";
+            }
+            if (!s.empty()) what += (what.empty() ? "" : "; ") + textquote::escape_for_terminal(s);
+            expected += squeeze(what);
+        }
+        EXPECT(rest == expected);
+        if (rest != expected) std::printf("  [columns %u]\n  have %s\n  want %s\n", columns, rest.c_str(), expected.c_str());
+    }
+    // the first line is the heading of the three columns, and the table keeps its indent
+    EXPECT(layout::render(l, "    ", 60).rfind("    offset", 0) == 0);
+}
+
 }  // namespace
 
 int run_layout_tests() {
@@ -1350,6 +1441,7 @@ int run_layout_tests() {
     test_around();
     test_text();
     test_text_of_images();
+    test_text_narrow();
     test_manifest_block();
     if (g_failures == 0) std::printf("layout: ok (%d checks)\n", g_checks);
     else std::printf("layout: %d failure(s)\n", g_failures);
