@@ -14,6 +14,7 @@
 #include <iostream>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <streambuf>
 #include <string_view>
 #include <system_error>
@@ -306,6 +307,164 @@ std::string render_bar(const progress::Snapshot& s, const BarStyle& style, int c
     return "\r" + p.finish() + "\x1b[K";
 }
 
+// ---------------------------------------------------------------- wrapping --
+
+namespace {
+
+bool is_blank(char c) { return c == ' ' || c == '\t'; }
+
+struct Word {
+    size_t gap = 0;        // the blanks in front of it
+    std::string_view text;  // (a group in parentheses has blanks inside)
+    size_t len = 0;        // characters
+};
+
+// The next word of `s` from `pos`, and `pos` behind it.
+bool next_word(std::string_view s, size_t& pos, Word& w) {
+    size_t gap = 0;
+    while (pos < s.size() && is_blank(s[pos])) ++gap, ++pos;
+    if (pos >= s.size()) return false;
+    size_t end = pos;
+    while (end < s.size() && !is_blank(s[end])) ++end;
+    w.gap = gap;
+    w.text = s.substr(pos, end - pos);
+    w.len = width_of(w.text);
+    pos = end;
+    return true;
+}
+
+int paren_balance(std::string_view s) {
+    int n = 0;
+    for (const char c : s) n += c == '(' ? 1 : c == ')' ? -1 : 0;
+    return n;
+}
+
+// The next word, or the next group: words from one that opens a parenthesis to the one that closes it (at most eight words, and only
+// when the group fits on a line of its own, `limit` characters), which are not to be torn apart.
+bool next_atom(std::string_view s, size_t& pos, size_t limit, bool groups, Word& a) {
+    if (!next_word(s, pos, a)) return false;
+    int balance = groups ? paren_balance(a.text) : 0;
+    if (balance <= 0) return true;
+    const size_t start = static_cast<size_t>(a.text.data() - s.data());
+    size_t p = pos;
+    Word w;
+    for (int more = 0; balance > 0 && more < 7 && next_word(s, p, w); ++more) {
+        balance += paren_balance(w.text);
+        const size_t end = static_cast<size_t>(w.text.data() - s.data()) + w.text.size();
+        const std::string_view group = s.substr(start, end - start);
+        if (width_of(group) > limit) return true;  // (the first word alone)
+        if (balance <= 0) {
+            a.text = group;
+            a.len = width_of(group);
+            pos = p;
+            return true;
+        }
+    }
+    return true;
+}
+
+bool weak_separator(char c) { return std::strchr("-_.,;:=+@", c) != nullptr && c != '\0'; }
+
+// How many bytes of `s` go on a line that has room for `room` characters (`s` is longer than that): up to and with the last `/` or `\`
+// in the second half of the room, else the last of the other separators there, else all the room.
+size_t break_point(std::string_view s, size_t room) {
+    // (the offsets of the first room + 1 characters: room characters take at most 4 * room bytes, so a word of any length costs the same)
+    std::vector<size_t> at;
+    for (size_t i = 0; i < s.size() && at.size() <= room; ++i)
+        if ((static_cast<unsigned char>(s[i]) & 0xc0) != 0x80) at.push_back(i);
+    if (at.empty() || at.front() != 0) at.insert(at.begin(), 0);
+    if (at.size() <= room) return s.size();
+    for (size_t i = room; i-- > room / 2;)
+        if (s[at[i]] == '/' || s[at[i]] == '\\') return at[i + 1];
+    for (size_t i = room; i-- > room / 2;)
+        if (weak_separator(s[at[i]])) return at[i + 1];
+    return at[room];
+}
+
+bool fits(std::string_view s, size_t room) {
+    size_t n = 0;
+    for (const char c : s) {
+        n += (static_cast<unsigned char>(c) & 0xc0) != 0x80;
+        if (n > room) return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+std::vector<std::string> wrap(std::string_view text, size_t width, size_t first, size_t next, bool groups) {
+    constexpr size_t kRoom = 16;
+    width = std::max<size_t>(width, 8);
+    const size_t most = width > kRoom ? width - kRoom : 0;
+    first = std::min(first, most);
+    next = std::min(next, most);
+
+    std::vector<std::string> lines;
+    std::string line(first, ' ');
+    size_t used = first;
+    bool has_word = false;
+    const auto end_line = [&] {
+        while (!line.empty() && line.back() == ' ') line.pop_back();
+        lines.push_back(std::move(line));
+        line.assign(next, ' ');
+        used = next;
+        has_word = false;
+    };
+
+    size_t pos = 0;
+    Word a;
+    while (next_atom(text, pos, width - std::max(first, next), groups, a)) {
+        size_t gap = has_word ? a.gap : 0;
+        if (has_word && used + gap + a.len > width) {
+            end_line();
+            gap = 0;
+        }
+        if (used + gap + a.len <= width) {
+            line.append(gap, ' ');
+            line.append(a.text);
+            used += gap + a.len;
+            has_word = true;
+            continue;
+        }
+        // A word that is longer than a line: the lines of it, the last one goes on with what follows.
+        std::string_view rest = a.text;
+        for (;;) {
+            const size_t room = width - used;
+            if (fits(rest, room)) {
+                line.append(rest);
+                used += width_of(rest);
+                has_word = true;
+                break;
+            }
+            const size_t cut = break_point(rest, room);
+            line.append(rest.substr(0, cut));
+            rest.remove_prefix(cut);
+            has_word = true;
+            end_line();
+        }
+    }
+    if (has_word || lines.empty()) end_line();
+    return lines;
+}
+
+std::vector<std::string> wrap_message(std::string_view line, size_t width) {
+    if (fits(line, width)) return {std::string(line)};
+    size_t lead = 0;
+    while (lead < line.size() && line[lead] == ' ') ++lead;
+    const std::string_view body = line.substr(lead);
+    size_t hang = lead + 2;
+    // `key:   value`: the lines after the first are indented to the value, as long as that is not far into the line
+    for (size_t i = 0; i < body.size() && i < 24; ++i) {
+        if (body[i] == '-' && body.compare(i, 2, "->") == 0) break;
+        if (body[i] != ':' || i + 1 >= body.size() || body[i + 1] != ' ') continue;
+        size_t j = i + 1;
+        while (j < body.size() && body[j] == ' ') ++j;
+        if (j < body.size() && lead + width_of(body.substr(0, j)) <= width / 2) hang = lead + width_of(body.substr(0, j));
+        break;
+    }
+    return wrap(body, width, lead, hang, true);
+}
+
 // ---------------------------------------------------------------- the terminal --
 
 namespace {
@@ -387,6 +546,68 @@ void on_signal(int sig) {
 
 }  // namespace
 
+int columns(int fd) {
+    if (const std::string c = env("ABR_COLUMNS"); !c.empty() && c.size() <= 4) {
+        const int w = std::atoi(c.c_str());
+        if (w > 0) return w;
+    }
+    if (!is_terminal(fd)) return 0;
+    if (const int w = terminal_width(fd); w > 0) return w;
+    if (const std::string c = env("COLUMNS"); !c.empty() && c.size() <= 4) {
+        const int w = std::atoi(c.c_str());
+        if (w > 0) return w;
+    }
+    return 80;
+}
+
+namespace {
+
+// `text` as a terminal that is `usable` characters wide is to be handed it: made safe first (as TerminalSafeBuf does, so that what is
+// counted is what is shown), the tabs spaces, every line that is too long broken (wrap_message). The end of a line that is not finished
+// is left as it is.
+std::string reflow(const std::string& text, size_t usable) {
+    std::stringbuf sink;
+    {
+        textquote::TerminalSafeBuf filter(&sink);
+        filter.sputn(text.data(), static_cast<std::streamsize>(text.size()));
+        filter.pubsync();
+    }
+    const std::string safe = sink.str();
+    std::string out;
+    out.reserve(safe.size() + safe.size() / 8);
+    for (size_t pos = 0; pos < safe.size();) {
+        const size_t nl = safe.find('\n', pos);
+        if (nl == std::string::npos) {
+            out.append(safe, pos, std::string::npos);
+            break;
+        }
+        std::string line = safe.substr(pos, nl - pos);
+        pos = nl + 1;
+        if (line.find('\t') != std::string::npos) {
+            std::string spread;
+            size_t col = 0;
+            for (const char c : line) {
+                if (c == '\t') {
+                    const size_t to = (col / 8 + 1) * 8;
+                    spread.append(to - col, ' ');
+                    col = to;
+                } else {
+                    spread += c;
+                    col += (static_cast<unsigned char>(c) & 0xc0) != 0x80;
+                }
+            }
+            line = std::move(spread);
+        }
+        for (const std::string& piece : wrap_message(line, usable)) {
+            out += piece;
+            out += '\n';
+        }
+    }
+    return out;
+}
+
+}  // namespace
+
 // ---------------------------------------------------------------- the printer --
 
 struct Printer::Impl {
@@ -450,15 +671,14 @@ struct Printer::Impl {
         cv.notify_one();
     }
 
-    int columns() const {
-        if (forced_columns > 0) return forced_columns;
-        if (const int w = terminal_width(bar_stream == 1 ? 2 : 1); w > 0) return w;
-        if (const std::string c = env("COLUMNS"); !c.empty() && c.size() <= 4) {
-            const int w = std::atoi(c.c_str());
-            if (w > 0) return w;
-        }
-        return 80;
+    // The width the bar is made for: that of the terminal it is on.
+    int bar_columns() const {
+        const int w = console::columns(bar_stream == 1 ? 2 : 1);
+        return w > 0 ? w : 80;
     }
+
+    // The width the text of a stream is wrapped to (0: it is not).
+    int wrap_width(int st) const { return safe[st] ? console::columns(st == 1 ? 2 : 1) : 0; }
 
     void erase_bar() {
         static const char erase[] = "\r\x1b[2K";
@@ -470,23 +690,40 @@ struct Printer::Impl {
 
     void write_item(const Item& it) {
         const int st = it.stream;
-        // The bar is on the terminal the line goes to, or on the one beside it that is a terminal as well.
-        if (bar_visible && (st == bar_stream || (is_tty[st] && is_tty[bar_stream]))) erase_bar();
+        // The bar is on the screen the line goes to.
+        if (bar_visible && screen[st]) erase_bar();
+        if (const int w = wrap_width(st); w > 0) {
+            // (made safe on the way, so that what is written is what was counted)
+            const std::string text = reflow(it.text, static_cast<size_t>(w) - 1);
+            real[st]->sputn(text.data(), static_cast<std::streamsize>(text.size()));
+            real[st]->pubsync();
+            line_open[st] = !text.empty() && text.back() != '\n';
+            return;
+        }
         std::streambuf* out = safe[st] ? &*safe[st] : real[st];
         out->sputn(it.text.data(), static_cast<std::streamsize>(it.text.size()));
         out->pubsync();
         line_open[st] = !it.text.empty() && it.text.back() != '\n';
     }
 
-    void draw_bar() {
-        const progress::Snapshot s = progress::snapshot();
-        if (!s.active) {
-            if (bar_visible) erase_bar();
-            return;
-        }
+    // The lines that waited for the end of the command come out, the bar away for them.
+    void release_held() {
+        for (const Item& it : held) write_item(it);
+        held.clear();
+        held_bytes = 0;
+    }
+
+    void hold(const Item& it) {
+        held_bytes += it.text.size();
+        held.push_back(it);
+        if (held_bytes > kHeldLimit) release_held();  // (a flood: it is not kept)
+    }
+
+    void draw_bar(const progress::Snapshot& s) {
         if (s.seconds * 1000 < show_after_ms || line_open[bar_stream]) return;
         const unsigned frame = static_cast<unsigned>(s.seconds * 12.5);
-        const std::string line = render_bar(s, style, columns(), frame);
+        const std::string line = render_bar(s, style, bar_columns(), frame);
+        if (line.empty()) return;  // (nothing to show: nothing on the screen to take away)
         real[bar_stream]->sputn(line.data(), static_cast<std::streamsize>(line.size()));
         real[bar_stream]->pubsync();
         bar_visible = true;
@@ -502,15 +739,18 @@ struct Printer::Impl {
             items.swap(queue);
             const bool last = stopping && items.empty();
             lock.unlock();
-            for (const Item& it : items) write_item(it);
+            // One look at the command for all the lines of this round. While it is in progress and the bar is on the screen, the lines
+            // wait (they come out below the bar's place when it is over); when it is not, what waited comes first, then the lines.
+            const progress::Snapshot snapshot = bar_enabled ? progress::snapshot() : progress::Snapshot{};
+            const bool working = bar_enabled && snapshot.active && !last;
+            if (!working) release_held();
+            for (const Item& it : items) {
+                if (working && bar_visible && screen[it.stream]) hold(it);
+                else write_item(it);
+            }
             if (bar_enabled) {
-                if (last) {
-                    if (bar_visible) erase_bar();
-                } else if (items.empty()) {
-                    // (the bar comes back on the tick after a line was written, not at once: the line that ends a command is not
-                    // followed by one more drawing of a bar that is over)
-                    draw_bar();
-                }
+                if (working) draw_bar(snapshot);
+                else if (bar_visible) erase_bar();
             }
             lock.lock();
             if (last) break;
@@ -522,14 +762,16 @@ struct Printer::Impl {
     std::streambuf* real[2] = {nullptr, nullptr};    // the same: where the printer writes to
     std::optional<textquote::TerminalSafeBuf> safe[2];
     bool is_tty[2] = {false, false};
+    bool screen[2] = {false, false};     // the stream is written to the screen the bar is on
     bool line_open[2] = {false, false};  // (printer thread only) the last thing written to the stream does not end a line
 
     bool bar_enabled = false;
     int bar_stream = 1;
     bool bar_visible = false;  // (printer thread only)
     BarStyle style;
-    int forced_columns = 0;
     int show_after_ms = 250;
+    std::deque<Item> held;  // (printer thread only) what the command said while the bar was on the screen
+    size_t held_bytes = 0;
 
     std::mutex mu;
     std::condition_variable cv;
@@ -592,11 +834,12 @@ Printer::Printer() : impl_(std::make_unique<Impl>()) {
     }
 #endif
     m.bar_enabled = !never && (always || terminal_ok);
-    if (always && !terminal_ok) {
-        m.bar_stream = 1;
-        m.show_after_ms = 0;
-        if (const std::string c = env("ABR_COLUMNS"); !c.empty() && c.size() <= 4) m.forced_columns = std::atoi(c.c_str());
-    }
+    if (always) m.show_after_ms = 0;
+    if (always && !terminal_ok) m.bar_stream = 1;
+    // The screen the bar is on: its own stream, the other one when that is a terminal as well, and -- where the bar is forced on output
+    // that is no terminal (the tests) -- both.
+    for (int st = 0; st < 2; ++st)
+        m.screen[st] = st == m.bar_stream || (m.is_tty[st] && m.is_tty[m.bar_stream]) || (always && !terminal_ok);
     m.style.colour = colour_level();
     m.style.utf8 = locale_is_utf8();
     g_bar_fd = m.bar_stream == 1 ? 2 : 1;
