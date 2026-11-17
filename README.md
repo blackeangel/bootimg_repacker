@@ -3,7 +3,8 @@
 **abr** -- *Android Boot Repacker*, in the repository `bootimg_repacker` -- is one static, dependency-free **C++26**
 program that takes the images of the Android boot family apart and puts them together again: boot, init_boot,
 vendor_boot, recovery, dtbo, dtb, QCDT, vbmeta (AVB), U-Boot uImage and FIT, and the older and vendor formats listed
-below. It is built for Linux, Windows and Android (arm64-v8a), and it runs nothing else -- no `cpio`, `gzip`, `mkbootimg`,
+below -- and the small firmware images of MediaTek and Qualcomm chips: the preloader, `md1img`, the logo and splash pictures,
+the secure-boot (MBN) images. It is built for Linux, Windows and Android (arm64-v8a), and it runs nothing else -- no `cpio`, `gzip`, `mkbootimg`,
 `avbtool`, `dtc`, no shell: every codec, hash, signature scheme and archive format is inside the one file, and so are the
 public test keys it signs with, so a single file is all there is to copy.
 
@@ -18,8 +19,8 @@ build-time contents:
 | boot (header v0-v4, and Marvell's PXA variant of v0) | `boot.img`, `init_boot.img`, `boot-debug.img`, `boot-test-harness.img`, `recovery.img`, `recovery-two-step.img`, the Samsung Galaxy J1 / Core Prime / Tab 4 boot images |
 | vendor_boot (header v3-v4) | `vendor_boot.img`, `vendor_boot-debug.img`, `vendor_kernel_boot.img` |
 | dtbo | `dtbo.img` (and the ACPIO variant) |
-| dtb | raw or concatenated Flattened Device Tree blobs |
-| QCDT (v1-v3) | Qualcomm's device tree table (`QCDT`, what `dtbTool` makes): `dt.img`, or the table of a boot image; a folder of `.dtb` files is packed into one |
+| dtb | raw or concatenated Flattened Device Tree blobs, with the gaps between them and an AVB hash footer on the partition; see below |
+| QCDT (v1-v3) | Qualcomm's device tree table (`QCDT`, what `dtbTool` makes): `dt.img`, or the table of a boot image; a folder of `.dtb` files is packed into one; see below |
 | vbmeta (AVB) | `vbmeta.img`, `vbmeta_system.img`, and AVB footers appended to other partitions |
 | uboot | U-Boot's legacy `mkimage`/uImage container |
 | U-Boot FIT image | what `mkimage -f` makes (`.itb`, `.fit`): a flattened device tree whose `/images` hold the kernel, ramdisks and device trees, the data in the tree or behind it (`-E`, `-E -B n`, `-E -p n`); see below |
@@ -28,9 +29,13 @@ build-time contents:
 | Rockchip KRNL | Rockchip's `kernel.img` and `boot.img` (`"KRNL"`, the size, a kernel or a gzip cpio ramdisk, Rockchip's own CRC) |
 | ASUS blob | the `"MSM-RADIO-UPDATE"` blobs of ASUS Tegra tablets (what `blobpack` writes), with or without the `-SIGNED-BY-SIGNBLOB-` signing header |
 | Intel OSIP | the boot images that Android Image Kitchen opens with `mboot`: an OSIP header (or none), a signature (or none), the cmdline, a bootstub, the kernel and a gzip ramdisk |
+| MediaTek partition image | `md1img.img` (the modem), `logo.bin`, and the other small images that have MediaTek's 512-byte partition header (`lk`, `tee`, `scp`, `sspm`, `spmfw`, ...); see below |
+| MediaTek preloader | `preloader.bin`, the loader of the boot ROM: a chain of GFH headers, the code, a signature; see below |
+| Qualcomm MBN | the secure-boot images of Qualcomm (`sbl1`/`xbl`, `tz`, `hyp`, `rpm`, `aboot`, ...), flat (header versions 3, 5, 6, 7 and the SBL header) or an ELF with a hash segment; see below |
+| splash and logo pictures | Qualcomm's `SPLASH!!`, the `SPLASH LOGO!` image of OPPO / realme / OnePlus, the `LOGO!!!!` image of Xiaomi, Motorola's `MotoLogo`: every picture comes out as a PNG or BMP file; see below |
 
 Also handled transparently, wherever it appears around those: a
-MediaTek (MTK) sub-header on the kernel and/or ramdisk, a DHTB wrapper
+MediaTek (MTK) sub-header on the kernel and/or ramdisk (see *MediaTek: md1img, logo and the other small images*), a DHTB wrapper
 (with its SEAndroid footer/padding), an ASUS blob that holds one image
 (`has_blob=true` in the manifest; see below), the *amonet* patch of Amazon's
 MediaTek Fire tablets (a 1024-byte microloader in front, the boot header
@@ -56,8 +61,8 @@ project has tested (see *Building*): zlib 1.4, LZ4 1.11.1, Zstandard 1.5.7, xz 5
 
 Format is auto-detected from magic bytes; you don't need to tell `abr`
 what kind of file it's looking at. Things that are not boot-family
-containers (an ext4/F2FS/EROFS/SquashFS filesystem, a sparse image, a
-ZIP, a raw cpio) are recognised and rejected with an explanation instead
+containers (an ext4/F2FS/EROFS/SquashFS/FAT filesystem, a sparse image, a
+GPT, a ZIP, a raw cpio) are recognised and rejected with an explanation instead
 of a bare "unknown format".
 
 ## Usage
@@ -158,7 +163,8 @@ layout (boot image, header version 0, 15581184 bytes):
 only -- `pack` does not read them, and writes the block again for the image it built. The parts of a container lie inside it and are
 indented (the fragments of a vendor ramdisk in the ramdisk section, the descriptors in the auxiliary block of a vbmeta, the
 images of a FIT in its tree); what lies between the parts is padding. The table covers boot, vendor_boot, dtbo, dtb, QCDT, vbmeta, uImage,
-FIT, Sony ELF, Rockchip KRNL, ASUS blob, Intel OSIP and ChromeOS images, with whatever lies around them (bytes in front, a tail, the
+FIT, Sony ELF, Rockchip KRNL, ASUS blob, Intel OSIP and ChromeOS images and the small firmware images of MediaTek and Qualcomm chips,
+with whatever lies around them (bytes in front, a tail, the
 fill up to the size of the partition, an AVB footer and its vbmeta). The offsets of an image that has a wrapper (DHTB, ChromeOS around
 a boot image, ...) are those of the plain image inside it, and the line that heads the table says so.
 
@@ -596,6 +602,225 @@ The tests make FIT images with `mkimage` in six layouts (the data in the tree, `
 images of what `abr` wrote) and by `tests/tools/fit_tool.py`, a reader of FIT images of its own that checks every hash with `hashlib`.
 No FIT image of a device has been tried.
 
+### Small firmware images of MediaTek and Qualcomm chips
+
+Beside the boot images, `abr` opens the small images that the firmware of MediaTek and Qualcomm chips keeps in partitions of their
+own: the loader of the boot ROM, the logo, the modem's image of a MediaTek phone, the secure-boot images of Qualcomm, the splash
+pictures. What an image is, is told by its bytes -- `abr info` names it on its first lines (`format: mtk_image`, `mtk_preloader`, `mbn`,
+`mbn_elf`, `splash`, `oplus_logo`, `xiaomi_logo`, `moto_logo`, `qcdt`) -- and not by the name of the file or of the partition, which
+differs from maker to maker, so nothing is said on the command line. The rest is as for every other image: an untouched image comes back
+byte for byte, `unpack`, `pack` and `info` print where every part lies, a part that is compressed in the image is unpacked from its
+compression and put back at the level it had (see *Compressed parts, and the level they were compressed with*), and the manifest keeps
+every field that `abr` has no name for, so that nothing is lost that it does not understand.
+
+| `format:` | what it is | what `unpack` writes |
+|---|---|---|
+| `mtk_image` | MediaTek's partition image: sections, each a header of 512 bytes (magic `0x58881688`) and its data -- the modem `md1img.img` (`md1rom`, `md1dsp`, ...), `logo.bin`, and the other small images that have this header (`lk`, `tee`, `scp`, `sspm`, `spmfw`, ...) | a file for every section; for a logo a folder of PNG pictures |
+| `mtk_preloader` | the loader that the boot ROM of a MediaTek chip runs (`preloader.bin`, `preloader_<project>.bin`): a chain of GFH headers, the code, a signature | `device.bin`, `headers.bin`, `loader.bin`, `signature.bin` |
+| `mbn` | the secure-boot images of Qualcomm (`sbl1`/`xbl`, `tz`, `hyp`, `rpm`, `aboot`/`appsboot`, `devcfg`, `keymaster`, ...) in the flat form: the header (versions 3, 5, 6, 7 and the SBL header), the code, a signature, a certificate chain | `code.bin`, `signature.bin`, `cert_chain.bin`, `metadata*.bin` |
+| `mbn_elf` | the same as an ELF file whose hash segment holds the header and the hash of every segment | the data of every segment, `seg<N>.bin` |
+| `splash` | Qualcomm's `SPLASH!!` picture image (`splash.img`): one picture or a table of up to 25, as pixels or run-length coded | a PNG for every picture |
+| `oplus_logo` | the `SPLASH LOGO!` image of OPPO, realme and OnePlus phones: named pictures, BMP files, gzip usual | a BMP for every picture |
+| `xiaomi_logo` | the `LOGO!!!!` image of Xiaomi and Redmi phones (MIUI before 13): a table of pictures in units of 4096 bytes | the BMP or PNG file of every picture |
+| `moto_logo` | the `MotoLogo` image of Motorola phones: a table of names, the pictures at multiples of 512 bytes | a PNG for every `MotoRun` picture, the other pictures as they are |
+| `qcdt` | Qualcomm's table of device trees (see *Device trees* below) | the trees and the entries of the table |
+
+A FAT12/16/32 file system image (the modem partition of a Qualcomm phone, `NON-HLOS.bin`, is one) and a GPT are recognised and
+explained, not opened: "Filesystems are out of scope for abr; 7-Zip or mtools open it". A split Qualcomm image (the `.mdt` file and its
+`.bNN` pieces) is refused with the reason.
+
+**What the sources of these formats are.** The layouts are those of the tools and loaders that make and read the images, all of them
+public: MediaTek's `part_hdr_t` and the GFH definitions (U-Boot's `tools/mtk_image.h`), the earlier tools of the same author,
+`blackeangel/md1img_repacker` and `blackeangel/mtklogorepacker` (C++20; `abr` has its own implementation of both in C++26 -- the same
+format, every field of the headers and the padding between the sections kept, strict reading of the tables, and the sections and
+pictures decoded and coded side by side on several threads), coreboot's `mbn_tools.py` and `qtestsign` for MBN,
+`logo_gen.py` of Qualcomm's QRD reference design, Magic-Splash-Wand, FolkSplash, `xiaomi-bootlogo-editor` and `moto-bootlogo` for the
+picture images. None of their code is in `abr`. *How it is verified* says what the tests build these images from, and what has not been
+tried on a real image.
+
+### MediaTek: md1img, logo and the other small images
+
+An image of this kind is a chain of *sections*. A section is a header of 512 bytes -- the header that MediaTek's boot loader keeps
+in front of every partition it loads, the same one that sits in front of the kernel and the ramdisk of an MTK boot image: the magic
+`0x58881688`, the size of the data, a name of up to 32 characters (`md1rom`, `logo`, `lk`, ...), the load address and, in the newer
+headers, an extension (`0x58891689`) with the version, the type, the "last of the list" flag and the alignment of the data --, the data,
+and padding up to the next header.
+
+```
+abr unpack -i md1img.img -o md1
+md1/
+  00_md1rom  01_md1dsp  02_md1_file_map     the data of the sections
+  .abr_raw/                                 the data as the image held it (used when a file is not changed)
+  manifest.txt
+```
+
+The manifest has a block of keys for every section: `section<N>_name`, `_load_addr`, `_mode`, every field of the header as it was
+(`_ext_magic`, `_hdr_size`, `_hdr_version`, `_img_type`, `_list_end`, `_align`, `_size_high`, `_load_addr_high`), the file and the
+compression of the data. A section whose data is a gzip stream (the `md1dsp` of the modem image, in the images the tests build) is
+unpacked from it: `section1_compression=gzip` and `section1_level=6` say how it goes back. The padding between two sections is
+`section<N>_pad_align` (the alignment) and, when it is not zeros, `_pad_byte` or `_pad_hex`. The sizes in the headers and the places of
+the sections are worked out by `pack` from the files, so a section may grow or shrink. If the image ended in fill up to the size of the
+partition (`pad_byte=0xff`, `pad_to=12344`), `pad_to` is the size it is filled up to, not a length: a smaller image is filled up again, a
+bigger one is not cut.
+
+**A logo** is a section named `logo`: the number of pictures, the size of the whole, the offset of every picture, and the pictures, each
+a zlib stream of raw pixels (a picture that nobody compressed is raw pixels). `unpack` writes them as `00_logo/img-000.png`, ... and
+the manifest says how they were stored:
+
+```
+section0_logo=true
+section0_logo_count=3
+section0_logo_format=bgra8888                 (or rgb565, ...)
+section0_p0_file=00_logo/img-000.png
+section0_p0_compression=zlib
+section0_p0_level=6
+section0_p0_width=240
+section0_p0_height=320
+section0_p0_alpha=255                          (every pixel has this alpha: the PNG has no alpha channel)
+```
+
+The image says neither how wide a picture is nor how its pixels are stored, so `abr` takes the pixel format that explains the sizes of
+the pictures best (4 bytes a pixel, 2, or 3) and the resolution from a table of the sizes that the logos of MediaTek phones have; `unpack` and
+`info` say which it took (`info`: `bgra8888 (guessed from the sizes)`), and `section0_logo_format` and `_p<N>_width`/`_p<N>_height` are
+there to be corrected when it guessed wrong. A picture that is not edited goes back as the very bytes it was; an edited one is compressed again at `_p<N>_level`. A PNG
+that has not the size of the picture it replaces is packed with a warning (the loader draws as many pixels as it knows), not refused.
+(PNG is read and written by `abr` itself, no library: every colour type and bit depth of the format, interlaced files too, 8-bit RGB or
+RGBA written.)
+
+**A boot image with an MTK sub-header** on the kernel or the ramdisk keeps the header in the manifest: `<part>_mtk_name` (`KERNEL`,
+`ROOTFS`), and, when the header is not the plain one (the magic, the size, the name, `0xFF`), `<part>_mtk_header_file` -- the header as a
+file, which `pack` puts back with the size it declares worked out again -- and `<part>_mtk_size_extra`, the bytes the component holds
+beyond the size the header declared.
+
+### MediaTek: the preloader
+
+The loader that the boot ROM of a MediaTek chip reads from the boot partition of the flash and runs before anything else. A preloader
+file is a chain of GFH headers (`FILE_INFO`, `BL_INFO`, `BROM_CFG`, `ANTI_CLONE`, `BROM_SEC_CFG`, `BL_SEC_KEY`, ...), the code and a
+signature, and it begins either with the chain at once or with a device header (`EMMC_BOOT`, `SF_BOOT`, `SDMMC_BOOT`) and a BRLYT
+record that put the chain at 0x800 (of the five real preloaders tried, three are of the first kind and two of the second). `abr info`
+reads the headers out in the words of the definitions and says where the code is (the load address plus the jump offset):
+
+```
+abr info -i preloader.bin                      (a preloader of the mtkclient collection)
+format: mtk_preloader
+device header:  EMMC_BOOT, version 1, 512 bytes
+BRLYT:          eMMC, version 1, the headers begin at 0x800, size the size of the file, 0x39c00
+FILE_INFO:      FILE_INFO, header version 1, file version 1, file type 1, flash type 5 (generic (NOR, SD, eMMC)), processed 0xc2600001
+load address:   0x200d00, jump offset 0x300: the code is at 0x201000
+sizes:          headers 768, loader 233112, signature 292, total 234172 bytes (max_size 0x40000)
+signature:      kind 3, 292 bytes, kept as it is (abr cannot make it again)
+```
+
+`unpack` writes `device.bin` (what is in front of the chain), `headers.bin` (every header behind FILE_INFO as bytes, so that a header of a
+kind `abr` has no name for loses nothing), `loader.bin` (the code; a compression on it is taken off and put back) and `signature.bin`;
+the fields of FILE_INFO are keys of the manifest (`file_ver`, `file_type`, `flash_type`, `sig_type`, `load_addr`, `max_size`, `jump_offset`,
+`processed`). `pack` works out `hdr_size`, `total_size`, `sig_size` and the sizes in the BRLYT from the files, and the fill (`pad_byte=0xff`,
+up to a multiple of `file_align=0x200`). A signature that is the SHA-256 of the image (`sig_type=1`, the kind that U-Boot's `mkimage`
+writes, over the bytes from the first header to the signature; the manifest says `signature=sha256` and there is no `signature.bin`) is
+made again, so that it matches the loader you edited. The other kinds of signature (`sig_type` 3 and 5, the kinds that the five real
+preloaders carry) are kept as they were: `abr` does not know how they are made, and `pack` warns that the edited image is not the one
+they came with and that a boot ROM that checks them will not accept it. `max_size` of FILE_INFO is checked: an image bigger than it is
+warned about, not changed.
+
+### Qualcomm: MBN images (secure boot)
+
+An MBN image is one structure -- a header (40 bytes in versions 3 and 5, 48 in 6, 64 in 7, 80 in the SBL header), the metadata of
+versions 6 and 7, the code, a signature, a certificate chain -- in one of two containers: **flat** (the file is the structure: `aboot`,
+the SBL1 of older chips) or **ELF** (the program headers describe the segments of the firmware, one more of them, the *hash segment*, holds
+the structure, and its code is a table with a hash of every program header, SHA-256 or SHA-384, SHA-1 in older images).
+
+```
+abr info -i flat_v3.mbn                       (an image that the tests build; the `file:` line and the layout table are left out)
+format: mbn
+header:         header version 3 (40 bytes), image id 5 (APPSBL)
+words:          image_src 0x28, image_dest 0x8f600000
+sizes:          code 5000, signature 256, certificate chain 3072, image_size 8328
+addresses:      signature 0x8f601388, certificate chain 0x8f601488 (pack works them out from the sizes)
+signature:      3328 bytes of signature and certificate chain, kept as they are (abr cannot sign: an image that is edited no longer matches them)
+certificates:   3072 bytes, 3 certificates, then 1727 bytes of fill
+    [0] C=US, O=QUALCOMM, OU=01 0000000000000003 SW_ID, OU=02 ... CN=QCT Attestation
+        SW_ID 0x0000000000000003, HW_ID 0x0000000000000000, DEBUG 0x0000, OEM_ID 0x0000, SW_SIZE 0x00000000, MODEL_ID 0x0000
+        issued by C=US, O=QUALCOMM, OU=QCT CA, CN=QCT Attestation CA
+    [1] C=US, O=QUALCOMM, OU=QCT CA, CN=QCT Attestation CA
+        issued by C=US, O=QUALCOMM, OU=QCT Root, CN=QCT Root CA 1
+    [2] C=US, O=QUALCOMM, OU=QCT Root, CN=QCT Root CA 1
+code:           5000 bytes, not compressed
+```
+
+`info` also shows the addresses of the signature and the chain, the certificates of the chain with the attributes of Qualcomm's secure
+boot (SW_ID, HW_ID, DEBUG, OEM_ID, SW_SIZE, MODEL_ID) and, for an ELF, every program header with its flags and what the hash segment is
+made of.
+
+`unpack` of a flat image writes `code.bin`, `signature.bin`, `cert_chain.bin` (and `metadata*.bin` in versions 6 and 7); of an ELF
+image `seg<N>.bin` for every segment that has data, and what is left of the ELF header and the program headers the manifest says
+(`seg<N>_type`, `_flags`, `_offset`, `_vaddr`, `_paddr`, `_memsz`, `_align`; `elf_layout=tidy`, or `skeleton` and a file `skeleton.bin` when
+the file is not laid out the way Qualcomm's tools lay it out). The code may be compressed (`code_compression`, `seg<N>_compression`): it
+is unpacked and put back. `pack` works out the sizes of the header, `image_size`, the addresses of the signature and the chain
+(`ptrs=derived`) and the table of hashes of an ELF (`hash_table=sha256`) from the files, so that a segment may grow. Where `abr` cannot make
+exactly the table that is in the image (an algorithm or a layout it does not know; this is checked when the image is read), the table is
+kept as it is (`hash_table.bin`).
+
+**`abr` cannot sign.** The signature and the certificate chain are kept as they are, and an image that was edited no longer matches them:
+`pack` says so ("the image was changed, and its signature and certificate chain ... are kept as they were: abr cannot sign, and a loader
+that checks the signature will not accept an image that is not the one it was made for"). The NAND form of the SBL (a preamble in front
+of the header) is told and not opened, and so is the split form (`.mdt` and the `.bNN` pieces).
+
+### Qualcomm and others: splash and logo pictures
+
+The pictures that the boot loader of a phone draws before Android starts lie in a partition of their own (`splash`, `logo`), and there
+are four makers' containers of them. Every picture is unpacked to a file that opens anywhere and `pack` builds the container again,
+working out the sizes, the blocks and the places of the pictures; a picture that is not edited goes back as the very bytes it was, and a
+changed one is coded again.
+
+- **`splash`** -- Qualcomm's `SPLASH!!`, the image that `logo_gen.py` of the QRD reference design makes: a header of 512 bytes and one
+  picture, or a table of up to 25 pictures; each is stored as pixels (blue, green, red) or run-length coded (RLE24). `unpack` writes
+  `00_picture.png`, ...; the manifest has `form=single` or `several`, and for every picture `picture<N>_file`, `_compression` (`rle24` or
+  `none`), `_width`, `_height`, `_blocks`. The PNG you put back may have another size: the header says the size of the picture.
+- **`oplus_logo`** -- the `SPLASH LOGO!` image of OPPO, realme and OnePlus phones: 0x4000 bytes (zeros, or the signing header `DDPH`),
+  a header with the table of named pictures, the pictures from 0x8000 on, each a BMP file, usually gzip. `unpack` writes
+  `00_logo.bmp`, ... with the compression taken off (`entry<N>_compression=gzip`, `entry<N>_level=9`, `entry<N>_plain_size`) and the words of
+  the header as they were (`logo_version`, `logo_width`, `logo_height`, `logo_compression`, `description<N>`). To leave a picture out, delete its
+  keys, number the later ones again and change `entries=`.
+- **`xiaomi_logo`** -- the `LOGO!!!!` image of Xiaomi and Redmi phones (MIUI before 13): 0x4000 bytes in front, a table of 4 KiB with the
+  offset and the size of every picture in units of 4096 bytes, and the pictures -- BMP files, in some images PNG. `pack` puts every file in
+  whole units, zeros behind it, and works out the table (`pictures=3`, `picture<N>_file`).
+- **`moto_logo`** -- the `MotoLogo` image of Motorola phones: a table of 24-byte names with the offset and the size of every picture, the
+  pictures at multiples of 512 bytes (`align=512`, filled with `header_fill` and `gap_fill`). A picture is usually a `MotoRun` image,
+  run-length coded: `unpack` makes a PNG of it (`entry<N>_compression=motorun`, `_width`, `_height`); any other picture is the file it is. An
+  entry with no `entry<N>_file` is an empty slot.
+
+An image whose pictures do not lie the way `pack` would put them -- one behind the other in an OPLUS or Xiaomi image, at multiples of
+one alignment in a Motorola image -- is refused by `unpack` with the reason, because `pack` could not give it back. The tests have
+no image of a phone of these makers: see *How it is verified*.
+
+### Device trees: dtb and QCDT
+
+A **dtb** file (or partition) is flattened device trees one behind another. `unpack` writes `blob<N>.dtb` for every tree. The gaps
+between them are kept: `blob_align=4096` when every tree begins at a multiple of one alignment (the smallest alignment that explains all
+the gaps), `blob<N>_pad` for a gap that follows no rule (zeros only). Bytes that are neither a tree nor zeros end the trees; they are
+`tail.bin`, up to the fill at the end of the partition (a run of 64 or more equal bytes), which `pad_byte` and `pad_to` keep (`pad_to` is
+a floor, as above). An **AVB hash footer** at the end of a dtb partition (what `avbtool add_hash_footer` writes) is understood like the
+one of dtbo and boot: `has_avb_footer=true`, `avb_partition_size`, the fields of the footer and the descriptors as `avb_*` keys and
+files; `pack` writes the footer again, hashes the new trees and signs with `keys/avb_key.pem` or, without it, with the public AVB test
+key (`testkey_rsa2048`), and says that it did.
+
+A **QCDT** table (what `dtbTool` makes, versions 1, 2 and 3) is the table of a Qualcomm boot image's device trees or the file `dt.img`: a
+table of entries -- the chipset, the platform, the subtype and the revision (from `qcom,msm-id` and `qcom,board-id`, `qcom,pmic-id`) --
+each naming one of the trees that follow, padded to the page size. `unpack` writes the trees as `dtb<N>_file` and the entries as
+`entry<K>_chipset`, `_platform`, `_subtype`, `_revision`, `_dtb`, with `version`, `page_size` and `entry_count`; in a boot image the same
+keys begin with `dt_` (`dt_format=qcdt`, `dt_version`, `dt_page_size`, `dt_dtb0_file`). A tree that is not a device tree is refused with the
+key and the file that hold it.
+
+`abr pack -i folder` of a folder of `.dtb` files and no `manifest.txt` makes a table in `dtbTool`'s manner: the entries come from the ids
+of the trees (`qcom,msm-id`, `qcom,board-id`, `qcom,pmic-id`), are sorted by chipset, platform, subtype and revision, every tree is stored
+once, and the page is filled up (a whole extra page when the table is exactly one page long). `type=qcdt`, `page_size=` and
+`table_version=1|2|3` in a `manifest.txt` choose another page size or another version. The rules were read from the source of `dtbTool` (the
+Code Aurora one, as LineageOS has it), and the tests have that `dtbTool` -- built from its source, not part of this repository -- make the
+table of the same folder: the two tables are the same bytes (versions 1 to 3, page sizes 512 to 8192, a version that is forced, a tree that
+is exactly one page long, and the two trees of a real boot image, which make that image's table again). A table that another tool made in
+another way (for instance, a byte that `dtbTool` leaves zero) is refused by `unpack` with the reason -- `abr` takes only a table that it can
+write again byte for byte -- and `info` says what is different.
+
 ### Threads, console and progress
 
 `abr` runs at least two threads: one **writes to the terminal** and the others do the work. While a command runs, everything
@@ -827,6 +1052,13 @@ library dependencies (verify with `ldd build/abr` -> "not a dynamic
 executable"). Omit it for a normal dynamically-linked build during
 development, which is faster to iterate on.
 
+**Size of the executable.** A build with no `CMAKE_BUILD_TYPE` is a Release build here (without a type the compiler is given no
+optimisation, and the Android NDK adds debug information). The `abr` of a Release or MinSizeRel build is **stripped** when it is linked
+(`--strip-all`: no symbol table, no debug sections, for `abr` and for every library in it), and the linker drops every function and datum
+that nothing refers to (`--gc-sections`, with `-ffunction-sections -fdata-sections` for abr and the libraries). On Linux x86-64, static,
+g++-14, `-O3`: 7.2 MB before, 5.6 MB after. `-DABR_STRIP=OFF` keeps the symbols for a debugger; a Debug or RelWithDebInfo build is not
+stripped, nor is one with `-DABR_SANITIZE` (the reports of a sanitizer name the functions through the symbol table).
+
 **The libraries and their versions.** `cmake/dependency_versions.cmake` is the one place that names them: zlib 1.4, LZ4 1.11.1 (built
 with its multithreaded frame compressor, `LZ4F_preferences_t.nbWorkers`: the stream it makes does not depend on the number of workers),
 Zstandard 1.5.7, xz 5.8.4 and bzip2 1.0.8, each fetched from its repository at that tag, so that a build can be repeated. LZO 2.10 (its
@@ -860,6 +1092,8 @@ check). The
 cross-check against the real AOSP `boot_signer` is skipped unless `javac`,
 `java` and BouncyCastle are present (Debian/Ubuntu: `apt install
 default-jdk-headless libbcprov-java`).
+The checks of the picture and MBN images compare pixels with Pillow and read what `cryptography` made, where Python has them
+(`pip install pillow cryptography`; without them those checks are skipped, with a note).
 They are used only as independent reference implementations to compare
 `abr` against -- none of them is needed to build or use `abr`.
 
@@ -923,11 +1157,11 @@ runs it again.)
 
 Beyond those, the suite compares `abr` with the programs Android Image Kitchen runs for the formats `abr` opens by
 itself -- `rkcrc`, `blobpack` / `blobunpack`, `mboot`, `loki_tool`, `pxa-mkbootimg` / `pxa-unpackbootimg`, `sony_dump`,
-`elftool` (and `futility`, GNU `cpio`, and `mkimage` / `dumpimage` for the FIT images). They are not part of this repository (several have no licence file):
+`elftool` -- and with Qualcomm's `dtbTool` for the QCDT tables (and `futility`, GNU `cpio`, and `mkimage` / `dumpimage` for the FIT images). They are not part of this repository (several have no licence file):
 `.github/scripts/build_oracles.sh <directory>` fetches them at the commits the tests were written against, compiles
 them and prints the variables that tell the suite where they are (`ABR_RKCRC`, `ABR_BLOBPACK`, `ABR_BLOBUNPACK`,
-`ABR_MBOOT`, `ABR_LOKI_TOOL`, `PXA_MKBOOTIMG`, `PXA_UNPACKBOOTIMG`, `ABR_SONY_DUMP`, `ABR_ELFTOOL`). A judge that is not
-there is a note in its section and the comparisons with it are skipped; `ABR_REQUIRE_ORACLES=futility,cpio,rkcrc,blobtools,mboot,loki,pxa,sony_dump,elftool,dumpimage`
+`ABR_MBOOT`, `ABR_LOKI_TOOL`, `PXA_MKBOOTIMG`, `PXA_UNPACKBOOTIMG`, `ABR_SONY_DUMP`, `ABR_ELFTOOL`, `ABR_DTBTOOL`). A judge that is not
+there is a note in its section and the comparisons with it are skipped; `ABR_REQUIRE_ORACLES=futility,cpio,rkcrc,blobtools,mboot,loki,pxa,sony_dump,elftool,dtbtool,dumpimage`
 (any of those names) makes a missing one a failure instead, which is how the CI runs the suite.
 
 ### Cross-compiling
@@ -1052,13 +1286,6 @@ fields is what `loki_tool patch` makes of the plain image the same directory
 builds without the patch. (No real LOKI image has been tried: none was at hand.)
 
 The ChromeOS kernel blobs are judged by a Python tool of the suite (`tests/tools/chromeos_tool.py`, written from
-**Size of the executable.** A build with no `CMAKE_BUILD_TYPE` is a Release build here (without a type the compiler is given no
-optimisation, and the Android NDK adds debug information). The `abr` of a Release or MinSizeRel build is **stripped** when it is linked
-(`--strip-all`: no symbol table, no debug sections, for `abr` and for every library in it), and the linker drops every function and datum
-that nothing refers to (`--gc-sections`, with `-ffunction-sections -fdata-sections` for abr and the libraries). On Linux x86-64, static,
-g++-14, `-O3`: 7.2 MB before, 5.6 MB after. `-DABR_STRIP=OFF` keeps the symbols for a debugger; a Debug or RelWithDebInfo build is not
-stripped, nor is one with `-DABR_SANITIZE` (the reports of a sanitizer name the functions through the symbol table).
-
 vboot_reference's `2struct.h` and `cmd_vbutil_kernel.c`, its RSA is Python's own integers) and, where `futility` is
 installed (`ABR_FUTILITY`, or on the `PATH`; the CI installs `vboot-kernel-utils`), by the real `futility vbutil_kernel`.
 Nine kinds of blob -- the preambles 2.0, 2.1 and 2.2; RSA keys of 1024, 2048, 3072 and 4096 bits, public exponents 65537
@@ -1108,6 +1335,59 @@ identical. (This is how the LZO writer's two faults were found: its header was
 not a valid lzop header, and it wrote blocks longer than the data they
 contained, which the kernel's decompressor rejects as a corrupt file.)
 
+The small firmware images of MediaTek and Qualcomm chips are judged by drivers in `tests/tools/` that build the images from the layouts
+in the sources named above -- `mk_mtk.py`, `mk_gfh.py`, `mk_mbn.py`, `mk_splash.py` and `mk_fatboot.py` share no code with `abr` -- and
+read what `abr` wrote with readers of their own. `livelib.py` is their harness: it runs `abr`, counts the checks, and damages an image
+(cut short, bytes changed) to demand that `abr` refuses it with a message or takes it, and that what it takes comes back.
+
+- `mtk_live.py`: containers (an md1img-like one with a gzip section, an older header, a 512-byte alignment, the fill up to the size of a
+  partition, sections that grow and shrink), logos in `bgra8888` and `rgb565` and with a constant alpha (Pillow reads the PNG pictures
+  that `unpack` wrote and makes the ones that `pack` is given), preloaders (an independent reader of the GFH chain and of the SHA-256 of
+  the image, and the warning for a signature `abr` cannot make), and boot images whose kernel and ramdisk carry an MTK sub-header that
+  is plain, odd, cut short or whole.
+- `mbn_live.py`: flat images of every header version and ELF32 and ELF64 images with a hash segment (the hashes made by `hashlib`, the
+  certificate chains by `cryptography`), padded, paged and gzip-compressed variants, and the files that are not MBN images (a split
+  `.mdt`, an ELF that is no hash-segment image).
+- `splash_live.py` and `rle_parity.py`: the four picture containers (images made with Pillow and an independent decoder, `mk_splash.py`),
+  every picture unpacked, edited (another size, another coding) and packed again; the RLE24 writer against a transcription of `logo_gen.py`;
+  names with control bytes in the tables of the images, which must not reach a terminal as they are.
+- `qcdt_live.py` and `qcdt_check.py` (a judge of a QCDT table that shares no code with `abr`; the trees are made by `dtc`), and
+  `dtb_live.py` (dtb partitions with gaps and with an AVB hash footer, which `avbtool verify_image` judges).
+- `png_oracle.py`: `abr`'s PNG reader and writer against Pillow and, where it is installed, ImageMagick -- every colour type and bit
+  depth, interlaced files.
+- The FAT and GPT files of `run_tests.sh`, and the fuzzers below, which take every one of these images as a seed.
+
+A judge that never fails judges nothing, so `tests/tools/sabotage_check.sh <abr> <directory>` runs the six drivers that run `abr` against the
+real one and against two copies of it that change a single byte: one in the image that `pack` writes, one in the biggest file that `unpack`
+writes (`tests/tools/abr_sabotage.py`). A driver has to pass the first and fail the other two; all six do. Pillow and `cryptography` are
+judges of the suite: where Python does not have them those checks are skipped with a note, and `ABR_REQUIRE_ORACLES` makes that a failure
+(the CI does).
+
+What has **not** been done for these images:
+
+- No `md1img`, `logo`, `lk`, `tee`, ... of a MediaTek phone and no MBN image of a Qualcomm phone was at hand, and none of the OPLUS,
+  Xiaomi and Motorola picture images: the tests build them from the layouts of the sources. A real image that those layouts do not
+  describe is refused with the reason or kept as bytes, not guessed -- and may well exist.
+- The real images that were tried are five MediaTek preloaders (from the loader collection of the public mtkclient project, which is not
+  part of this repository; each unpacks and packs again to the same bytes), two sample `SPLASH!!` images of Qualcomm's own
+  (`mm_splash.img` and `lp_splash.img`: raw pixels, the same), one QCDT table (the boot image of a device with lk2nd), and the real device
+  dumps mentioned above. The other 833 files of the mtkclient collection are the `MTK_BLOADER_INFO` record on its own, not a loader
+  image: `abr` says so and does not unpack them.
+- The SHA-256 trailer of a GFH preloader was checked on the images the tests build, not on a real one: the five real preloaders carry the
+  signatures of `sig_type` 3 and 5, which `abr` keeps as they are. `abr` cannot sign an MBN image or make any signature of a preloader
+  but the SHA-256 one.
+- The `SPLASH!!` image that holds several pictures is as the analysis of Magic-Splash-Wand describes it. The RLE24 writer equals a
+  transcription of `logo_gen.py`, but for a picture one pixel wide, where it makes other bytes that decode to the same picture. The `DDPH`
+  preamble of an OPLUS image is kept as it is, not checked. A Motorola image has to be given PNG files of the size of the pictures
+  they replace.
+- The sub-header of an MTK boot image follows the loader's `part_hdr_t`; no device image with a header that is not the plain one was at
+  hand.
+- The real `dtbTool` made the table of twelve folders of trees (the cases named above) and `abr`'s tables are the same bytes. What `dtbTool`
+  has no option for (a table of version 1 for trees that need more) and what it does in its own way (trees in subfolders, trees that are
+  for no board) is judged by `qcdt_check.py` and by a second computation in the driver, not by `dtbTool`.
+  `blob_align` of a dtb file is the smallest alignment that explains its gaps, which may not be the one its maker used.
+- A FAT image is told, not unpacked.
+
 AVB signing is judged by implementations that share no code with `abr`:
 
 - the BigInt arithmetic against Python's integers (tens of thousands of
@@ -1152,8 +1432,13 @@ Two smaller gaps:
 - Hard links in a ramdisk's cpio archive (the ramdisk then stays one
   `ramdisk.cpio`); a directory tree is made for `newc`/`crc` archives only.
 - Sony SIN is read, and never written (the container is Sony's); SIN v4 and v5 are not read. See `PROGRESS.md` for the plan.
-- The small firmware images of MediaTek and Qualcomm chips (preloader, logo, modem, splash, lk, tee, MBN and the like) are
-  not unpacked yet.
+- File systems in the small partitions: a FAT image (the modem partition of a Qualcomm phone, `NON-HLOS.bin`, is one) and a GPT are
+  recognised and explained, not opened -- `abr` has no FAT reader (7-Zip or mtools open such an image).
+- Qualcomm's split images (the `.mdt` file and its `.bNN` pieces) are refused with the reason, and so is the NAND form of the SBL
+  (told, not opened). `abr` cannot sign an MBN image or make a signature of a preloader other than the SHA-256 one: they are kept as
+  they were, and `pack` says that an edited image no longer matches them.
+- A picture image whose pictures do not lie the way `pack` would put them (OPLUS and Xiaomi images with gaps between the pictures,
+  a Motorola image whose pictures are not at multiples of one alignment) is refused by `unpack` with the reason.
 - Signatures of a FIT image (checking them, making them): the signature nodes are kept, and the repack says which an edit makes
   wrong.
 - Filesystems (ext4, F2FS, EROFS, SquashFS) and sparse images: out of

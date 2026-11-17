@@ -19,7 +19,7 @@ tools" below.
 | boot (header v0-v4): boot.img, init_boot.img, boot-debug.img, boot-test-harness.img, recovery.img, recovery-two-step.img | **done + verified** |
 | vendor_boot (header v3-v4): vendor_boot.img, vendor_boot-debug.img, vendor_kernel_boot.img | **done + verified** |
 | dtbo.img (+ ACPIO variant) | **done + verified** |
-| dtb (raw/concatenated FDT) | **done + verified** |
+| dtb (raw/concatenated FDT): trees at an alignment with zeros between them (`blob_align`, `blob<N>_pad`), `tail.bin`, the fill of the partition, an AVB hash footer | **done + verified** (the first form earlier; the gaps and the footer 12-14 Nov 2026: `avbtool verify_image` judges the footer) |
 | vbmeta (AVB): vbmeta.img, vbmeta_system.img, footer-on-other-partitions | **done + verified**, incl. RSA signing (images made by the real `avbtool` round-trip exactly; images `abr` re-signed pass `avbtool verify_image`) |
 | uboot: U-Boot legacy uImage | **done + verified** |
 | U-Boot FIT images (`mkimage -f`: `.itb`, `.fit`; the data in the tree, `-E`, `-E -B n`, `-E -p N`) | **done + verified** (1 Nov 2026) against the real `mkimage` and `dumpimage` (u-boot-tools 2025.10, run as oracles), `dtc` 1.7.0 and an independent Python reader (`tests/tools/fit_tool.py`, hashes with `hashlib`): `fit.its` plus a file for every image (a ramdisk also as a directory), an untouched FIT comes back byte for byte in all six layouts `mkimage` was run with (and signed with `-k`), a new kernel or an image put in is the file `mkimage` makes of the same text, the hash nodes of a changed image are made again (crc32, md5, sha1, sha256, sha384, sha512), signatures are kept and named when an edit makes them wrong; **no FIT image of a device has been tried**, and `abr` neither checks nor makes a signature, see "U-Boot FIT images" |
@@ -33,17 +33,27 @@ tools" below.
 | LOKI patch of `loki_tool` (AIK: `loki_tool unlok` / `patch`) on boot and recovery images | **done + verified** against the real `loki_tool` (compiled, not vendored) and an independent Python tool, on synthetic bootloader images: a wrapper layer (`has_loki=true`) that needs no `aboot.img` -- the block of the bootloader's code behind the ramdisk is carried, so an untouched image comes back as it was and an edited one is what `loki_tool patch` makes of the plain repack; the patch code at offsets 0/4/8/12, a block of 512 bytes or of a page, boot and recovery, with and without a device tree, tails and partition fill; `loki patch` itself (the search in an `aboot.img`, loki's table of targets) is not done |
 | ChromeOS (vboot) kernel blobs (AIK: `futility vbutil_kernel --get-vmlinuz` / `--pack`) | **done + verified** against the real `futility` (package `vboot-kernel-utils`, run as an oracle, not vendored) and an independent Python tool: the blob is a wrapper layer around the image in its kernel field (`has_chromeos=true`) or a container of its own (`type=chromeos`); preambles 2.0 / 2.1 / 2.2, RSA of 1024 to 4096 bits with the exponent 65537 or 3, SHA-1 / 256 / 512; an untouched blob comes back byte for byte whoever signed it, an edited one is signed again (with the public developer key of vboot_reference, which abr carries, or with `--chromeos-key` / `--chromeos-keyblock`) and is what `futility --pack` / `--repack` make; x86 blobs and layouts futility does not write are refused with the reason; no real Chromebook partition has been tried, see "ChromeOS kernel blobs" |
 | Marvell PXA boot header (Samsung Galaxy J1 / Core Prime / Tab 4) | **done + verified** against the real `pxa-mkbootimg` / `pxa-unpackbootimg` (compiled, not vendored): 240 images byte-identical, 34 edits equal to the tool's output (commit `0652429`) |
-| `abr identify`: AIK's `androidbootimg.magic` as code | **done + verified**: 98 samples, agree with `file(1)` + AIK's magic file on all (when both are at hand) and with the built-in table; unsupported-but-known formats are named in the refusal (commit `803b820`) |
+| `abr identify`: AIK's `androidbootimg.magic` as code | **done + verified**: 101 samples; `abr` agrees with the built-in table and (when both are at hand) with `file(1)` + AIK's magic file on all of them but the deliberate deviations listed in `tests/tools/magic_samples.py` (the 64 KiB search window, a vendor_boot behind a boot header, an MTK header only at offset 0, and, since 9 Nov, the machine words of an ELF: AArch64 and Hexagon are named, and a machine without a name gets no bare ")"); unsupported-but-known formats are named in the refusal (commit `803b820`) |
 | Nook / Nook-tablet signing header in front, LG Bump footer behind | **done** (synthetic fixtures; no real device dump of either yet): header kept as a constant prefix (`prefix_kind=`), footer kept as tail, neither triggers the stale-signature warning (commit `2a76f87`) |
 | MTK sub-header, DHTB wrapper | **done + verified** against real mkmtkhdr/dhtbsign |
 | Everything around the container: opaque prefix (BFBF/SSSS-style wrappers), verbatim tail, partition-size fill, boot `id` schemes (sha1 / sha1+dt / sha256 / raw), QCDT `dt_size`, reserved words, odd `header_size`, header-page data, trimmed dumps, vendor_boot v4 with an empty ramdisk table | **done + verified** -- 13 of 14 real device dumps round-trip byte-for-byte (the 14th is an ext4 filesystem, out of scope and rejected with a clear message); see "Round-tripping 14 real device images" at the end |
 | AVB footer on boot / vendor_boot / dtbo: layout, digest check, digest refresh after an edit, `--avb-key` required for signed footers | **done + verified** against the real `avbtool` (`add_hash_footer` output round-trips byte-for-byte; edited + re-signed output passes `verify_image`) and the independent Python/openssl checks |
 | AVBv1 `BootSignature` (pre-AVB `boot_signer`, DER blob after the image): detect, verify (`info`, unpack warning), re-create after an edit with the AOSP test key or `--avb1-key/--avb1-cert` (AIK `name.pk8`+`name.x509.pem` naming too), add to an unsigned image | **done + verified** against the real AOSP `boot_signer` (compiled from its Java sources) and an independent Python/openssl signer: same bytes from the same key and image; abr-re-signed images pass `boot_signer -verify`; real-device AVBv1 images read VALID |
-| compression: gzip, lz4, lz4-legacy (HC 12, as Android builds it), zstd, xz, lzma(alone), bzip2, lzo (genuine lzop framing) | **done + verified, all algorithms**, each also read back by the real `gzip`/`lz4`/`zstd`/`xz`/`bzip2`/`lzop` |
+| compression: gzip, zlib, lz4 frame, lz4-legacy (HC 12, as Android builds it), zstd, xz, lzma(alone), bzip2, lzo (lzop framing, levels 1-9); the level of every unpacked component recorded and used again; libraries at their newest releases (zlib 1.4, LZ4 1.11.1 with worker threads, zstd 1.5.7, xz 5.8.4, bzip2 1.0.8, LZO 2.10) | **done + verified, all algorithms**, each also read back by the real `gzip`/`lz4`/`zstd`/`xz`/`bzip2`/`lzop` (the lzo blocks are `lzop` 1.04's at levels 1, 3, 7, 8, 9); `tools/check_deps.py` and a weekly workflow say which pin is behind (5-14 Nov 2026) |
 | multithreading (`-j N`): components of an image, LZ4 legacy blocks, zstd workers | **done + verified**: bytes identical for any thread count (suite, every codec), `abr::par` unit-tested, TSan/ASan-clean; see "Threads, and what the codecs taught us" |
 | bundled MD5 and SHA-1/256/384/512 | **done**, self-test passes, catches its own transcription bug once already (see Verification below); MD5 and SHA-384 (the hash nodes of a FIT image) are checked against vectors from Python's `hashlib` |
 | self-contained RSA: BigInt (Knuth D, Montgomery), DER/PEM/X.509, PKCS#1 v1.5 sign/verify, PKCS#8/PKCS#1 key parsing, AVB public-key blob -- **no OpenSSL anywhere in the build** | **done + verified** (Python integers, `openssl dgst -sign`, `avbtool extract_public_key`; see "Self-contained crypto" below) |
-| manifest + CLI (`abr info/unpack/repack`) | **done** |
+| the command line: `abr unpack` / `pack` / `info` / `help` / `version` (`-i`, `-o`; names made beside the input; everything found by the content; keys of signatures from the folder or the built-in test keys; version `1.YYYYMMDD.N`) | **done** (3-5 Nov 2026): see "The command line, the console and the tables of offsets" |
+| console: one thread writes, the others work; a coloured progress bar; offsets and sizes of every part on the console and in `manifest.txt` (`layout_*`), for every format | **done + unit-tested** (groups `console` and `layout`): the table is made from the bytes read again, so `unpack`, `pack` and `info` say the same numbers |
+| MediaTek small images (`md1img`, `lk`, `tee`, `scp`, `sspm`, `logo`, ...): the 512-byte partition header, sections with their compression taken off, the pictures of the logo as PNG; the MTK sub-header of a kernel/ramdisk | **done** (7-14 Nov 2026), judged by independent writers and readers (Python, Pillow) on images built from the layouts of the sources; **no image of a MediaTek phone was at hand** |
+| MediaTek preloader (the GFH chain; the SHA-256 trailer made again, other signatures kept) | **done** (8 Nov 2026): the 5 full real preloaders of the public mtkclient collection come back byte for byte (the other 833 files there are the `MTK_BLOADER_INFO` record alone: named and refused); the SHA-256 trailer seen on hand-built images only |
+| Qualcomm MBN (flat v3/v5/v6/v7/SBL and ELF with a hash segment; hashes made again, signature and certificates kept) | **done** (9 Nov 2026) on images of an independent Python writer; **no MBN of a phone was at hand; `abr` cannot sign** |
+| picture partitions: Qualcomm `SPLASH!!` (RLE24 or raw), OPLUS `SPLASH LOGO!`, Xiaomi `LOGO!!!!`, Motorola `MotoLogo` | **done** (10-12 Nov 2026): two real `SPLASH!!` samples come back byte for byte; the other three from the layouts of the sources |
+| QCDT (dtbTool's table) as trees + entries, and made from a folder of trees | **done + verified** (3 and 12-16 Nov 2026) against the real `dtbTool` (built from the Code Aurora source, run as a judge: 12 tables, the same bytes) and the table of one real boot image |
+| `abr`'s own PNG reader and writer (no libpng) | **done + verified** against Pillow (and ImageMagick where present): every colour type and bit depth, interlaced |
+| FAT volumes and GPT files named (not unpacked) | **done** (12 Nov 2026), recognition only |
+| what reaches a terminal from the tables of an image (picture names, certificate subjects, ...) | **done** (15 Nov 2026): the cells of the layout table are escaped; unit and live regression tests; sanitizer fuzz after the fix: 30 837 runs, nothing |
+| the judges are judged: every live driver fails against an `abr` that changes one byte of what `pack` or `unpack` wrote | **done** (16 Nov 2026): `tests/tools/sabotage_check.sh` |
 | CMake: FetchContent-vendored static zlib/lz4/zstd/xz/bzip2 | **done + build-verified natively on Linux**, both the dynamic and the `-DABR_STATIC_BINARY=ON` fully-static configurations |
 | Test suite (`tests/run_tests.sh`) | **done**; the last full runs (those of "Streams, decoders and names"): 490/490 on g++-14 (all judges required, as in the CI) and under AddressSanitizer + UndefinedBehaviorSanitizer (no report); the clang-20 and wine runs are older (at 483 checks: 474/474 on clang-20 -- the nine "the judge is there" checks belong to `ABR_REQUIRE_ORACLES`, which that run did not set --, 481/481 for `abr.exe` under wine, the suite with the 14 real images and AIK's magic file 487/487). Since then the groups of the FIT work (ten blocks, 152 checks of the CLI; the unit groups `fdt` and `fit`) have been run on their own only: the whole matrix is run once, after the work on formats is done (see "Next steps"). CI runs the matrix (g++-14, clang-20, ASan+UBSan with a fuzz run, Windows under wine, arm64 under qemu-user, android-arm64) -- see Verification |
 | CMake cross toolchains (mingw-w64, Android NDK) | **done + verified** (mingw reproduced locally; NDK only provable via CI, see below) |
@@ -2149,6 +2159,166 @@ names and packed to the same bytes, an image with values no table has (99, 77, 9
 a name in any case, a decimal or a hex number is the same value, the old names are read, 17 wrong values are refused with the list.
 **Both blocks fail on the binary of `ee11ff0`.** Not done: a real device's uImage with an operating system or a type outside
 `mkimage`'s lists has not been seen (the numbers are kept anyway).
+
+## The command line, the console and the tables of offsets (done, 2-5 Nov 2026)
+
+The user's requirements of 2 Nov 2026 (also in the memory of the Claude side): `abr unpack -i <image> [-o <folder>]`, `abr pack -i <folder>
+[-o <image>]`, `abr info -i <image>` (everything about an image without unpacking it), `abr help`, `abr version` (numbered
+`1.YYYYMMDD.N`); without `-o` the output is made beside the input and named after it; format, signature and so on found by `abr` itself; every
+test key inside `abr`, and `abr` one independent file; a compressed file of an image unpacked, with the codec, the level and the output
+name recorded, and packed the same way again; at least two threads, one of which writes to the screen (a coloured progress bar); offsets and
+sizes on the console and in the manifest.
+
+- **The commands** (`6e3aa55`): as above. Without `-o`: `boot.img` -> `boot/`, `boot/` -> `boot.img`; `boot_new.img` when `boot.img` is
+  there (the image a folder came from is not written over unless `-o` names it -- a deliberate deviation from "the name of the folder" so that
+  a careless `pack` cannot destroy the original), and an `unpack` does not write into a folder it chose itself when that is not empty. Gone:
+  `repack` (it is `pack`), `qcdt` (a folder of `.dtb` files and no `manifest.txt` is a QCDT table; a `manifest.txt` of `type=qcdt` with
+  `page_size=` and `table_version=` says how), `-j` (`ABR_THREADS` stays), `--no-tree`, `--tree-only`, `--ramdisk-from` (a ramdisk edited as a
+  file and as a folder: the folder wins and `abr` says so), and the key options. `identify` stays, out of the help, for the tests.
+- **The version** is made when cmake configures (`cmake/AbrVersion.cmake`): 1, the UTC date of the commit that is built, and the number of
+  commits of that day in its history (`ABR_BUILD_DATE` / `ABR_BUILD_NUMBER` override it); the workflow checks out the whole history for that.
+  The number counts commits of the day, not builds: two builds of one commit have one version.
+- **Keys** (`9b90957`): the keys of the signatures are files of the unpacked folder (`keys/avb_key.pem`; `keys/avb1.pk8` + `avb1.x509.pem`;
+  `keys/chromeos.vbprivk` + `chromeos.keyblock`); without them `abr` signs with the AVB project's public test keys that are built in
+  (`src/avb_testkeys.cpp`, made by `tools/gen_avb_testkeys.py`, with the SHA-256 of every source file and the MIT notice), chosen in this
+  order: the key of the folder; none, when nothing the signature covers changed (the signature stays byte for byte); the test key whose public
+  key is the image's own (a note says so); the first test key of the size the algorithm needs, with a warning that the public key in the
+  image is then another one. ML-DSA vbmetas (libavb algorithm types 7 and 8) are read, listed and rebuilt when nothing changed; `abr` cannot
+  make an ML-DSA signature (checked on hand-made images only: the OpenSSL here has no ML-DSA, so no image from a real signer was compared).
+- **The console** (`99e1168`): everything written to `std::cout` and `std::cerr` goes to one thread (`abr::console::Printer`), so the threads
+  that work never wait for the terminal and a line is never torn; the filter that writes what a terminal would act on as an escape moved
+  there (per stream; `ABR_UNFILTERED_OUTPUT=1` turns it off, which the fuzzers use so that `abr`'s own quoting is what they judge). On a
+  terminal a bar is drawn on the last line (gradient, share, stage, jobs, time) and taken away for every line that is written, so a pipe
+  gets what is written; `NO_COLOR`, `ABR_PROGRESS=never|always` (`ABR_COLUMNS`), `TERM=dumb`, `COLORTERM`/`TERM`/`LANG` are honoured. The
+  progress is real: `compress()` takes a callback (gzip in 1 MiB slices, the same bytes as before -- checked on a 133 MB kernel).
+- **Offsets and sizes** (`fd31909`, `c75419c`): `unpack`, `pack` and `info` print one table -- offset in hex, size in decimal, of the header,
+  every component, the wrappers (prefix, tail, fill) and the AVB footer with its vbmeta block, descriptors and public key -- and keep it
+  as `layout_<part>_offset|_size|_unpacked_size` lines at the end of `manifest.txt` (`pack` ignores them and replaces the block). The table is
+  made from the bytes that were taken apart / built / asked about, read again, so the three commands tell the same numbers. Every format has
+  one: boot v0-v4 (and PXA), vendor_boot v3/v4 (fragments, table, bootconfig), dtbo, uImage (and the payload of it unpacked from its
+  compression), FIT, QCDT, flattened device trees, vbmeta, ELF boot, KRNL, ASUS blob, OSIP, ChromeOS blobs -- and, later, the small images
+  below.
+
+Verified by the unit groups `console`, `layout` (every region that names a part: the bytes at `[offset, offset + size)` are that part, on
+images made with the builders of `abr`) and the CLI blocks of `tests/run_tests.sh`; the numbers of the single full run are at the end of the
+section "Judges, and who judges them".
+
+## Compression: levels, libraries, damaged streams (done, 5-14 Nov 2026)
+
+- **The level of every unpacked component is recorded and used again** (`f1ecebb`): `<part>_compression` and `<part>_level` (with
+  `<part>_level_basis` saying how it is known); `pack` compresses a changed component again at that level, an untouched one is replayed
+  byte for byte. bzip2 tells it in the header, gzip in the XFL byte and, without a mark, by making the same data again; lz4-legacy and zstd by
+  making the first block / the first 256 KiB again at the levels in use; xz, lzma, lz4 frame and lzo have no level in their stream (the usual
+  one is used) -- later `dbfb343` reads xz's from the dictionary of its first block and lzma-alone's `lc/lp/pb` and dictionary, and `9a26037`
+  lzo's from the lzop header. The second try of a build that did not fit its partition lifts the level to the densest the decoders take, also
+  for a component whose level is in the manifest.
+- **zlib as a codec** (`dbfb343`): what the logo of a MediaTek phone holds for each picture. It is never found by content (two bytes that any
+  data may start with): only a format that knows it is there, or `<part>_compression=zlib`, uses it.
+- **The libraries at their newest** (`9a26037`), after the user's remark of 9 Nov that the pinned versions were old (zlib 1.4, LZ4 1.11, "where
+  they worked on threads") and that LZO had been lost: `cmake/dependency_versions.cmake` names them -- zlib 1.4, LZ4 1.11.1, zstd 1.5.7,
+  xz 5.8.4, bzip2 1.0.8 (the last release; the CVE of 2026 is in `bzip2recover`, which is not built), LZO 2.10 -- `-DABR_<LIB>_VERSION=`
+  overrides one, `-DABR_DEPS_LATEST=ON` takes the newest release tag of every repository when cmake configures, `tools/check_deps.py` says
+  which pin is behind, and `.github/workflows/deps.yml` runs it every week and builds `abr` with `-DABR_DEPS_LATEST=ON` and runs the codec
+  unit tests on that (its first run found LZ4 1.11.1, which fixes an out-of-bounds write in `LZ4_resetStreamHC()` at levels 10 and up that
+  1.11.0 has).
+  *LZ4*: the frame compressor uses `nbWorkers` (the stream does not depend on the number of workers: the same bytes with 1, 2 and 8 threads at
+  levels 1, 3, 9 and 12 on 60 MB, on Linux and under wine). What 1.11 costs: the HC levels 10-12 and level 1 make other bytes than 1.9 did, so
+  the level of an LZ4-legacy ramdisk that an older `lz4 -l -12` made (Android's build) is no longer found; an unedited part keeps its bytes, an
+  edited one is made again at level 12. *LZO* (lost since the first versions, which had miniLZO only): `third_party/lzo/` is the LZO1X family
+  of LZO 2.10, unmodified (nemequ/lzo mirror, "Release 2.10"); levels are lzop's (1, 2-6, 7-9 = LZO1X-999 at that level; the default and the dense
+  level are 9, what the kernel's build uses); 256 KiB blocks on parallel threads, joined in order. Judged by the real `lzop` 1.04 on eight
+  inputs at `-1`, `-3`, `-7`, `-8` and `-9`: the blocks are the same bytes (the optimizer `lzo1x_optimize()` that lzop runs on levels 7-9
+  was what a first version missed).
+- **A stream that is cut short is told** (`5f22c7e`): measured on every codec, zstd, xz, lzma, bzip2 and lzo refuse a cut stream; gzip, zlib
+  and lz4 frame returned what they had decoded without a word and lz4-legacy returned nothing. `decompress()` has an optional `damage`
+  string; `unpack` warns for each component whose stream is not whole and says what `pack` does (an untouched one puts the stored bytes
+  back, an edited one is packed as a whole stream of the data in it); `info` marks it in the table. A whole stream with other bytes behind it
+  (zeros, a pad of 0xFF, a device tree behind a kernel) is not a damaged one.
+
+Not done, and said: xz is written with CRC32; an LZMA-alone repack writes "size unknown" with an end marker; the lz4-legacy levels below
+12 that an older `lz4` made are not recognised (above).
+
+## The small firmware images of MediaTek and Qualcomm chips (done, 7-14 Nov 2026)
+
+The user's request (2 Nov): `abr` should unpack the small firmware images -- preloader, logo, modem, splash and so on -- of MediaTek and
+Qualcomm chips. On 7 Nov the user pointed at their own C++20 `mtklogorepacker` and `md1img_repacker` as a base (an own implementation in
+C++26, the narrow places fixed) and at a gist about the partitions of MediaTek firmware that might help. The layouts are those of the tools
+and loaders that make and read the images, all of them public (README.md, "What the sources of these formats are": MediaTek's `part_hdr_t`
+and the GFH definitions of U-Boot's `tools/mtk_image.h`, the user's two tools -- the table of picture sizes of `mtklogorepacker` is in
+`src/mtkimg.cpp` -- coreboot's `mbn_tools.py` and `qtestsign`, `logo_gen.py`, Magic-Splash-Wand, ...); they were read from read-only clones
+(`git clone --depth 1`) and none of their code is in `abr`. The formats and their limits are in README.md ("Small firmware images of
+MediaTek and Qualcomm chips" and the sections after it). Here: the decisions, and what was not seen.
+
+- **`mtk_image`** (`9281edf`, `3cbf2fc`): the 512-byte partition header (`0x58881688`, with the extension `0x58891689`) of `md1img`, `lk`, `tee`,
+  `scp`, `sspm`, `logo`, ...: every section a file with its compression taken off, the header fields kept in the manifest
+  (`section<i>_*`), the alignment that placed the next header and the padding; an edited section moves the next ones; `pad_to` is a floor (a
+  partition that is bigger than the content is kept as it is). A section that is a table of pictures (the logo) is a folder of PNG files: the
+  pixel format is guessed from the sizes (`bgra8888`, `rgb565`, `bgr888`), the size of a picture from a table of the resolutions of MediaTek
+  logos, a constant alpha is a manifest key, the zlib level is detected, a picture whose pixels did not change goes back as the very stream
+  it was (`.abr_raw`), also when an editor re-saved the PNG. `abr::png` (`a5740f7`) is `abr`'s own PNG reader and writer (no libpng), judged
+  by Pillow and ImageMagick. Limits of memory: 64 MiB a picture, 512 MiB the table. *No image of a MediaTek phone was at hand.*
+- **MTK sub-header on a kernel or ramdisk of a boot image** (`6e660c9`): a header that is not the plain one is kept as a file
+  (`kernel.mtk_header`, ...; `<part>_mtk_header_file`, `<part>_mtk_size_extra`); fields as in the loader's `part_hdr_t`. *Not seen on a
+  device image.*
+- **`mtk_preloader`** (`661df15`): the GFH chain (`FILE_INFO`, `BL_INFO`, `BROM_CFG`, `ANTI_CLONE`, `BROM_SEC_CFG`, `BL_SEC_KEY`, ...) with
+  the device header and the BRLYT in front in a partition image; `FILE_INFO` is read as fields (`hdr_size`, `total_size`, `sig_size` are made
+  again), the other headers are kept as bytes (`headers.bin`), the SHA-256 trailer (`sig_type` 1) is made again where it was that hash when
+  the image was read, other kinds (3 and 5, which the real files carry) are kept with a warning when the image changed. Judged by five real
+  preloaders from the public mtkclient loader collection (each comes back byte for byte); the other 833 files of that collection are the
+  `MTK_BLOADER_INFO` record alone, which `abr` names and refuses. *The SHA-256 trailer was seen only on hand-built images.*
+- **Qualcomm MBN** (`4087f28`, `70675a2`): flat images (headers v3/v5/v6/v7 and the 80-byte SBL header: metadata, code or the table of hashes, the
+  signature, the certificate chain, the slack up to `image_size`) and ELF32/ELF64 with a hash segment (the hash table is recognised only where
+  `abr` makes exactly that table: SHA-1, SHA-256, SHA-384, one hash per page for a paged segment). Sizes and pointers are made again where they were
+  derived and kept where they were not; a layout that is not tidy is kept as a skeleton. `info` shows the header, the parts and the
+  certificate chain (subjects, the OU attributes SW_ID, HW_ID, ...). **`abr` cannot sign**: after an edit `pack` says that the old signature no
+  longer matches and leaves it. Split firmware (`.mdt`) and the NAND SBL preamble are recognised and explained, not opened. *Built by an
+  independent Python writer and verifier (24 images in the first version of the driver); no MBN of a phone was at hand.*
+- **Picture partitions** (`8b0be43`, `607e6f1`): Qualcomm `SPLASH!!` (one picture, or a table of up to 25; RLE24 or raw; the RLE24 writer is a
+  transcription of `logo_gen.py`'s, equal except for a picture one pixel wide), OPLUS `SPLASH LOGO!` (BMP pictures in gzip streams, the
+  `DDPH` preamble kept), Xiaomi `LOGO!!!!` (pictures as they are, whole 4 KiB units), Motorola `MotoLogo` (MotoRun pictures as PNG, others
+  as files, empty slots kept). Found with the two real Qualcomm samples (`mm_splash.img`, `lp_splash.img`): their header says 0 blocks; that
+  is now read and kept. Non-dense OPLUS / Xiaomi / non-aligned Moto layouts are refused with the reason. *Only the two Qualcomm samples are
+  real; the others are the layouts of the sources.*
+- **QCDT** (`8fab3fe`, `456abfe`): the Qualcomm device tree table (what `dtbTool` makes; versions 1-3) as a file for every tree and the
+  entries in the manifest; made from a folder of `.dtb` files by `dtbTool`'s rules (entries from `qcom,msm-id`, `qcom,board-id`,
+  `qcom,pmic-id`, sorted, every tree once, the page filled up, a whole page behind a tree that ends on one). A table that is not what
+  `dtbTool` makes is refused by `unpack` with the reason. **Judged by the real `dtbTool`** (the Code Aurora one, LineageOS/
+  android_device_qcom_common at a pinned commit, built by `.github/scripts/build_oracles.sh`, not part of this repository): from the first
+  day in narrow runs (20 tables of 4 folders, versions, page sizes, forced versions: the same bytes), and since 16 Nov inside the suite
+  (`qcdt_live.py`, `ABR_DTBTOOL`, required by the CI): 12 tables, among them the two trees of a real boot image, which make that image's
+  table again. The table of that image (`boot_lk2nd.img`, version 2, 9 entries, 2 trees) is the only real one.
+- **dtb partitions** (`a6ba735`, `3c48636`): trees at multiples of an alignment with zeros between them are separate trees (`blob_align` is the
+  smallest alignment that explains all the gaps, which may not be the one the maker used; `blob<N>_pad` for gaps that follow no rule); what
+  follows the trees is `tail.bin`, up to the fill of the partition (`pad_byte`, `pad_to`); an AVB hash footer at the end of the partition is
+  understood like the one of dtbo and boot (the hash is made again after an edit; `avbtool verify_image` judges the result).
+- **FAT volumes and GPT files** (`14e4d37`): named with their variant and size (a FAT volume by its boot sector and the number of clusters; a GPT
+  by `EFI PART` at 512 or 4096), not unpacked: the modem partition (`NON-HLOS.bin`) is usually FAT. *Unpacking FAT is not implemented; it
+  would be the next extension.*
+
+## Judges, and who judges them (15-16 Nov 2026)
+
+- **The live drivers** (`tests/tools/`): `mtk_live.py`, `mbn_live.py`, `splash_live.py`, `rle_parity.py`, `qcdt_live.py`, `dtb_live.py`,
+  `png_oracle.py`, with their writers (`mk_mtk.py`, `mk_gfh.py`, `mk_mbn.py`, `mk_splash.py`, `mk_fatboot.py`, `qcdt_check.py`) that share no
+  code with `abr`, and the harness `livelib.py` (runs `abr`, counts checks, damages an image -- cut short, bytes changed -- and demands that
+  `abr` refuses it with a message or takes it and gives back what it took). `run_tests.sh` runs them (`ABR_LIVE_MUTANTS` sets the number of
+  damaged images; 6 under wine) and the fuzzers take every one of these images as a seed. Pillow and `cryptography` are judges of the suite
+  (`ABR_REQUIRE_ORACLES` in the CI names them; so it names `dtbtool` now).
+- **The judges are judged** (16 Nov): `tests/tools/sabotage_check.sh <abr> <directory>` runs the six drivers that run `abr` against the real one
+  and against two copies of it (`tests/tools/abr_sabotage.py`) that change ONE byte -- in the image `pack` wrote, or in the biggest file
+  `unpack` wrote. Result of the run of 16 Nov (6 drivers x 3, `ABR_LIVE_MUTANTS=2`): every driver passes with the real `abr` and fails with
+  both copies; the lines that say so (`pack` / `unpack` copy): splash 94 / 3, rle 8 / 2 (`DIFFERENT`; and the CRC check of `abr`'s own PNG
+  reader), mbn 81 / 35, mtk 33 / 46, qcdt 45 / 10 (with the real `dtbTool` at hand), dtb 22 / 26. (The first run of the idea, by a throwaway
+  wrapper the day before, gave the same verdicts.) `png_oracle.py` is not among the six: it runs the unit-test binary, not `abr`.
+- **What reaches a terminal** (15 Nov): the sanitizer fuzz (ASan+UBSan build, `fuzz_images.py`) found, in its first campaign (3853 runs), three
+  `terminal` findings: `info` of a MotoLogo image printed the control bytes of a picture name raw in the layout table. The same exposure was
+  in the names of vendor ramdisk fragments, FIT images, OSIP command lines, MTK section names, MBN certificate subjects and OPLUS names.
+  Fixed at the root: `textquote::escape_for_terminal` (control characters including tab and newline, C1 controls and bytes that are not UTF-8 as `\xNN`)
+  is applied to every cell of the layout table, and the name column is cut on a UTF-8 boundary. Regression tests: the unit test
+  `test_text_of_images` (hostile names through `layout::render` for Moto, vendor_boot v4 and OPLUS; group `layout` 7006 checks) and
+  section 4 of `splash_live.py` (names with control bytes in the three containers: `info`, `unpack` and `pack` print nothing a terminal
+  would act on, and the repack is the image; the section fails on the binary without the fix: 45 checks). The campaign after the fix: **8480
+  damaged images, 30 837 runs under ASan+UBSan, no finding**; where an unpacked image did not come back from `pack` as the image (dtb 138,
+  ELF boot 36, splash 3), `abr` had said so every time (silent: 0).
 
 ## Next steps (in order)
 
