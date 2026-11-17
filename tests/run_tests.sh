@@ -7595,6 +7595,14 @@ else
     echo "SKIP: the PNG comparison with Pillow (Pillow or abr_unit_tests is not there)"
 fi
 
+# ---- the console: what a person at a terminal sees. Lines that fit the screen (ABR_COLUMNS, and a pseudo terminal of 56 columns -- a phone's)
+# with the numbers kept in a column, the tables made for a narrow screen, the help; and the progress bar, which stays where it is while what the
+# command says waits for its end. (The pseudo terminal runs are a SKIP note under wine and under an emulator, which have no pty to give.)
+rm -rf lv_console_work
+live_driver "console: lines that fit a narrow screen, the tables and the help made for it, the bar that stays where it is while the lines wait for the end of the command" \
+    lv_console.log python3 -I "$TOOLS/console_live.py" "$ABR" lv_console_work
+grep -h '^SKIP' lv_console.log 2>/dev/null
+
 # ---- file systems and partition tables are told apart from images abr opens, and explained
 rm -rf lv_fat
 if live_make "FAT and GPT samples" lv_fat_make.log python3 -I "$TOOLS/mk_fatboot.py" lv_fat; then

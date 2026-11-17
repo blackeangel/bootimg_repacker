@@ -44,7 +44,7 @@ tools" below.
 | bundled MD5 and SHA-1/256/384/512 | **done**, self-test passes, catches its own transcription bug once already (see Verification below); MD5 and SHA-384 (the hash nodes of a FIT image) are checked against vectors from Python's `hashlib` |
 | self-contained RSA: BigInt (Knuth D, Montgomery), DER/PEM/X.509, PKCS#1 v1.5 sign/verify, PKCS#8/PKCS#1 key parsing, AVB public-key blob -- **no OpenSSL anywhere in the build** | **done + verified** (Python integers, `openssl dgst -sign`, `avbtool extract_public_key`; see "Self-contained crypto" below) |
 | the command line: `abr unpack` / `pack` / `info` / `help` / `version` (`-i`, `-o`; names made beside the input; everything found by the content; keys of signatures from the folder or the built-in test keys; version `1.YYYYMMDD.N`) | **done** (3-5 Nov 2026): see "The command line, the console and the tables of offsets" |
-| console: one thread writes, the others work; a coloured progress bar; offsets and sizes of every part on the console and in `manifest.txt` (`layout_*`), for every format | **done + unit-tested** (groups `console` and `layout`): the table is made from the bytes read again, so `unpack`, `pack` and `info` say the same numbers |
+| console: one thread writes, the others work; a coloured progress bar that stays where it is while the lines of the command wait for its end; lines and tables that fit the width of the terminal; offsets and sizes of every part on the console and in `manifest.txt` (`layout_*`), for every format | **done + tested** (unit groups `console` and `layout`; the live driver `console_live.py`, 118 checks, with a pseudo terminal of 56 columns): the table is made from the bytes read again, so `unpack`, `pack` and `info` say the same numbers; the changes of 16-17 Nov are in "The console again" |
 | MediaTek small images (`md1img`, `lk`, `tee`, `scp`, `sspm`, `logo`, ...): the 512-byte partition header, sections with their compression taken off, the pictures of the logo as PNG; the MTK sub-header of a kernel/ramdisk | **done** (7-14 Nov 2026), judged by independent writers and readers (Python, Pillow) on images built from the layouts of the sources; **no image of a MediaTek phone was at hand** |
 | MediaTek preloader (the GFH chain; the SHA-256 trailer made again, other signatures kept) | **done** (8 Nov 2026): the 5 full real preloaders of the public mtkclient collection come back byte for byte (the other 833 files there are the `MTK_BLOADER_INFO` record alone: named and refused); the SHA-256 trailer seen on hand-built images only |
 | Qualcomm MBN (flat v3/v5/v6/v7/SBL and ELF with a hash segment; hashes made again, signature and certificates kept) | **done** (9 Nov 2026) on images of an independent Python writer; **no MBN of a phone was at hand; `abr` cannot sign** |
@@ -55,7 +55,7 @@ tools" below.
 | what reaches a terminal from the tables of an image (picture names, certificate subjects, ...) | **done** (15 Nov 2026): the cells of the layout table are escaped; unit and live regression tests; sanitizer fuzz after the fix: 30 837 runs, nothing |
 | the judges are judged: every live driver fails against an `abr` that changes one byte of what `pack` or `unpack` wrote | **done** (16 Nov 2026): `tests/tools/sabotage_check.sh` |
 | CMake: FetchContent-vendored static zlib/lz4/zstd/xz/bzip2 | **done + build-verified natively on Linux**, both the dynamic and the `-DABR_STATIC_BINARY=ON` fully-static configurations |
-| Test suite (`tests/run_tests.sh`) | **done**; the last full runs (those of "Streams, decoders and names"): 490/490 on g++-14 (all judges required, as in the CI) and under AddressSanitizer + UndefinedBehaviorSanitizer (no report); the clang-20 and wine runs are older (at 483 checks: 474/474 on clang-20 -- the nine "the judge is there" checks belong to `ABR_REQUIRE_ORACLES`, which that run did not set --, 481/481 for `abr.exe` under wine, the suite with the 14 real images and AIK's magic file 487/487). Since then the groups of the FIT work (ten blocks, 152 checks of the CLI; the unit groups `fdt` and `fit`) have been run on their own only: the whole matrix is run once, after the work on formats is done (see "Next steps"). CI runs the matrix (g++-14, clang-20, ASan+UBSan with a fuzz run, Windows under wine, arm64 under qemu-user, android-arm64) -- see Verification |
+| Test suite (`tests/run_tests.sh`) | **done**; the last complete run is the CI's run 44000758114 (commit `2cfef05`, 16 Nov): all six jobs green, 535 passed and 0 failed on x86-64 (g++-14 with all judges required, clang-20, ASan+UBSan with a fuzz run), 534 for arm64 under qemu-user. Since then: the console work of 17 Nov (unit groups `console` and `layout`, the live driver `console_live.py`: 118 checks) has been run on its own; the local full run of that day was cut short by a pause in the block of the real images (506 passed, 0 failed up to there). The whole matrix is run once more when the work of 17 Nov (device trees as text, the kernel) is done -- see "Next steps". CI runs the matrix (g++-14, clang-20, ASan+UBSan with a fuzz run, Windows under wine, arm64 under qemu-user, android-arm64) -- see Verification |
 | CMake cross toolchains (mingw-w64, Android NDK) | **done + verified** (mingw reproduced locally; NDK only provable via CI, see below) |
 | GitHub Actions static build matrix (linux-x86_64, windows-x86_64, android-arm64) | **done + verified**: run 35313499827, all 3 jobs green, all 3 static binaries produced as artifacts (abr-linux-x86_64, abr-windows-x86_64, abr-android-arm64) |
 
@@ -2320,30 +2320,83 @@ MediaTek and Qualcomm chips" and the sections after it). Here: the decisions, an
   damaged images, 30 837 runs under ASan+UBSan, no finding**; where an unpacked image did not come back from `pack` as the image (dtb 138,
   ELF boot 36, splash 3), `abr` had said so every time (silent: 0).
 
+## The console again: a bar that stays, lines that fit (16-17 Nov 2026)
+
+The user's report of 16 Nov (a phone, 56 columns, `abr unpack -i vendor_boot_ofox.img`): the bar looked good, but while the command
+printed its information the bar jumped -- first on top, then below the table -- and the information was a mess, because the lines
+were wider than the screen and the terminal broke them in the middle of words. Two ways were offered: print everything at the end, or
+find something that looks right; and "the information in a column".
+
+What was wrong: the printer took the bar away for every line and drew it again below, so the bar went down the screen with the
+output, and the tables were made for 80 or more columns whatever the terminal was.
+
+What it does now (`include/abr/console.hpp`, `src/console.cpp`, `src/layout.cpp`, `src/main.cpp`):
+
+* **The bar stays and the lines wait.** While the bar is on the screen and the command is in progress (`progress::snapshot().active`), what
+  the command writes to that screen is kept (`held`), and comes out in one piece -- the bar taken away first -- when the command is over
+  or the printer stops. A pipe gets the same lines in the same order as before (checked byte for byte against the build before, for
+  `unpack` and `info`). A flood (more than `kHeldLimit`, one mebibyte) is not made to wait: it comes out at once, the bar away for it and
+  drawn again below. The stream that is not on the bar's screen (stdout redirected, stderr a terminal) is not held. `ABR_PROGRESS=always`
+  draws the bar at once also where the output is no terminal, so that the tests can see it.
+* **Lines that fit.** `console::wrap` (words, the blanks between words kept, the blanks at a break dropped; a path broken behind a `/`,
+  else behind `- _ . , ; : = + @`, else where the room ends; UTF-8 characters, never bytes; parentheses kept together for the cells of a
+  table) and `console::wrap_message` (a line that fits is left alone; else the continuation lines are indented under the value of a
+  `key:   value` line -- the key at most 24 characters, the value starting before the middle of the line -- and by two blanks more than the
+  line has otherwise). The printer does this for a terminal (or for `ABR_COLUMNS=N`, which makes a pipe do it too); tabs are
+  expanded to 8 first; `ABR_UNFILTERED_OUTPUT=1` turns it off with the escaping.
+* **Tables for a narrow screen.** `layout::render(layout, indent, columns)`: the wide table where the widest line fits, else the stacked
+  one -- the numbers (`0xOFFSET`, the size right-aligned) in a column of their own, the name beside them when there is room (14 characters
+  at least) or under them, the notes wrapped under the name. Nothing of what the wide table says is left out (a test checks that the
+  words come in the same order).
+* **`abr help`** is set for the terminal too: paragraphs reflowed to the width (at most 100), the table of commands side by side where it
+  fits and stacked (the usage line, the description indented under it) where it does not.
+* **`console::columns(fd)`**: `ABR_COLUMNS` (1 to 9999) before the terminal's width (ioctl, the console API of Windows), then `COLUMNS`, else 80;
+  0 for a pipe or a file, so that what a script reads is the same everywhere. A bad `ABR_COLUMNS` (`abc`, `0`, `-3`, empty, too long) is
+  not a width and is ignored.
+
+How it was checked:
+
+* unit group `console`: `test_wrap` (hand-computed examples and 6000 random cases of the properties -- no line wider than the width, the
+  characters of the text in order, no blank at the end of a line, valid UTF-8, the indent is the one asked for), `test_hold` (the bar's
+  frames have no line break; the held lines come after the erase and nothing after them; a line written when no command is in progress is
+  not held; the flood comes out early), `test_printer_wrap` (a pipe is not wrapped; `ABR_COLUMNS=30` wraps; the hang under the value;
+  tabs; an ESC counts as the four characters of its escape; unfiltered output is not wrapped; the cases of `columns()`); group `layout`:
+  `test_text_narrow` (hostile names and big offsets at the widths 40 to 160).
+* `tests/tools/console_live.py` (118 checks, in the suite): `info` and `unpack` at 40/56/80/120 columns on a pipe (no line wider than the
+  columns, the words and the numbers of the plain text, the stacked table of a boot image), the real images (`ABR_REAL_IMAGES`) at 40/56/80,
+  the help at five widths, and a pseudo terminal of 56 columns with a slow image: the bar is drawn at least twice (else a SKIP note), taken
+  away once, no line break while it is there, nothing after the last line but the end of the line, and the text is the plain one.
+  Skipped under wine, under an emulator and where there is no pty.
+* sabotage: the unit tests fail on a build where the lines are not held (3 checks), where the flood valve is gone (3), where the group
+  limit of `wrap` is `width - next` (the real bug found while writing the test; 3); the live driver fails where the narrow table is off
+  (4 checks), where the continuation lines have no hang under the value (1 -- it **survived** the first version of the driver, which only
+  compared squeezed texts; a check of the indent of the `cmdline` line was added) and where the bar is drawn after the end (8; the first
+  mutant of this was an equivalent one, because `render_bar` of an inactive snapshot is empty, and the driver counted a bar that was
+  never taken away as a run that was too short: that is a failure now, and `draw_bar` no longer remembers a bar it did not draw).
+
+Not changed on purpose: the `file:`/`format:` labels of `info` stay as they are (tests and scripts read them). Not done: a terminal that
+changes its size while the command runs is not followed (the width is read for every write, so the next lines are right,
+and what was held is wrapped when it comes out, for the width of that moment).
+
 ## Next steps (in order)
 
-1. The formats that are left, in this order, one commit each and only
-   narrow checks until all of them are in (the user's order of 31 Oct):
-   QCDT creation (`dtbTool` v1-v3: a
-   table of the dtbs of a directory, chosen by `qcom,msm-id` /
-   `board-id` / `pmic-id`); MBN and the Qualcomm ELF loaders (the hash
-   segment, a SHA-256 per segment, the signature and the certificate chain
-   kept and named when what they cover changed); CPIO odc/binary as trees
-   and hard links; `loki patch`; what is left of dtb/MTK (an AVB footer on a
-   dtb, blobs separated by padding, the raw MTK header). Then one full run
-   of the whole matrix (see below). The stages 2 and 3 of the user's own
-   spec need a scope decision before anything is built (asked, not yet
-   answered).
-2. Housekeeping: AIK-like default levels as an opt-in, gzip OS-byte
-   determinism, `zlib-ng` for faster gzip, splitting `main.cpp`.
-3. Run the CI matrix on every push (the workflow only runs on `main`, pull
-   requests and manual dispatch: dispatch it with
-   `gh api -X POST repos/<repo>/actions/workflows/build.yml/dispatches -f ref=<branch>`).
+1. The user's requests of 17 Nov 2026, in this order (one commit per step; narrow checks while they are built, then the one full run):
+   a. **The device trees as text wherever they are.** An own `dtc` -- the whole language except the C preprocessor, `dtc` 1.7 stays the
+      judge -- behind a standalone dtb, the dtb of boot (v2) and vendor_boot (v3/v4), the entries of a dtbo and of a QCDT, the device trees
+      of a FIT: `unpack` writes `entryN.dts`, `pack` compiles it (the bytes `unpack` read when the text is the one it wrote).
+   b. **Deeper than the first layer** for everything that has more inside it (the kernel, and what else `unpack` leaves as a file that a person
+      cannot read or edit).
+   c. **`kernel_info/`**: what can be learnt from the kernel -- the build configuration, the symbol table, the binaries glued to it, the
+      initramfs inside it, the keys, the text metadata -- in a folder of its own that `pack` never reads.
+2. Then the one full run of the whole matrix, with the CI on all six jobs.
+3. Housekeeping: AIK-like default levels as an opt-in, gzip OS-byte determinism, `zlib-ng` for faster gzip, splitting `main.cpp`, an atomic
+   write of the manifest block that `pack` rewrites.
+4. Not done, on purpose: CPIO odc/binary as trees and hard links, `loki patch`.
 
-CI status of the branch: the newest run is 40763274252 (commit `ee11ff0`): five jobs green and the fuzz step of the ASan job red
-(a `terminal` finding, fixed in `501d515`); `501d515`, `5cb929f`, `57e8331` and the FIT work have had **no CI run** -- the next one
-is part of the matrix that is run once after the formats are done. The run before it, 40145515015 (commit `04d347c`, the bytes
-behind a uImage), was green on all **six** jobs: the
+CI status of the branch: the newest run is 44000758114 (commit `2cfef05`, 16 Nov): all six jobs green -- 535 passed and 0 failed on
+x86-64 (g++-14, clang-20, ASan+UBSan), 534 for arm64 under qemu-user; the console work of 17 Nov and what follows have had **no CI run**
+yet. Before it: 40763274252 (commit `ee11ff0`) had five jobs green and the fuzz step of the ASan job red (a `terminal` finding, fixed
+in `501d515`); 40145515015 (commit `04d347c`, the bytes behind a uImage) was green on all **six** jobs: the
 annotations of the jobs say "462 passed, 0 failed" for linux g++-14, clang-20, the ASan+UBSan build and arm64 under qemu-user,
 "461 passed, 0 failed" for Windows under wine; android-arm64 only builds. The run before it, 40123468084 (commit `780f063`,
 padding behind the components), was green on the same six (447 passed, 446 for Windows); 40038351307 (commit `7bccfc0`, the

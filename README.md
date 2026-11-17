@@ -91,7 +91,8 @@ one file per component (kernel, ramdisk, dtb, ...) into the output
 directory. Edit whatever you need to, then `pack`.
 
 The environment variable `ABR_THREADS=N` limits the number of threads (the result never depends on it); `NO_COLOR` and
-`ABR_PROGRESS=0` turn the colours and the progress bar off, see *Threads, console and progress* below.
+`ABR_PROGRESS=0` turn the colours and the progress bar off, and `ABR_COLUMNS=N` sets the width the lines are made for, see
+*Threads, console and progress* below.
 
 `pack` reads what you edited strictly, and says which key and which value it will not take (it writes nothing then).
 A number is decimal digits, or `0x` and hexadecimal digits (`010` is ten, not eight): no sign, no unit, no text behind it,
@@ -827,12 +828,24 @@ write again byte for byte -- and `info` says what is different.
 that is written to the standard output and the standard error goes to a thread of its own, the only one that touches the terminal
 (or file, or pipe): the threads that work never wait for it, a line is never torn by another one's, and the lines come out in the
 order they were written. On a terminal that thread also draws a coloured **progress bar** on the last line -- a gradient, the share
-that is done, the stage and the jobs in progress, the time -- and takes it away for every line that is written and at the end, so that
-what is written is what a pipe would have got. Where the output is not a terminal there is no bar, only the lines.
+that is done, the stage and the jobs in progress, the time. The bar **stays where it is**: what the command says while the bar is
+on the screen (the offsets and sizes, the warnings) is kept and comes out in one piece, after the bar is taken away, when the command
+is over -- a bar that is taken away for every line and drawn again below it jumps about the screen. What comes out is what a pipe
+would have got, line for line (a command that says more than a mebibyte meanwhile is not made to wait for the end: that comes out at
+once, the bar away for it). Where the output is not a terminal there is no bar, only the lines.
+
+The lines fit the screen: a line that is longer than the terminal is broken at its blanks (never in the middle of a word; a path is
+broken behind a `/`) and the rest of it is indented under the value of a `key:   value` line, so that a phone's 56 columns show a
+column and not a mess. The table of `info` and of `unpack` (offset, size, part) is the wide one where it fits, and a stacked one where
+it does not: the numbers in a column of their own, the name beside them or under them, the notes under that. Where the output is not
+a terminal nothing is broken and the tables are the wide ones, so that what a script reads is the same everywhere; `abr help` is set
+for the width of the terminal as well.
+
 `NO_COLOR=1` turns the colours off (the bar is drawn in plain characters), `ABR_PROGRESS=0` (also `never`, `off`, `no`, `false`) turns
-the bar off, `ABR_PROGRESS=always` draws it where the output is no terminal (the tests of the bar do that; `ABR_COLUMNS=N` is the
-width then), and `ABR_UNFILTERED_OUTPUT=1` turns off the filter that writes what a terminal would act on -- a control character in a
-name that an image holds -- as an escape.
+the bar off, `ABR_PROGRESS=always` draws it at once also where the output is no terminal (the tests of the bar do that),
+`ABR_COLUMNS=N` (1 to 9999) is the width the output is made for in place of the terminal's -- it breaks the lines of a pipe too --,
+and `ABR_UNFILTERED_OUTPUT=1` turns off the filter that writes what a terminal would act on -- a control
+character in a name that an image holds -- as an escape (and the breaking of lines with it).
 
 The work uses several cores where that pays: the components of an image (kernel,
 ramdisk, each vendor ramdisk fragment, ...) are decoded, hashed and written
