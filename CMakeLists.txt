@@ -87,6 +87,31 @@ if(ABR_SANITIZE)
   message(STATUS "abr: built with -fsanitize=${ABR_SANITIZE}")
 endif()
 
+# ---------------------------------------------------------------------------
+# Size of the executable.
+#
+# A build that is given no type gets no optimisation at all (and, with the Android NDK, debug information as well): the executable that comes out
+# is several times the size it has to be. So Release is what an empty CMAKE_BUILD_TYPE means here, and the abr executable of a Release or
+# MinSizeRel build is stripped when it is linked: the symbol table and the debug sections of abr and of every library in it are left out
+# (`-s`; GNU ld, lld and gold all take it, for ELF and for the MinGW targets). What stays is what runs.
+#
+#   -DABR_STRIP=OFF            keeps them, for a debugger (a Debug or RelWithDebInfo build is never stripped either, and a build with
+#                              ABR_SANITIZE is not: a report of a sanitizer names the functions through the symbol table)
+#
+# Every function and every datum of the sources of abr and of its libraries is also put in a section of its own and the linker drops the sections
+# that nothing refers to (--gc-sections), so what a library has that abr does not call is not in the file.
+# ---------------------------------------------------------------------------
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Release, MinSizeRel, RelWithDebInfo or Debug (Release when empty)" FORCE)
+endif()
+option(ABR_STRIP
+       "Strip the symbols and the debug information from the abr executable when it is linked (Release and MinSizeRel builds without sanitizers). Turn OFF to keep them for a debugger." ON)
+set(ABR_GNU_LINKER OFF)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT APPLE AND NOT MSVC)
+  set(ABR_GNU_LINKER ON)
+  add_compile_options(-ffunction-sections -fdata-sections)  # (for every target made from here on: the vendored libraries too)
+endif()
+
 option(ABR_VENDOR_DEPS
        "Build zlib/lz4/zstd/xz/bzip2 (fetched) and LZO (third_party/lzo) statically from source (the shipping default). Turn OFF to use system dev packages instead, for fast local iteration." ON)
 option(ABR_DEPS_LATEST
@@ -228,6 +253,12 @@ add_executable(abr src/main.cpp)
 target_include_directories(abr PRIVATE "${CMAKE_BINARY_DIR}/generated")
 target_link_libraries(abr PRIVATE abr_core)
 abr_link_statically(abr)
+if(ABR_GNU_LINKER)
+  target_link_options(abr PRIVATE "$<$<CONFIG:Release,MinSizeRel,RelWithDebInfo>:LINKER:--gc-sections>")
+  if(ABR_STRIP AND NOT ABR_SANITIZE)
+    target_link_options(abr PRIVATE "$<$<CONFIG:Release,MinSizeRel>:LINKER:--strip-all>")
+  endif()
+endif()
 
 if(ABR_BUILD_TESTS)
   add_executable(abr_unit_tests tests/unit/crypto_test.cpp tests/unit/par_test.cpp tests/unit/cpio_test.cpp

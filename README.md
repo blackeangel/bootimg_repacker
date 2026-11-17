@@ -1052,6 +1052,13 @@ fields is what `loki_tool patch` makes of the plain image the same directory
 builds without the patch. (No real LOKI image has been tried: none was at hand.)
 
 The ChromeOS kernel blobs are judged by a Python tool of the suite (`tests/tools/chromeos_tool.py`, written from
+**Size of the executable.** A build with no `CMAKE_BUILD_TYPE` is a Release build here (without a type the compiler is given no
+optimisation, and the Android NDK adds debug information). The `abr` of a Release or MinSizeRel build is **stripped** when it is linked
+(`--strip-all`: no symbol table, no debug sections, for `abr` and for every library in it), and the linker drops every function and datum
+that nothing refers to (`--gc-sections`, with `-ffunction-sections -fdata-sections` for abr and the libraries). On Linux x86-64, static,
+g++-14, `-O3`: 7.2 MB before, 5.6 MB after. `-DABR_STRIP=OFF` keeps the symbols for a debugger; a Debug or RelWithDebInfo build is not
+stripped, nor is one with `-DABR_SANITIZE` (the reports of a sanitizer name the functions through the symbol table).
+
 vboot_reference's `2struct.h` and `cmd_vbutil_kernel.c`, its RSA is Python's own integers) and, where `futility` is
 installed (`ABR_FUTILITY`, or on the `PATH`; the CI installs `vboot-kernel-utils`), by the real `futility vbutil_kernel`.
 Nine kinds of blob -- the preambles 2.0, 2.1 and 2.2; RSA keys of 1024, 2048, 3072 and 4096 bits, public exponents 65537
