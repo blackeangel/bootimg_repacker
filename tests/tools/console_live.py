@@ -152,6 +152,16 @@ def pty_run(argv, columns, env, rows=50, timeout=120):
     return p.wait(), bytes(data)
 
 
+def wrapped_for_emulator(abr):
+    """tests/run_tests.sh runs a Windows build under wine, and any build under ABR_RUNNER, through a small shell script that it names `abr`."""
+    try:
+        with open(abr, "rb") as f:
+            head = f.read(512)
+    except OSError:
+        return False
+    return head.startswith(b"#!") and (b"wine" in head or b"qemu" in head)
+
+
 def main():
     abr, work = sys.argv[1], sys.argv[2]
     live = Live(abr, work)
@@ -178,9 +188,16 @@ def main():
         for columns in (40, 56):
             rc, text = live.run("info", "-i", small, env={"ABR_COLUMNS": str(columns)})
             lines = text.splitlines()
-            for name, note in (("header", "header version 0, 1632 bytes"), ("ramdisk", "gzip (472 bytes unpacked)")):
+            # (what is known of the ramdisk may say the level the gzip stream was made with, or not: that is for the zlib that made the fixture)
+            for name, note in (("header", "header version 0, 1632 bytes"), ("ramdisk", "gzip (472 bytes unpacked")):
                 at = [i for i, ln in enumerate(lines) if re.fullmatch(r"  0x[0-9a-f]{8}\s+\d+  " + name, ln)]
-                live.check(len(at) == 1 and at[0] + 1 < len(lines) and lines[at[0] + 1].startswith("      " + note),
+                under = []
+                if len(at) == 1:
+                    k = at[0] + 1
+                    while k < len(lines) and lines[k].startswith("      "):  # (the notes, indented under the name)
+                        under.append(lines[k].strip())
+                        k += 1
+                live.check(len(at) == 1 and bool(under) and squeeze(" ".join(under)).startswith(squeeze(note)),
                            "info at %d columns: the numbers and the name of %r are on a line, what is known of it is under them, indented" % (columns, name), text[-500:])
 
     # ---- help
@@ -220,7 +237,7 @@ def main():
             print("note: the console was tried on the info of %d images of %s" % (tried, real))
 
     # ---- a terminal
-    emulated = bool(os.environ.get("ABR_RUNNER")) or abr.lower().endswith(".exe") or os.environ.get("ABR_LIVE_NO_PTY")
+    emulated = bool(os.environ.get("ABR_RUNNER")) or abr.lower().endswith(".exe") or bool(os.environ.get("ABR_LIVE_NO_PTY")) or wrapped_for_emulator(abr)
     try:
         import pty  # noqa: F401
         have_pty = True

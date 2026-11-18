@@ -72,6 +72,7 @@ case "$ABR" in
         done
         ABR="$WORK/winebin/abr"
         UNIT_DEFAULT="$WORK/winebin/abr_unit_tests"
+        export ABR_LIVE_NO_PTY=1  # (wine has no pseudo terminal to give: the live driver of the console skips the runs that need one)
         echo "note: running the Windows build under $(wine --version 2>/dev/null)"
         ;;
     *)

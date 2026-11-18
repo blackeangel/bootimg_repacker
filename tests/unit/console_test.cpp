@@ -549,6 +549,18 @@ size_t count_of(const std::string& s, const std::string& part) {
     return n;
 }
 
+// Waits until `done()` holds, for 15 seconds at most: the printer is a thread of its own, and an emulator or a busy machine makes it late.
+// (A test that sleeps a fixed time and then looks fails there, and says nothing about the printer.)
+template <class F>
+bool wait_for(F&& done) {
+    const auto end = std::chrono::steady_clock::now() + 15s;
+    while (!done()) {
+        if (std::chrono::steady_clock::now() >= end) return false;
+        std::this_thread::sleep_for(10ms);
+    }
+    return true;
+}
+
 void test_hold() {
     set_env("ABR_UNFILTERED_OUTPUT", nullptr);
     set_env("ABR_PROGRESS", "always");
@@ -564,16 +576,19 @@ void test_hold() {
             progress::begin("pack", {{"a", 1}});
             progress::enter("a", 10);
             progress::advance(5);
-            std::this_thread::sleep_for(300ms);
+            EXPECT(wait_for([&] { return count_of(cap.buf.text(), "pack") >= 1; }));  // (the bar is on the screen)
             std::cout << "first\n";
             std::cerr << "second\n";
-            std::this_thread::sleep_for(300ms);
+            EXPECT(wait_for([&] { return count_of(cap.buf.text(), "pack") >= 3; }));  // (and goes on being drawn)
             const std::string meanwhile = cap.buf.text();
             EXPECT(meanwhile.find("first") == std::string::npos && meanwhile.find("second") == std::string::npos);
             EXPECT(meanwhile.find('\n') == std::string::npos);
             EXPECT(count_of(meanwhile, "pack") >= 3);  // (frames of the bar, one over the other: it did not move)
             progress::end();
-            std::this_thread::sleep_for(250ms);
+            EXPECT(wait_for([&] {
+                const std::string s = cap.buf.text();
+                return s.size() >= 7 && s.compare(s.size() - 7, 7, "second\n") == 0;
+            }));
         }
         const std::string text = cap.buf.text();
         const size_t first = text.find("first");
@@ -591,7 +606,7 @@ void test_hold() {
         {
             console::Printer printer;
             std::cout << "alone\n";
-            std::this_thread::sleep_for(250ms);
+            EXPECT(wait_for([&] { return !cap.buf.text().empty(); }));
             EXPECT(cap.buf.text() == "alone\n");
         }
     }
@@ -604,14 +619,19 @@ void test_hold() {
             progress::begin("pack", {{"a", 1}});
             progress::enter("a", 10);
             progress::advance(5);
-            std::this_thread::sleep_for(300ms);
+            EXPECT(wait_for([&] { return count_of(cap.buf.text(), "pack") >= 1; }));  // (the bar is on the screen)
             const std::string line(900, 'f');
             size_t sent = 0;
             while (sent <= console::kHeldLimit + 4000) {
                 std::cout << line << "\n";
                 sent += line.size() + 1;
             }
-            std::this_thread::sleep_for(400ms);
+            // (the lines come out, and the bar is drawn again under them; the printer may be late)
+            const auto came_out = [&](const std::string& s) {
+                const size_t last_line = s.rfind('\n');
+                return s.size() > console::kHeldLimit && last_line != std::string::npos && s.find("pack", last_line) != std::string::npos;
+            };
+            EXPECT(wait_for([&] { return came_out(cap.buf.text()); }));
             const std::string meanwhile = cap.buf.text();
             EXPECT(meanwhile.size() > console::kHeldLimit);  // (it came out)
             EXPECT(meanwhile.find("\r\x1b[2K" + std::string(40, 'f')) != std::string::npos);
