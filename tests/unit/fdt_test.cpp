@@ -15,9 +15,12 @@
 //     is canonical, build() gives the blob (8000 damaged blobs);
 //   * names are found in the strings block as libfdt finds them (the end of a longer name is a name), a name that is not there is
 //     added, and a tree that was made from text (no strings block yet) gets its names in the order of their use;
-//   * the text: every kind of value, comments, escapes, /bits/, octal and character numbers; what is not read says so with the
-//     line (labels, references, expressions, a node twice, a property twice, a property after a subnode, a second root, nesting
-//     above the limit, a number that does not fit); parse(print(tree)) is the tree, for 3000 random trees and for damaged text.
+//   * the text (dtc's language, read by abr's own compiler): every kind of value, comments, escapes, /bits/, octal and character numbers,
+//     labels and references, expressions, /include/, /incbin/, line markers, a node twice (merged), /delete-node/ and /delete-property/,
+//     phandles, /plugin/; what dtc refuses is refused with the line and dtc's words (a name or a label twice, a property after a
+//     subnode, a reference to nothing, a number that does not fit, a bad phandle, nesting above the limit, ...);
+//     parse(print(tree)) is the tree, for 3000 random trees and for damaged text. The bytes are judged against dtc itself by
+//     `abr_unit_tests dts-golden` (dts_test.cpp) and tests/tools/dtc_live.py.
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -645,29 +648,48 @@ void test_dts_syntax() {
     const Bad bad[] = {
         {"/ { };", "starts with /dts-v1/"},
         {"/dts-v1/ / { };", "expected ';'"},
-        {"/dts-v1/;\n/ {\n  l: n { };\n};", "labels are not read"},
-        {"/dts-v1/;\n/ {\n  a = <&ref>;\n};", "reference"},
-        {"/dts-v1/;\n/ {\n  a = <(1+2)>;\n};", "expression"},
-        {"/dts-v1/;\n/ {\n  a = <MACRO>;\n};", "no macros"},
-        {"/dts-v1/;\n/ {\n  a = <0x100000000>;\n};", "does not fit 32 bits"},
-        {"/dts-v1/;\n/ {\n  a = /bits/ 8 <256>;\n};", "does not fit 8 bits"},
-        {"/dts-v1/;\n/ {\n  a = /bits/ 12 <1>;\n};", "has to be 8, 16, 32 or 64"},
-        {"/dts-v1/;\n/ {\n  a = <1>;\n  a = <2>;\n};", "is there twice"},
-        {"/dts-v1/;\n/ {\n  n { };\n  n { };\n};", "is there twice"},
-        {"/dts-v1/;\n/ {\n  n { };\n  a = <1>;\n};", "comes after a subnode"},
-        {"/dts-v1/;\n/ { };\n/ { };", "something behind the root node"},
+        {"/dts-v1/;\n/ {\n  a = <&ref>;\n};", "non-existent node or label \"ref\""},
+        {"/dts-v1/;\n/ {\n  a = &{/nothing};\n};", "non-existent node or label \"/nothing\""},
+        {"/dts-v1/;\n/ {\n  a = <MACRO>;\n};", "expected a number"},
+        {"/dts-v1/;\n/ {\n  a = <-1>;\n};", "expected a number"},
+        {"/dts-v1/;\n/ {\n  a = /bits/ 12 <1>;\n};", "must be 8, 16, 32 or 64-bits"},
+        {"/dts-v1/;\n/ {\n  a = /bits/ 8 <&x>;\n};", "32-bit elements"},
+        {"/dts-v1/;\n/ {\n  a = <1>;\n  a = <2>;\n};", "Duplicate property name"},
+        {"/dts-v1/;\n/ {\n  n { };\n  n { };\n};", "Duplicate node name"},
+        {"/dts-v1/;\n/ {\n  n { };\n  a = <1>;\n};", "Properties must precede subnodes"},
         {"/dts-v1/;\n/ {\n  a = \"open;\n};", "not closed"},
         {"/dts-v1/;\n/ {\n  /* open\n};", "not closed"},
-        {"/dts-v1/;\n/ {\n  a = [123];\n};", "odd number"},
-        {"/dts-v1/;\n/ {\n  a = [zz];\n};", "hexadecimal digit"},
-        {"/dts-v1/;\n/ {\n  /delete-node/ x;\n};", "not read"},
-        {"/dts-v1/;\n/ {\n  a = /incbin/(\"f\", 1, 2);\n};", "skip and a length"},
+        {"/dts-v1/;\n/ {\n  a = [123];\n};", "two hexadecimal digits"},
+        {"/dts-v1/;\n/ {\n  a = [zz];\n};", "hexadecimal digits"},
+        {"/dts-v1/;\n/ {\n  a = /incbin/(\"f\", 1, 2);\n};", "offset and a length"},
         {"/dts-v1/;\n/ {\n  a = <1>, /incbin/(\"f\");\n};", "only value"},
-        {"/dts-v1/;\n/ {\n  a = \"x\\q\";\n};", "none that abr reads"},
+        {"/dts-v1/;\n/ {\n  a = \"x\\xg\";\n};", "no following hex digits"},
         {"/dts-v1/;\n/ {\n  a = 5;\n};", "expected a value"},
         {"/dts-v1/;\n/ {\n  a = <1>\n};", "expected ';'"},
-        {"/dts-v1/;\n/ {\n  a = <0x>;\n};", "no digits"},
-        {"/dts-v1/;\n/ {\n  a = <12ab>;\n};", "followed by letters"},
+        {"/dts-v1/;\n/ {\n  a = <0x>;\n};", "found 'x'"},
+        {"/dts-v1/;\n/ {\n  a = <12ab>;\n};", "found 'a'"},
+        {"/dts-v1/;\n/ {\n  a = <089>;\n};", "Bad integer literal"},
+        {"/dts-v1/;\n/ {\n  a = <0xfffffffffffffffff>;\n};", "out of range"},
+        {"/dts-v1/;\n/ {\n  a = <(1/0)>;\n};", "Division by zero"},
+        {"/dts-v1/;\n/ {\n  a = <''>;\n};", "Empty character literal"},
+        {"/dts-v1/;\n/ {\n  a = <'ab'>;\n};", "2 characters instead of 1"},
+        {"/dts-v1/;\n/ {\n  a = <(1 2)>;\n};", "expected ')'"},
+        {"/dts-v1/;\n/ {\n  a = <(1 ? 2)>;\n};", "expected ':'"},
+        {"/dts-v1/;\n/ {\n  x#y { };\n};", "Bad character '#' in node name"},
+        {"/dts-v1/;\n/ {\n  x@y@z { };\n};", "multiple '@'"},
+        {"/dts-v1/;\n/ {\n  a@b = <1>;\n};", "Bad character '@' in property name"},
+        {"/dts-v1/;\n/ {\n  a: x { };\n  a: y { };\n};", "Duplicate label 'a'"},
+        {"/dts-v1/;\n/ {\n  phandle = <0>;\n};", "bad value (0x0) in phandle property"},
+        {"/dts-v1/;\n/ {\n  phandle = <1 2>;\n};", "bad length"},
+        {"/dts-v1/;\n/ {\n  a { phandle = <5>; };\n  b { phandle = <5>; };\n};", "duplicated phandle 0x5"},
+        {"/dts-v1/;\n/ {\n  name = <1>;\n};", "not a string"},
+        {"/dts-v1/;\n/ {\n  a { name = \"b\"; };\n};", "\"name\" property is incorrect"},
+        {"/dts-v1/;\n/ {\n  /delete-node/ ;\n};", "expected a name"},
+        {"/dts-v1/;\n/ {\n  /unknown/ x;\n};", "a directive that abr does not read"},
+        {"/dts-v1/;\n/ {\n  a = <1>;\n};\n&nothing { };", "Label or path nothing not found"},
+        {"/dts-v1/;\n/ { };\n/memreserve/ 1 2;", "before the root node"},
+        {"/dts-v1/;\n/ { };\n/include/ \"x.dtsi\"", "no directory to read the file from"},
+        {"/dts-v1/;\n/ { a = <1>; };\n&{} { };", "Label or path (empty: &{}) not found"},
         {"/dts-v1/;\n/ {\n", "ends inside a node"},
         {"/dts-v1/;\n", "root node"},
     };
@@ -681,6 +703,7 @@ void test_dts_syntax() {
     }
     // the line is the right one
     EXPECT_HAS(refusal_of([&] { dts::parse("/dts-v1/;\n\n/ {\n  a = <1>;\n  b = <&x>;\n};", "t.dts"); }), "t.dts: line 5:");
+    EXPECT_HAS(refusal_of([&] { dts::parse("/dts-v1/;\n\n/ {\n  a = <1>;\n  n {\n    b;\n    n2 { };\n    n2 { };\n  };\n};", "t.dts"); }), "t.dts: line 8:");
     // depth
     std::string deep = "/dts-v1/;\n/ {\n";
     for (size_t k = 1; k < fdt::kMaxDepth; ++k) deep += "n {\n";
@@ -702,8 +725,41 @@ void test_dts_syntax() {
     EXPECT_HAS(refusal_of([&] { dts::print(q); }), "cannot be written as text");
 }
 
+// A blob can name a node or a property with characters that dtc's checks (and so abr's reader of the text) do not let a source have: a node
+// name has no `#`, `?`, `*` and one `@` at most, a property name no `@`. The names of a tree that is going to be written as text are made to follow
+// that rule (and stay different from their neighbours').
+void tame_names(fdt::Node& n) {
+    for (fdt::Property& p : n.props)
+        for (char& c : p.name)
+            if (c == '@') c = 'y';
+    for (size_t i = 0; i < n.props.size(); ++i)
+        for (size_t j = 0; j < i; ++j)
+            if (n.props[i].name == n.props[j].name) {
+                n.props[i].name += "_" + std::to_string(i);
+                j = static_cast<size_t>(-1);  // (the new name is checked against all of them again)
+            }
+    for (fdt::Node& c : n.children) {
+        bool seen_at = false;
+        for (char& ch : c.name) {
+            if (ch == '#' || ch == '?' || ch == '*') ch = 'x';
+            if (ch == '@') {
+                if (seen_at) ch = '_';
+                seen_at = true;
+            }
+        }
+    }
+    for (size_t i = 0; i < n.children.size(); ++i)
+        for (size_t j = 0; j < i; ++j)
+            if (n.children[i].name == n.children[j].name) {
+                n.children[i].name += "_" + std::to_string(i);
+                j = static_cast<size_t>(-1);
+            }
+    for (fdt::Node& c : n.children) tame_names(c);
+}
+
 fdt::Tree random_text_tree(std::mt19937_64& rng) {
     fdt::Tree t = random_tree(rng);
+    tame_names(t.root);
     // the text carries the memory map and the nodes; the rest of the header is not text
     t.version = 17;
     t.last_comp_version = 16;
