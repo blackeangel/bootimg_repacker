@@ -1,0 +1,10 @@
+/dts-v1/;
+/ {
+	r = <&used>;
+	q = &plain;
+	/omit-if-no-ref/ unused { };
+	/omit-if-no-ref/ used: usedn { };
+	/omit-if-no-ref/ plain: plainn { v = <1>; };
+	/omit-if-no-ref/ other: othern { };
+};
+/omit-if-no-ref/ &other;

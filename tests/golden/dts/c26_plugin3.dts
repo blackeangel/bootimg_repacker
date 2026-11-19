@@ -1,0 +1,9 @@
+/dts-v1/;
+/plugin/;
+&{/soc/uart@1000} { status = "okay"; };
+&lbl { x = <&lbl2>; };
+&lbl { y = <1>; };
+/ {
+	lbl3: node { p = <&lbl3>; };
+};
+&lbl3 { z = <&lbl>; };

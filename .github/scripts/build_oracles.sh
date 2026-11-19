@@ -3,15 +3,16 @@
 #
 # tests/run_tests.sh compares abr with the programs Android Image Kitchen runs for the formats abr opens by itself: rkcrc
 # (Rockchip), blobpack and blobunpack (ASUS blobs), mboot (Intel OSIP), loki_tool (LOKI), pxa-mkbootimg and pxa-unpackbootimg
-# (Marvell PXA), sony_dump (Sony SIN), elftool (Sony ELF boot images) and dtbtool (the Qualcomm device tree table). None of them is
+# (Marvell PXA), sony_dump (Sony SIN), elftool (Sony ELF boot images) and dtbtool (the Qualcomm device tree table); and the sources of
+# the test suite of dtc 1.7.0 (dtctests), which tests/tools/dtc_live.py has dtc and abr's own device tree compiler both compile. None of them is
 # part of this repository, and several have no licence file: they are fetched at the commits the tests were written against, compiled
 # here, and the suite only runs them -- nothing of them goes into abr.
 #
 #     .github/scripts/build_oracles.sh <directory> [name ...]
 #
-# builds into <directory>/bin (every one, or the names given: rkcrc blobtools mboot loki pxa sony_dump elftool dtbtool) and prints one
+# builds into <directory>/bin (every one, or the names given: rkcrc blobtools mboot loki pxa sony_dump elftool dtbtool dtctests) and prints one
 # VARIABLE=/path line on stdout for each program that was built -- the variables tests/run_tests.sh reads (ABR_RKCRC, ABR_BLOBPACK,
-# ABR_BLOBUNPACK, ABR_MBOOT, ABR_LOKI_TOOL, PXA_MKBOOTIMG, PXA_UNPACKBOOTIMG, ABR_SONY_DUMP, ABR_ELFTOOL, ABR_DTBTOOL). In GitHub Actions:
+# ABR_BLOBUNPACK, ABR_MBOOT, ABR_LOKI_TOOL, PXA_MKBOOTIMG, PXA_UNPACKBOOTIMG, ABR_SONY_DUMP, ABR_ELFTOOL, ABR_DTBTOOL, ABR_DTC_TESTS -- the directory of the test sources of dtc). In GitHub Actions:
 #
 #     .github/scripts/build_oracles.sh "$RUNNER_TEMP/oracles" | tee -a "$GITHUB_ENV"
 #
@@ -103,11 +104,16 @@ build_dtbtool() {  # the dtbTool of the Code Aurora Forum, in LineageOS/android_
         announce dtbtool "ABR_DTBTOOL=$out/bin/dtbtool"
 }
 
+build_dtctests() {  # dtc (GPL-2.0-or-later or BSD-2-Clause) at v1.7.0: nothing is built, the *.dts and *.dtsi of its tests/ are the sources
+    fetch dtc https://github.com/dgibson/dtc.git 039a99414e778332d8f9c04cbd3072e1dcc62798 &&
+        announce dtctests "ABR_DTC_TESTS=$out/src/dtc/tests"
+}
+
 names=("$@")
-[ ${#names[@]} -gt 0 ] || names=(rkcrc blobtools mboot loki pxa sony_dump elftool dtbtool)
+[ ${#names[@]} -gt 0 ] || names=(rkcrc blobtools mboot loki pxa sony_dump elftool dtbtool dtctests)
 for n in "${names[@]}"; do
     case "$n" in
-        rkcrc | blobtools | mboot | loki | pxa | sony_dump | elftool | dtbtool) ;;
+        rkcrc | blobtools | mboot | loki | pxa | sony_dump | elftool | dtbtool | dtctests) ;;
         *)
             say "unknown name: $n"
             failed=1

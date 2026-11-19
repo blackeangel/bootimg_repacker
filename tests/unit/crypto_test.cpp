@@ -207,6 +207,9 @@ int run_manifest_tests();  // manifest_test.cpp
 int run_compression_tests();  // compression_test.cpp
 int run_fdt_tests();  // fdt_test.cpp
 int run_fdt_files(int argc, char** argv);  // fdt_test.cpp
+int run_dts_golden(int argc, char** argv);  // dts_test.cpp
+int run_dts_compile(int argc, char** argv);  // dts_test.cpp
+int run_dts_decompile(int argc, char** argv);  // dts_test.cpp
 int run_fit_tests();  // fit_test.cpp
 int run_fit_files(int argc, char** argv);  // fit_test.cpp
 int run_console_tests();  // console_test.cpp
@@ -235,6 +238,9 @@ int main(int argc, char** argv) {
         if (cmd == "compression") return run_compression_tests();
         if (cmd == "fdt") return run_fdt_tests();
         if (cmd == "fdt-files") return run_fdt_files(argc, argv);
+        if (cmd == "dts-golden") return run_dts_golden(argc, argv);
+        if (cmd == "dts-compile") return run_dts_compile(argc, argv);
+        if (cmd == "dts-decompile") return run_dts_decompile(argc, argv);
         if (cmd == "console") return run_console_tests();
         if (cmd == "avbkeys") return run_avb_keys_tests();
         if (cmd == "layout") return run_layout_tests();

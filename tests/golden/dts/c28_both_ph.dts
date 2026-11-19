@@ -1,0 +1,6 @@
+/dts-v1/;
+/ {
+	a { phandle = <3>; linux,phandle = <3>; };
+	b { phandle = <4>; r = <&c>; };
+	c: c { };
+};

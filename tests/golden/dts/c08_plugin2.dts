@@ -1,0 +1,11 @@
+/dts-v1/;
+/plugin/;
+/ {
+	compatible = "x";
+	fragment@0 {
+		target = <&ext>;
+		__overlay__ {
+			l: node { p = <&l &ext>; q = <&other 3>; };
+		};
+	};
+};

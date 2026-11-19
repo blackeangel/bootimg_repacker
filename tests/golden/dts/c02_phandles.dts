@@ -1,0 +1,14 @@
+/dts-v1/;
+/ {
+	#address-cells = <1>;
+	#size-cells = <1>;
+	p = &a;
+	q = "x", &b, "y";
+	r = &{/node-c};
+	t = <&{/node-a}>;
+	u = <&d 1 &a>;
+	a: node-a { };
+	b: node-b { ref = <&a &b>, <&a>; };
+	c: node-c { phandle = <0x7>; users = <&c &a>; };
+	d: node-d { self = <&d>; };
+};

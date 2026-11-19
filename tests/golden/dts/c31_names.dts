@@ -1,0 +1,9 @@
+/dts-v1/;
+/ {
+	#address-cells = <1>;
+	a,b.c_d+e-f = <1>;
+	x*y#z?w = <2>;
+	node,a.b_c+d-e@1,2.3 { };
+	0 { };
+	n-1 { };
+};

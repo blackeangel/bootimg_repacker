@@ -1,0 +1,2 @@
+/dts-v1/;
+/ { a { phandle = <1>; }; b { phandle = <1>; }; };

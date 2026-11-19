@@ -1,0 +1,4 @@
+/dts-v1/;
+/ { n { a { }; b { }; }; m { }; };
+/delete-node/ &{/n/a};
+/delete-node/ &{/m};

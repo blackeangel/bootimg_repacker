@@ -1173,8 +1173,8 @@ itself -- `rkcrc`, `blobpack` / `blobunpack`, `mboot`, `loki_tool`, `pxa-mkbooti
 `elftool` -- and with Qualcomm's `dtbTool` for the QCDT tables (and `futility`, GNU `cpio`, and `mkimage` / `dumpimage` for the FIT images). They are not part of this repository (several have no licence file):
 `.github/scripts/build_oracles.sh <directory>` fetches them at the commits the tests were written against, compiles
 them and prints the variables that tell the suite where they are (`ABR_RKCRC`, `ABR_BLOBPACK`, `ABR_BLOBUNPACK`,
-`ABR_MBOOT`, `ABR_LOKI_TOOL`, `PXA_MKBOOTIMG`, `PXA_UNPACKBOOTIMG`, `ABR_SONY_DUMP`, `ABR_ELFTOOL`, `ABR_DTBTOOL`). A judge that is not
-there is a note in its section and the comparisons with it are skipped; `ABR_REQUIRE_ORACLES=futility,cpio,rkcrc,blobtools,mboot,loki,pxa,sony_dump,elftool,dtbtool,dumpimage`
+`ABR_MBOOT`, `ABR_LOKI_TOOL`, `PXA_MKBOOTIMG`, `PXA_UNPACKBOOTIMG`, `ABR_SONY_DUMP`, `ABR_ELFTOOL`, `ABR_DTBTOOL`, `ABR_DTC_TESTS`: the test sources of dtc 1.7.0). A judge that is not
+there is a note in its section and the comparisons with it are skipped; `ABR_REQUIRE_ORACLES=futility,cpio,rkcrc,blobtools,mboot,loki,pxa,sony_dump,elftool,dtbtool,dtc,dtctests,dumpimage`
 (any of those names) makes a missing one a failure instead, which is how the CI runs the suite.
 
 ### Cross-compiling

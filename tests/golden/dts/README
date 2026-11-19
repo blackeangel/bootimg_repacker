@@ -1,0 +1,7 @@
+Golden files of abr's device tree compiler (src/dts.cpp), checked by `abr_unit_tests dts-golden tests/golden/dts` and by tests/tools/dtc_live.py.
+
+  NAME.dts    a source (inc*.dtsi and a.bin are what some of them include)
+  NAME.dtb    the blob that dtc 1.7.0 wrote from it (dtc -@ when NAME.flags says -@): abr must write the same bytes
+  NAME.fail   when dtc refuses the source (it writes no .dtb): "LINE WORDS" -- the line abr names and the words its message has
+
+tests/tools/dtc_live.py --update-golden writes the .dtb files again with the dtc that is installed; without it the live check compares them.

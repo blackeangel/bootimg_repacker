@@ -1,0 +1,6 @@
+/dts-v1/;
+/ {
+	/include/ "inc1.dtsi"
+	arr = <1 /include/ "inc3.dtsi" 3>;
+	n { /include/ "inc2.dtsi" };
+};

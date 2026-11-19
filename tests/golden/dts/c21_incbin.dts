@@ -1,0 +1,9 @@
+/dts-v1/;
+/ {
+	whole = /incbin/("a.bin");
+	part = /incbin/("a.bin", 4, 6);
+	past = /incbin/("a.bin", 12, 100);
+	beyond = /incbin/("a.bin", 100, 4);
+	mixed = <1>, /incbin/("a.bin", 0, 2), "x";
+	expr = /incbin/("a.bin", (1 + 1), (2 * 2));
+};

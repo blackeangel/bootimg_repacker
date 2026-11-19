@@ -7596,6 +7596,26 @@ else
     echo "SKIP: the PNG comparison with Pillow (Pillow or abr_unit_tests is not there)"
 fi
 
+# ---- the device tree compiler: the sources of tests/golden/dts against the blobs that dtc 1.7.0 wrote (abr_unit_tests dts-golden), then dtc itself as the
+# judge (dtc_live.py: the same sources, the sources of dtc's own test suite where $ABR_DTC_TESTS has them, mutated sources, and the text of the blobs
+# both ways -- what dtc writes of a blob, which abr compiles; what abr writes of a blob, which dtc compiles)
+if [ -x "$UNIT" ]; then
+    rm -rf dts_golden lv_dtc_work
+    cp -R "$SCRIPT_DIR/golden/dts" dts_golden
+    if out=$("$UNIT" dts-golden dts_golden 2>&1); then
+        pass "device tree compiler: $(tail -n 1 <<<"$out")"
+    else
+        fail "device tree compiler against the blobs of dtc: $(grep -E 'FAIL|failure' <<<"$out" | head -n 4 | tr '\n' ' ')"
+    fi
+    lv_dtc_fuzz=300
+    [ "$RD_WINE" = 1 ] && lv_dtc_fuzz=40
+    lv_dtc_args=(--fuzz "$lv_dtc_fuzz")
+    [ -n "${ABR_DTC_TESTS:-}" ] && [ -d "$ABR_DTC_TESTS" ] && lv_dtc_args+=(--dtc-tests "$ABR_DTC_TESTS")
+    live_driver "device tree compiler: dtc is the judge (golden sources, mutated sources, the text of blobs both ways$([ -n "${ABR_DTC_TESTS:-}" ] && echo ', the test sources of dtc'))" \
+        lv_dtc.log python3 -I "$TOOLS/dtc_live.py" "$UNIT" lv_dtc_work "${lv_dtc_args[@]}"
+    grep -h '^SKIP' lv_dtc.log 2>/dev/null
+fi
+
 # ---- the console: what a person at a terminal sees. Lines that fit the screen (ABR_COLUMNS, and a pseudo terminal of 56 columns -- a phone's)
 # with the numbers kept in a column, the tables made for a narrow screen, the help; and the progress bar, which stays where it is while what the
 # command says waits for its end. (The pseudo terminal runs are a SKIP note under wine and under an emulator, which have no pty to give.)
@@ -7639,7 +7659,7 @@ fi
 # Judges that have to be there. A judge that is not (rkcrc, mboot, sony_dump, ...) is a note in its section and the
 # comparisons with it are skipped, which is right on a machine that has not got it and wrong in a run that is meant to have
 # them all (the CI): a skipped comparison passes unseen. ABR_REQUIRE_ORACLES=<names, separated by commas> makes the absence
-# of the named judges a failure: futility, cpio, rkcrc, blobtools, mboot, loki, pxa, sony_dump, elftool, dtbtool, dumpimage, pillow, cryptography. A name that is not
+# of the named judges a failure: futility, cpio, rkcrc, blobtools, mboot, loki, pxa, sony_dump, elftool, dtbtool, dtc, dtctests, dumpimage, pillow, cryptography. A name that is not
 # on this list is a failure too (a misspelt name would otherwise check nothing).
 # =========================================================================
 oracle_have() {
@@ -7654,6 +7674,8 @@ oracle_have() {
         sony_dump) [ -n "${SIN_DUMP:-}" ] && [ -x "$SIN_DUMP" ] ;;
         elftool) elf_tool_ok ;;
         dtbtool) [ -n "${ABR_DTBTOOL:-}" ] && [ -x "$ABR_DTBTOOL" ] && command -v dtc >/dev/null 2>&1 ;;
+        dtc) command -v dtc >/dev/null 2>&1 && dtc --version 2>&1 | grep -q '1\.7\.' ;;
+        dtctests) [ -n "${ABR_DTC_TESTS:-}" ] && ls "$ABR_DTC_TESTS"/*.dts >/dev/null 2>&1 ;;
         dumpimage) [ "$FIT_DUMPIMAGE" = 1 ] ;;
         pillow) have_pillow ;;
         cryptography) have_cryptography ;;
@@ -7670,7 +7692,7 @@ if [ -n "${ABR_REQUIRE_ORACLES:-}" ]; then
         oracle_have "$oracle"
         case $? in
             0) pass "the judge '$oracle' is there (ABR_REQUIRE_ORACLES)" ;;
-            2) fail "ABR_REQUIRE_ORACLES names '$oracle', which is not a judge of this suite (futility, cpio, rkcrc, blobtools, mboot, loki, pxa, sony_dump, elftool, dtbtool, dumpimage, pillow, cryptography)" ;;
+            2) fail "ABR_REQUIRE_ORACLES names '$oracle', which is not a judge of this suite (futility, cpio, rkcrc, blobtools, mboot, loki, pxa, sony_dump, elftool, dtbtool, dtc, dtctests, dumpimage, pillow, cryptography)" ;;
             *) fail "the judge '$oracle' is required (ABR_REQUIRE_ORACLES) and is not there: its comparisons were skipped" ;;
         esac
     done

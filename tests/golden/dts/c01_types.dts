@@ -1,0 +1,16 @@
+/dts-v1/;
+/memreserve/ 0x1000 0x2000;
+/memreserve/ 4096 010;
+// a comment
+/ {
+    /* another */ s = "one", "two\n\"q\"\\ \x41\101";
+    c = <0x1 2 010 'a'>, <0xffffffff>;
+    b = [00 11 2233 aB];
+    e;
+    q = /bits/ 8 <0xff 1>, /bits/ 16 <0x1234>, /bits/ 64 <0x1122334455667788>;
+    empty = "";
+    raw = "line1
+line2", "x\qy";
+    node@1 { x = <1>; };
+    other,name+x { sub { }; };
+};

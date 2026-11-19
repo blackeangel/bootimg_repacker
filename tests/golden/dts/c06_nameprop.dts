@@ -1,0 +1,6 @@
+/dts-v1/;
+/ {
+	/delete-property/ y;
+	n { name = "n"; x = <1>; };
+	m@4 { name = "m"; };
+};

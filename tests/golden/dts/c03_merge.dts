@@ -1,0 +1,10 @@
+/dts-v1/;
+/ {
+	n1 { a = <1>; b = <2>; c1 { x; }; c2 { y; }; };
+	n2 { z = <1>; };
+	l: n3 { };
+};
+/ { n1 { a = <10>; d = <4>; /delete-property/ b; /delete-node/ c1; c3 { }; }; };
+&l { added = "yes"; sub { }; };
+/delete-node/ &l;
+/ { n1 { b = <20>; c1 { w; }; }; };

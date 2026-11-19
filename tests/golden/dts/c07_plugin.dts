@@ -1,0 +1,7 @@
+/dts-v1/;
+/plugin/;
+&foo { a = <1>; };
+&{/bar/baz} { b = <2>; };
+/ {
+	fragment@5 { target = <&foo>; __overlay__ { c = <&foo>; l: m { n = <&l>; }; }; };
+};
