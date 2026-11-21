@@ -43,6 +43,7 @@
 #include "abr/fdt.hpp"
 #include "abr/fit.hpp"
 #include "abr/identify.hpp"
+#include "abr/kernel.hpp"
 #include "abr/layout.hpp"
 #include "abr/legacy/amonet.hpp"
 #include "abr/legacy/avb1.hpp"
@@ -519,7 +520,8 @@ struct DecodedComponent {
     std::optional<std::string> mtk_name;
     std::optional<Bytes> mtk_header;     // the 512 bytes of its MTK sub-header, when that is not the plain one (kept: pack puts the same bytes back)
     int64_t mtk_extra = 0;               // the bytes the component holds beyond the size that sub-header declares (see legacy::MtkHeader::extra)
-    std::optional<Bytes> stripped;       // the stored bytes without their MTK sub-header, when it had one
+    std::optional<Bytes> stripped;       // the stored bytes without their MTK sub-header and without the device trees glued behind them, when it had either
+    std::optional<Bytes> glued;          // the device trees glued behind the stream (and what follows them), cut off the stored bytes (see kernel.hpp)
     Codec codec = Codec::NONE;
     std::string damage;                  // what is wrong with a stream that was taken all the same (cut short: see decompress()); else empty
     int level = -1;                      // the level the stream was made with, when abr could tell (detect_level()); else -1
@@ -534,7 +536,9 @@ struct DecodedComponent {
 
 // `what` names the component in the message of a stream that cannot be decompressed (a damaged image, or a bomb: a stream
 // that would be more than kMaxDecompressedSize); empty, the message does not name it.
-DecodedComponent decode_component(const Bytes& raw, std::string_view what = {}, bool strip_mtk = true) {
+// `cut_trees`: the device trees that a kernel build glues behind its stream (`Image.gz-dtb`; kernel.hpp) are cut off before the stream is decoded
+// and come back in `glued`: they are sources of their own, and what is in the raw copy is the stream.
+DecodedComponent decode_component(const Bytes& raw, std::string_view what = {}, bool strip_mtk = true, bool cut_trees = false) {
     DecodedComponent d;
     if (raw.empty()) return d;
     d.present = true;
@@ -546,6 +550,13 @@ DecodedComponent decode_component(const Bytes& raw, std::string_view what = {}, 
             d.mtk_extra = mtk->extra;
         }
         d.stripped = std::move(after_mtk);
+    }
+    if (cut_trees) {
+        const Bytes& all = d.stored(raw);
+        if (const auto appended = kernel::find_appended_trees(all)) {
+            d.glued = Bytes(all.begin() + static_cast<std::ptrdiff_t>(appended->start), all.end());
+            d.stripped = Bytes(all.begin(), all.begin() + static_cast<std::ptrdiff_t>(appended->start));
+        }
     }
     const Bytes& working = d.stored(raw);
     d.codec = detect_codec(working);
@@ -568,6 +579,7 @@ DecodedComponent decode_component(const Bytes& raw, std::string_view what = {}, 
 struct ComponentSource {
     const Bytes* raw;       // the component as found in the image
     std::string filename;   // its file in the unpack directory
+    bool trees = false;     // the kernel: the device trees glued behind its stream are cut off (decode_component)
 };
 
 // The file that keeps the MTK sub-header of a component when it is not the plain one: "kernel.mtk_header" beside "kernel".
@@ -594,7 +606,7 @@ std::vector<DecodedComponent> save_components(const fs::path& dir,
     par::for_each(sources.size(), [&](size_t k) {
         const size_t i = order[k];
         const progress::Activity doing(sources[i].filename);
-        out[i] = decode_component(*sources[i].raw, sources[i].filename);
+        out[i] = decode_component(*sources[i].raw, sources[i].filename, /*strip_mtk=*/true, sources[i].trees);
         if (!out[i].damage.empty())
             warn(shown(sources[i].filename) + " (" + std::string(codec_name(out[i].codec)) + "): " + out[i].damage +
                  ". The file holds what came out. An untouched pack puts the stored bytes back as they were; a pack of a file that was edited "
@@ -756,6 +768,8 @@ void check_unpacks_as_is(const Bytes& stored, const std::string& prefix, const s
     }
 }
 
+Bytes load_tree_section(const Manifest& m, const fs::path& dir, const std::string& key);  // (below, with the device trees)
+
 // What goes into the image for one component. For a ramdisk that also exists as a directory (see
 // ramdisk_tree.hpp) there are two places it may have been edited, and which one counts is decided
 // by what changed since unpacking, not by file times: the file by the hash of its contents, the
@@ -859,6 +873,12 @@ Bytes load_component(const Manifest& m, const fs::path& dir, const std::string& 
             result = compress(codec, plain, level, [](size_t n) { progress::advance(n); });
         }
         if (codec == Codec::NONE) check_unpacks_as_is(result, prefix, filename);
+    }
+    // The device trees glued behind the stream (`Image.gz-dtb`): the sources of kernel_dtb/, compiled, and what followed them. Under the MTK header,
+    // which declares the size of all of it.
+    if (m.has(prefix + "_dtb_count") || m.has(prefix + "_dtb_file")) {
+        const Bytes glued = load_tree_section(m, dir, prefix + "_dtb");
+        result.insert(result.end(), glued.begin(), glued.end());
     }
     if (m.has(prefix + "_mtk_header_file")) {
         const std::string header_file = m.get_path(prefix + "_mtk_header_file");
@@ -1706,10 +1726,11 @@ void unpack_boot(const Bytes& whole, const fs::path& dir) {
     if (img.missing_tail_padding && img.kept_tail_padding) m.set_u64("tail_padding_kept", *img.kept_tail_padding);
 
     {
-        auto parts = save_components(dir, {{&img.kernel, "kernel"},
+        auto parts = save_components(dir, {{&img.kernel, "kernel", true},
                                            {&img.ramdisk, "ramdisk.cpio"},
                                            {&img.second, "second"}});
         record_component(m, "kernel", "kernel", parts[0]);
+        if (parts[0].glued) save_tree_section(m, dir, "kernel_dtb", *parts[0].glued, "kernel_dtb.bin");
         record_component(m, "ramdisk", "ramdisk.cpio", parts[1]);
         record_component(m, "second", "second", parts[2]);
         save_ramdisk_trees(m, dir, {{"ramdisk", "ramdisk.cpio", &parts[1]}});

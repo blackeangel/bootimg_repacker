@@ -23,7 +23,7 @@ tools" below.
 | vbmeta (AVB): vbmeta.img, vbmeta_system.img, footer-on-other-partitions | **done + verified**, incl. RSA signing (images made by the real `avbtool` round-trip exactly; images `abr` re-signed pass `avbtool verify_image`) |
 | uboot: U-Boot legacy uImage | **done + verified** |
 | U-Boot FIT images (`mkimage -f`: `.itb`, `.fit`; the data in the tree, `-E`, `-E -B n`, `-E -p N`) | **done + verified** (1 Nov 2026) against the real `mkimage` and `dumpimage` (u-boot-tools 2025.10, run as oracles), `dtc` 1.7.0 and an independent Python reader (`tests/tools/fit_tool.py`, hashes with `hashlib`): `fit.its` plus a file for every image (a ramdisk also as a directory), an untouched FIT comes back byte for byte in all six layouts `mkimage` was run with (and signed with `-k`), a new kernel or an image put in is the file `mkimage` makes of the same text, the hash nodes of a changed image are made again (crc32, md5, sha1, sha256, sha384, sha512), signatures are kept and named when an edit makes them wrong; **no FIT image of a device has been tried**, and `abr` neither checks nor makes a signature, see "U-Boot FIT images" |
-| flattened device tree as a tree (`abr::fdt`) and as source text (`abr::dts`) | **done + verified** (31 Oct 2026, commit `57e8331`; the bytes behind a value 1 Nov): 51 device trees of real images and the blobs of `dtc` (`-@`, `-p`, `-V 16`) come back byte for byte, the ones that do not (a version 16 blob, NOP tokens, a property behind a subnode, ...) are said not to be canonical; see "U-Boot FIT images"; **abr's own device tree compiler** (`abr::dts`: the whole source language of `dtc` 1.7, same bytes as `dtc`) and the use of it for every device tree of every image (`abr::dtfile`), 17-21 Nov 2026: see "Device trees as text" |
+| flattened device tree as a tree (`abr::fdt`) and as source text (`abr::dts`) | **done + verified** (31 Oct 2026, commit `57e8331`; the bytes behind a value 1 Nov): 51 device trees of real images and the blobs of `dtc` (`-@`, `-p`, `-V 16`) come back byte for byte, the ones that do not (a version 16 blob, NOP tokens, a property behind a subnode, ...) are said not to be canonical; see "U-Boot FIT images"; **abr's own device tree compiler** (`abr::dts`: the whole source language of `dtc` 1.7, same bytes as `dtc`) and the use of it for every device tree of every image (`abr::dtfile`), the trees glued behind a boot image's kernel too, 17-21 Nov 2026: see "Device trees as text" |
 | ELF boot images (Sony/Xperia `kernel.elf`) | **done + verified** against the real `elftool` (compiled, not vendored) and an independent Python tool and C++ writer: kernel / ramdisk (a directory) / `ipl` / `rpm` / command line by `p_flags`, positional roles for unflagged segments, ELF32 and ELF64; an image in elftool's layout is built from the manifest alone, any other layout (padding, another start of the data, own `e_entry`/OS-ABI/`p_align`/`p_memsz`/`p_paddr`, data in another order, empty segments) is kept and written back; 16 layouts in the CLI suite, 60,000+ unit checks; no real `kernel.elf` has been tried, see "Sony ELF boot images" |
 | Sony SIN containers v1-v3 (AIK: `sony_dump`) | **done + verified** against the real `sony_dump` (compiled from its source, not vendored: no licence file) and an independent Python tool: the container comes off and is never put back (AIK forgets it too), what is inside is unpacked as it is on its own; MMCF with `ADDR` / `LZ4A` parts (decoded on several threads when large), loader, data in front; damaged containers are refused with the reason; no real `.sin` has been tried, see "Sony SIN containers" |
 | Rockchip KRNL images (`kernel.img`, SDK `boot.img`) | **done + verified** against the real `rkcrc -k` (compiled, not vendored) and an independent Python tool: the payload (kernel, or a compressed cpio ramdisk -> `ramdisk.cpio` + `ramdisk/`), Rockchip's own CRC (polynomial 0x04C10DB7), partition fill, wrong stored CRC kept |
@@ -2378,7 +2378,7 @@ Not changed on purpose: the `file:`/`format:` labels of `info` stay as they are 
 changes its size while the command runs is not followed (the width is read for every write, so the next lines are right,
 and what was held is wrapped when it comes out, for the width of that moment).
 
-## Device trees as text (done for the trees that stand alone, 17-21 Nov 2026)
+## Device trees as text (done, 17-21 Nov 2026)
 
 The request of 17 Nov: a dtb is not unpacked as far as `entry0.dts`, neither as a file of its own nor in a vendor_boot; whatever can be
 unpacked to something a person reads and edits should be (kernel, ramdisk, dtb, ...). Use `dtc` as the model, but with `abr`'s own
@@ -2410,14 +2410,29 @@ implementation inside `abr`.
   is refused with the file and the line, the same tree as a `.dtb` is the same image); the 14 real images: 13 byte for byte (the 14th is
   a filesystem), two of them with a tree that a source cannot reproduce (a QCDT with slack: `lk2nd`; a vendor_boot with an orphan
   string: the Orange Fox one), both come back exactly and say why.
-* **Not done yet**: the trees glued to a kernel (`Image.gz-dtb`: 7 of the 10 kernels of the real images have one to three trees behind
-  the stream, and an edit of the kernel file drops them without a word) -- the next step, with the rest of the kernel.
+* **The trees glued to a kernel** (`Image.gz-dtb`, `zImage-dtb`, `Image-dtb`; `include/abr/kernel.hpp`, `src/kernel.cpp`, 21 Nov): 7 of the 10
+  kernels of the real images have one to three trees (370 KB each in one of them) right behind the stream -- gzip's `unused_data` shows a gap
+  of 0 -- and an edit of the kernel file dropped them without a word. `kernel::find_appended_trees` finds them (a scan for `d0 0d fe ed`, a
+  header that holds together, the trees one behind the other with zeros between two, a tail of 64 KiB at most or zeros only, and the same
+  cut as `split_fdt_blobs` makes), `unpack_boot` cuts them off before the kernel is decoded (the raw copy in `.abr_raw/kernel.raw` is the
+  stream alone) and writes `kernel_dtb/entry<N>.dts` with the usual manifest keys (`kernel_dtb_count`, `_align`, `_tail_zeros`, `_tail_file`);
+  `load_component` appends them before the MediaTek header is made; the layout has them as rows of the kernel. **Verified by**: unit group
+  `kernel` (3083 checks: the header's plausibility, 3000 random layouts), five reports of the suite (the 8 codecs, each with three trees of
+  different sizes: unpack, the sources judged by `dtc`, untouched repack, an edited tree, an edited kernel read by the real decompressor, the
+  keys dropped, the count; five shapes: an uncompressed arm64 kernel, alignment, a signature, a fill, a gap; what is no glued tree; header
+  version 2 with a dtb section, the MediaTek header; the refusals), four deliberate breakages of the code each caught by the report that
+  should catch it, and the 14 real images (13 byte for byte; an edit of a tree of one of them is repacked in 0.4 s with the kernel and the
+  other trees unchanged).
+* **Not done**: the kernels of the other containers (uImage, Rockchip KRNL, OSIP, ChromeOS, Sony, FIT) are not looked at for glued trees; trees
+  inside a compressed stream are not found; zeros between the stream and the first tree stay in the raw copy and go when the kernel is edited;
+  a last tree that is cut short turns the whole search off (the kernel is left whole, as before). Other things in a boot image that are
+  trees in disguise (Amlogic's `AML_` container in `second`, plain trees in the `dt` field of a non-QCDT image) are step b.
 
 ## Next steps (in order)
 
 1. The user's requests of 17 Nov 2026, in this order (one commit per step; narrow checks while they are built, then the one full run):
-   a. **The device trees as text wherever they are** -- done for the trees that stand alone (see "Device trees as text"); the trees glued
-      to a kernel are done with step b.
+   a. **The device trees as text wherever they are** -- done, the trees glued to the kernel of a boot image too (see "Device trees as
+      text"); what is left of it (the kernels of the other containers, `second` and `dt` of boot images) is part of step b.
    b. **Deeper than the first layer** for everything that has more inside it (the kernel, and what else `unpack` leaves as a file that a person
       cannot read or edit).
    c. **`kernel_info/`**: what can be learnt from the kernel -- the build configuration, the symbol table, the binaries glued to it, the

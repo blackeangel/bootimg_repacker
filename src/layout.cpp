@@ -16,6 +16,7 @@
 #include "abr/dtb.hpp"
 #include "abr/dtbo.hpp"
 #include "abr/envelope.hpp"
+#include "abr/kernel.hpp"
 #include "abr/legacy/blob.hpp"
 #include "abr/legacy/chromeos.hpp"
 #include "abr/legacy/elf_boot.hpp"
@@ -116,7 +117,11 @@ Layout boot(const BootImage& img) {
         r.codec = codec_of(b);
         pos = align_up(pos + b.size(), page);
     };
+    const uint64_t kernel_at = pos;
     part("kernel", "kernel", img.kernel);
+    // The device trees glued behind the kernel's stream (`Image.gz-dtb`): the rows of a section of trees, from where the first begins.
+    if (const auto glued = kernel::find_appended_trees(img.kernel))
+        tree_section(l, Bytes(img.kernel.begin() + static_cast<std::ptrdiff_t>(glued->start), img.kernel.end()), kernel_at + glued->start, 1, "kernel_dtb");
     part("ramdisk", "ramdisk", img.ramdisk);
     part("second", "second", img.second, "second stage");
     const uint64_t dt_at = pos;

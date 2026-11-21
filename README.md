@@ -824,6 +824,19 @@ one of dtbo and boot: `has_avb_footer=true`, `avb_partition_size`, the fields of
 files; `pack` writes the footer again, hashes the new trees and signs with `keys/avb_key.pem` or, without it, with the public AVB test
 key (`testkey_rsa2048`), and says that it did.
 
+**Device trees glued behind a kernel** (`Image.gz-dtb`, `zImage-dtb`, `Image-dtb`): the build of an Android kernel puts device trees behind
+the kernel -- a gzip stream, or a kernel that is not compressed -- with no byte between them, and the boot loader picks the one whose ids
+(`qcom,msm-id`, `qcom,board-id`, ...) fit the board. `unpack` finds them in the kernel of a boot or recovery image *before* it decodes the
+kernel and writes them as `kernel_dtb/entry<N>.dts` (`kernel_dtb_count`, `kernel_dtb<N>_file`); the file `kernel` is the kernel without them.
+Zeros between two trees are `kernel_dtb_align` (or `kernel_dtb<N>_pad`), what follows the last tree is `kernel_dtb_tail_zeros` or the file
+`kernel_dtb/tail.bin`. `pack` puts them behind the kernel again, whatever its codec, and under the MediaTek header when there is one (it
+declares the size of all of it): an edit of the kernel keeps the trees, an edit of a tree is compiled into its place, and a manifest without
+the `kernel_dtb_*` keys has no trees. Trees are glued when from the first of them to the end of the kernel field there is nothing but trees
+(and the zeros between them) and a tail of 64 KiB at most, or zeros only; a tree inside a kernel, with code and data behind it, is not. Zeros
+between the end of the stream and the first tree stay in the copy of the kernel in `.abr_raw/`, so they are gone after an edit of the kernel.
+The kernels of the other containers (uImage, Rockchip, ChromeOS, ...) are not looked at for trees yet. The layout of `unpack` and `info` lists
+the trees as rows of the kernel.
+
 A **QCDT** table (what `dtbTool` makes, versions 1, 2 and 3) is the table of a Qualcomm boot image's device trees or the file `dt.img`: a
 table of entries -- the chipset, the platform, the subtype and the revision (from `qcom,msm-id` and `qcom,board-id`, `qcom,pmic-id`) --
 each naming one of the trees that follow, padded to the page size. `unpack` writes the trees as `dtb<N>.dts` (`dtb<N>_file`) and the entries as

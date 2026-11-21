@@ -1594,10 +1594,10 @@ if [ -x "$UNIT" ]; then
     fi
 fi
 
-# The other groups of unit tests: device trees (fdt), a device tree in the folder of an unpack (dtfile), the filter that makes output safe for a terminal (console), the readers of AVB keys
+# The other groups of unit tests: device trees (fdt), a device tree in the folder of an unpack (dtfile), what a kernel holds besides the kernel (kernel), the filter that makes output safe for a terminal (console), the readers of AVB keys
 # (avbkeys), the tables of the layout (layout), compression levels (levels), PNG (png), the MediaTek containers (mtkimg) and the preloader
 # (mtkgfh), the Qualcomm secure boot images (mbn), the picture partitions (splash), the device tree tables (qcdt) and FIT (fit).
-for unit_group in fdt dtfile console avbkeys layout levels png mtkimg mtkgfh mbn splash qcdt fit; do
+for unit_group in fdt dtfile kernel console avbkeys layout levels png mtkimg mtkgfh mbn splash qcdt fit; do
     if [ -x "$UNIT" ]; then
         if out=$("$UNIT" "$unit_group" 2>&1); then
             pass "unit tests of the group $unit_group ($(tail -n 1 <<<"$out"))"
@@ -5802,6 +5802,344 @@ dt_unpack_refused dt_cut.dtb "20 bytes that start with the magic" "this dtb is c
 { cat a.dtb; dt_patch_total a.dtb dt_second.tmp 4096; cat dt_second.tmp; } >dt_second_long.dtb
 dt_unpack_refused dt_second_long.dtb "a second blob whose totalsize runs past the end" "the FDT blob at offset 192 has a totalsize of 4096"
 rp_report "a dtb that is cut short (20 bytes), whose totalsize is less than the header or runs past the end of the file, in the first blob or in a later one, is refused on unpack with where, and no directory is left"
+
+# ---- device trees glued behind a kernel: Image.gz-dtb, zImage-dtb, Image-dtb ---------------------------------------------------
+# The build of an Android kernel glues device trees behind it: a gzip stream (or a kernel that is not compressed) and, with no byte between,
+# one to a few dozen trees, which the boot loader picks from by the ids inside them. The decoders ignore what follows the end of a stream, so
+# the trees were only in the copy of the kernel that unpack keeps for an untouched repack: none could be edited, and an edit of the kernel
+# dropped all of them. Now unpack cuts them off before it decodes the kernel and writes them as sources (kernel_dtb/entryN.dts; the zeros
+# between two of them and what follows the last one are in the manifest), the layout lists them, and pack puts them behind the kernel again,
+# whatever its codec, with the header of MediaTek in front of it or not. A tree inside a kernel, with code and data behind it, is no glued
+# tree: such a kernel stays as it was.
+python3 -I - <<'PYEOF'
+import random, struct
+random.seed(5)
+words = [b"init", b"kernel", b"driver", b"probe", b"clock", b"regulator", b"sched", b"memory",
+         b"Linux version 5.10.101-android12-9 (build@host) (clang version 14.0.7)", b"\x00\x01\x02\x03"]
+payload = b"".join(random.choice(words) + struct.pack("<I", random.getrandbits(20)) for _ in range(9000))
+open("gk_payload.bin", "wb").write(payload)
+image = bytearray(payload[:100000])  # a kernel that is not compressed: arm64, with its magic at 0x38
+image[0x38:0x3c] = b"ARM\x64"
+open("gk_image.bin", "wb").write(bytes(image))
+image[1000] ^= 0x55
+open("gk_image2.bin", "wb").write(bytes(image))
+PYEOF
+gk_names=("Glued board zero" "Glued board one" "Glued board two, with a longer name than the others have")
+for gk_i in 0 1 2; do
+    printf '/dts-v1/;\n/ {\n\tmodel = "%s";\n\tcompatible = "test,glued-%s", "test,soc";\n\tqcom,msm-id = <%s 0x10000>;\n\tqcom,board-id = <%s 0>;\n\t#address-cells = <1>;\n\t#size-cells = <1>;\n\tchosen { bootargs = "console=ttyMSM0"; };\n};\n' \
+        "${gk_names[$gk_i]}" "$gk_i" "$((300 + gk_i))" "$((8 + gk_i))" >"gk_t$gk_i.dts"
+    dtc -q -I dts -O dtb -o "gk_t$gk_i.dtb" "gk_t$gk_i.dts" 2>/dev/null
+done
+cat gk_t0.dtb gk_t1.dtb gk_t2.dtb >gk_trees.bin
+gk_tsum=$(wc -c <gk_trees.bin | tr -d ' ')
+head -c 100000 /dev/urandom | gzip -9 >gk_rd.gz
+gzip -9 -n -c gk_payload.bin >gk_gz.bin
+gk_gzlen=$(wc -c <gk_gz.bin | tr -d ' ')
+
+gk_stream() {  # <codec> <in> <out>: the stream the real tool makes of the file; fails when that tool is not installed
+    case "$1" in
+        gzip) gzip -9 -n -c "$2" >"$3" ;;
+        xz) command -v xz >/dev/null 2>&1 && xz -9 --check=crc32 -c "$2" >"$3" ;;
+        lzma) command -v xz >/dev/null 2>&1 && xz --format=lzma -9 -c "$2" >"$3" ;;
+        bzip2) command -v bzip2 >/dev/null 2>&1 && bzip2 -9 -c "$2" >"$3" ;;
+        zstd) command -v zstd >/dev/null 2>&1 && zstd -q -19 -c "$2" >"$3" ;;
+        lz4) command -v lz4 >/dev/null 2>&1 && lz4 -q -9 -c "$2" >"$3" ;;
+        lz4_legacy) command -v lz4 >/dev/null 2>&1 && lz4 -q -9 -l -c "$2" >"$3" ;;
+        lzo) command -v lzop >/dev/null 2>&1 && lzop -q -9 -c "$2" >"$3" ;;
+        *) return 1 ;;
+    esac
+}
+gk_boot() {  # <kernel> <image> <arguments of mkbootimg>: a boot image with that kernel and a gzip ramdisk
+    local k="$1" out="$2"
+    shift 2
+    python3 "$MKBOOTIMG" >/dev/null 2>&1 --kernel "$k" --ramdisk gk_rd.gz --cmdline "console=ttyS0" "$@" --output "$out"
+}
+gk_part() {  # <image> <part> <out>: a field of the image, cut out without abr
+    python3 -I "$TOOLS/verify.py" boot-part "$1" "$2" "$3"
+}
+gk_unpack() {  # <image> <dir>: a fresh unpack, what it says in gk.log
+    rm -rf "$2"
+    "$ABR" unpack -i "$1" -o "$2" >gk.log 2>&1
+}
+gk_edit() {  # <dir> <sed expression> <file in the dir>: gk_e is a copy of the directory with that file edited
+    rm -rf gk_e
+    cp -a "$1" gk_e
+    sed -i "$2" "gk_e/$3"
+}
+gk_same() {  # <label> <image>: the untouched directory gk_d is the image it was unpacked from
+    if rp_made gk_d "$1: untouched"; then
+        cmp -s "$rp_run" "$2" || rp_bad="$rp_bad [$1: the untouched directory is not the image]"
+    fi
+}
+gk_trees_at() {  # <kernel field> <where the first tree is> <alignment> <how many>: the trees are what they should be, up to the end of the field
+    python3 -I - "$@" <<'PYEOF'
+import struct, sys
+k = open(sys.argv[1], "rb").read()
+pos, align, want = int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+first, n = pos, 0
+while pos + 40 <= len(k) and k[pos:pos + 4] == b"\xd0\x0d\xfe\xed":
+    if (pos - first) % align:
+        sys.exit("tree %d is %d bytes behind the first, not a multiple of %d" % (n, pos - first, align))
+    pos += struct.unpack(">I", k[pos + 4:pos + 8])[0]
+    n += 1
+    while pos < len(k) and k[pos] == 0:
+        pos += 1
+if n != want or pos != len(k):
+    sys.exit("%d trees, the last ends at %d of %d; %d are wanted" % (n, pos, len(k), want))
+PYEOF
+}
+
+gk_done=""
+for gk_codec in gzip xz lzma bzip2 zstd lz4 lz4_legacy lzo; do
+    if ! gk_stream "$gk_codec" gk_payload.bin gk_stream.bin; then
+        echo "SKIP: device trees behind a $gk_codec kernel (that compressor is not installed)"
+        continue
+    fi
+    gk_done="$gk_done $gk_codec"
+    cat gk_stream.bin gk_trees.bin >gk_kernel.bin
+    gk_boot gk_kernel.bin "gk_$gk_codec.img" --header_version 0
+    rp_n=$((rp_n + 1))
+    if ! gk_unpack "gk_$gk_codec.img" gk_d; then
+        rp_bad="$rp_bad [$gk_codec: unpack: $(head -c 160 gk.log)]"
+        continue
+    fi
+    grep -q -F 'reproduces this image byte-for-byte' gk.log || rp_bad="$rp_bad [$gk_codec: unpack does not say that it is exact]"
+    grep -q -F 'file kernel_dtb/entry2.dts' gk.log || rp_bad="$rp_bad [$gk_codec: the layout of unpack does not list the third tree]"
+    said 'device tree 2' "$ABR" info -i "gk_$gk_codec.img" || rp_bad="$rp_bad [$gk_codec: info does not list the third tree]"
+    { grep -q "^kernel_compression=$gk_codec\$" gk_d/manifest.txt && grep -q '^kernel_dtb_count=3$' gk_d/manifest.txt \
+        && [ -f gk_d/kernel_dtb/entry0.dts ] && [ -f gk_d/kernel_dtb/entry1.dts ] && [ -f gk_d/kernel_dtb/entry2.dts ] \
+        && [ ! -e gk_d/kernel_dtb/tail.bin ] && ! grep -q '^kernel_dtb_tail' gk_d/manifest.txt; } \
+        || rp_bad="$rp_bad [$gk_codec: the manifest and the files do not have three trees and nothing behind them]"
+    cmp -s gk_d/kernel gk_payload.bin || rp_bad="$rp_bad [$gk_codec: the file kernel is not the kernel without its trees]"
+    for gk_i in 0 1 2; do
+        dtc -q -I dts -O dtb -o gk_o.dtb "gk_d/kernel_dtb/entry$gk_i.dts" 2>/dev/null
+        cmp -s gk_o.dtb "gk_t$gk_i.dtb" || rp_bad="$rp_bad [$gk_codec: dtc compiles entry$gk_i.dts to something else than the tree that was glued]"
+    done
+    gk_same "$gk_codec" "gk_$gk_codec.img"
+    # a tree edited: it is compiled into its place; the stream, the other trees and the ramdisk are as they were
+    gk_edit gk_d 's/Glued board one/Edited tree/' kernel_dtb/entry1.dts
+    if rp_made gk_e "$gk_codec: a tree edited"; then
+        gk_part "$rp_run" kernel gk_k.bin
+        dtc -q -I dts -O dtb -o gk_n1.dtb gk_e/kernel_dtb/entry1.dts 2>/dev/null
+        cat gk_stream.bin gk_t0.dtb gk_n1.dtb gk_t2.dtb >gk_want.bin
+        cmp -s gk_want.bin gk_k.bin || rp_bad="$rp_bad [$gk_codec: an edited tree: the kernel is not the stream, the first tree, the edited one and the third]"
+        gk_part "gk_$gk_codec.img" ramdisk gk_r0.bin
+        gk_part "$rp_run" ramdisk gk_r1.bin
+        cmp -s gk_r0.bin gk_r1.bin || rp_bad="$rp_bad [$gk_codec: an edited tree: the ramdisk is not as it was]"
+    fi
+    # the kernel edited: the trees are behind the new stream, as they were
+    rm -rf gk_e
+    cp -a gk_d gk_e
+    { cat gk_payload.bin; printf 'THE-KERNEL-IS-EDITED'; } >gk_e/kernel
+    if rp_made gk_e "$gk_codec: the kernel edited"; then
+        gk_part "$rp_run" kernel gk_k.bin
+        tail -c "$gk_tsum" gk_k.bin >gk_kt.bin
+        cmp -s gk_kt.bin gk_trees.bin || rp_bad="$rp_bad [$gk_codec: an edited kernel: the trees are not behind it as they were]"
+        head -c $(($(wc -c <gk_k.bin | tr -d ' ') - gk_tsum)) gk_k.bin >gk_ks.bin
+        { cat gk_payload.bin; printf 'THE-KERNEL-IS-EDITED'; } >gk_want.bin
+        gk_dec="$(thr_decoder "$gk_codec")"
+        if [ -n "$gk_dec" ]; then
+            # shellcheck disable=SC2086
+            { $gk_dec <gk_ks.bin >gk_dec.bin 2>/dev/null && cmp -s gk_dec.bin gk_want.bin; } || rp_bad="$rp_bad [$gk_codec: the real $gk_dec does not read the stream of an edited kernel back]"
+        fi
+        { gk_unpack "$rp_run" gk_d2 && cmp -s gk_d2/kernel gk_want.bin && grep -q '^kernel_dtb_count=3$' gk_d2/manifest.txt; } \
+            || rp_bad="$rp_bad [$gk_codec: an edited kernel: unpacked again it is not the edited kernel with its three trees]"
+    fi
+    # the keys of the trees taken out of the manifest: the trees are gone, and the kernel is the stream alone
+    gk_edit gk_d '/^kernel_dtb/d' manifest.txt
+    if rp_made gk_e "$gk_codec: the trees dropped"; then
+        gk_part "$rp_run" kernel gk_k.bin
+        cmp -s gk_k.bin gk_stream.bin || rp_bad="$rp_bad [$gk_codec: keys of the trees taken out: the kernel is not the stream alone]"
+    fi
+    # two of the three: the count says how many
+    rm -rf gk_e
+    cp -a gk_d gk_e
+    rp_set gk_e kernel_dtb_count 2
+    if rp_made gk_e "$gk_codec: two trees of three"; then
+        gk_part "$rp_run" kernel gk_k.bin
+        cat gk_stream.bin gk_t0.dtb gk_t1.dtb >gk_want.bin
+        cmp -s gk_want.bin gk_k.bin || rp_bad="$rp_bad [$gk_codec: kernel_dtb_count=2: the kernel is not the stream and two trees]"
+    fi
+done
+rp_report "boot images with a kernel that is a stream of each codec the machine has a compressor for (${gk_done# }) and three device trees of different sizes glued behind it: unpack writes the trees as the sources kernel_dtb/entry0.dts to entry2.dts (dtc compiles each one to the tree that was glued), the file kernel is the kernel without them, the layout of unpack and of info lists them, the untouched directory is the image; an edited tree goes to its place with the stream, the other trees and the ramdisk as they were; an edited kernel has the trees behind it (the real decompressor reads its stream, unpacked again it has the trees); without the keys there are no trees, and the count says how many"
+
+# shapes: a kernel that is not compressed, trees at multiples of a few bytes, a signature behind the trees, zeros behind them (a field that is filled
+# up), zeros between the stream and the first tree
+python3 -I - <<'PYEOF'
+t = [open("gk_t%d.dtb" % i, "rb").read() for i in range(3)]
+gz = open("gk_gz.bin", "rb").read()
+img = open("gk_image.bin", "rb").read()
+pad = lambda n, a: b"\0" * ((-n) % a)
+sig = bytes((i * 7 + 3) & 255 for i in range(256))
+open("gk_shape_none", "wb").write(img + t[0] + t[1])
+open("gk_shape_align", "wb").write(gz + t[0] + pad(len(t[0]), 16) + t[1] + pad(len(t[1]), 16) + t[2])
+open("gk_shape_tail", "wb").write(gz + t[0] + t[1] + t[2] + sig)
+open("gk_shape_fill", "wb").write(gz + t[0] + t[1] + t[2] + b"\0" * 4096)
+open("gk_shape_gap", "wb").write(gz + b"\0" * 5 + t[0] + t[1])
+open("gk_sig.bin", "wb").write(sig)
+PYEOF
+for gk_shape in none align tail fill gap; do
+    gk_boot "gk_shape_$gk_shape" "gk_shape_$gk_shape.img" --header_version 0
+    rp_n=$((rp_n + 1))
+    if ! gk_unpack "gk_shape_$gk_shape.img" gk_d; then
+        rp_bad="$rp_bad [$gk_shape: unpack: $(head -c 160 gk.log)]"
+        continue
+    fi
+    grep -q -F 'reproduces this image byte-for-byte' gk.log || rp_bad="$rp_bad [$gk_shape: unpack does not say that it is exact]"
+    gk_same "$gk_shape" "gk_shape_$gk_shape.img"
+    case "$gk_shape" in
+        none)
+            { grep -q '^kernel_compression=none$' gk_d/manifest.txt && grep -q '^kernel_dtb_count=2$' gk_d/manifest.txt && cmp -s gk_d/kernel gk_image.bin; } \
+                || rp_bad="$rp_bad [none: not two trees behind an uncompressed kernel that is the file kernel]"
+            # the kernel edited: all of it is behind the new kernel, whole
+            rm -rf gk_e
+            cp -a gk_d gk_e
+            cp gk_image2.bin gk_e/kernel
+            if rp_made gk_e "none: the kernel edited"; then
+                gk_part "$rp_run" kernel gk_k.bin
+                cat gk_image2.bin gk_t0.dtb gk_t1.dtb >gk_want.bin
+                cmp -s gk_want.bin gk_k.bin || rp_bad="$rp_bad [none: an edited kernel is not followed by the two trees]"
+            fi
+            ;;
+        align)
+            gk_align="$(sed -n 's/^kernel_dtb_align=//p' gk_d/manifest.txt)"
+            { [ -n "$gk_align" ] && grep -q '^kernel_dtb_count=3$' gk_d/manifest.txt; } || rp_bad="$rp_bad [align: no kernel_dtb_align for three trees at multiples of 16 bytes]"
+            # the first tree is longer: the others are still at multiples of the alignment (the zeros between are made again)
+            gk_edit gk_d 's/Glued board zero/Glued board zero, now with a name that is a good deal longer/' kernel_dtb/entry0.dts
+            if rp_made gk_e "align: the first tree edited"; then
+                gk_part "$rp_run" kernel gk_k.bin
+                gk_msg="$(gk_trees_at gk_k.bin "$gk_gzlen" "${gk_align:-16}" 3 2>&1)" || rp_bad="$rp_bad [align: after an edit: $gk_msg]"
+                head -c "$gk_gzlen" gk_k.bin | cmp -s - gk_gz.bin || rp_bad="$rp_bad [align: after an edit the stream is not as it was]"
+            fi
+            ;;
+        tail)
+            { grep -q '^kernel_dtb_count=3$' gk_d/manifest.txt && grep -q '^kernel_dtb_tail_file=kernel_dtb/tail.bin$' gk_d/manifest.txt \
+                && cmp -s gk_d/kernel_dtb/tail.bin gk_sig.bin; } || rp_bad="$rp_bad [tail: the 256 bytes behind the trees are not kernel_dtb/tail.bin]"
+            gk_edit gk_d 's/Glued board one/Edited tree/' kernel_dtb/entry1.dts
+            if rp_made gk_e "tail: a tree edited"; then
+                gk_part "$rp_run" kernel gk_k.bin
+                dtc -q -I dts -O dtb -o gk_n1.dtb gk_e/kernel_dtb/entry1.dts 2>/dev/null
+                cat gk_gz.bin gk_t0.dtb gk_n1.dtb gk_t2.dtb gk_sig.bin >gk_want.bin
+                cmp -s gk_want.bin gk_k.bin || rp_bad="$rp_bad [tail: after an edit of a tree the signature is not behind the last one]"
+            fi
+            ;;
+        fill)
+            { grep -q '^kernel_dtb_count=3$' gk_d/manifest.txt && grep -q '^kernel_dtb_tail_zeros=4096$' gk_d/manifest.txt && [ ! -e gk_d/kernel_dtb/tail.bin ]; } \
+                || rp_bad="$rp_bad [fill: 4096 zeros behind the trees are not kernel_dtb_tail_zeros=4096]"
+            ;;
+        gap)
+            grep -q '^kernel_dtb_count=2$' gk_d/manifest.txt || rp_bad="$rp_bad [gap: not two trees behind five zeros behind the stream]"
+            ;;
+    esac
+done
+rp_report "boot images whose kernel has its trees in other shapes (an arm64 kernel that is not compressed, trees at multiples of 16 bytes with zeros between them, a signature of 256 bytes behind the last tree, 4096 zeros behind it, five zeros between the stream and the first tree) are unpacked with the trees as sources, and come back byte for byte; the kernel that is not compressed is the file kernel, whole, and an edit of it keeps the trees behind it; the trees keep their alignment after an edit of the first, the signature stays behind the last tree after an edit of a tree"
+
+# what is no glued tree: a tree in the middle of a kernel with 80 KB of code and data behind it, a stream and a tree and 70000 bytes behind that are no tree,
+# a tree at the very start (a dtb is no kernel with trees behind it), a stream and 64 zeros
+python3 -I - <<'PYEOF'
+t0 = open("gk_t0.dtb", "rb").read()
+gz = open("gk_gz.bin", "rb").read()
+img = open("gk_image.bin", "rb").read()
+junk = bytes(((i * 13 + 5) & 255) | 1 for i in range(70000))  # (odd bytes only: no d0 0d fe ed in it, no zero)
+open("gk_not_inside", "wb").write(img[:20000] + t0 + img[20000:])
+open("gk_not_junk", "wb").write(gz + t0 + junk)
+open("gk_not_first", "wb").write(t0 + img[:5000])
+open("gk_not_zeros", "wb").write(gz + b"\0" * 64)
+PYEOF
+for gk_not in inside junk first zeros; do
+    gk_boot "gk_not_$gk_not" "gk_not_$gk_not.img" --header_version 0
+    rp_n=$((rp_n + 1))
+    if ! gk_unpack "gk_not_$gk_not.img" gk_d; then
+        rp_bad="$rp_bad [$gk_not: unpack: $(head -c 160 gk.log)]"
+        continue
+    fi
+    { ! grep -q '^kernel_dtb' gk_d/manifest.txt && [ ! -e gk_d/kernel_dtb ] && ! grep -q -F 'kernel_dtb' gk.log; } \
+        || rp_bad="$rp_bad [$gk_not: device trees were found where there are none glued]"
+    gk_same "$gk_not" "gk_not_$gk_not.img"
+done
+rp_report "boot images whose kernel has a tree where none is glued (a tree in the middle of an uncompressed kernel with 80 KB of code and data behind it, a gzip stream with a tree and 70000 bytes that are no tree behind it, a kernel that begins with a tree, a stream and 64 zeros) are unpacked without kernel_dtb, and come back byte for byte"
+
+# the dtb of a header version 2 image and the trees behind its kernel are two things: an edit of either does not touch the other
+cat gk_gz.bin gk_trees.bin >gk_kernel_gz.bin
+gk_boot gk_kernel_gz.bin gk_v2.img --header_version 2 --dtb gk_t1.dtb --pagesize 2048
+rp_n=$((rp_n + 1))
+if ! gk_unpack gk_v2.img gk_d; then
+    rp_bad="$rp_bad [v2: unpack: $(head -c 160 gk.log)]"
+else
+    { [ -f gk_d/dtb/entry0.dts ] && [ -f gk_d/kernel_dtb/entry2.dts ] && grep -q '^kernel_dtb_count=3$' gk_d/manifest.txt; } \
+        || rp_bad="$rp_bad [v2: not both the dtb of the header (dtb/entry0.dts) and the trees behind the kernel (kernel_dtb/entry0.dts to entry2.dts)]"
+    gk_same v2 gk_v2.img
+    gk_part gk_v2.img kernel gk_k0.bin
+    gk_part gk_v2.img dtb gk_b0.bin
+    gk_edit gk_d 's/Glued board one/The dtb of the header/' dtb/entry0.dts
+    if rp_made gk_e "v2: the dtb edited"; then
+        gk_part "$rp_run" kernel gk_k.bin
+        gk_part "$rp_run" dtb gk_b.bin
+        dtc -q -I dts -O dtb -o gk_n.dtb gk_e/dtb/entry0.dts 2>/dev/null
+        { cmp -s gk_k.bin gk_k0.bin && cmp -s gk_b.bin gk_n.dtb; } || rp_bad="$rp_bad [v2: an edit of dtb/entry0.dts changed the kernel, or is not the dtb of the header]"
+    fi
+    gk_edit gk_d 's/Glued board zero/The first of the trees behind the kernel/' kernel_dtb/entry0.dts
+    if rp_made gk_e "v2: a tree behind the kernel edited"; then
+        gk_part "$rp_run" kernel gk_k.bin
+        gk_part "$rp_run" dtb gk_b.bin
+        dtc -q -I dts -O dtb -o gk_n0.dtb gk_e/kernel_dtb/entry0.dts 2>/dev/null
+        cat gk_gz.bin gk_n0.dtb gk_t1.dtb gk_t2.dtb >gk_want.bin
+        { cmp -s gk_k.bin gk_want.bin && cmp -s gk_b.bin gk_b0.bin; } || rp_bad="$rp_bad [v2: an edit of kernel_dtb/entry0.dts changed the dtb of the header, or is not in the kernel]"
+    fi
+fi
+# a header of MediaTek in front of the kernel is made behind the trees: its size is the size of the stream and the trees
+python3 -I - <<'PYEOF'
+import struct
+payload = open("gk_gz.bin", "rb").read() + open("gk_trees.bin", "rb").read()
+h = struct.pack("<II", 0x58881688, len(payload)) + b"KERNEL".ljust(32, b"\0")
+open("gk_mtk_kernel", "wb").write(h + b"\xff" * (512 - len(h)) + payload)
+PYEOF
+gk_boot gk_mtk_kernel gk_mtk.img --header_version 0
+rp_n=$((rp_n + 1))
+if ! gk_unpack gk_mtk.img gk_d; then
+    rp_bad="$rp_bad [mtk: unpack: $(head -c 160 gk.log)]"
+else
+    { grep -q '^kernel_mtk_name=KERNEL$' gk_d/manifest.txt && grep -q '^kernel_dtb_count=3$' gk_d/manifest.txt; } \
+        || rp_bad="$rp_bad [mtk: not three trees behind a kernel with the header of MediaTek]"
+    gk_same mtk gk_mtk.img
+    gk_edit gk_d 's/Glued board one/Edited tree/' kernel_dtb/entry1.dts
+    if rp_made gk_e "mtk: a tree edited"; then
+        gk_part "$rp_run" kernel gk_k.bin
+        dtc -q -I dts -O dtb -o gk_n1.dtb gk_e/kernel_dtb/entry1.dts 2>/dev/null
+        cat gk_gz.bin gk_t0.dtb gk_n1.dtb gk_t2.dtb >gk_want.bin
+        tail -c +513 gk_k.bin | cmp -s - gk_want.bin || rp_bad="$rp_bad [mtk: after an edit of a tree the payload is not the stream and the three trees]"
+        python3 -I - gk_k.bin <<'PYEOF' || rp_bad="$rp_bad [mtk: after an edit of a tree the header of MediaTek is not right for the new size]"
+import struct, sys
+k = open(sys.argv[1], "rb").read()
+magic, size = struct.unpack_from("<II", k, 0)
+sys.exit(0 if magic == 0x58881688 and size == len(k) - 512 else 1)
+PYEOF
+    fi
+fi
+rp_report "a header version 2 image keeps the dtb of its header (dtb/entry0.dts) and the trees behind its kernel (kernel_dtb/entry0.dts to entry2.dts) apart: an edit of either reaches only its own; a kernel with the 512-byte header of MediaTek in front of the stream and the trees has them found, and after an edit of a tree the header says the new size"
+
+# what is wrong in the trees of kernel_dtb is told as for any other tree: the file or the key, and nothing is written
+gk_unpack gk_gzip.img gk_d
+rm -rf gk_e
+cp -a gk_d gk_e
+printf '/dts-v1/;\n/ {\n\tmodel = "x"\n};\n' >gk_e/kernel_dtb/entry0.dts
+rp_refused gk_e "a source with a missing semicolon" "entry0.dts: line 4"
+rm -rf gk_e
+cp -a gk_d gk_e
+rp_set gk_e kernel_dtb1_file x.dtb
+printf 'this is not a device tree, it is a text of some length, more than the 40 bytes of a header\n' >gk_e/x.dtb
+rp_refused gk_e "a text in the place of a tree" "kernel_dtb1_file (x.dtb) is not a flattened device tree"
+rm -rf gk_e
+cp -a gk_d gk_e
+rm gk_e/kernel_dtb/entry2.dts
+rp_refused gk_e "a source that is gone" "entry2.dts"
+rm -rf gk_e
+cp -a gk_d gk_e
+rp_set gk_e kernel_dtb_count 4
+rp_refused gk_e "a count of four for three trees" "manifest.txt has no kernel_dtb3_file"
+rp_set gk_e kernel_dtb_count 0
+rp_refused gk_e "a count of none" "kernel_dtb_count is 0"
+rp_report "trees behind a kernel that are wrong (a source with a missing semicolon, a text in the place of a tree, a source that is gone, a count of four for three trees, a count of none) are refused with the file or the key named, and nothing is written"
 
 # the OSIP image: a header of the image is told by its first 7 bytes, an image without one by the bootstub
 rp_fresh osip_u4.img rp_osd
