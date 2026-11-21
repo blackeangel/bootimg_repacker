@@ -1594,10 +1594,10 @@ if [ -x "$UNIT" ]; then
     fi
 fi
 
-# The other groups of unit tests: device trees (fdt), the filter that makes output safe for a terminal (console), the readers of AVB keys
+# The other groups of unit tests: device trees (fdt), a device tree in the folder of an unpack (dtfile), the filter that makes output safe for a terminal (console), the readers of AVB keys
 # (avbkeys), the tables of the layout (layout), compression levels (levels), PNG (png), the MediaTek containers (mtkimg) and the preloader
 # (mtkgfh), the Qualcomm secure boot images (mbn), the picture partitions (splash), the device tree tables (qcdt) and FIT (fit).
-for unit_group in fdt console avbkeys layout levels png mtkimg mtkgfh mbn splash qcdt fit; do
+for unit_group in fdt dtfile console avbkeys layout levels png mtkimg mtkgfh mbn splash qcdt fit; do
     if [ -x "$UNIT" ]; then
         if out=$("$UNIT" "$unit_group" 2>&1); then
             pass "unit tests of the group $unit_group ($(tail -n 1 <<<"$out"))"
@@ -5703,30 +5703,44 @@ for dt_img in dt_zero dt_ff dt_trailer dt_trailer_zero; do
         dt_trailer|dt_trailer_zero) said "trailing: *$(wc -c <dt_trailer.bin | tr -d ' ') bytes after the image" "$ABR" info -i "$dt_img.dtb" || rp_bad="$rp_bad [$dt_img: info does not name the trailer]" ;;
     esac
 done
-# an edit of a blob: the image is as long as it was (the fill is made up again), the blob is the new one
+# an edit of a blob: the image is as long as it was (the fill is made up again), the blob is the new one. A tree is unpacked as its source
+# (entry0.dts): the edit is a new text for it, or -- when the manifest says so -- a file of another name, which goes in as the blob it is
 rp_fresh dt_zero.dtb rp_dtd
-cp dt_big.dtb rp_dtd/blob0.dtb
-if rp_made rp_dtd "a bigger first blob"; then
-    [ "$(wc -c <"$rp_run" | tr -d ' ')" = "$(wc -c <dt_zero.dtb | tr -d ' ')" ] || rp_bad="$rp_bad [a bigger blob: the image is not as long as it was]"
-    cmp -s -n "$(wc -c <dt_big.dtb | tr -d ' ')" "$rp_run" dt_big.dtb || rp_bad="$rp_bad [a bigger blob: it is not the first one]"
-    cmp -s -i "$(wc -c <dt_big.dtb | tr -d ' ')":0 -n 192 "$rp_run" a.dtb || rp_bad="$rp_bad [a bigger blob: the second one moved]"
-fi
+rp_n=$((rp_n + 1))
+{ [ -f rp_dtd/entry0.dts ] && [ -f rp_dtd/entry1.dts ] && [ ! -e rp_dtd/entry0.dtb ] && grep -q '^blob0_file=entry0.dts$' rp_dtd/manifest.txt; } || rp_bad="$rp_bad [the trees are not unpacked as the sources entry0.dts and entry1.dts]"
+for rp_how in source blob; do
+    rp_fresh dt_zero.dtb rp_dtd
+    if [ "$rp_how" = source ]; then
+        cp dt_big.dts rp_dtd/entry0.dts
+    else
+        rp_set rp_dtd blob0_file blob0.dtb
+        cp dt_big.dtb rp_dtd/blob0.dtb
+    fi
+    if rp_made rp_dtd "a bigger first blob ($rp_how)"; then
+        [ "$(wc -c <"$rp_run" | tr -d ' ')" = "$(wc -c <dt_zero.dtb | tr -d ' ')" ] || rp_bad="$rp_bad [a bigger blob ($rp_how): the image is not as long as it was]"
+        cmp -s -n "$(wc -c <dt_big.dtb | tr -d ' ')" "$rp_run" dt_big.dtb || rp_bad="$rp_bad [a bigger blob ($rp_how): it is not the first one]"
+        cmp -s -i "$(wc -c <dt_big.dtb | tr -d ' ')":0 -n 192 "$rp_run" a.dtb || rp_bad="$rp_bad [a bigger blob ($rp_how): the second one moved]"
+    fi
+done
 rp_fresh dt_trailer.dtb rp_dtd
-cp dt_big.dtb rp_dtd/blob0.dtb
+cp dt_big.dts rp_dtd/entry0.dts
 rp_n=$((rp_n + 1))
 "$ABR" pack -i rp_dtd -o "$rp_run" >rp_dt.log 2>&1 && grep -q "kept as they were" rp_dt.log || rp_bad="$rp_bad [an edit with a trailer behind: no warning: $(head -c 160 rp_dt.log)]"
 rp_report "dtb files with something behind the last blob (zero fill, 0xFF fill, a trailer, a trailer and fill) come back byte for byte, are said to, keep it as a fill (padded up to the old size after an edit) or a file; a trailer behind an edited blob is warned of"
 
 rp_fresh dt_zero.dtb rp_dtd
-for rp_case in "blob0.dtb|a text|is not a flattened device tree" "blob1.dtb|a text for the second blob|blob1_file (blob1.dtb) is not a flattened device tree"; do
+# (a file that is not a source -- its key says it is a blob of the name .dtb -- is a blob as it is, and has to be a device tree)
+for rp_case in "blob0|a text|blob0_file (blob0.dtb) is not a flattened device tree" "blob1|a text for the second blob|blob1_file (blob1.dtb) is not a flattened device tree"; do
     IFS='|' read -r rp_f rp_what rp_want <<<"$rp_case"
     rm -rf rp_try
     cp -a rp_dtd rp_try
-    printf 'this is not a device tree, it is a text of some length, more than the 40 bytes of a header\n' >"rp_try/$rp_f"
+    rp_set rp_try "${rp_f}_file" "$rp_f.dtb"
+    printf 'this is not a device tree, it is a text of some length, more than the 40 bytes of a header\n' >"rp_try/$rp_f.dtb"
     rp_refused rp_try "$rp_what" "$rp_want"
 done
 rm -rf rp_try
 cp -a rp_dtd rp_try
+rp_set rp_try blob0_file blob0.dtb
 head -c 191 a.dtb >rp_try/blob0.dtb
 rp_refused rp_try "a blob a byte short" "blob0_file (blob0.dtb) is 191 bytes, but the totalsize in its header is 192"
 { cat a.dtb; printf x; } >rp_try/blob0.dtb
@@ -5744,7 +5758,16 @@ rp_set rp_try blob_count 3
 rp_set rp_try blob2_file blob2.dtb
 cp dt_trailer.bin rp_try/blob2.dtb
 rp_refused rp_try "a trailer as a third blob" "blob2_file (blob2.dtb) is not a flattened device tree"
-rp_report "a dtb blob that is no flattened device tree (a text, nothing, the magic alone, 39 bytes, a trailer as a blob) or is not as long as its header says (a byte short, a byte too long) is refused, with the key and the file named, and nothing is written"
+# a source: its text is read by abr's own compiler, which says where and what; the file is named, and nothing is written
+rm -rf rp_try
+cp -a rp_dtd rp_try
+printf '/dts-v1/;\n/ {\n\tmodel = "x"\n};\n' >rp_try/entry0.dts
+rp_refused rp_try "a source with a missing semicolon" "entry0.dts:"
+printf '/dts-v1/;\n/ { a = <&nowhere>; };\n' >rp_try/entry0.dts
+rp_refused rp_try "a source with a reference to a label that is not there" "nowhere"
+printf '/dts-v1/;\n/ { /include/ "../../etc/passwd" };\n' >rp_try/entry0.dts
+rp_refused rp_try "a source that includes a file from outside the folder" "may be read"
+rp_report "a dtb blob that is no flattened device tree (a text, nothing, the magic alone, 39 bytes, a trailer as a blob) or is not as long as its header says (a byte short, a byte too long), and a source with an error (a missing semicolon, a reference to a label that is not there, an /include/ from outside the folder), are refused, with the key or the file named, and nothing is written"
 
 dt_patch_total() {  # <in> <out> <totalsize>: the dtb with the big-endian totalsize of its first blob replaced
     python3 -I - "$@" <<'PYEOF'
@@ -6838,7 +6861,11 @@ for fit_lay in "inline:" "E:-E" "EB8:-E -B 8" "EB1000:-E -B 0x1000" "Ep800:-E -p
     grep -q -F "reproduces this image byte-for-byte" fit_un.log || rp_bad="$rp_bad [$fit_name: unpack does not say it is exact: $(head -c 160 fit_un.log)]"
     grep -q '^type=fit$' "fit_d_$fit_name/manifest.txt" || rp_bad="$rp_bad [$fit_name: not unpacked as a fit]"
     # the files of the images are the data that went in; fit.its says where they go
-    cmp -s "fit_d_$fit_name/kernel_1" fit_kernel.bin && cmp -s "fit_d_$fit_name/fdt_1.dtb" fit_fdt.dtb || rp_bad="$rp_bad [$fit_name: the files are not the data]"
+    # (the device tree is a source, fdt_1.dts: dtc compiles it to the data that went in)
+    cmp -s "fit_d_$fit_name/kernel_1" fit_kernel.bin && dtc -q -I dts -O dtb -o fit_fdt_back.dtb "fit_d_$fit_name/fdt_1.dts" 2>/dev/null &&
+        cmp -s fit_fdt_back.dtb fit_fdt.dtb || rp_bad="$rp_bad [$fit_name: the files are not the data]"
+    [ -f "fit_d_$fit_name/fdt_1.dts" ] && [ ! -e "fit_d_$fit_name/fdt_1.dtb" ] && grep -q -F 'data = /incbin/("fdt_1.dts");' "fit_d_$fit_name/fit.its" ||
+        rp_bad="$rp_bad [$fit_name: the device tree is not the source fdt_1.dts that fit.its names]"
     grep -q -F 'data = /incbin/("kernel_1");' "fit_d_$fit_name/fit.its" || rp_bad="$rp_bad [$fit_name: fit.its does not name the file of the kernel]"
     # an untouched directory is the file
     if rp_made "fit_d_$fit_name" "$fit_name: untouched"; then
@@ -6956,6 +6983,56 @@ else
 fi
 rp_report "checks of the ramdisk of a FIT edited as a directory (3 layouts): a file put in lands in the ramdisk the image holds, its md5 is made again, GNU cpio lists the edited ramdisk, fit_tool finds every hash right"
 
+# ---- the device tree of a FIT is a source: edited as text it goes in compiled, and the hash of its image is made again
+for fit_name in inline EB8 Ep800; do
+    rp_fresh "fit_$fit_name.itb" "fit_t_$fit_name"
+    rp_n=$((rp_n + 1))
+    if [ -f "fit_t_$fit_name/fdt_1.dts" ] && grep -q -F 'model = "Test";' "fit_t_$fit_name/fdt_1.dts"; then
+        sed -i 's/model = "Test";/model = "edited by hand";/' "fit_t_$fit_name/fdt_1.dts"
+        if rp_made "fit_t_$fit_name" "$fit_name: the source of the device tree edited"; then
+            grep -q "the hash of fdt-1 was made again (1 hash node)" rp_run.log || rp_bad="$rp_bad [$fit_name: the sha1 of the device tree was not made again: $(head -c 200 rp_run.log)]"
+            grep -q '^warning' rp_run.log && rp_bad="$rp_bad [$fit_name: a warning: $(grep '^warning' rp_run.log | head -c 160)]"
+            fit_ck "$fit_name: a device tree edited: fit_tool verify" python3 -I "$FIT_TOOL" verify "$rp_run"
+            if [ "$FIT_DUMPIMAGE" = 1 ]; then
+                rm -f fit_x.dtb fit_x.bin
+                rp_n=$((rp_n + 1))
+                if dumpimage -T flat_dt -p 1 -o fit_x.dtb "$rp_run" >/dev/null 2>&1; then
+                    dtc -q -I dtb -O dts fit_x.dtb 2>/dev/null | grep -q -F 'model = "edited by hand";' ||
+                        rp_bad="$rp_bad [$fit_name: dtc does not read the edit in the device tree that went in]"
+                else
+                    rp_bad="$rp_bad [$fit_name: dumpimage does not extract the device tree]"
+                fi
+                # nothing else moved: the kernel is the one that was there
+                rp_n=$((rp_n + 1))
+                dumpimage -T flat_dt -p 0 -o fit_x.bin "$rp_run" >/dev/null 2>&1 && cmp -s fit_x.bin fit_kernel.bin || rp_bad="$rp_bad [$fit_name: the kernel is not the one that was there]"
+            fi
+        fi
+        # the edit unpacked again and packed again: the same file
+        if [ -s "$rp_run" ]; then
+            cp "$rp_run" "fit_t_$fit_name.itb"
+            rp_fresh "fit_t_$fit_name.itb" "fit_t2_$fit_name"
+            if rp_made "fit_t2_$fit_name" "$fit_name: the edited device tree unpacked and packed"; then
+                cmp -s "$rp_run" "fit_t_$fit_name.itb" || rp_bad="$rp_bad [$fit_name: the edited FIT does not come back]"
+            fi
+        fi
+        # a source with a mistake: refused with the file and the line, nothing written
+        rp_fresh "fit_$fit_name.itb" "fit_t3_$fit_name"
+        sed -i 's/model = "Test";/model = "Test"/' "fit_t3_$fit_name/fdt_1.dts"
+        rp_refused "fit_t3_$fit_name" "$fit_name: a source with a ';' missing" "fdt_1.dts: line 5: expected ';' at the end of the property"
+        # a binary device tree put where the source was is taken as it is, under the name `.dtb` that fit.its says
+        rp_fresh "fit_$fit_name.itb" "fit_t4_$fit_name"
+        rm "fit_t4_$fit_name/fdt_1.dts"
+        cp a.dtb "fit_t4_$fit_name/fdt_1.dtb"
+        sed -i 's|/incbin/("fdt_1.dts")|/incbin/("fdt_1.dtb")|' "fit_t4_$fit_name/fit.its"
+        if rp_made "fit_t4_$fit_name" "$fit_name: a .dtb for the device tree"; then
+            cmp -s "$rp_run" "fit_$fit_name.itb" || rp_bad="$rp_bad [$fit_name: the same device tree as a .dtb is not the same image]"
+        fi
+    else
+        rp_bad="$rp_bad [$fit_name: the device tree is not the source with the model in it]"
+    fi
+done
+rp_report "checks of the device tree of a FIT edited as a source (3 layouts): the edit is in the tree that goes in, the sha1 of its image is made again (fit_tool, dumpimage and dtc agree), the kernel is the one that was there, the edited FIT comes back byte for byte, a ';' missing is refused with the file and the line, the same tree as a .dtb is the same image"
+
 # ---- the images of a FIT that are compressed streams: unpacked decompressed, put back with their codec
 if command -v gzip >/dev/null 2>&1; then
     gzip -9n -c fit_kernel.bin >fit_kernel.bin.gz
@@ -6985,7 +7062,8 @@ PYEOF
         cmp -s fit_rd.cpio "fit_g_$fit_name/ramdisk_1.cpio" || rp_bad="$rp_bad [$fit_name: ramdisk_1.cpio is not the decompressed ramdisk]"
         rp_n=$((rp_n + 1))
         grep -q '^kernel_1_compression=gzip$' "fit_g_$fit_name/manifest.txt" && grep -q '^ramdisk_1_compression=gzip$' "fit_g_$fit_name/manifest.txt" &&
-            grep -q '^fdt_1_compression=none$' "fit_g_$fit_name/manifest.txt" || rp_bad="$rp_bad [$fit_name: the manifest does not say which images are gzip]"
+            grep -q '^fdt_1_file=fdt_1.dts$' "fit_g_$fit_name/manifest.txt" && [ -f "fit_g_$fit_name/fdt_1.dts" ] && ! grep -q '^fdt_1_compression=' "fit_g_$fit_name/manifest.txt" ||
+            rp_bad="$rp_bad [$fit_name: the manifest does not say which images are gzip, or the device tree is not a source]"
         if rp_made "fit_g_$fit_name" "$fit_name: gzip images, untouched"; then
             cmp -s "$rp_run" "fit_gz_$fit_name.itb" || rp_bad="$rp_bad [$fit_name: the untouched directory is not the image]"
         fi

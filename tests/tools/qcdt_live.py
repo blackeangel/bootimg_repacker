@@ -64,6 +64,25 @@ def dtc(src, dst):
     return read(dst)
 
 
+def compile_source(path):
+    """What `dtc` makes of a source: the blob (the judge of the .dts files abr unpacks)."""
+    r = subprocess.run(["dtc", "-q", "-I", "dts", "-O", "dtb", "-o", "-", path], capture_output=True)
+    if r.returncode != 0:
+        raise SystemExit("dtc cannot compile %s: %s" % (path, r.stderr.decode(errors="replace")))
+    return r.stdout
+
+
+def tree_blob(folder, name):
+    """The tree that the file `name` of an unpacked folder stands for: a source is compiled by dtc, any other file is the blob."""
+    path = os.path.join(folder, name)
+    return compile_source(path) if name.endswith(".dts") else read(path)
+
+
+def put_tree_file(path, tree):
+    """The tree goes into the file of the folder: its source where the file is a source (a name that ends in .dts), else its blob."""
+    write(path, tree.text().encode() if path.endswith(".dts") else tree.dtb)
+
+
 class Tree:
     """A device tree for some boards: `msm`, `board` and `pmic` are lists of groups of cells (see the header of include/abr/qcdt.hpp)."""
 
@@ -190,6 +209,14 @@ with live.section('1. a folder of trees'):
         tables[name] = read(out)
         judge("%s folder" % name, tables[name], trees)
         same_as_dtbtool("%s folder" % name, src, tables[name])
+        # the same trees as sources (.dts, what dtc is given): abr compiles them, and the table is the one the blobs make
+        srcs = live.fresh("set_%s.dts" % name)
+        os.makedirs(srcs)
+        for t in trees:
+            write(os.path.join(srcs, t.name + ".dts"), t.text().encode())
+        from_sources = live.fresh("set_%s.dts.img" % name)
+        rc, text = live.run("pack", "-i", srcs, "-o", from_sources)
+        live.check(rc == 0 and same_bytes(from_sources, out), "%s: a folder of sources (.dts) makes the table that the blobs they compile to make" % name, text[-300:])
         again = live.fresh("set_%s.again.img" % name)
         live.run("pack", "-i", src, "-o", again)
         live.check(same_bytes(out, again), "%s: the same folder gives the same table" % name)
@@ -307,6 +334,10 @@ with live.section('2. refused'):
     refused("qcom,pmic-id without qcom,board-id", src, "qcom,pmic-id")
     src = folder("badcells", [], {"bad.dtb": dtc((lambda p: (write(p, b'/dts-v1/;\n/ { qcom,msm-id = <0x100 0x8>; qcom,board-id = <1 2 3>; };\n'), p)[1])(os.path.join(WORK, "badcells.dts")), os.path.join(WORK, "badcells.dtb"))})
     refused("a qcom,board-id that is not whole groups of two cells", src, "bad.dtb")
+    src = folder("badsource", [], {"bad.dts": b'/dts-v1/;\n/ { qcom,msm-id = <0x100 0x8>\n};\n'})
+    refused("a source with an error (a missing semicolon)", src, "bad.dts:")
+    src = folder("includeout", [], {"out.dts": b'/dts-v1/;\n/ { /include/ "../../etc/passwd" };\n'})
+    refused("a source that includes a file from outside its folder", src, "may be read")
     src = folder("badpage", SETS["v1"])
     recipe(src, page_size=0)
     refused("page_size=0", src, "page_size")
@@ -330,7 +361,8 @@ with live.section('3. an unpacked table, edited'):
         trees = SETS["v2"]
         order = expected(trees)[2]  # the trees as the table has them: dtb0.dtb is the first of these
         files = [manifest_get(base, "dtb%d_file" % i) for i in range(len(order))]
-        live.check(all(files) and all(read(os.path.join(base, f)) == t.dtb for f, t in zip(files, order)), "edit: dtb<N>.dtb are the trees, in the order of the table")
+        live.check(all(files) and all(f.endswith(".dts") for f in files) and all(tree_blob(base, f) == t.dtb for f, t in zip(files, order)),
+                   "edit: dtb<N> are sources that dtc compiles to the trees, in the order of the table")
         entries0 = qcdt_check.read(v2)[1]
 
         def entries_of(table):
@@ -340,7 +372,7 @@ with live.section('3. an unpacked table, edited'):
         work = live.fresh("edit.bigger")
         shutil.copytree(base, work)
         bigger = Tree("bigger", [(0x1A0, 0x10000)], board=[(8, 1)], pad=5000).make(WORK)
-        write(os.path.join(work, files[0]), bigger.dtb)
+        put_tree_file(os.path.join(work, files[0]), bigger)
         out = live.fresh("edit.bigger.img")
         rc, text = live.run("pack", "-i", work, "-o", out)
         if live.check(rc == 0, "edit: pack with the first tree replaced by one of 5000 bytes more", text[-300:]):
@@ -377,13 +409,20 @@ with live.section('3. an unpacked table, edited'):
             if manifest_get(work, "entry%d_dtb" % i) == "1":
                 manifest_set(work, "entry%d_dtb" % i, "0")
         refused("a tree that no entry points at", work, "tree", out_name="edit.orphan.img")
-        # a tree that is no device tree, and one that is not as long as its header says
-        for label, data, want in (("a text", b"text of some length, more than the bytes of a header of a device tree " * 3, files[0]),
-                                  ("a byte short", read(os.path.join(base, files[0]))[:-1], files[0])):
+        # a source that is no source, and one that is cut in half; a file that is not a source (the manifest says so) that is no device tree, and one that
+        # is not as long as its header says
+        text0 = read(os.path.join(base, files[0]))
+        for label, data, as_blob in (("a text", b"text of some length, more than the bytes of a header of a device tree " * 3, False),
+                                     ("a source cut in half", text0[:len(text0) // 2], False),
+                                     ("a blob that is a text", b"text of some length, more than the bytes of a header of a device tree " * 3, True),
+                                     ("a blob a byte short", order[0].dtb[:-1], True)):
             work = live.fresh("edit.badtree")
             shutil.copytree(base, work)
-            write(os.path.join(work, files[0]), data)
-            refused("a replaced tree that is %s" % label, work, want, out_name="edit.badtree.img")
+            name = "dtb0.dtb" if as_blob else files[0]
+            if as_blob:
+                manifest_set(work, "dtb0_file", name)
+            write(os.path.join(work, name), data)
+            refused("a replaced tree that is %s" % label, work, name, out_name="edit.badtree.img")
         # the page size of the table changed
         work = live.fresh("edit.page")
         shutil.copytree(base, work)
@@ -412,7 +451,7 @@ with live.section('4. the table in a boot image'):
         # a tree replaced by a bigger one: the table is made again, the size in the header and the id follow
         order = expected(SETS["v2"])[2]
         bigger = Tree("bigger", [(0x1A0, 0x10000)], board=[(8, 1)], pad=4000).make(WORK)
-        write(os.path.join(u, manifest_get(u, "dt_dtb0_file")), bigger.dtb)
+        put_tree_file(os.path.join(u, manifest_get(u, "dt_dtb0_file")), bigger)
         new = live.fresh("boot_dt.edited.img")
         rc, text = live.run("pack", "-i", u, "-o", new)
         if live.check(rc == 0, "boot with a table: pack after a tree was replaced", text[-300:]):
@@ -456,11 +495,18 @@ with live.section("5. a real device's table"):
         rc, text = live.run("unpack", "-i", REAL, "-o", u)
         trees_dir = live.fresh("real.trees")
         os.makedirs(trees_dir)
+        # (the trees are cut out of the table by the judge, not taken from what abr unpacked)
+        uniq = []
+        for e in sorted(ents, key=lambda e: e["offset"]):
+            if e["tree"] not in uniq:
+                uniq.append(e["tree"])
+        for n_tree, blob in enumerate(uniq):
+            write(os.path.join(trees_dir, "dtb%d.dtb" % n_tree), blob)
         n_trees = 0
         while manifest_get(u, "dt_dtb%d_file" % n_trees):
-            shutil.copy(os.path.join(u, manifest_get(u, "dt_dtb%d_file" % n_trees)), os.path.join(trees_dir, "dtb%d.dtb" % n_trees))
             n_trees += 1
-        if live.check(rc == 0 and n_trees >= 1, "the real image: its device trees are files", text[-300:]):
+        if live.check(rc == 0 and n_trees >= 1 and n_trees == len(uniq) and all(os.path.isfile(os.path.join(u, manifest_get(u, "dt_dtb%d_file" % i))) for i in range(n_trees)),
+                      "the real image: its device trees are files, as many as the table has trees", text[-300:]):
             recipe(trees_dir, page_size=page)
             from_trees = live.fresh("real.from_trees.img")
             prc, ptext = live.run("pack", "-i", trees_dir, "-o", from_trees)
@@ -470,7 +516,7 @@ with live.section("5. a real device's table"):
         # a tree of the real table replaced by a bigger one: the entries stay, the offsets are made again, the image behind the table is moved on whole
         if live.check(rc == 0 and "byte-for-byte" in text, "the real image: unpack, and the repack is identical", text[-300:]) and ents:
             bigger = Tree("bigger", [(0x125, 0x44, 0)], pad=4000).make(WORK)
-            write(os.path.join(u, manifest_get(u, "dt_dtb1_file")), bigger.dtb)
+            put_tree_file(os.path.join(u, manifest_get(u, "dt_dtb1_file")), bigger)
             new = live.fresh("real.img.edited")
             rc, text = live.run("pack", "-i", u, "-o", new)
             if live.check(rc == 0, "the real image: pack after the last tree was replaced by a bigger one", text[-300:]):

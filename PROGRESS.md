@@ -19,11 +19,11 @@ tools" below.
 | boot (header v0-v4): boot.img, init_boot.img, boot-debug.img, boot-test-harness.img, recovery.img, recovery-two-step.img | **done + verified** |
 | vendor_boot (header v3-v4): vendor_boot.img, vendor_boot-debug.img, vendor_kernel_boot.img | **done + verified** |
 | dtbo.img (+ ACPIO variant) | **done + verified** |
-| dtb (raw/concatenated FDT): trees at an alignment with zeros between them (`blob_align`, `blob<N>_pad`), `tail.bin`, the fill of the partition, an AVB hash footer | **done + verified** (the first form earlier; the gaps and the footer 12-14 Nov 2026: `avbtool verify_image` judges the footer) |
+| dtb (raw/concatenated FDT): trees at an alignment with zeros between them (`blob_align`, `blob<N>_pad`), `tail.bin`, the fill of the partition, an AVB hash footer; every tree as source text, `entry<N>.dts` | **done + verified** (the first form earlier; the gaps and the footer 12-14 Nov 2026: `avbtool verify_image` judges the footer; the trees as text 17-21 Nov: `dtc` judges them) |
 | vbmeta (AVB): vbmeta.img, vbmeta_system.img, footer-on-other-partitions | **done + verified**, incl. RSA signing (images made by the real `avbtool` round-trip exactly; images `abr` re-signed pass `avbtool verify_image`) |
 | uboot: U-Boot legacy uImage | **done + verified** |
 | U-Boot FIT images (`mkimage -f`: `.itb`, `.fit`; the data in the tree, `-E`, `-E -B n`, `-E -p N`) | **done + verified** (1 Nov 2026) against the real `mkimage` and `dumpimage` (u-boot-tools 2025.10, run as oracles), `dtc` 1.7.0 and an independent Python reader (`tests/tools/fit_tool.py`, hashes with `hashlib`): `fit.its` plus a file for every image (a ramdisk also as a directory), an untouched FIT comes back byte for byte in all six layouts `mkimage` was run with (and signed with `-k`), a new kernel or an image put in is the file `mkimage` makes of the same text, the hash nodes of a changed image are made again (crc32, md5, sha1, sha256, sha384, sha512), signatures are kept and named when an edit makes them wrong; **no FIT image of a device has been tried**, and `abr` neither checks nor makes a signature, see "U-Boot FIT images" |
-| flattened device tree as a tree (`abr::fdt`) and as source text (`abr::dts`) | **done + verified** (31 Oct 2026, commit `57e8331`; the bytes behind a value 1 Nov): 51 device trees of real images and the blobs of `dtc` (`-@`, `-p`, `-V 16`) come back byte for byte, the ones that do not (a version 16 blob, NOP tokens, a property behind a subnode, ...) are said not to be canonical; see "U-Boot FIT images" |
+| flattened device tree as a tree (`abr::fdt`) and as source text (`abr::dts`) | **done + verified** (31 Oct 2026, commit `57e8331`; the bytes behind a value 1 Nov): 51 device trees of real images and the blobs of `dtc` (`-@`, `-p`, `-V 16`) come back byte for byte, the ones that do not (a version 16 blob, NOP tokens, a property behind a subnode, ...) are said not to be canonical; see "U-Boot FIT images"; **abr's own device tree compiler** (`abr::dts`: the whole source language of `dtc` 1.7, same bytes as `dtc`) and the use of it for every device tree of every image (`abr::dtfile`), 17-21 Nov 2026: see "Device trees as text" |
 | ELF boot images (Sony/Xperia `kernel.elf`) | **done + verified** against the real `elftool` (compiled, not vendored) and an independent Python tool and C++ writer: kernel / ramdisk (a directory) / `ipl` / `rpm` / command line by `p_flags`, positional roles for unflagged segments, ELF32 and ELF64; an image in elftool's layout is built from the manifest alone, any other layout (padding, another start of the data, own `e_entry`/OS-ABI/`p_align`/`p_memsz`/`p_paddr`, data in another order, empty segments) is kept and written back; 16 layouts in the CLI suite, 60,000+ unit checks; no real `kernel.elf` has been tried, see "Sony ELF boot images" |
 | Sony SIN containers v1-v3 (AIK: `sony_dump`) | **done + verified** against the real `sony_dump` (compiled from its source, not vendored: no licence file) and an independent Python tool: the container comes off and is never put back (AIK forgets it too), what is inside is unpacked as it is on its own; MMCF with `ADDR` / `LZ4A` parts (decoded on several threads when large), loader, data in front; damaged containers are refused with the reason; no real `.sin` has been tried, see "Sony SIN containers" |
 | Rockchip KRNL images (`kernel.img`, SDK `boot.img`) | **done + verified** against the real `rkcrc -k` (compiled, not vendored) and an independent Python tool: the payload (kernel, or a compressed cpio ramdisk -> `ramdisk.cpio` + `ramdisk/`), Rockchip's own CRC (polynomial 0x04C10DB7), partition fill, wrong stored CRC kept |
@@ -2378,12 +2378,46 @@ Not changed on purpose: the `file:`/`format:` labels of `info` stay as they are 
 changes its size while the command runs is not followed (the width is read for every write, so the next lines are right,
 and what was held is wrapped when it comes out, for the width of that moment).
 
+## Device trees as text (done for the trees that stand alone, 17-21 Nov 2026)
+
+The request of 17 Nov: a dtb is not unpacked as far as `entry0.dts`, neither as a file of its own nor in a vendor_boot; whatever can be
+unpacked to something a person reads and edits should be (kernel, ramdisk, dtb, ...). Use `dtc` as the model, but with `abr`'s own
+implementation inside `abr`.
+
+* **`abr::dts`** (`include/abr/dts.hpp`, `src/dts.cpp`; commits `973c0ec`, `b0b9eff`): the whole source language of `dtc` 1.7 compiled to
+  the bytes `dtc` makes (`/dts-v1/`, `/plugin/`, `/include/`, `/memreserve/`, `/delete-*/`, `/omit-if-no-ref/`, labels, `&label`, `&{/path}`,
+  `/bits/`, `/incbin/`, expressions, `-@` symbols, the padding behind the strings, blob versions 16 and 17), and a printer for abr's own
+  plain style. Not read: the C preprocessor (`#include <...>`, `#define`: run `cpp` first, `abr` reads its output with the line markers), the
+  other formats of `dtc`; not made: the style warnings of `dtc`. The judge is `dtc` 1.7.0 itself (a golden suite and `tests/tools/dtc_live.py`).
+* **`abr::dtfile`** (`include/abr/dtfile.hpp`, `src/dtfile.cpp`): what a tree in an image is as a file. The source `entryN.dts` is written
+  with the SHA-256 of its text in the manifest (`<slot>_text_hash`). When the text does not compile back to the very blob (an orphan
+  string, free space behind the strings, a version 16 header, NOP tokens), the original bytes are kept in `.abr_raw/<file>.raw`
+  (`<slot>_raw_hash`), and free space behind the strings is the number `<slot>_slack`. **Unchanged text: the original bytes. Edited text:
+  compiled as `dtc` compiles it, with a note when that is not the original layout** (slack and the raw copy belong to the text that was
+  written). A raw copy that does not match its hash is refused; a raw copy that is not there is compiled from the text; a tree that cannot
+  be read or printed stays a `.dtb` and says why; a file that is not `.dts` is a binary blob and must be one (`check_fdt_blob`).
+  `/include/` reads only inside the folder of the source.
+* **Where it is used**: a standalone dtb (`entry<N>.dts`, the manifest's slots stay `blob<N>_file`), the dtb of boot v2 and vendor_boot
+  v3/v4 (`dtb/entry<N>.dts`, slots `dtb<N>`; a dtbo table inside the section as `dtb/entry<N>.dts` with the slots `dtb_entry<N>`),
+  `recovery_dtbo` of a boot image, `dtbo.img` (`entry<N>.dts`), QCDT (`dtb<N>.dts` in a file of its own, `dt/dtb<N>.dts` in a boot image;
+  a folder of `.dts` or `.dtb` files with no manifest is made into a table as `dtbTool` makes it), the `flat_dt` images of a FIT
+  (`fdt_1.dts`, with the hash of the image made again when the text was edited). The tables of the console have the trees as child rows
+  of their section (`layout::tree_section`), and `unpack` has a stage `dts` on the bar.
+* **Verified by**: unit groups `fdt` (11639 checks), `dtfile` (1008: each of the cases above, hostile sources, include confinement),
+  `layout` (7667), `qcdt` (9996), `fit` (25513); `dtb_live.py` (411 checks) and `qcdt_live.py` (383, also against the real `dtbTool`);
+  the dtb and FIT blocks of the suite, with a new block for the device tree of a FIT edited as text (3 layouts: the edit reaches the
+  tree that goes in, the sha1 of the image is made again, `fit_tool`, `dumpimage` and `dtc` agree, the edited FIT comes back, a missing `;`
+  is refused with the file and the line, the same tree as a `.dtb` is the same image); the 14 real images: 13 byte for byte (the 14th is
+  a filesystem), two of them with a tree that a source cannot reproduce (a QCDT with slack: `lk2nd`; a vendor_boot with an orphan
+  string: the Orange Fox one), both come back exactly and say why.
+* **Not done yet**: the trees glued to a kernel (`Image.gz-dtb`: 7 of the 10 kernels of the real images have one to three trees behind
+  the stream, and an edit of the kernel file drops them without a word) -- the next step, with the rest of the kernel.
+
 ## Next steps (in order)
 
 1. The user's requests of 17 Nov 2026, in this order (one commit per step; narrow checks while they are built, then the one full run):
-   a. **The device trees as text wherever they are.** An own `dtc` -- the whole language except the C preprocessor, `dtc` 1.7 stays the
-      judge -- behind a standalone dtb, the dtb of boot (v2) and vendor_boot (v3/v4), the entries of a dtbo and of a QCDT, the device trees
-      of a FIT: `unpack` writes `entryN.dts`, `pack` compiles it (the bytes `unpack` read when the text is the one it wrote).
+   a. **The device trees as text wherever they are** -- done for the trees that stand alone (see "Device trees as text"); the trees glued
+      to a kernel are done with step b.
    b. **Deeper than the first layer** for everything that has more inside it (the kernel, and what else `unpack` leaves as a file that a person
       cannot read or edit).
    c. **`kernel_info/`**: what can be learnt from the kernel -- the build configuration, the symbol table, the binaries glued to it, the

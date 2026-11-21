@@ -40,6 +40,39 @@ def cells(n, seed):
     return "\tdata = [%s];\n" % " ".join("%02x" % ((i * seed + 3) & 255) for i in range(n))
 
 
+def compile_source(path):
+    """What `dtc` makes of a source: the blob."""
+    r = subprocess.run(["dtc", "-q", "-I", "dts", "-O", "dtb", "-o", "-", path], capture_output=True)
+    if r.returncode != 0:
+        raise SystemExit("dtc cannot compile %s: %s" % (path, r.stderr.decode(errors="replace")))
+    return r.stdout
+
+
+def decompile(blob):
+    """What `dtc` makes of a blob: its source."""
+    r = subprocess.run(["dtc", "-q", "-I", "dtb", "-O", "dts", "-o", "-"], input=blob, capture_output=True)
+    if r.returncode != 0:
+        raise SystemExit("dtc cannot read a blob: " + r.stderr.decode(errors="replace"))
+    return r.stdout
+
+
+def tree_file(f, i):
+    """The file of tree i of an unpacked folder (a source, NAME.dts, or a blob)."""
+    return os.path.join(f, manifest_get(f, "blob%d_file" % i))
+
+
+def tree_of(f, i):
+    """The tree that the file of tree i stands for: the blob that dtc makes of a source."""
+    p = tree_file(f, i)
+    return compile_source(p) if p.endswith(".dts") else read(p)
+
+
+def put_tree(f, i, blob):
+    """Tree i of the folder is `blob` from now on: its source (what dtc says of it) goes where the old file is."""
+    p = tree_file(f, i)
+    write(p, decompile(blob) if p.endswith(".dts") else blob)
+
+
 A = dtc("tree_a", "")
 B = dtc("tree_b", cells(16, 3))
 C = dtc("tree_c", cells(520, 5))
@@ -106,10 +139,11 @@ with live.section('1. gaps'):
         align = manifest_get(f, "blob_align")
         live.check(align is not None and 1 <= int(align) <= n and n % int(align) == 0, "aligned%d: blob_align is recorded and divides %d" % (n, n), str(align))
         live.check(all(manifest_get(f, "blob%d_pad" % i) is None for i in range(4)), "aligned%d: with an alignment there is no blob<N>_pad" % n)
-        live.check([read(os.path.join(f, manifest_get(f, "blob%d_file" % i))) for i in range(4)] == trees, "aligned%d: the blob files are the trees" % n)
+        live.check([tree_of(f, i) for i in range(4)] == trees and all(tree_file(f, i).endswith(".dts") for i in range(4)),
+                   "aligned%d: the files are the sources of the trees (dtc compiles them to the trees)" % n)
         a = int(align or 1)
         # a bigger tree 1: the trees behind it move on to their next multiples of the alignment
-        write(os.path.join(f, "blob1.dtb"), BIG)
+        put_tree(f, 1, BIG)
         out = live.fresh("aligned%d.edited" % n)
         rc, text = live.run("pack", "-i", f, "-o", out)
         if live.check(rc == 0, "aligned%d: pack with a bigger tree" % n, text[-300:]):
@@ -128,7 +162,7 @@ with live.section('1. gaps'):
     if f:
         live.check(manifest_get(f, "blob_align") is None, "irregular: no blob_align where the gaps follow no rule")
         live.check([manifest_get(f, "blob%d_pad" % i) for i in range(4)] == [None, "3", "12", None], "irregular: blob<N>_pad are the gaps that are not zero in size")
-        write(os.path.join(f, "blob0.dtb"), BIG)
+        put_tree(f, 0, BIG)
         out = live.fresh("irregular.edited")
         rc, text = live.run("pack", "-i", f, "-o", out)
         if live.check(rc == 0, "irregular: pack with a bigger first tree", text[-300:]):
@@ -237,7 +271,7 @@ with live.section('2. footers'):
         rc, text = live.run("info", "-i", img)
         live.check("avb footer:" in text and ("signed" if label == "signed" else "unsigned") in text and "hash check:   OK" in text, "footer_%s: info says there is a footer and that the hash matches" % label, text[:600])
         live.check(manifest_get(f, "has_avb_footer") == "true" and manifest_get(f, "avb_partition_size") == str(PARTITION), "footer_%s: the manifest has the footer and the size of the partition" % label)
-        live.check([read(os.path.join(f, manifest_get(f, "blob%d_file" % i))) for i in range(2)] == [A, B], "footer_%s: the blob files are the trees, not the footer" % label)
+        live.check([tree_of(f, i) for i in range(2)] == [A, B], "footer_%s: the files are the trees (not the footer)" % label)
 
         # a tree replaced by a bigger one; and, for the signed image, the three ways the signature can come out
         variants = [("", {})]
@@ -246,7 +280,7 @@ with live.section('2. footers'):
         for suffix, keys in variants:
             work = live.fresh("footer_%s.edit%s" % (label, suffix))
             shutil.copytree(f, work)
-            write(os.path.join(work, "blob1.dtb"), C)
+            put_tree(work, 1, C)
             for rel, src in keys.items():
                 os.makedirs(os.path.dirname(os.path.join(work, rel)), exist_ok=True)
                 shutil.copy(src, os.path.join(work, rel))
@@ -279,7 +313,7 @@ with live.section('2. footers'):
         # the trees do not fit the partition: refused, with the sizes, and nothing is written
         work = live.fresh("footer_%s.huge" % label)
         shutil.copytree(f, work)
-        write(os.path.join(work, "blob1.dtb"), dtc("tree_huge", cells(PARTITION, 13)))
+        put_tree(work, 1, dtc("tree_huge", cells(PARTITION, 13)))
         out = live.fresh("footer_%s.huge.img" % label)
         rc, text = live.run("pack", "-i", work, "-o", out)
         live.check(rc != 0 and not os.path.exists(out) and "partition" in text and "terminate called" not in text and "std::" not in text,
@@ -290,7 +324,7 @@ with live.section('2. footers'):
     img = with_footer("footer_gaps.img", layout([A, B, C], gaps))
     f = roundtrip("footer_gaps", img)
     if f:
-        write(os.path.join(f, "blob0.dtb"), BIG)
+        put_tree(f, 0, BIG)
         out = live.fresh("footer_gaps.edited.img")
         rc, text = live.run("pack", "-i", f, "-o", out)
         if live.check(rc == 0, "footer_gaps: pack with a bigger first tree", text[-300:]):

@@ -6,7 +6,8 @@
 //   * boot images of every header version (0 to 4, a Marvell PXA header, a version 0 header with a device tree behind the second stage),
 //     page sizes 2048 and 4096, parts that are streams (gzip is told by the first bytes), parts of a size that is no multiple of the page;
 //   * vendor_boot v3 and v4 (one fragment, three fragments, a v4 header with no table), with a dtb and a bootconfig;
-//   * dtbo v0 and v1, with entries stored as zlib and as gzip;
+//   * dtbo v0 and v1, with entries stored as zlib and as gzip; the device trees inside the dtb and recovery_dtbo sections of a boot and a vendor_boot
+//     image (trees, a dtbo table, a QCDT) as regions of their own;
 //   * a uImage; a Qualcomm device tree table made by qcdt::build; flattened device trees one after the other;
 //   * a FIT image with its data in the tree, behind it by data-offset and by data-position; a Sony ELF boot image (ELF32 and ELF64); a
 //     Rockchip KRNL image; an ASUS blob, signed and not; an Intel OSIP image with and without its header; a ChromeOS kernel blob;
@@ -340,6 +341,151 @@ Bytes tiny_fdt(uint8_t marker) {
     be32(2);                                       // FDT_END_NODE
     be32(9);                                       // FDT_END
     return b;
+}
+
+// The device trees inside a section of a boot or vendor_boot image: the trees one behind the other (with the zeros between two and behind the last), or
+// a dtbo table; and what the layouts of the images make of them.
+void test_tree_sections() {
+    const Bytes t1 = tiny_fdt(1), t2 = tiny_fdt(2);
+    {
+        Bytes section = t1;
+        section.insert(section.end(), 4, 0);
+        section.insert(section.end(), t2.begin(), t2.end());
+        section.insert(section.end(), 12, 0);
+        layout::Layout l;
+        layout::tree_section(l, section, 4096, 1, "dtb");
+        EXPECT(l.regions.size() == 4);
+        if (l.regions.size() == 4) {
+            EXPECT(l.regions[0].key == "dtb0" && l.regions[0].offset == 4096 && l.regions[0].size == 72 && l.regions[0].depth == 1);
+            EXPECT(l.regions[1].name == "padding" && l.regions[1].key.empty() && l.regions[1].offset == 4096 + 72 && l.regions[1].size == 4);
+            EXPECT(l.regions[2].key == "dtb1" && l.regions[2].offset == 4096 + 76 && l.regions[2].size == 72 && l.regions[2].depth == 1);
+            EXPECT(l.regions[3].name == "padding" && l.regions[3].offset == 4096 + 148 && l.regions[3].size == 12 && l.regions[3].key.empty());
+        }
+    }
+    {
+        // what follows the last tree and is not zeros is a file of its own
+        Bytes section = t1;
+        const Bytes tail = {'T', 'A', 'I', 'L', 0, 0, 7};
+        section.insert(section.end(), tail.begin(), tail.end());
+        layout::Layout l;
+        layout::tree_section(l, section, 0, 1, "dtb");
+        EXPECT(l.regions.size() == 2 && l.regions[1].key == "dtb_tail" && l.regions[1].offset == 72 && l.regions[1].size == tail.size());
+    }
+    {
+        // bytes that are no tree: nothing is added, and nothing that is empty
+        layout::Layout l;
+        layout::tree_section(l, pattern(500, 3), 0, 1, "dtb");
+        layout::tree_section(l, Bytes(), 0, 1, "dtb");
+        EXPECT(l.regions.empty());
+    }
+    {
+        // a dtbo table: its header, its table of entries, its entries (with the keys of the entries of a section), and the zeros behind them
+        DtboImage dtbo;
+        dtbo.version = 0;
+        dtbo.page_size = 4096;
+        for (uint32_t i = 0; i < 2; ++i) {
+            DtboEntry e;
+            e.id = i;
+            e.data = i ? t2 : t1;
+            dtbo.entries.push_back(e);
+        }
+        Bytes section = dtbo.build();
+        const size_t used = section.size();
+        section.insert(section.end(), 100, 0);
+        layout::Layout l;
+        layout::tree_section(l, section, 8192, 1, "recovery_dtbo");
+        EXPECT(find_name(l, "header") && find_name(l, "header")->offset == 8192 && find_name(l, "header")->depth == 1);
+        EXPECT(find_name(l, "entry table") && find_name(l, "entry table")->offset == 8192 + 32);
+        const layout::Region* e0 = find_key(l, "recovery_dtbo_entry0");
+        const layout::Region* e1 = find_key(l, "recovery_dtbo_entry1");
+        EXPECT(e0 && e1 && e0->size == 72 && e1->size == 72 && e1->offset == e0->offset + 72 && e0->depth == 1);
+        EXPECT(e0 && same_at(section, e0->offset - 8192, t1));
+        EXPECT(l.regions.back().name == "padding" && l.regions.back().offset == 8192 + used && l.regions.back().size == 100);
+    }
+    // the layouts of the images list them: a boot image of header version 2 (a table in the recovery dtbo section of version 1 and 2, trees in dtb) ...
+    {
+        DtboImage dtbo;
+        dtbo.version = 0;
+        dtbo.page_size = 2048;
+        DtboEntry e;
+        e.data = t1;
+        dtbo.entries.push_back(e);
+        BootImage img;
+        img.header_version = 2;
+        img.page_size = 2048;
+        img.kernel = pattern(3000, 1);
+        img.ramdisk = pattern(2500, 2);
+        img.recovery_dtbo = dtbo.build();
+        img.dtb = t1;
+        img.dtb.insert(img.dtb.end(), t2.begin(), t2.end());
+        img.recompute_id();
+        const Bytes built = img.build();
+        const BootImage parsed = BootImage::parse(built);
+        layout::Layout l = layout::boot(parsed);
+        layout::around(l, built, built.size(), 0, parsed.consumed);
+        check_layout(l, built, boot_parts(parsed));
+        const layout::Region* r0 = find_key(l, "dtb0");
+        const layout::Region* r1 = find_key(l, "dtb1");
+        const layout::Region* section = find_key(l, "dtb");
+        EXPECT(r0 && r1 && section && r0->depth == 1 && r0->offset == section->offset && r1->offset == section->offset + 72);
+        EXPECT(r0 && same_at(built, r0->offset, t1) && r1 && same_at(built, r1->offset, t2));
+        const layout::Region* e0 = find_key(l, "recovery_dtbo_entry0");
+        EXPECT(e0 && e0->depth == 1 && same_at(built, e0->offset, t1));
+        EXPECT(find_key(l, "recovery_dtbo") != nullptr);
+    }
+    // ... a boot image of header version 0 with a Qualcomm device tree table (the trees are `dt_dtb<N>`) ...
+    {
+        qcdt::Table t;
+        t.version = 2;
+        t.page_size = 2048;
+        t.dtbs = {t1, t2};
+        for (uint32_t i = 0; i < 2; ++i) {
+            qcdt::Entry e;
+            e.chipset = 0x100 + i;
+            e.platform = 8;
+            e.revision = 0x10000;
+            e.dtb = i;
+            t.entries.push_back(e);
+        }
+        BootImage img;
+        img.header_version = 0;
+        img.page_size = 2048;
+        img.kernel = pattern(3000, 1);
+        img.ramdisk = pattern(2500, 2);
+        img.dt = qcdt::build(t);
+        img.recompute_id();
+        const Bytes built = img.build();
+        const BootImage parsed = BootImage::parse(built);
+        layout::Layout l = layout::boot(parsed);
+        layout::around(l, built, built.size(), 0, parsed.consumed);
+        check_layout(l, built, boot_parts(parsed));
+        for (size_t j = 0; j < 2; ++j) {
+            const layout::Region* r = find_key(l, "dt_dtb" + std::to_string(j));
+            EXPECT(r && r->depth == 1 && same_at(built, r->offset, j ? t2 : t1));
+        }
+        EXPECT(find_name(l, "QCDT table") && find_name(l, "QCDT table")->depth == 1);
+    }
+    // ... and a vendor_boot image (trees in dtb)
+    {
+        VendorBootImage img;
+        img.header_version = 4;
+        img.page_size = 4096;
+        img.dtb = t1;
+        img.dtb.insert(img.dtb.end(), t2.begin(), t2.end());
+        VendorRamdiskEntry e;
+        e.type = 1;
+        e.data = pattern(5000, 3);
+        img.ramdisk_fragments.push_back(e);
+        const Bytes built = img.build();
+        const VendorBootImage parsed = VendorBootImage::parse(built);
+        layout::Layout l = layout::vendor_boot(parsed);
+        layout::around(l, built, built.size(), 0, parsed.consumed);
+        const layout::Region* r0 = find_key(l, "dtb0");
+        const layout::Region* r1 = find_key(l, "dtb1");
+        EXPECT(r0 && r1 && r0->depth == 1 && same_at(built, r0->offset, t1) && same_at(built, r1->offset, t2));
+        const layout::Region* section = find_key(l, "dtb");
+        EXPECT(section && section->depth == 0 && r0 && r0->offset == section->offset);
+    }
 }
 
 void test_qcdt() {
@@ -1427,6 +1573,7 @@ int run_layout_tests() {
     test_dtbo();
     test_uimage_and_dtb();
     test_qcdt();
+    test_tree_sections();
     test_krnl();
     test_elf_boot();
     test_blob();

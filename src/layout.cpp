@@ -13,6 +13,7 @@
 #include "abr/boot_image.hpp"
 #include "abr/compression.hpp"
 #include "abr/console.hpp"
+#include "abr/dtb.hpp"
 #include "abr/dtbo.hpp"
 #include "abr/envelope.hpp"
 #include "abr/legacy/blob.hpp"
@@ -66,6 +67,17 @@ std::string codec_at(const Bytes& d, uint64_t off, uint64_t n) {
     return codec_of(Bytes(first, first + static_cast<std::ptrdiff_t>(std::min<uint64_t>(n, 64))));
 }
 
+// The regions of `inner` -- the layout of a container, from its own first byte -- put into `l` where the container is (`at`), `depth` levels
+// deeper, and the keys of the regions that have one behind `key_prefix`.
+void nest(Layout& l, Layout&& inner, uint64_t at, unsigned depth, const std::string& key_prefix = {}) {
+    for (Region& r : inner.regions) {
+        r.offset += at;
+        r.depth += depth;
+        if (!r.key.empty()) r.key = key_prefix + r.key;
+        l.regions.push_back(std::move(r));
+    }
+}
+
 }  // namespace
 
 Region& Layout::add(std::string name, std::string key, uint64_t offset, uint64_t size, unsigned depth, std::string note) {
@@ -97,6 +109,7 @@ Layout boot(const BootImage& img) {
     l.add("header", "", 0, header, 0,
           "header version " + std::to_string(img.header_version) + ", " + std::to_string(header_bytes) + " bytes, page size " + std::to_string(page));
     uint64_t pos = header;
+    // (the offset of the part is `pos` as it was before the call, when the part is there)
     auto part = [&](const char* name, const char* key, const Bytes& b, const std::string& note = {}) {
         if (b.empty()) return;
         Region& r = l.add(name, key, pos, b.size(), 0, note);
@@ -106,9 +119,15 @@ Layout boot(const BootImage& img) {
     part("kernel", "kernel", img.kernel);
     part("ramdisk", "ramdisk", img.ramdisk);
     part("second", "second", img.second, "second stage");
+    const uint64_t dt_at = pos;
     part("dt", "dt", img.dt, qcdt::looks_like(img.dt) ? "Qualcomm device tree table (QCDT)" : "device tree");
+    if (qcdt::looks_like(img.dt)) nest(l, qcdt(img.dt, "dt_"), dt_at, 1);  // (the table and its trees, which are files of their own)
+    const uint64_t recovery_dtbo_at = pos;
     part("recovery dtbo", "recovery_dtbo", img.recovery_dtbo);
+    tree_section(l, img.recovery_dtbo, recovery_dtbo_at, 1, "recovery_dtbo");
+    const uint64_t dtb_at = pos;
     part("dtb", "dtb", img.dtb, "device tree");
+    tree_section(l, img.dtb, dtb_at, 1, "dtb");
     part("boot signature", "boot_signature", img.boot_signature, "GKI boot signature");
     l.size = img.consumed;
     return l;
@@ -144,6 +163,7 @@ Layout vendor_boot(const VendorBootImage& img) {
     pos = align_up(pos + total, page);
     if (!img.dtb.empty()) {
         l.add("dtb", "dtb", pos, img.dtb.size(), 0, "device trees");
+        tree_section(l, img.dtb, pos, 1, "dtb");
         pos = align_up(pos + img.dtb.size(), page);
     }
     if (img.header_version >= 4 && img.has_ramdisk_table && !img.ramdisk_fragments.empty()) {
@@ -466,6 +486,39 @@ Layout qcdt(const Bytes& d, const std::string& kp) {
         ++j;
     }
     return l;
+}
+
+void tree_section(Layout& l, const Bytes& section, uint64_t at, unsigned depth, const std::string& key) {
+    if (section.empty()) return;
+    uint64_t consumed = 0;
+    if (section.size() >= 4 && be32(section, 0) == kDtTableMagic) {
+        Layout table = dtbo(section);
+        if (table.regions.empty()) return;
+        for (const Region& r : table.regions) consumed = std::max(consumed, r.offset + r.size);
+        nest(l, std::move(table), at, depth, key + "_");
+    } else {
+        FdtBlobs split;
+        try {
+            split = split_fdt_blobs(section);
+        } catch (const FormatError&) {
+            return;
+        }
+        if (split.blobs.empty()) return;  // (not trees: the section is one file)
+        uint64_t pos = 0;
+        for (size_t i = 0; i < split.blobs.size(); ++i) {
+            if (split.gaps[i]) {
+                l.add("padding", "", at + pos, split.gaps[i], depth, "zeros");
+                pos += split.gaps[i];
+            }
+            l.add("device tree " + std::to_string(i), key + std::to_string(i), at + pos, split.blobs[i].size(), depth);
+            pos += split.blobs[i].size();
+        }
+        consumed = split.consumed;
+    }
+    if (consumed >= section.size()) return;
+    const bool zeros = std::all_of(section.begin() + static_cast<std::ptrdiff_t>(consumed), section.end(), [](uint8_t b) { return b == 0; });
+    if (zeros) l.add("padding", "", at + consumed, section.size() - consumed, depth, "zeros");
+    else l.add("tail", key + "_tail", at + consumed, section.size() - consumed, depth, "what follows the device trees");
 }
 
 void vbmeta(Layout& l, const Bytes& d, uint64_t at, unsigned depth, const std::string& key_prefix) {

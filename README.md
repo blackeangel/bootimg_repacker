@@ -20,7 +20,7 @@ build-time contents:
 | vendor_boot (header v3-v4) | `vendor_boot.img`, `vendor_boot-debug.img`, `vendor_kernel_boot.img` |
 | dtbo | `dtbo.img` (and the ACPIO variant) |
 | dtb | raw or concatenated Flattened Device Tree blobs, with the gaps between them and an AVB hash footer on the partition; see below |
-| QCDT (v1-v3) | Qualcomm's device tree table (`QCDT`, what `dtbTool` makes): `dt.img`, or the table of a boot image; a folder of `.dtb` files is packed into one; see below |
+| QCDT (v1-v3) | Qualcomm's device tree table (`QCDT`, what `dtbTool` makes): `dt.img`, or the table of a boot image; a folder of `.dts` or `.dtb` files is packed into one; see below |
 | vbmeta (AVB) | `vbmeta.img`, `vbmeta_system.img`, and AVB footers appended to other partitions |
 | uboot | U-Boot's legacy `mkimage`/uImage container |
 | U-Boot FIT image | what `mkimage -f` makes (`.itb`, `.fit`): a flattened device tree whose `/images` hold the kernel, ramdisks and device trees, the data in the tree or behind it (`-E`, `-E -B n`, `-E -p n`); see below |
@@ -82,7 +82,7 @@ into again unless `-o` names it.
 
 **Nothing has to be said about what the image is.** The format (boot, vendor_boot, vbmeta, FIT, ...), the wrappers around
 it (DHTB, ChromeOS, ASUS blob, SIN, LOKI, AMONET, ...), the compression of every part and the signatures are worked out from the
-image itself; `pack` finds them again in the folder's `manifest.txt`. A folder of device trees (files that end in `.dtb`) and no
+image itself; `pack` finds them again in the folder's `manifest.txt`. A folder of device trees (files that end in `.dts` or `.dtb`) and no
 `manifest.txt` is packed into a Qualcomm device tree table; `type=qcdt`, `page_size=` and `table_version=` (1, 2 or 3) in a
 `manifest.txt` say how.
 
@@ -572,7 +572,7 @@ kernel, the ramdisks and the device trees, `/configurations` says which of them 
 writes `data-size` and `data-position` (counted from the start of the file), and `-B n` aligns what goes behind.
 
 `abr unpack` writes `fit.its`, the tree as device tree source, and a file for every image: `data = /incbin/("kernel_1");` in
-`fit.its` names the file of `kernel-1`, a `flat_dt` image is `fdt_1.dtb`, a ramdisk is `ramdisk_1.cpio` and, as in a boot image, a
+`fit.its` names the file of `kernel-1`, a `flat_dt` image is the source `fdt_1.dts`, a ramdisk is `ramdisk_1.cpio` and, as in a boot image, a
 directory `ramdisk_1/` with `ramdisk_1.meta` (an image that is a compressed stream, a kernel or a ramdisk, is decompressed for
 editing, and compressed again with the codec it had; the tests do that with gzip). `abr pack` puts it together again: an untouched directory is the file byte for byte -- the places of the images, how
 the end of the tree is padded (to the `-B` it was made with, or by the number of bytes it had), the free space behind the strings, the
@@ -796,7 +796,26 @@ no image of a phone of these makers: see *How it is verified*.
 
 ### Device trees: dtb and QCDT
 
-A **dtb** file (or partition) is flattened device trees one behind another. `unpack` writes `blob<N>.dtb` for every tree. The gaps
+**A device tree comes out as source text, and goes in compiled.** Wherever `unpack` finds one -- a dtb file or partition, the `dtb` of a
+boot or vendor_boot image, the trees of a dtbo table (`dtbo.img`, or a boot image's `recovery_dtbo`), a QCDT table, the `flat_dt` images of a FIT
+-- it writes a `.dts` file that a person can read and edit (`entry0.dts`, `dtb/entry0.dts`, `recovery_dtbo/entry0.dts`, `dt/dtb0.dts`,
+`fdt_1.dts`), and `pack` compiles it again. The compiler is `abr`'s own (`abr::dts`): the whole language of `dtc` 1.7 -- `/dts-v1/`,
+`/plugin/`, `/include/`, `/delete-node/`, `/delete-property/`, `/omit-if-no-ref/`, `/memreserve/`, labels and references, `&{/path}`, the
+expressions of a cell, `/bits/`, `/incbin/`, the line markers of a C preprocessor's output (not the preprocessor: run `cpp` first for a
+source that has `#include <...>` or `#define`) -- with errors that name the file and the line, and the same bytes (the tests have `dtc`
+itself judge it: the same source gives the same blob, a blob gives the source that compiles back to it); `dtc` is not needed to run
+`abr`. It does not make the style warnings of `dtc`. What it prints is its own, plain style. `/include/` and `/incbin/` read only files in the
+folder of the source (a relative name without `..`).
+
+An untouched source gives the blob it came from, byte for byte. A blob that no source can reproduce -- a strings block with a string that no
+property uses, free space behind the strings (`<slot>_slack`), a version 16 header, `NOP` tokens -- is kept beside the source in
+`.abr_raw/<file>.raw`, and the manifest says (`..._text_hash`, `..._raw_hash`) that the source is the one that was written: **the raw copy is
+used only while the text is unchanged**. An edited source is compiled the way `dtc` compiles it (and `pack` says when that is not the layout
+of the original). A tree that `abr` cannot read as a tree stays a `.dtb` file with the reason said, and a file that is named `.dtb` (not
+`.dts`) in a folder is taken as a binary blob, as before.
+
+A **dtb** file (or partition) is flattened device trees one behind another. `unpack` writes `entry<N>.dts` for every tree (the manifest
+calls them `blob<N>_file`). The gaps
 between them are kept: `blob_align=4096` when every tree begins at a multiple of one alignment (the smallest alignment that explains all
 the gaps), `blob<N>_pad` for a gap that follows no rule (zeros only). Bytes that are neither a tree nor zeros end the trees; they are
 `tail.bin`, up to the fill at the end of the partition (a run of 64 or more equal bytes), which `pad_byte` and `pad_to` keep (`pad_to` is
@@ -807,12 +826,12 @@ key (`testkey_rsa2048`), and says that it did.
 
 A **QCDT** table (what `dtbTool` makes, versions 1, 2 and 3) is the table of a Qualcomm boot image's device trees or the file `dt.img`: a
 table of entries -- the chipset, the platform, the subtype and the revision (from `qcom,msm-id` and `qcom,board-id`, `qcom,pmic-id`) --
-each naming one of the trees that follow, padded to the page size. `unpack` writes the trees as `dtb<N>_file` and the entries as
+each naming one of the trees that follow, padded to the page size. `unpack` writes the trees as `dtb<N>.dts` (`dtb<N>_file`) and the entries as
 `entry<K>_chipset`, `_platform`, `_subtype`, `_revision`, `_dtb`, with `version`, `page_size` and `entry_count`; in a boot image the same
 keys begin with `dt_` (`dt_format=qcdt`, `dt_version`, `dt_page_size`, `dt_dtb0_file`). A tree that is not a device tree is refused with the
 key and the file that hold it.
 
-`abr pack -i folder` of a folder of `.dtb` files and no `manifest.txt` makes a table in `dtbTool`'s manner: the entries come from the ids
+`abr pack -i folder` of a folder of `.dts` (or `.dtb`) files and no `manifest.txt` makes a table in `dtbTool`'s manner: the entries come from the ids
 of the trees (`qcom,msm-id`, `qcom,board-id`, `qcom,pmic-id`), are sorted by chipset, platform, subtype and revision, every tree is stored
 once, and the page is filled up (a whole extra page when the table is exactly one page long). `type=qcdt`, `page_size=` and
 `table_version=1|2|3` in a `manifest.txt` choose another page size or another version. The rules were read from the source of `dtbTool` (the

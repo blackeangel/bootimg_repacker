@@ -37,6 +37,7 @@
 #include "abr/console.hpp"
 #include "abr/dtb.hpp"
 #include "abr/dtbo.hpp"
+#include "abr/dtfile.hpp"
 #include "abr/dts.hpp"
 #include "abr/envelope.hpp"
 #include "abr/fdt.hpp"
@@ -1276,15 +1277,274 @@ size_t refresh_avb1_signature(const Manifest& m, Envelope& e, Bytes& core, uint3
     return e.tail.size() - rest.size();
 }
 
+
+// ------------------------------------------------------ device trees --
+//
+// A device tree is unpacked as its source (abr/dtfile.hpp: entry0.dts, which pack compiles again) -- in every image that holds one:
+// a dtb file, the dtb section of a boot or vendor_boot image, a dtbo table, a Qualcomm device tree table, the trees of a FIT.
+
+// The name of a tree of a set: "entry3.dts", in `subdir` when there is one.
+std::string tree_source_name(const std::string& subdir, size_t i, const char* stem = "entry") {
+    return (subdir.empty() ? "" : subdir + "/") + stem + std::to_string(i) + ".dts";
+}
+
+// The work of turning blobs into sources (reading each as a tree, writing its source, compiling the source to see that it gives the blob
+// back): every tree does it alone, so they run at once. `files[i]` is the name of the source of blob i, for the bar.
+std::vector<dtfile::Prepared> prepare_trees(const std::vector<const Bytes*>& blobs, const std::vector<std::string>& files) {
+    const size_t n = blobs.size();
+    std::vector<dtfile::Prepared> prepared(n);
+    std::vector<size_t> order(n);
+    uint64_t work = 0;
+    for (size_t i = 0; i < n; ++i) {
+        order[i] = i;
+        work += blobs[i]->size();
+    }
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return blobs[a]->size() > blobs[b]->size(); });
+    progress::enter("dts", work);
+    par::for_each(n, [&](size_t k) {
+        const size_t i = order[k];
+        const progress::Activity doing(files[i]);
+        prepared[i] = dtfile::prepare(*blobs[i]);
+        progress::advance(blobs[i]->size());
+    });
+    return prepared;
+}
+
+// Writes the file of one tree and its keys (the slot `slot`), and says what is worth saying.
+void commit_tree(Manifest& m, const fs::path& dir, const std::string& slot, const std::string& file, const dtfile::Prepared& p, const Bytes& blob) {
+    dtfile::commit(m, dir, slot, file, p, blob);
+    if (!p.note.empty()) note(shown(dtfile::file_name(file, p)) + ": " + p.note);
+}
+
+// The trees of slots `slots` as blobs (compiled where they are sources), on several threads. What the compiler says is said in order.
+// `edited`, when given, gets one entry for every slot: whether its source was edited since the unpack (a tree that is a file of the blob is not).
+std::vector<Bytes> load_trees_from_sources(const Manifest& m, const fs::path& dir, const std::vector<std::string>& slots, bool must_be_tree = true,
+                                           std::vector<char>* edited = nullptr) {
+    const size_t n = slots.size();
+    std::vector<dtfile::Loaded> loaded(n);
+    std::vector<size_t> order(n), size(n, 0);
+    for (size_t i = 0; i < n; ++i) {
+        order[i] = i;
+        std::error_code ec;
+        if (m.has(slots[i] + "_file")) {
+            const auto s = fs::file_size(dir / m.get_path(slots[i] + "_file"), ec);
+            if (!ec) size[i] = static_cast<size_t>(s);
+        }
+    }
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return size[a] > size[b]; });
+    par::for_each(n, [&](size_t k) {
+        const size_t i = order[k];
+        const progress::Activity doing(m.has(slots[i] + "_file") ? m.get_path(slots[i] + "_file") : slots[i]);
+        loaded[i] = dtfile::load(m, dir, slots[i], must_be_tree);
+        progress::advance(size[i]);
+    });
+    std::vector<Bytes> out;
+    for (size_t i = 0; i < n; ++i) {
+        const std::string file = m.get_path(slots[i] + "_file");
+        for (const std::string& w : loaded[i].warnings) warn(shown(file) + ": " + w);
+        if (!loaded[i].note.empty()) note(loaded[i].note);
+        if (edited) edited->push_back(loaded[i].edited ? 1 : 0);
+        out.push_back(std::move(loaded[i].blob));
+    }
+    return out;
+}
+
+// A section of a file that is made of device trees one behind the other (a dtb file; the dtb section of a boot or a vendor_boot image): the
+// keys `<prefix>_count`, `<prefix>_align` (the trees are put at multiples of it: a bigger tree moves the ones behind it on to the next
+// multiple) or `<prefix><N>_pad` (the zeros in front of tree N, where no alignment says them), and a slot `<prefix><N>` for each tree, whose
+// source is `subdir`/entry<N>.dts.
+void save_trees(Manifest& m, const fs::path& dir, const std::string& prefix, const std::string& subdir, const FdtBlobs& split) {
+    const size_t n = split.blobs.size();
+    m.set_u32(prefix + "_count", static_cast<uint32_t>(n));
+    const size_t align = fdt_gap_alignment(split);
+    if (align) m.set_u64(prefix + "_align", align);
+    std::vector<const Bytes*> blobs;
+    std::vector<std::string> files;
+    for (size_t i = 0; i < n; ++i) {
+        blobs.push_back(&split.blobs[i]);
+        files.push_back(tree_source_name(subdir, i));
+    }
+    const std::vector<dtfile::Prepared> prepared = prepare_trees(blobs, files);
+    for (size_t i = 0; i < n; ++i) {
+        commit_tree(m, dir, prefix + std::to_string(i), files[i], prepared[i], split.blobs[i]);
+        if (!align && split.gaps[i]) m.set_u64(prefix + std::to_string(i) + "_pad", split.gaps[i]);
+    }
+}
+
+// The section that save_trees() recorded, put together again.
+Bytes load_trees(const Manifest& m, const fs::path& dir, const std::string& prefix) {
+    const uint32_t count = m.get_count(prefix + "_count", 0);
+    if (count == 0)
+        throw FormatError("manifest.txt: " + prefix + "_count is 0; there is at least one device tree (" + prefix + "0_file=...)");
+    std::vector<std::string> slots;
+    for (uint32_t i = 0; i < count; ++i) slots.push_back(prefix + std::to_string(i));
+    std::vector<Bytes> blobs = load_trees_from_sources(m, dir, slots);
+    // The zero bytes in front of each tree after the first: <prefix>_align puts the trees at multiples of it; <prefix><N>_pad says how many
+    // zeros there are in front of tree N (and wins over the alignment for that tree). Neither: the trees follow one another.
+    std::vector<size_t> gaps;
+    if (m.has(prefix + "_align")) {
+        const uint64_t align = m.get_size(prefix + "_align", 0);
+        if (align == 0)
+            throw FormatError("manifest.txt: " + prefix + "_align is 0; it is the size the trees are put at multiples of (1 or more), or leave it out "
+                              "when they follow one another");
+        gaps = fdt_aligned_gaps(blobs, static_cast<size_t>(align));
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+        const std::string key = prefix + std::to_string(i) + "_pad";
+        if (!m.has(key)) continue;
+        const uint64_t pad = m.get_size(key, 0);
+        if (i == 0 && pad)
+            throw FormatError("manifest.txt: " + prefix + "0_pad is " + std::to_string(pad) + "; the first tree starts the section (there is nothing in front of it)");
+        if (gaps.empty()) gaps.assign(count, 0);
+        gaps[i] = static_cast<size_t>(pad);
+    }
+    uint64_t total = 0;
+    for (const Bytes& b : blobs) total += b.size();
+    for (const size_t g : gaps) total += g;
+    if (total > kMaxImageSize)
+        throw FormatError("the trees and the zeros between them come to " + std::to_string(total) + " bytes (" + prefix + "_align and " + prefix +
+                          "<N>_pad of manifest.txt set the zeros); no image of the family is more than " + std::to_string(kMaxImageSize >> 20) + " MiB");
+    return join_fdt_blobs(blobs, gaps);
+}
+
+// What follows the table or the last tree of a section (the zeros that fill it up, or whatever it is): a count of zeros, or a file.
+void save_section_tail(Manifest& m, const fs::path& dir, const std::string& key, const Bytes& section, size_t consumed) {
+    if (consumed >= section.size()) return;
+    const Bytes rest(section.begin() + static_cast<std::ptrdiff_t>(consumed), section.end());
+    if (std::all_of(rest.begin(), rest.end(), [](uint8_t b) { return b == 0; })) m.set_u64(key + "_tail_zeros", rest.size());
+    else save_raw(m, dir, key + "_tail", rest, key + "/tail.bin");
+}
+
+void load_section_tail(const Manifest& m, const fs::path& dir, const std::string& key, Bytes& section) {
+    const Bytes tail = load_raw(m, dir, key + "_tail");
+    const uint64_t zeros = m.get_size(key + "_tail_zeros", 0);
+    if (zeros && !tail.empty())
+        throw FormatError("manifest.txt has " + key + "_tail_file and " + key + "_tail_zeros: what follows the device trees is one of them");
+    section.insert(section.end(), tail.begin(), tail.end());
+    section.insert(section.end(), static_cast<size_t>(zeros), 0);
+}
+
+// The table of a dtbo image as keys of a manifest and a source for each of its trees: the same keys for an image of its own (no prefix,
+// the trees beside the manifest) and for the `recovery_dtbo` of a boot image (`recovery_dtbo_`, the trees in recovery_dtbo/). The data of
+// an entry that is not a device tree (an ACPI table, or anything else) is a file as it is.
+void save_dtbo_table(Manifest& m, const fs::path& dir, const std::string& prefix, const std::string& subdir, const DtboImage& img) {
+    m.set_u32(prefix + "version", img.version);
+    m.set_u32(prefix + "page_size", img.page_size);
+    m.set_bool(prefix + "acpio", img.acpio);
+    m.set_u32(prefix + "entry_count", static_cast<uint32_t>(img.entries.size()));
+    std::vector<const Bytes*> blobs;
+    std::vector<std::string> files;
+    for (size_t i = 0; i < img.entries.size(); ++i) {
+        blobs.push_back(&img.entries[i].data);
+        files.push_back(tree_source_name(subdir, i));
+    }
+    std::vector<dtfile::Prepared> prepared;
+    if (img.acpio) prepared.assign(img.entries.size(), dtfile::Prepared{});  // (ACPI tables, not trees: nothing to read, nothing to say)
+    else prepared = prepare_trees(blobs, files);
+    for (size_t i = 0; i < img.entries.size(); ++i) {
+        const DtboEntry& e = img.entries[i];
+        const std::string p = prefix + "entry" + std::to_string(i);
+        m.set_u32(p + "_id", e.id);
+        m.set_u32(p + "_rev", e.rev);
+        Bytes extra;
+        for (auto v : e.extra) {
+            extra.push_back(uint8_t(v));
+            extra.push_back(uint8_t(v >> 8));
+            extra.push_back(uint8_t(v >> 16));
+            extra.push_back(uint8_t(v >> 24));
+        }
+        m.set_hex(p + "_extra", extra);
+        if (!e.data.empty()) commit_tree(m, dir, p, files[i], prepared[i], e.data);
+    }
+}
+
+DtboImage load_dtbo_table(const Manifest& m, const fs::path& dir, const std::string& prefix) {
+    DtboImage img;
+    img.version = m.get_u32(prefix + "version", 0);
+    img.page_size = m.get_u32(prefix + "page_size", 2048);
+    img.acpio = m.get_bool(prefix + "acpio", false);
+    const uint32_t count = m.get_count(prefix + "entry_count", 0);
+    std::vector<std::string> slots;  // the entries that have a file
+    std::vector<size_t> owner;
+    for (uint32_t i = 0; i < count; ++i) {
+        const std::string p = prefix + "entry" + std::to_string(i);
+        DtboEntry e;
+        e.id = m.get_u32(p + "_id", 0);
+        e.rev = m.get_u32(p + "_rev", 0);
+        const Bytes extra = m.get_hex(p + "_extra");
+        for (size_t j = 0; j < e.extra.size() && j * 4 + 3 < extra.size(); ++j)
+            e.extra[j] = uint32_t(extra[j * 4]) | (uint32_t(extra[j * 4 + 1]) << 8) |
+                         (uint32_t(extra[j * 4 + 2]) << 16) | (uint32_t(extra[j * 4 + 3]) << 24);
+        if (m.has(p + "_file")) {
+            slots.push_back(p);
+            owner.push_back(img.entries.size());
+        }
+        img.entries.push_back(std::move(e));
+    }
+    std::vector<Bytes> blobs = load_trees_from_sources(m, dir, slots, /*must_be_tree=*/false);
+    for (size_t k = 0; k < slots.size(); ++k) img.entries[owner[k]].data = std::move(blobs[k]);
+    return img;
+}
+
+// A section of a boot or vendor_boot image that holds device trees -- the dtb section (header v2 and vendor_boot), the recovery_dtbo (header v1
+// and v2) -- is unpacked as what it is made of, when abr can write it again byte for byte:
+//   * device trees one behind the other (a dtb): `<key>_count`, `<key>_align` or `<key><N>_pad`, and a source for each in <key>/entry<N>.dts;
+//   * a dtbo table (magic d7 b7 ab 1e): `<key>_format=dtbo`, the keys of the table (`<key>_entry0_id`, ...) and a source for each tree;
+// and what follows the last of them (<key>_tail_zeros, or <key>_tail_file); any other section is the file `<key>` (the recovery_dtbo:
+// recovery_dtbo.img).
+void save_tree_section(Manifest& m, const fs::path& dir, const std::string& key, const Bytes& section, const std::string& raw_file) {
+    if (section.empty()) return;
+    if (section.size() >= 4 && section[0] == 0xd7 && section[1] == 0xb7 && section[2] == 0xab && section[3] == 0x1e) {
+        try {
+            const DtboImage table = DtboImage::parse(section);
+            const Bytes whole(section.begin(), section.begin() + static_cast<std::ptrdiff_t>(table.consumed));
+            if (table.build() != whole) throw FormatError("abr cannot write the table again byte for byte");
+            m.set(key + "_format", "dtbo");
+            save_dtbo_table(m, dir, key + "_", key, table);
+            save_section_tail(m, dir, key, section, table.consumed);
+            return;
+        } catch (const FormatError& e) {
+            note("the " + key + " of this image is kept as the file " + raw_file + ": " + e.what());
+        }
+    } else {
+        FdtBlobs split;
+        try {
+            split = split_fdt_blobs(section);
+        } catch (const FormatError& e) {
+            note("the " + key + " of this image is kept as the file " + raw_file + ": " + e.what());
+        }
+        if (!split.blobs.empty()) {
+            save_trees(m, dir, key, key, split);
+            save_section_tail(m, dir, key, section, split.consumed);
+            return;
+        }
+    }
+    save_raw(m, dir, key, section, raw_file);
+}
+
+Bytes load_tree_section(const Manifest& m, const fs::path& dir, const std::string& key) {
+    const bool table = m.has(key + "_format"), trees = m.has(key + "_count");
+    if (!table && !trees) return load_raw(m, dir, key);
+    if (m.has(key + "_file"))
+        throw FormatError("manifest.txt has " + key + "_file and " + (table ? key + "_format" : key + "_count") + ": the " + key + " of the image is either a file or made "
+                          "of the device trees of the manifest. Take out the one that is not meant");
+    Bytes out;
+    if (table) {
+        if (m.get(key + "_format") != "dtbo")
+            throw FormatError("manifest.txt: " + key + "_format=" + shown(m.get(key + "_format")) + " is not a format abr knows (dtbo)");
+        out = load_dtbo_table(m, dir, key + "_").build();
+    } else {
+        out = load_trees(m, dir, key);
+    }
+    load_section_tail(m, dir, key, out);
+    return out;
+}
+
 // ------------------------------------------------------------------ qcdt --
 //
 // A Qualcomm device tree table (abr/qcdt.hpp) is keys of a manifest and a file for every tree it holds: the same keys for a table that is a file
 // of its own (no prefix, the trees beside the manifest) and for the `dt` of a boot image (`dt_`, the trees in dt/). An entry says the board its
 // tree is for by numbers, and the tree by its number.
-
-std::string qcdt_tree_file(const std::string& subdir, size_t i) {
-    return (subdir.empty() ? "" : subdir + "/") + "dtb" + std::to_string(i) + ".dtb";
-}
 
 void save_qcdt(Manifest& m, const fs::path& dir, const std::string& prefix, const std::string& subdir, const qcdt::Table& t) {
     m.set_u32(prefix + "version", t.version);
@@ -1302,11 +1562,14 @@ void save_qcdt(Manifest& m, const fs::path& dir, const std::string& prefix, cons
         m.set_u64(p + "dtb", e.dtb);
     }
     m.set_u32(prefix + "dtb_count", static_cast<uint32_t>(t.dtbs.size()));
+    std::vector<const Bytes*> blobs;
+    std::vector<std::string> files;
     for (size_t j = 0; j < t.dtbs.size(); ++j) {
-        const std::string file = qcdt_tree_file(subdir, j);
-        m.set(prefix + "dtb" + std::to_string(j) + "_file", file);
-        write_file(dir / file, t.dtbs[j]);
+        blobs.push_back(&t.dtbs[j]);
+        files.push_back(tree_source_name(subdir, j, "dtb"));  // (the number is the tree's, which the entries name; not the entry's)
     }
+    const std::vector<dtfile::Prepared> prepared = prepare_trees(blobs, files);
+    for (size_t j = 0; j < t.dtbs.size(); ++j) commit_tree(m, dir, prefix + "dtb" + std::to_string(j), files[j], prepared[j], t.dtbs[j]);
 }
 
 // What a manifest says (it is read all, whatever the version: a subtype in a version 1 table is a contradiction that qcdt::build says, not a key
@@ -1331,13 +1594,16 @@ qcdt::Table load_qcdt(const Manifest& m, const fs::path& dir, const std::string&
         t.entries.push_back(e);
     }
     const uint32_t trees = m.get_count(prefix + "dtb_count", 0);
+    std::vector<std::string> slots;
     for (uint32_t j = 0; j < trees; ++j) {
         const std::string key = prefix + "dtb" + std::to_string(j) + "_file";
-        const std::string name = m.get_path(key);
-        if (name.empty()) throw FormatError("manifest.txt has no " + shown(key) + " (the file of device tree " + std::to_string(j) + ")");
-        Bytes blob = read_file(dir / name);
-        qcdt::check_device_tree(blob, key + " (" + textquote::quote_shown(name) + ")");  // (the file is named, not "device tree 0")
-        t.dtbs.push_back(std::move(blob));
+        if (m.get_path(key).empty()) throw FormatError("manifest.txt has no " + shown(key) + " (the file of device tree " + std::to_string(j) + ")");
+        slots.push_back(prefix + "dtb" + std::to_string(j));
+    }
+    t.dtbs = load_trees_from_sources(m, dir, slots);
+    for (uint32_t j = 0; j < trees; ++j) {
+        const std::string key = slots[j] + "_file";
+        qcdt::check_device_tree(t.dtbs[j], key + " (" + textquote::quote_shown(m.get_path(key)) + ")");  // (the file is named, not "device tree 0")
     }
     return t;
 }
@@ -1466,8 +1732,8 @@ void unpack_boot(const Bytes& whole, const fs::path& dir) {
         }
         if (!table) save_raw(m, dir, "dt", img.dt, "dt.img");
     }
-    save_raw(m, dir, "recovery_dtbo", img.recovery_dtbo, "recovery_dtbo.img");
-    save_raw(m, dir, "dtb", img.dtb, "dtb");
+    save_tree_section(m, dir, "recovery_dtbo", img.recovery_dtbo, "recovery_dtbo.img");
+    save_tree_section(m, dir, "dtb", img.dtb, "dtb");
     save_raw(m, dir, "boot_signature", img.boot_signature, "boot_signature.bin");
     save_raw(m, dir, "header_padding", img.header_padding, "header_padding.bin");
     save_section_padding(m, dir, img.section_padding, BootImage::kSectionNames);
@@ -1556,8 +1822,8 @@ Bytes repack_boot(const Manifest& m, const fs::path& dir, const RepackOptions& o
     } else {
         img.dt = load_raw(m, dir, "dt");
     }
-    img.recovery_dtbo = load_raw(m, dir, "recovery_dtbo");
-    img.dtb = load_raw(m, dir, "dtb");
+    img.recovery_dtbo = load_tree_section(m, dir, "recovery_dtbo");
+    img.dtb = load_tree_section(m, dir, "dtb");
     img.boot_signature = load_raw(m, dir, "boot_signature");
     img.header_padding = load_raw(m, dir, "header_padding");
     img.section_padding = load_section_padding(m, dir, BootImage::kSectionNames);
@@ -1611,7 +1877,7 @@ void unpack_vendor_boot(const Bytes& whole, const fs::path& dir) {
     if (img.header_version >= 4 && !img.has_ramdisk_table) m.set_bool("ramdisk_table", false);
     if (img.missing_tail_padding) m.set_u64("missing_tail_padding", img.missing_tail_padding);
     if (img.missing_tail_padding && img.kept_tail_padding) m.set_u64("tail_padding_kept", *img.kept_tail_padding);
-    save_raw(m, dir, "dtb", img.dtb, "dtb");
+    save_tree_section(m, dir, "dtb", img.dtb, "dtb");
     save_raw(m, dir, "bootconfig", img.bootconfig, "bootconfig");
     save_raw(m, dir, "header_padding", img.header_padding, "header_padding.bin");
     save_section_padding(m, dir, img.section_padding, VendorBootImage::kSectionNames);
@@ -1675,7 +1941,7 @@ Bytes repack_vendor_boot(const Manifest& m, const fs::path& dir, const RepackOpt
     img.has_ramdisk_table = m.get_bool("ramdisk_table", true);
     img.missing_tail_padding = m.get_size("missing_tail_padding", 0);
     if (m.has("tail_padding_kept")) img.kept_tail_padding = m.get_size("tail_padding_kept", 0);
-    img.dtb = load_raw(m, dir, "dtb");
+    img.dtb = load_tree_section(m, dir, "dtb");
     img.bootconfig = load_raw(m, dir, "bootconfig");
     img.header_padding = load_raw(m, dir, "header_padding");
     img.section_padding = load_section_padding(m, dir, VendorBootImage::kSectionNames);
@@ -1709,25 +1975,7 @@ void unpack_dtbo(const Bytes& whole, const fs::path& dir) {
     DtboImage img = DtboImage::parse(data);
     Manifest m;
     m.set("type", "dtbo");
-    m.set_u32("version", img.version);
-    m.set_u32("page_size", img.page_size);
-    m.set_bool("acpio", img.acpio);
-    m.set_u32("entry_count", static_cast<uint32_t>(img.entries.size()));
-    for (size_t i = 0; i < img.entries.size(); ++i) {
-        auto& e = img.entries[i];
-        std::string p = "entry" + std::to_string(i);
-        m.set_u32(p + "_id", e.id);
-        m.set_u32(p + "_rev", e.rev);
-        Bytes extra;
-        for (auto v : e.extra) {
-            extra.push_back(uint8_t(v));
-            extra.push_back(uint8_t(v >> 8));
-            extra.push_back(uint8_t(v >> 16));
-            extra.push_back(uint8_t(v >> 24));
-        }
-        m.set_hex(p + "_extra", extra);
-        save_raw(m, dir, p, e.data, p + ".dtb");
-    }
+    save_dtbo_table(m, dir, "", "", img);
     save_envelope(m, dir, Envelope::capture(data, 0, img.consumed), data, 0, img.consumed);
     save_avb_footer(m, dir, footer, data);
     m.save(dir / "manifest.txt",
@@ -1735,23 +1983,7 @@ void unpack_dtbo(const Bytes& whole, const fs::path& dir) {
 }
 
 Bytes repack_dtbo(const Manifest& m, const fs::path& dir, const RepackOptions& opt) {
-    DtboImage img;
-    img.version = m.get_u32("version", 0);
-    img.page_size = m.get_u32("page_size", 2048);
-    img.acpio = m.get_bool("acpio", false);
-    uint32_t count = m.get_count("entry_count", 0);
-    for (uint32_t i = 0; i < count; ++i) {
-        std::string p = "entry" + std::to_string(i);
-        DtboEntry e;
-        e.id = m.get_u32(p + "_id", 0);
-        e.rev = m.get_u32(p + "_rev", 0);
-        Bytes extra = m.get_hex(p + "_extra");
-        for (size_t j = 0; j < e.extra.size() && j * 4 + 3 < extra.size(); ++j)
-            e.extra[j] = uint32_t(extra[j * 4]) | (uint32_t(extra[j * 4 + 1]) << 8) |
-                         (uint32_t(extra[j * 4 + 2]) << 16) | (uint32_t(extra[j * 4 + 3]) << 24);
-        e.data = load_raw(m, dir, p);
-        img.entries.push_back(std::move(e));
-    }
+    const DtboImage img = load_dtbo_table(m, dir, "");
     Bytes host = assemble_envelope(m, dir, img.build(), opt);
     return reattach_avb_footer(m, dir, std::move(host), opt.avb_key_pem);
 }
@@ -1769,17 +2001,9 @@ void unpack_dtb(const Bytes& whole, const fs::path& dir) {
     if (split.blobs.empty()) throw FormatError("this is not a dtb: it does not start with a flattened device tree");
     Manifest m;
     m.set("type", "dtb");
-    m.set_u32("blob_count", static_cast<uint32_t>(split.blobs.size()));
     // Zero bytes between the trees: when the trees are put at multiples of an alignment that says all of it (a bigger tree then moves
     // the ones behind it on to the next multiple); the gaps of trees that follow no such rule are kept as they are, one by one.
-    const size_t align = fdt_gap_alignment(split);
-    if (align) m.set_u64("blob_align", align);
-    for (size_t i = 0; i < split.blobs.size(); ++i) {
-        std::string filename = "blob" + std::to_string(i) + ".dtb";
-        m.set("blob" + std::to_string(i) + "_file", filename);
-        if (!align && split.gaps[i]) m.set_u64("blob" + std::to_string(i) + "_pad", split.gaps[i]);
-        write_file(dir / filename, split.blobs[i]);
-    }
+    save_trees(m, dir, "blob", "", split);
     save_envelope(m, dir, Envelope::capture(data, 0, split.consumed), data, 0, split.consumed);
     save_avb_footer(m, dir, footer, data);
     m.save(dir / "manifest.txt",
@@ -1787,41 +2011,8 @@ void unpack_dtb(const Bytes& whole, const fs::path& dir) {
 }
 
 Bytes repack_dtb(const Manifest& m, const fs::path& dir, const RepackOptions& opt) {
-    uint32_t count = m.get_count("blob_count", 0);
-    if (count == 0) throw FormatError("manifest.txt: blob_count is 0; a dtb has at least one blob (blob0_file=...)");
-    std::vector<Bytes> blobs;
-    for (uint32_t i = 0; i < count; ++i) {
-        const std::string key = "blob" + std::to_string(i) + "_file";
-        const std::string name = m.get_path(key);
-        blobs.push_back(read_file(dir / name));
-        check_fdt_blob(blobs.back(), key + " (" + textquote::quote_shown(name) + ")");
-    }
-    // The zero bytes in front of each tree after the first: blob_align puts the trees at multiples of it; blob<N>_pad says how many
-    // zeros there are in front of tree N (and wins over the alignment for that tree). Neither: the trees follow one another.
-    std::vector<size_t> gaps;
-    if (m.has("blob_align")) {
-        const uint64_t align = m.get_size("blob_align", 0);
-        if (align == 0)
-            throw FormatError("manifest.txt: blob_align is 0; it is the size the trees are put at multiples of (1 or more), or leave it out "
-                              "when they follow one another");
-        gaps = fdt_aligned_gaps(blobs, static_cast<size_t>(align));
-    }
-    for (uint32_t i = 0; i < count; ++i) {
-        const std::string key = "blob" + std::to_string(i) + "_pad";
-        if (!m.has(key)) continue;
-        const uint64_t pad = m.get_size(key, 0);
-        if (i == 0 && pad)
-            throw FormatError("manifest.txt: blob0_pad is " + std::to_string(pad) + "; the first tree starts the file (there is nothing in front of it)");
-        if (gaps.empty()) gaps.assign(count, 0);
-        gaps[i] = static_cast<size_t>(pad);
-    }
-    uint64_t total = 0;
-    for (const Bytes& b : blobs) total += b.size();
-    for (const size_t g : gaps) total += g;
-    if (total > kMaxImageSize)
-        throw FormatError("the trees and the zeros between them come to " + std::to_string(total) + " bytes (blob_align and blob<N>_pad of manifest.txt "
-                          "set the zeros); no image of the family is more than " + std::to_string(kMaxImageSize >> 20) + " MiB");
-    Bytes host = assemble_envelope(m, dir, join_fdt_blobs(blobs, gaps), opt);
+    if (m.get_count("blob_count", 0) == 0) throw FormatError("manifest.txt: blob_count is 0; a dtb has at least one blob (blob0_file=...)");
+    Bytes host = assemble_envelope(m, dir, load_trees(m, dir, "blob"), opt);
     return reattach_avb_footer(m, dir, std::move(host), opt.avb_key_pem);
 }
 
@@ -2071,9 +2262,33 @@ bool unpack_fit(const Bytes& data, const fs::path& dir, std::string& why) {
     fdt::Node* images = o.tree.root.find_child("images");
     const std::vector<FitName> names = fit_names(o.images);
 
+    // The device trees that the FIT holds (the images of the type flat_dt) are sources, as everywhere: fdt_1.dts. A flat_dt whose data abr cannot
+    // read as a tree stays a file of its data, like any other image.
+    std::vector<dtfile::Prepared> tree(o.images.size());  // `.text`: the image is a tree that has a source
+    {
+        std::vector<size_t> flat;
+        std::vector<const Bytes*> blobs;
+        std::vector<std::string> files;
+        for (size_t i = 0; i < o.images.size(); ++i) {
+            if (o.images[i].type != "flat_dt" || o.images[i].data.empty()) continue;
+            flat.push_back(i);
+            blobs.push_back(&o.images[i].data);
+            files.push_back(names[i].prefix + ".dts");
+        }
+        std::vector<dtfile::Prepared> prepared = prepare_trees(blobs, files);
+        for (size_t k = 0; k < flat.size(); ++k) tree[flat[k]] = std::move(prepared[k]);
+    }
+
     std::vector<ComponentSource> sources;
-    for (size_t i = 0; i < o.images.size(); ++i) sources.push_back({&o.images[i].data, names[i].filename});
-    std::vector<DecodedComponent> parts = save_components(dir, sources);
+    std::vector<size_t> image_of_source;
+    for (size_t i = 0; i < o.images.size(); ++i) {
+        if (tree[i].text) continue;
+        sources.push_back({&o.images[i].data, names[i].filename});
+        image_of_source.push_back(i);
+    }
+    std::vector<DecodedComponent> decoded = save_components(dir, sources);
+    std::vector<DecodedComponent> parts(o.images.size());
+    for (size_t k = 0; k < image_of_source.size(); ++k) parts[image_of_source[k]] = std::move(decoded[k]);
 
     Manifest m;
     m.set("type", "fit");
@@ -2093,6 +2308,13 @@ bool unpack_fit(const Bytes& data, const fs::path& dir, std::string& why) {
 
     uint32_t recorded = 0;
     for (size_t i = 0; i < o.images.size(); ++i) {
+        if (tree[i].text) {
+            const std::string file = names[i].prefix + ".dts";
+            commit_tree(m, dir, names[i].prefix, file, tree[i], o.images[i].data);
+            m.set("component" + std::to_string(recorded++) + "_prefix", names[i].prefix);
+            images->children[o.images[i].index].find_prop("data")->incbin = file;
+            continue;
+        }
         if (!parts[i].present) continue;  // an image without data is `data;` in the text
         record_component(m, names[i].prefix, names[i].filename, parts[i]);
         m.set("component" + std::to_string(recorded++) + "_prefix", names[i].prefix);
@@ -2107,7 +2329,7 @@ bool unpack_fit(const Bytes& data, const fs::path& dir, std::string& why) {
 
     const std::string text =
         "// A U-Boot FIT image, as abr unpacked it. `data = /incbin/(\"file\")` is the data of an image: the file is in this directory\n"
-        "// (data-size and data-offset or data-position are made again by repack when the size of an image changed).\n\n" +
+        "// (data-size and data-offset or data-position are made again when the size changed; a .dts is a device tree, compiled).\n\n" +
         dts::print(o.tree);
     write_file(dir / "fit.its", reinterpret_cast<const uint8_t*>(text.data()), text.size());
     m.set_hex("fit_its_hash", hash::sha256(reinterpret_cast<const uint8_t*>(text.data()), text.size()));
@@ -2170,6 +2392,7 @@ Bytes repack_fit(const Manifest& m, const fs::path& dir, const RepackOptions& op
         size_t index;        // the image: a child of /images
         std::string prefix;  // the component that holds its data; empty for a file that is not one (an image put in)
         std::string file;
+        int tree = 0;        // 1: the source of a device tree that was unpacked (a slot of the manifest), 2: a source that was put in (compiled as it is)
     };
     std::vector<Slot> slots;
     std::set<size_t> changed;  // the images whose data is not what the image had
@@ -2187,18 +2410,39 @@ Bytes repack_fit(const Manifest& m, const fs::path& dir, const RepackOptions& op
             throw FormatError(shown(its_name) + ": the image " + shown(n.name) + " has data = /incbin/(" + shown(d->incbin) + "), a name that " + problem +
                               ". A file of an image has to be in the directory it is in (a relative path without '..'); copy it there");
         const auto known = prefix_of.find(d->incbin);
-        slots.push_back({i, known == prefix_of.end() ? std::string() : known->second, d->incbin});
+        int tree = 0;
+        if (dtfile::is_source_name(d->incbin)) {
+            std::string type;
+            if (known != prefix_of.end()) tree = 1;
+            else if (n.get_string("type", type) && type == "flat_dt") tree = 2;
+        }
+        slots.push_back({i, known == prefix_of.end() ? std::string() : known->second, d->incbin, tree});
     }
-    std::vector<std::string> wanted;
-    for (const Slot& s : slots)
-        if (!s.prefix.empty()) wanted.push_back(s.prefix);
-    std::vector<char> replayed;
+    std::vector<std::string> wanted, tree_slots;
+    for (const Slot& s : slots) {
+        if (s.tree == 1) tree_slots.push_back(s.prefix);
+        else if (!s.prefix.empty()) wanted.push_back(s.prefix);
+    }
+    std::vector<char> replayed, tree_edited;
     std::vector<Bytes> loaded = load_components(m, dir, wanted, opt, &replayed);
-    size_t at = 0;
+    std::vector<Bytes> trees = load_trees_from_sources(m, dir, tree_slots, true, &tree_edited);
+    size_t at = 0, tree_at = 0;
     for (const Slot& s : slots) {
         fdt::Node& n = images->children[s.index];
         fdt::Property* d = n.find_prop("data");
-        if (!s.prefix.empty()) {
+        if (s.tree == 1) {
+            d->value = std::move(trees[tree_at]);
+            if (tree_edited[tree_at]) changed.insert(s.index);
+            ++tree_at;
+        } else if (s.tree == 2) {
+            const fs::path file = dir / s.file;
+            if (!fs::exists(file))
+                throw FormatError(shown(its_name) + ": the image " + shown(n.name) + " has data = /incbin/(" + shown(s.file) + ") and there is no such file in the directory");
+            std::vector<std::string> warnings;
+            d->value = dtfile::compile(read_file(file), shown(s.file), file.parent_path(), 0, &warnings);
+            for (const std::string& w : warnings) warn(shown(s.file) + ": " + w);
+            changed.insert(s.index);
+        } else if (!s.prefix.empty()) {
             d->value = std::move(loaded[at]);
             if (!replayed[at]) changed.insert(s.index);
             std::string said;
@@ -5820,7 +6064,7 @@ void self_check(const fs::path& outdir, const Bytes& original, const char* what 
 }
 
 void do_unpack(const fs::path& in, const fs::path& outdir) {
-    const progress::Scope progress_scope("unpack", {{"read", 1}, {"decode", 6}, {"tree", 2}, {"verify", 5}});
+    const progress::Scope progress_scope("unpack", {{"read", 1}, {"decode", 6}, {"tree", 2}, {"dts", 2}, {"verify", 5}});
     progress::enter("read", 1);
     Bytes data = read_file(in);
     progress::advance(1);
@@ -5830,6 +6074,8 @@ void do_unpack(const fs::path& in, const fs::path& outdir) {
 
     Fmt f = detect_format(payload);
     if (f == Fmt::UNKNOWN) throw FormatError(in.string() + ": " + describe_unknown(payload));
+    // A file of device trees has no component to decode and no ramdisk: its work is the trees, and the bar is not to jump over the rest of the plan.
+    if (f == Fmt::DTB || f == Fmt::DTBO || f == Fmt::QCDT) progress::begin("unpack", {{"read", 1}, {"dts", 8}, {"verify", 5}});
     // A directory this unpack made is not left behind, empty or half written, when it fails (a cut-short
     // image, say); one that was there before is not touched.
     const bool made_outdir = !fs::exists(outdir);
@@ -5924,15 +6170,16 @@ void do_unpack(const fs::path& in, const fs::path& outdir) {
 }
 
 // A folder of device trees packed as a Qualcomm device tree table: what dtbTool does. The trees are the files of the folder whose names
-// end in .dtb, in the subfolders as well but not in those whose names start with a dot, in the order of their paths (dtbTool takes them
-// in the order the file system lists them, and the order is in the table where two trees are for the same board).
+// end in .dtb (a blob) or .dts (a source, which is compiled), in the subfolders as well but not in those whose names start with a dot, in
+// the order of their paths (dtbTool takes them in the order the file system lists them, and the order is in the table where two trees are
+// for the same board).
 void pack_device_trees(const fs::path& dir, const fs::path& out, const qcdt::MakeOptions& opt) {
     std::vector<fs::path> files;
     for (fs::recursive_directory_iterator it(dir, fs::directory_options::skip_permission_denied), end; it != end; ++it) {
         const std::string name = it->path().filename().string();
         if (it->is_directory()) {
             if (!name.empty() && name[0] == '.') it.disable_recursion_pending();
-        } else if (it->is_regular_file() && name.size() > 4 && name.compare(name.size() - 4, 4, ".dtb") == 0) {
+        } else if (it->is_regular_file() && name.size() > 4 && (name.compare(name.size() - 4, 4, ".dtb") == 0 || dtfile::is_source_name(name))) {
             files.push_back(it->path());
         }
     }
@@ -5940,10 +6187,18 @@ void pack_device_trees(const fs::path& dir, const fs::path& out, const qcdt::Mak
     files.erase(std::unique(files.begin(), files.end()), files.end());
     if (files.empty())
         throw FormatError(shown(dir.string()) + " has no manifest.txt (it is not a folder that `abr unpack` made) and no file whose name ends in .dtb "
-                          "(the device trees to make a Qualcomm device tree table of)");
+                          "or .dts (the device trees to make a Qualcomm device tree table of)");
     std::vector<qcdt::Source> sources;
     sources.reserve(files.size());
-    for (const fs::path& f : files) sources.push_back({f.string(), read_file(f)});
+    for (const fs::path& f : files) {
+        if (!dtfile::is_source_name(f.filename().string())) {
+            sources.push_back({f.string(), read_file(f)});
+            continue;
+        }
+        std::vector<std::string> warnings;
+        sources.push_back({f.string(), dtfile::compile(read_file(f), shown(f.string()), f.parent_path(), 0, &warnings)});
+        for (const std::string& w : warnings) warn(w);
+    }
     qcdt::Made made = qcdt::make(sources, opt);
     for (const std::string& n : made.notes) note(n);
     const Bytes table = qcdt::build(made.table);

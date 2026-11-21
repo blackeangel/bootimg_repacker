@@ -74,6 +74,11 @@ Layout dtbo(const Bytes& table);
 Layout uimage(const UImage& img);
 // A Qualcomm device tree table, read from its bytes (the table at the start of `data`).
 Layout qcdt(const Bytes& data, const std::string& key_prefix = "");
+// A section of a boot or vendor_boot image that holds device trees (`section`, which lies at `at` in the file: the dtb, the recovery_dtbo), added
+// to `l` as regions of depth `depth` the way `unpack` takes it apart (`key` is the key of the section: "dtb", "recovery_dtbo"): the trees of a dtb
+// one behind the other (`<key>0`, `<key>1`, ...; the zeros between two of them are regions of their own), or a dtbo table (its header, its table of
+// entries, the entries `<key>_entry0`, ...), and what follows the last (zeros, or `<key>_tail`). Nothing is added for a section that is neither.
+void tree_section(Layout& l, const Bytes& section, uint64_t at, unsigned depth, const std::string& key);
 // The vbmeta blob at `at` in `data` (a vbmeta image has it at 0; the AVB footer of a partition points at it), added to `l` with its
 // header, its authentication and auxiliary blocks, the descriptors, the public key. `key_prefix` is the prefix of the manifest's
 // keys for it ("" for a vbmeta image, "avb_" for the footer of another partition). Nothing is added for what is not a vbmeta blob.
