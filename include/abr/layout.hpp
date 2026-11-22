@@ -74,6 +74,9 @@ Layout dtbo(const Bytes& table);
 Layout uimage(const UImage& img);
 // A Qualcomm device tree table, read from its bytes (the table at the start of `data`).
 Layout qcdt(const Bytes& data, const std::string& key_prefix = "");
+// An Amlogic device tree container ("AML_": the table of entries and the trees, each one with the boards it is for), read from its bytes (the container
+// at the start of `data`); `key_prefix` goes in front of the keys of the trees ("second_" for the second stage of a boot image).
+Layout aml(const Bytes& data, const std::string& key_prefix = "");
 // A section of a boot or vendor_boot image that holds device trees (`section`, which lies at `at` in the file: the dtb, the recovery_dtbo), added
 // to `l` as regions of depth `depth` the way `unpack` takes it apart (`key` is the key of the section: "dtb", "recovery_dtbo"): the trees of a dtb
 // one behind the other (`<key>0`, `<key>1`, ...; the zeros between two of them are regions of their own), or a dtbo table (its header, its table of

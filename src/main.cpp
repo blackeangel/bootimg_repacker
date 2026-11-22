@@ -30,6 +30,7 @@
 #include <tuple>
 #include <vector>
 
+#include "abr/aml.hpp"
 #include "abr/avb_keys.hpp"
 #include "abr/boot_image.hpp"
 #include "abr/byte_io.hpp"
@@ -106,7 +107,7 @@ std::string tails_text(std::initializer_list<std::pair<const char*, const Bytes*
 
 // ------------------------------------------------------------ detection --
 
-enum class Fmt { BOOT, VENDOR_BOOT, DTBO, DTB, FIT, QCDT, VBMETA, UIMAGE, ELF_BOOT, KRNL, BLOB, OSIP, CHROMEOS, MTK_IMAGE, MTK_PRELOADER, MBN, MBN_ELF, SPLASH, OPLUS_LOGO, XIAOMI_LOGO, MOTO_LOGO, UNKNOWN };
+enum class Fmt { BOOT, VENDOR_BOOT, DTBO, DTB, FIT, QCDT, AML, VBMETA, UIMAGE, ELF_BOOT, KRNL, BLOB, OSIP, CHROMEOS, MTK_IMAGE, MTK_PRELOADER, MBN, MBN_ELF, SPLASH, OPLUS_LOGO, XIAOMI_LOGO, MOTO_LOGO, UNKNOWN };
 
 // Where the "ANDROID!" container starts: within the first kMagicSearchLimit bytes (a vendor
 // wrapper in front of it), or -- Barnes & Noble Nook images -- right behind the fixed-size
@@ -137,6 +138,7 @@ Fmt detect_format(const Bytes& d) {
     if (mtkimg::looks_like(d, 0)) return Fmt::MTK_IMAGE;
     if (mtkgfh::looks_like(d)) return Fmt::MTK_PRELOADER;
     if (qcdt::looks_like(d)) return Fmt::QCDT;
+    if (aml::looks_like(d)) return Fmt::AML;
     if (has_chromeos_header(d)) return Fmt::CHROMEOS;
     if (d.size() >= 4) {
         uint32_t be = (uint32_t(d[0]) << 24) | (uint32_t(d[1]) << 16) | (uint32_t(d[2]) << 8) | d[3];
@@ -298,6 +300,7 @@ const char* fmt_name(Fmt f) {
         case Fmt::DTB: return "dtb";
         case Fmt::FIT: return "fit";
         case Fmt::QCDT: return "qcdt";
+        case Fmt::AML: return "aml";
         case Fmt::VBMETA: return "vbmeta";
         case Fmt::UIMAGE: return "uimage";
         case Fmt::ELF_BOOT: return "elf_boot";
@@ -325,6 +328,7 @@ Fmt fmt_from_name(const std::string& s) {
     if (s == "dtb") return Fmt::DTB;
     if (s == "fit") return Fmt::FIT;
     if (s == "qcdt") return Fmt::QCDT;
+    if (s == "aml") return Fmt::AML;
     if (s == "vbmeta") return Fmt::VBMETA;
     if (s == "uimage") return Fmt::UIMAGE;
     if (s == "elf_boot") return Fmt::ELF_BOOT;
@@ -1564,7 +1568,45 @@ Bytes load_tree_section(const Manifest& m, const fs::path& dir, const std::strin
 //
 // A Qualcomm device tree table (abr/qcdt.hpp) is keys of a manifest and a file for every tree it holds: the same keys for a table that is a file
 // of its own (no prefix, the trees beside the manifest) and for the `dt` of a boot image (`dt_`, the trees in dt/). An entry says the board its
-// tree is for by numbers, and the tree by its number.
+// tree is for by numbers, and the tree by its number. The multi-tree container of Amlogic (abr/aml.hpp, below) is kept the same way.
+
+// The trees of a table: `<prefix>dtb_count` and the source of each, `<prefix>dtb<N>_file`, in `subdir` (the number is the tree's, which the entries
+// name; not the entry's).
+void save_table_trees(Manifest& m, const fs::path& dir, const std::string& prefix, const std::string& subdir, const std::vector<Bytes>& dtbs) {
+    m.set_u32(prefix + "dtb_count", static_cast<uint32_t>(dtbs.size()));
+    std::vector<const Bytes*> blobs;
+    std::vector<std::string> files;
+    for (size_t j = 0; j < dtbs.size(); ++j) {
+        blobs.push_back(&dtbs[j]);
+        files.push_back(tree_source_name(subdir, j, "dtb"));
+    }
+    const std::vector<dtfile::Prepared> prepared = prepare_trees(blobs, files);
+    for (size_t j = 0; j < dtbs.size(); ++j) commit_tree(m, dir, prefix + "dtb" + std::to_string(j), files[j], prepared[j], dtbs[j]);
+}
+
+// What the manifest says of them, compiled where they are sources, and each checked by `check` (which names the file it is told the tree is of).
+std::vector<Bytes> load_table_trees(const Manifest& m, const fs::path& dir, const std::string& prefix,
+                                    const std::function<void(const Bytes&, const std::string&)>& check) {
+    const uint32_t trees = m.get_count(prefix + "dtb_count", 0);
+    std::vector<std::string> slots;
+    for (uint32_t j = 0; j < trees; ++j) {
+        const std::string key = prefix + "dtb" + std::to_string(j) + "_file";
+        if (m.get_path(key).empty()) throw FormatError("manifest.txt has no " + shown(key) + " (the file of device tree " + std::to_string(j) + ")");
+        slots.push_back(prefix + "dtb" + std::to_string(j));
+    }
+    std::vector<Bytes> dtbs = load_trees_from_sources(m, dir, slots);
+    for (uint32_t j = 0; j < trees; ++j) {
+        const std::string key = slots[j] + "_file";
+        check(dtbs[j], key + " (" + textquote::quote_shown(m.get_path(key)) + ")");  // (the file is named, not "device tree 0")
+    }
+    return dtbs;
+}
+
+// A line for `info`: "version 2, page size 2048, 9 entries, 2 device trees".
+std::string table_summary(uint32_t version, uint32_t page_size, size_t entries, size_t trees) {
+    return "version " + std::to_string(version) + ", page size " + std::to_string(page_size) + ", " + std::to_string(entries) +
+           (entries == 1 ? " entry, " : " entries, ") + std::to_string(trees) + (trees == 1 ? " device tree" : " device trees");
+}
 
 void save_qcdt(Manifest& m, const fs::path& dir, const std::string& prefix, const std::string& subdir, const qcdt::Table& t) {
     m.set_u32(prefix + "version", t.version);
@@ -1581,15 +1623,7 @@ void save_qcdt(Manifest& m, const fs::path& dir, const std::string& prefix, cons
             for (size_t k = 0; k < e.pmic.size(); ++k) m.set_addr(p + "pmic" + std::to_string(k), e.pmic[k]);
         m.set_u64(p + "dtb", e.dtb);
     }
-    m.set_u32(prefix + "dtb_count", static_cast<uint32_t>(t.dtbs.size()));
-    std::vector<const Bytes*> blobs;
-    std::vector<std::string> files;
-    for (size_t j = 0; j < t.dtbs.size(); ++j) {
-        blobs.push_back(&t.dtbs[j]);
-        files.push_back(tree_source_name(subdir, j, "dtb"));  // (the number is the tree's, which the entries name; not the entry's)
-    }
-    const std::vector<dtfile::Prepared> prepared = prepare_trees(blobs, files);
-    for (size_t j = 0; j < t.dtbs.size(); ++j) commit_tree(m, dir, prefix + "dtb" + std::to_string(j), files[j], prepared[j], t.dtbs[j]);
+    save_table_trees(m, dir, prefix, subdir, t.dtbs);
 }
 
 // What a manifest says (it is read all, whatever the version: a subtype in a version 1 table is a contradiction that qcdt::build says, not a key
@@ -1613,26 +1647,11 @@ qcdt::Table load_qcdt(const Manifest& m, const fs::path& dir, const std::string&
         e.dtb = static_cast<size_t>(m.get_bounded(p + "dtb", 0, 32));
         t.entries.push_back(e);
     }
-    const uint32_t trees = m.get_count(prefix + "dtb_count", 0);
-    std::vector<std::string> slots;
-    for (uint32_t j = 0; j < trees; ++j) {
-        const std::string key = prefix + "dtb" + std::to_string(j) + "_file";
-        if (m.get_path(key).empty()) throw FormatError("manifest.txt has no " + shown(key) + " (the file of device tree " + std::to_string(j) + ")");
-        slots.push_back(prefix + "dtb" + std::to_string(j));
-    }
-    t.dtbs = load_trees_from_sources(m, dir, slots);
-    for (uint32_t j = 0; j < trees; ++j) {
-        const std::string key = slots[j] + "_file";
-        qcdt::check_device_tree(t.dtbs[j], key + " (" + textquote::quote_shown(m.get_path(key)) + ")");  // (the file is named, not "device tree 0")
-    }
+    t.dtbs = load_table_trees(m, dir, prefix, qcdt::check_device_tree);
     return t;
 }
 
-// A line for `info`: "version 2, page size 2048, 9 entries, 2 device trees".
-std::string qcdt_summary(const qcdt::Table& t) {
-    return "version " + std::to_string(t.version) + ", page size " + std::to_string(t.page_size) + ", " + std::to_string(t.entries.size()) +
-           (t.entries.size() == 1 ? " entry, " : " entries, ") + std::to_string(t.dtbs.size()) + (t.dtbs.size() == 1 ? " device tree" : " device trees");
-}
+std::string qcdt_summary(const qcdt::Table& t) { return table_summary(t.version, t.page_size, t.entries.size(), t.dtbs.size()); }
 
 void unpack_qcdt(const Bytes& data, const fs::path& dir) {
     qcdt::Table t;
@@ -1650,6 +1669,72 @@ void unpack_qcdt(const Bytes& data, const fs::path& dir) {
 
 Bytes repack_qcdt(const Manifest& m, const fs::path& dir, const RepackOptions& opt) {
     return assemble_envelope(m, dir, qcdt::build(load_qcdt(m, dir, "")), opt);
+}
+
+// ------------------------------------------------------------------ aml --
+//
+// The multi-tree container of Amlogic (abr/aml.hpp) -- a partition of its own (`dtb`) and the `second` of the boot image of an Amlogic box -- is kept
+// like the table of Qualcomm above, with the keys of an entry for what the container says of it: the board its tree is for, as the three pieces of its
+// name (`gxl`, `p212`, `2g` for gxl_p212_2g; an id is text), and the tree by its number.
+
+void save_aml(Manifest& m, const fs::path& dir, const std::string& prefix, const std::string& subdir, const aml::Table& t) {
+    m.set_u32(prefix + "version", t.version);
+    m.set_u32(prefix + "page_size", t.page_size);
+    m.set_u32(prefix + "entry_count", static_cast<uint32_t>(t.entries.size()));
+    for (size_t i = 0; i < t.entries.size(); ++i) {
+        const aml::Entry& e = t.entries[i];
+        const std::string p = prefix + "entry" + std::to_string(i) + "_";
+        m.set(p + "soc", e.soc);
+        m.set(p + "platform", e.platform);
+        m.set(p + "variant", e.variant);
+        m.set_u64(p + "dtb", e.dtb);
+    }
+    save_table_trees(m, dir, prefix, subdir, t.dtbs);
+}
+
+// What a manifest says. The three ids of an entry are all there (an id that is empty is `entry0_variant=`): one that is not is a key with a typo in
+// it, which would be read as an empty id.
+aml::Table load_aml(const Manifest& m, const fs::path& dir, const std::string& prefix) {
+    aml::Table t;
+    if (!m.has(prefix + "version"))
+        throw FormatError("manifest.txt has no " + shown(prefix + "version") + " (1 or 2: the length of an id of the container)");
+    t.version = m.get_u32(prefix + "version");
+    t.page_size = m.get_u32(prefix + "page_size", aml::kDefaultPageSize);
+    const uint32_t entries = m.get_count(prefix + "entry_count", 0);
+    for (uint32_t i = 0; i < entries; ++i) {
+        const std::string p = prefix + "entry" + std::to_string(i) + "_";
+        aml::Entry e;
+        for (const auto& [part, text] : {std::pair<const char*, std::string*>{"soc", &e.soc}, {"platform", &e.platform}, {"variant", &e.variant}}) {
+            if (!m.has(p + part))
+                throw FormatError("manifest.txt has no " + shown(p + part) + " (a piece of the name of the board the tree is for; empty, if the name has none: `" + p + part + "=`)");
+            *text = m.get(p + part);
+        }
+        if (!m.has(p + "dtb")) throw FormatError("manifest.txt has no " + shown(p + "dtb") + " (the number of the device tree the entry is for)");
+        e.dtb = static_cast<size_t>(m.get_bounded(p + "dtb", 0, 32));
+        t.entries.push_back(std::move(e));
+    }
+    t.dtbs = load_table_trees(m, dir, prefix, aml::check_device_tree);
+    return t;
+}
+
+std::string aml_summary(const aml::Table& t) { return table_summary(t.version, t.page_size, t.entries.size(), t.dtbs.size()); }
+
+void unpack_aml(const Bytes& data, const fs::path& dir) {
+    aml::Table t;
+    try {
+        t = aml::parse(data);
+    } catch (const FormatError& e) {
+        throw FormatError(std::string("this is an Amlogic device tree container (AML_), but abr cannot write it again byte for byte: ") + e.what());
+    }
+    Manifest m;
+    m.set("type", "aml");
+    save_aml(m, dir, "", "", t);
+    save_envelope(m, dir, Envelope::capture(data, 0, t.consumed), data, 0, t.consumed);
+    m.save(dir / "manifest.txt", "abr aml manifest -- edit then `abr pack -i " + dir.string() + " -o dtb.img`");
+}
+
+Bytes repack_aml(const Manifest& m, const fs::path& dir, const RepackOptions& opt) {
+    return assemble_envelope(m, dir, aml::build(load_aml(m, dir, "")), opt);
 }
 
 // ------------------------------------------------------------- boot.img --
@@ -1725,14 +1810,33 @@ void unpack_boot(const Bytes& whole, const fs::path& dir) {
     if (img.missing_tail_padding) m.set_u64("missing_tail_padding", img.missing_tail_padding);
     if (img.missing_tail_padding && img.kept_tail_padding) m.set_u64("tail_padding_kept", *img.kept_tail_padding);
 
+    // The `second` of an Amlogic box is a container of device trees (abr/aml.hpp): unpacked into its entries and its trees when abr can write it again
+    // byte for byte; any other `second` is a file, and so is a container that abr cannot write again (the note says why).
+    std::optional<aml::Table> second_table;
+    if (aml::looks_like(img.second)) {
+        try {
+            aml::Table t = aml::parse(img.second, img.page_size);
+            if (t.consumed != img.second.size())
+                throw FormatError(std::to_string(img.second.size() - t.consumed) + " bytes follow the container inside second_size (" +
+                                  std::to_string(img.second.size()) + " bytes), and the container ends at " + std::to_string(t.consumed));
+            second_table = std::move(t);
+        } catch (const FormatError& e) {
+            note(std::string("the second of this image is an Amlogic device tree container, and it is kept as the file second: ") + e.what());
+        }
+    }
     {
-        auto parts = save_components(dir, {{&img.kernel, "kernel", true},
-                                           {&img.ramdisk, "ramdisk.cpio"},
-                                           {&img.second, "second"}});
+        std::vector<ComponentSource> sources = {{&img.kernel, "kernel", true}, {&img.ramdisk, "ramdisk.cpio"}};
+        if (!second_table) sources.push_back({&img.second, "second"});
+        auto parts = save_components(dir, sources);
         record_component(m, "kernel", "kernel", parts[0]);
         if (parts[0].glued) save_tree_section(m, dir, "kernel_dtb", *parts[0].glued, "kernel_dtb.bin");
         record_component(m, "ramdisk", "ramdisk.cpio", parts[1]);
-        record_component(m, "second", "second", parts[2]);
+        if (second_table) {
+            m.set("second_format", "aml");
+            save_aml(m, dir, "second_", "second", *second_table);
+        } else {
+            record_component(m, "second", "second", parts[2]);
+        }
         save_ramdisk_trees(m, dir, {{"ramdisk", "ramdisk.cpio", &parts[1]}});
     }
     {
@@ -1828,10 +1932,20 @@ Bytes repack_boot(const Manifest& m, const fs::path& dir, const RepackOptions& o
     if (m.has("tail_padding_kept")) img.kept_tail_padding = m.get_size("tail_padding_kept", 0);
 
     {
-        auto parts = load_components(m, dir, {"kernel", "ramdisk", "second"}, opt);
+        // A `second` that is a container of device trees is built from the entries and the trees of the manifest; any other is a component.
+        const bool second_table = m.has("second_format");
+        if (second_table) {
+            if (m.get("second_format") != "aml")
+                throw FormatError("manifest.txt: second_format=" + shown(m.get("second_format")) + " is not a format abr knows (aml)");
+            if (m.has("second_file"))
+                throw FormatError("manifest.txt has second_file and second_format=aml: the second of the image is either a file or a container made of the entries and "
+                                  "trees of the manifest. Take out the one that is not meant");
+        }
+        auto parts = load_components(m, dir, second_table ? std::vector<std::string>{"kernel", "ramdisk"} : std::vector<std::string>{"kernel", "ramdisk", "second"}, opt);
         img.kernel = std::move(parts[0]);
         img.ramdisk = std::move(parts[1]);
-        img.second = std::move(parts[2]);
+        if (second_table) img.second = aml::build(load_aml(m, dir, "second_"));
+        else img.second = std::move(parts[2]);
     }
     if (m.has("dt_format")) {
         if (m.get("dt_format") != "qcdt")
@@ -5327,6 +5441,12 @@ std::optional<layout::Layout> describe_layout(Fmt f, const Bytes& whole) {
                 layout::around(l, whole, whole.size(), 0, t.consumed);
                 return l;
             }
+            case Fmt::AML: {
+                const aml::Table t = aml::parse(whole);
+                layout::Layout l = layout::aml(whole);
+                layout::around(l, whole, whole.size(), 0, t.consumed);
+                return l;
+            }
             case Fmt::VBMETA: {
                 const VbmetaImage v = VbmetaImage::parse(whole);
                 if (v.has_footer) {  // an AVB footer behind something abr has no reader for: the image it protects is one lump
@@ -5588,7 +5708,19 @@ void print_info(const fs::path& path) {
                        << codec_name(detect_codec(img.kernel)) << ")\n";
             std::cout << "ramdisk:        " << img.ramdisk.size() << " bytes ("
                        << codec_name(detect_codec(img.ramdisk)) << ")\n";
-            if (!img.second.empty()) std::cout << "second:         " << img.second.size() << " bytes\n";
+            if (!img.second.empty()) {
+                std::cout << "second:         " << img.second.size() << " bytes";
+                if (aml::looks_like(img.second)) {
+                    std::string about = "Amlogic device tree container, ";
+                    try {
+                        about += aml_summary(aml::parse(img.second, img.page_size));
+                    } catch (const FormatError& e) {
+                        about += std::string("kept as a file: ") + e.what();
+                    }
+                    std::cout << " (" << about << ")";
+                }
+                std::cout << "\n";
+            }
             if (!img.dt.empty()) {
                 std::cout << "dt (QCDT):      " << img.dt.size() << " bytes";
                 if (qcdt::looks_like(img.dt)) {
@@ -5693,6 +5825,23 @@ void print_info(const fs::path& path) {
                     for (size_t k = 0; k < e.pmic.size(); ++k) std::cout << (k ? "," : "") << "0x" << std::hex << e.pmic[k] << std::dec;
                 }
                 std::cout << " -> device tree " << e.dtb << "\n";
+            }
+            for (size_t j = 0; j < t.dtbs.size(); ++j) std::cout << "  device tree " << j << ": " << t.dtbs[j].size() << " bytes\n";
+            print_envelope_info(Envelope::capture(data, 0, t.consumed));
+            break;
+        }
+        case Fmt::AML: {
+            aml::Table t;
+            try {
+                t = aml::parse(data);
+            } catch (const FormatError& e) {
+                std::cout << "unpack:      no, " << e.what() << "\n";
+                break;
+            }
+            std::cout << "container:   " << aml_summary(t) << "\n";
+            for (size_t i = 0; i < t.entries.size(); ++i) {
+                const aml::Entry& e = t.entries[i];
+                std::cout << "  [" << i << "] " << shown(e.soc + "_" + e.platform + "_" + e.variant) << " -> device tree " << e.dtb << "\n";
             }
             for (size_t j = 0; j < t.dtbs.size(); ++j) std::cout << "  device tree " << j << ": " << t.dtbs[j].size() << " bytes\n";
             print_envelope_info(Envelope::capture(data, 0, t.consumed));
@@ -5961,6 +6110,7 @@ Bytes build_image_once(const fs::path& dir, const RepackOptions& opt) {
         case Fmt::DTB: result = repack_dtb(m, dir, opt); break;
         case Fmt::FIT: result = repack_fit(m, dir, opt); break;
         case Fmt::QCDT: result = repack_qcdt(m, dir, opt); break;
+        case Fmt::AML: result = repack_aml(m, dir, opt); break;
         case Fmt::VBMETA: result = repack_vbmeta(m, dir, opt); break;
         case Fmt::UIMAGE: result = repack_uimage(m, dir, opt); break;
         case Fmt::ELF_BOOT: result = repack_elf_boot(m, dir, opt); break;
@@ -6096,7 +6246,7 @@ void do_unpack(const fs::path& in, const fs::path& outdir) {
     Fmt f = detect_format(payload);
     if (f == Fmt::UNKNOWN) throw FormatError(in.string() + ": " + describe_unknown(payload));
     // A file of device trees has no component to decode and no ramdisk: its work is the trees, and the bar is not to jump over the rest of the plan.
-    if (f == Fmt::DTB || f == Fmt::DTBO || f == Fmt::QCDT) progress::begin("unpack", {{"read", 1}, {"dts", 8}, {"verify", 5}});
+    if (f == Fmt::DTB || f == Fmt::DTBO || f == Fmt::QCDT || f == Fmt::AML) progress::begin("unpack", {{"read", 1}, {"dts", 8}, {"verify", 5}});
     // A directory this unpack made is not left behind, empty or half written, when it fails (a cut-short
     // image, say); one that was there before is not touched.
     const bool made_outdir = !fs::exists(outdir);
@@ -6108,6 +6258,7 @@ void do_unpack(const fs::path& in, const fs::path& outdir) {
             case Fmt::DTBO: unpack_dtbo(payload, outdir); break;
             case Fmt::DTB: unpack_dtb(payload, outdir); break;
             case Fmt::QCDT: unpack_qcdt(payload, outdir); break;
+            case Fmt::AML: unpack_aml(payload, outdir); break;
             case Fmt::FIT: {
                 std::string why;
                 if (!unpack_fit(payload, outdir, why)) {
@@ -6409,7 +6560,8 @@ void usage(std::ostream& os, int columns) {
     os << "\n";
     paragraph("Supported: boot.img/init_boot.img/boot-debug.img/boot-test-harness.img, recovery.img/recovery-two-step.img (header v0-v4), "
               "vendor_boot.img/vendor_boot-debug.img/vendor_kernel_boot.img (header v3-v4), dtbo.img, raw dtb, Qualcomm device tree tables "
-              "(QCDT: a dt.img, or the dt of a boot image), vbmeta.img/vbmeta_system.img (AVB), U-Boot legacy uImage and FIT image, Sony ELF "
+              "(QCDT: a dt.img, or the dt of a boot image), Amlogic's container of device trees (AML_: a dtb partition, or the second of a boot image), "
+              "vbmeta.img/vbmeta_system.img (AVB), U-Boot legacy uImage and FIT image, Sony ELF "
               "boot images, Rockchip KRNL (kernel.img / boot.img), ASUS blobs (\"MSM-RADIO-UPDATE\", signed with the SIGNBLOB header or not), "
               "Intel OSIP boot images, ChromeOS kernel blobs (the vboot format of a Chromebook's kernel partition); firmware partitions: "
               "MediaTek images with the 0x58881688 header (md1img/modem, lk, tee, scp, sspm, logo) and the MediaTek preloader (GFH), Qualcomm "

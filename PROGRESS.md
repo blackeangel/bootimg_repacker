@@ -50,6 +50,7 @@ tools" below.
 | Qualcomm MBN (flat v3/v5/v6/v7/SBL and ELF with a hash segment; hashes made again, signature and certificates kept) | **done** (9 Nov 2026) on images of an independent Python writer; **no MBN of a phone was at hand; `abr` cannot sign** |
 | picture partitions: Qualcomm `SPLASH!!` (RLE24 or raw), OPLUS `SPLASH LOGO!`, Xiaomi `LOGO!!!!`, Motorola `MotoLogo` | **done** (10-12 Nov 2026): two real `SPLASH!!` samples come back byte for byte; the other three from the layouts of the sources |
 | QCDT (dtbTool's table) as trees + entries, and made from a folder of trees | **done + verified** (3 and 12-16 Nov 2026) against the real `dtbTool` (built from the Code Aurora source, run as a judge: 12 tables, the same bytes) and the table of one real boot image |
+| Amlogic's container of device trees (`AML_`: a `dtb` partition, or the `second` of the boot image of an Amlogic box) as trees + entries | **done + verified** (22 Nov 2026): the `second` of one real image (`TWRP Recovery Amlogic S9xx.img`: 2 trees) comes back byte for byte, judged by an independent Python writer and reader written after u-boot's `common/aml_dt.c`, `dtc`, and 22 + 12 deliberate breakages of the code; only containers that `abr` writes again byte for byte are taken apart; **no container is made from a folder of trees yet**, see "Amlogic's container of device trees" |
 | `abr`'s own PNG reader and writer (no libpng) | **done + verified** against Pillow (and ImageMagick where present): every colour type and bit depth, interlaced |
 | FAT volumes and GPT files named (not unpacked) | **done** (12 Nov 2026), recognition only |
 | what reaches a terminal from the tables of an image (picture names, certificate subjects, ...) | **done** (15 Nov 2026): the cells of the layout table are escaped; unit and live regression tests; sanitizer fuzz after the fix: 30 837 runs, nothing |
@@ -2297,7 +2298,7 @@ MediaTek and Qualcomm chips" and the sections after it). Here: the decisions, an
 
 ## Judges, and who judges them (15-16 Nov 2026)
 
-- **The live drivers** (`tests/tools/`): `mtk_live.py`, `mbn_live.py`, `splash_live.py`, `rle_parity.py`, `qcdt_live.py`, `dtb_live.py`,
+- **The live drivers** (`tests/tools/`): `mtk_live.py`, `mbn_live.py`, `splash_live.py`, `rle_parity.py`, `qcdt_live.py`, `aml_live.py` (22 Nov), `dtb_live.py`,
   `png_oracle.py`, with their writers (`mk_mtk.py`, `mk_gfh.py`, `mk_mbn.py`, `mk_splash.py`, `mk_fatboot.py`, `qcdt_check.py`) that share no
   code with `abr`, and the harness `livelib.py` (runs `abr`, counts checks, damages an image -- cut short, bytes changed -- and demands that
   `abr` refuses it with a message or takes it and gives back what it took). `run_tests.sh` runs them (`ABR_LIVE_MUTANTS` sets the number of
@@ -2309,6 +2310,9 @@ MediaTek and Qualcomm chips" and the sections after it). Here: the decisions, an
   both copies; the lines that say so (`pack` / `unpack` copy): splash 94 / 3, rle 8 / 2 (`DIFFERENT`; and the CRC check of `abr`'s own PNG
   reader), mbn 81 / 35, mtk 33 / 46, qcdt 45 / 10 (with the real `dtbTool` at hand), dtb 22 / 26. (The first run of the idea, by a throwaway
   wrapper the day before, gave the same verdicts.) `png_oracle.py` is not among the six: it runs the unit-test binary, not `abr`.
+  **22 Nov**: `aml_live.py` is the seventh driver (7 drivers x 3 again, `ABR_LIVE_MUTANTS=2`, the real QCDT and AML_ images at hand): all pass
+  with the real `abr` and fail with both copies -- splash 94 / 3, rle 8 / 2, mbn 81 / 35, mtk 33 / 46, qcdt 33 / 10, aml 11 / 22, dtb 22 / 1 (the
+  `dtb` driver now stops at the first tree that `dtc` cannot read, which is the one the copy damaged).
 - **What reaches a terminal** (15 Nov): the sanitizer fuzz (ASan+UBSan build, `fuzz_images.py`) found, in its first campaign (3853 runs), three
   `terminal` findings: `info` of a MotoLogo image printed the control bytes of a picture name raw in the layout table. The same exposure was
   in the names of vendor ramdisk fragments, FIT images, OSIP command lines, MTK section names, MBN certificate subjects and OPLUS names.
@@ -2426,13 +2430,57 @@ implementation inside `abr`.
 * **Not done**: the kernels of the other containers (uImage, Rockchip KRNL, OSIP, ChromeOS, Sony, FIT) are not looked at for glued trees; trees
   inside a compressed stream are not found; zeros between the stream and the first tree stay in the raw copy and go when the kernel is edited;
   a last tree that is cut short turns the whole search off (the kernel is left whole, as before). Other things in a boot image that are
-  trees in disguise (Amlogic's `AML_` container in `second`, plain trees in the `dt` field of a non-QCDT image) are step b.
+  trees in disguise: Amlogic's `AML_` container in `second` is done (see below); plain trees in the `dt` field of a non-QCDT image are step b.
+
+## Amlogic's container of device trees: `AML_` (done, 22 Nov 2026)
+
+Step b of the request of 17 Nov, for what `unpack` left as a file that a person cannot read or edit: the `second` of the boot image of an Amlogic
+TV box (the TWRP recoveries for the S905, S912 and the like) is not a ramdisk or a kernel but the device trees of the boards of one family of
+SoCs, in one file, and a partition of its own (`dtb`) holds the same on other boxes.
+
+* **The format** (`include/abr/aml.hpp`, `src/aml.cpp`; written after `common/aml_dt.c` of the Amlogic u-boot and checked against the real
+  file below): `AML_`, a version (1: ids of 4 bytes, 2: ids of 16 bytes) and the number of entries, three 32-bit little-endian words; an entry
+  per board (`3 * id + 8` bytes: the ids of the SoC, the platform and the variant, the offset and the size of the tree); zeros up to a multiple of the
+  page size; the trees, each at a multiple of the page size and followed by zeros up to the next one (a whole page of zeros when it ends on one --
+  what `dtbTool` does). The offsets count from the start of the container, the size in the table is the padded size, u-boot does not read it, and
+  several entries may point at one tree. An id is its text with spaces behind it up to the length of the id, in words of four characters of which each
+  is stored reversed (u-boot reads a little-endian word, takes the characters from the top byte down and turns the spaces into NULs, so a space
+  *inside* an id cannot be written, and `abr` refuses it). The page size is not in the container: `abr` takes the page size of the boot image first,
+  then the usual ones (`abr::pages::candidates`, shared with QCDT, whose own copy of this code went into `include/abr/pages.hpp`), and records
+  the one that lays the container out as it is in the manifest.
+* **What `unpack` does**: a container is taken apart only when `aml::build` writes it again byte for byte (`parse` builds it and compares, and says
+  what differs when it does not): a tree for every distinct blob as `dtb<N>.dts` (the usual `dtfile` source, with the raw copy when the text does
+  not compile back to the bytes), and in the manifest `type=aml`, `version`, `page_size`, `entry_count`, `entry<K>_soc|platform|variant|dtb`,
+  `dtb_count`, `dtb<N>_file`. In a boot image the same keys have the prefix `second_`, with `second_format=aml` and the trees in `second/dtb<N>.dts`
+  (no `second_file`); a `second` with bytes behind the container, or one that `abr` cannot write again, stays the file `second` and says why in a
+  note. `pack` builds the container from the manifest (all three ids of every entry are required, an empty one is written `entry<K>_variant=`;
+  `second_file` together with `second_format` is refused, as is a `second_format` that is not `aml`). `info` and the layout table show
+  `container: version 2, page size 2048, 2 entries, 2 device trees`, a line per board (`[0] gxl_p212_1g -> device tree 0`), and the offset and size of
+  every tree in the layout (the boot image's `second:` line says it in one: `Amlogic device tree container, version 2, page size 2048, 2 entries, 2 device trees`).
+* **Verified by**: unit group `aml` (22804 checks: the 124-byte header of the real file as a literal, an independent writer, 300 random
+  containers, the layout rows, the refusals, and 22 deliberate breakages of `aml.cpp` made one at a time, 21 caught by the group -- the 22nd is an
+  equivalent mutant), `layout` (7753, with an AML boot image), `qcdt` (9996, after the shared page code moved); `tests/tools/aml_live.py` (599
+  checks, 335 with `ABR_LIVE_MUTANTS=2`; its writer and reader share no code with `abr` and read the file the way u-boot does; five sets of
+  containers -- the layout of the real file, version 1, trees shared by entries, trees that end on a page, one tree -- each unpacked, judged by
+  `dtc`, repacked untouched, edited, put into a boot image, and 84 damaged containers that `abr` has to refuse with a message or take and give
+  back as it took them), 12 deliberate breakages of `src/` each caught by it, and the sabotage check (a changed byte in the image `pack`
+  wrote: 11 failing lines; in the biggest file `unpack` wrote: 22). The sabotage check found two weak checks of the driver (`format: aml` was
+  satisfied by `format: amlx`, the board names of `info` by the notes of the layout) and a layout offset nobody read; all three are tightened.
+  The real `second` of `TWRP Recovery Amlogic S9xx.img` (77824 bytes, version 2, `gxl_p212_1g` and `gxl_p212_2g`, trees of 36670 and 37224
+  bytes, page 2048, offsets 0x800 and 0x9800) is taken apart, the image comes back byte for byte, a tree of it made longer reaches the image
+  and a reader written after u-boot finds it.
+* **Not done**: a container is not made from a folder of trees (`dtbTool` derives the ids from the `amlogic-dt-id` property that the trees of the
+  real file have -- `gxl_p212_1g` -- which would do for a recipe, as the QCDT tables are made from a folder); a container with ids that contain
+  a space, with padding that is not zeros, or that another tool laid out in another way is refused by `unpack` as a file of its own, with the
+  reason (`info` says `unpack: no, ...` and the same reason), and stays the file `second` in a boot image, with a note. (Zeros behind a
+  container in a file of its own are the generic `fill`, kept.)
 
 ## Next steps (in order)
 
 1. The user's requests of 17 Nov 2026, in this order (one commit per step; narrow checks while they are built, then the one full run):
    a. **The device trees as text wherever they are** -- done, the trees glued to the kernel of a boot image too (see "Device trees as
-      text"); what is left of it (the kernels of the other containers, `second` and `dt` of boot images) is part of step b.
+      text"); what is left of it (the kernels of the other containers, plain trees in the `dt` field of a boot image) is part of step b;
+      Amlogic's `AML_` container in `second` is done.
    b. **Deeper than the first layer** for everything that has more inside it (the kernel, and what else `unpack` leaves as a file that a person
       cannot read or edit).
    c. **`kernel_info/`**: what can be learnt from the kernel -- the build configuration, the symbol table, the binaries glued to it, the

@@ -10,6 +10,7 @@
 
 #include "abr/dtb.hpp"
 #include "abr/manifest.hpp"
+#include "abr/pages.hpp"
 #include "abr/textquote.hpp"
 
 namespace abr::qcdt {
@@ -38,8 +39,7 @@ void put_le32(Bytes& out, uint32_t v) {
     for (unsigned i = 0; i < 4; ++i) out.push_back(uint8_t(v >> (8 * i)));
 }
 
-// What dtbTool pads with: up to the next multiple of the page size, and a whole page when the length already is one.
-uint64_t padded(uint64_t length, uint64_t page) { return length + (page - length % page); }
+using pages::padded;
 
 // Where everything is for one page size: the first tree behind the table (its entries, the word that ends it) and the trees one
 // behind the other.
@@ -123,28 +123,6 @@ std::string board_text(const Chip& c, uint32_t version) {
     if (version >= 3)
         s += ", pmic " + hex(c.pmic[0]) + " " + hex(c.pmic[1]) + " " + hex(c.pmic[2]) + " " + hex(c.pmic[3]);
     return s;
-}
-
-// The page sizes that the offsets and sizes of the trees allow (every one divides all of them), the one asked for first, then the
-// usual ones, then the rest from the smallest.
-std::vector<uint32_t> page_candidates(uint64_t common, uint32_t hint) {
-    std::vector<uint32_t> divisors;
-    for (uint64_t d = 1; d * d <= common; ++d) {
-        if (common % d != 0) continue;
-        if (d <= kMaxPageSize) divisors.push_back(static_cast<uint32_t>(d));
-        const uint64_t other = common / d;
-        if (other != d && other <= kMaxPageSize) divisors.push_back(static_cast<uint32_t>(other));
-    }
-    std::sort(divisors.begin(), divisors.end());
-    std::vector<uint32_t> order;
-    const auto take = [&](uint32_t p) {
-        if (p != 0 && std::binary_search(divisors.begin(), divisors.end(), p) && std::find(order.begin(), order.end(), p) == order.end())
-            order.push_back(p);
-    };
-    take(hint);
-    for (const uint32_t p : {2048u, 4096u, 8192u, 16384u, 1024u, 512u, 32768u, 65536u, 131072u, 262144u, 524288u, 1048576u}) take(p);
-    for (const uint32_t d : divisors) take(d);
-    return order;
 }
 
 }  // namespace
@@ -277,7 +255,7 @@ Table parse(const Bytes& data, uint32_t page_hint) {
     }
 
     // The page size is not in the table; the layout is what tells it.
-    for (const uint32_t page : page_candidates(common, page_hint)) {
+    for (const uint32_t page : pages::candidates(common, page_hint, kMaxPageSize)) {
         const Layout l = lay_out(version, page, count, lengths);
         if (l.offsets != offsets || l.sizes != sizes) continue;
         Table t;

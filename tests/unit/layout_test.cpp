@@ -28,6 +28,7 @@
 #include <string>
 #include <vector>
 
+#include "abr/aml.hpp"
 #include "abr/avb_keys.hpp"
 #include "abr/boot_image.hpp"
 #include "abr/byte_io.hpp"
@@ -465,6 +466,42 @@ void test_tree_sections() {
         }
         EXPECT(find_name(l, "QCDT table") && find_name(l, "QCDT table")->depth == 1);
     }
+    // ... a boot image whose second stage is an Amlogic container of device trees (`second_dtb<N>`, nested in the row of the second)
+    {
+        aml::Table t;
+        t.version = 2;
+        t.page_size = 2048;
+        t.dtbs = {t1, t2};
+        for (size_t i = 0; i < 2; ++i) {
+            aml::Entry e;
+            e.soc = "gxl";
+            e.platform = "p212";
+            e.variant = i ? "2g" : "1g";
+            e.dtb = i;
+            t.entries.push_back(e);
+        }
+        BootImage img;
+        img.header_version = 0;
+        img.page_size = 2048;
+        img.kernel = pattern(3000, 1);
+        img.ramdisk = pattern(2500, 2);
+        img.second = aml::build(t);
+        img.recompute_id();
+        const Bytes built = img.build();
+        const BootImage parsed = BootImage::parse(built);
+        layout::Layout l = layout::boot(parsed);
+        layout::around(l, built, built.size(), 0, parsed.consumed);
+        check_layout(l, built, boot_parts(parsed));
+        const layout::Region* second = find_key(l, "second");
+        EXPECT(second && second->depth == 0 && second->note.find("Amlogic device tree container") != std::string::npos);
+        const layout::Region* table = find_name(l, "AML_ table");
+        EXPECT(table && table->depth == 1 && second && table->offset == second->offset && table->size == 12 + 2 * 56);
+        for (size_t j = 0; j < 2; ++j) {
+            const layout::Region* r = find_key(l, "second_dtb" + std::to_string(j));
+            EXPECT(r && r->depth == 1 && second && r->offset == second->offset + 2048 + 2048 * j && r->size == 2048);
+            EXPECT(r && same_at(built, r->offset, j ? t2 : t1));
+        }
+    }
     // ... and a vendor_boot image (trees in dtb)
     {
         VendorBootImage img;
@@ -520,6 +557,69 @@ void test_qcdt() {
             EXPECT(zeros);
         }
         EXPECT(l.regions.size() == 3);  // the three entries share two trees
+    }
+}
+
+void test_aml() {
+    for (uint32_t version = 1; version <= 2; ++version) {
+        for (const uint32_t page : {512u, 2048u}) {
+            aml::Table t;
+            t.version = version;
+            t.page_size = page;
+            t.dtbs = {tiny_fdt(1), tiny_fdt(2)};
+            const char* variants[] = {"1g", "2g", "4g"};
+            for (size_t i = 0; i < 3; ++i) {
+                aml::Entry e;
+                e.soc = "gxl";
+                e.platform = "p21";
+                e.variant = variants[i];
+                e.dtb = i < 2 ? 0 : 1;  // the first two entries share the first tree
+                t.entries.push_back(e);
+            }
+            const Bytes built = aml::build(t);
+            const layout::Layout l = layout::aml(built, "second_");
+            EXPECT(l.format == "Amlogic device tree container (AML_)" && l.size == built.size());
+            const size_t table_size = 12 + 3 * aml::entry_size(version);
+            const layout::Region* table = find_name(l, "AML_ table");
+            EXPECT(table && table->offset == 0 && table->size == table_size && table->depth == 0);
+            EXPECT(l.regions.size() == 3);  // the table and the two trees
+            const uint64_t first = (table_size / page + 1) * page;
+            for (size_t j = 0; j < 2; ++j) {
+                const layout::Region* r = find_key(l, "second_dtb" + std::to_string(j));
+                EXPECT(r != nullptr);
+                if (!r) continue;
+                EXPECT(r->name == "device tree " + std::to_string(j));
+                EXPECT(r->offset == first + page * j && r->size == page);  // (a tree of 72 bytes: one page each)
+                EXPECT(same_at(built, r->offset, t.dtbs[j]));
+            }
+            // the boards of the trees are in the notes: the first tree is for two of them, the second for one
+            const layout::Region* r0 = find_key(l, "second_dtb0");
+            const layout::Region* r1 = find_key(l, "second_dtb1");
+            EXPECT(r0 && r0->note.find("for gxl_p21_1g, gxl_p21_2g") != std::string::npos && r0->note.find("72 bytes") != std::string::npos);
+            EXPECT(r1 && r1->note.find("for gxl_p21_4g") != std::string::npos);
+        }
+    }
+    // what is not a container, or is cut short, is a layout without regions or with the regions that are there
+    EXPECT(layout::aml(Bytes(100, 0)).regions.empty());
+    EXPECT(layout::aml(Bytes{'A', 'M', 'L', '_', 3, 0, 0, 0, 1, 0, 0, 0}).regions.empty());  // a version there is not
+    {
+        aml::Table t;
+        t.version = 2;
+        t.page_size = 2048;
+        t.dtbs = {tiny_fdt(1)};
+        aml::Entry e;
+        e.soc = "a";
+        e.platform = "b";
+        e.variant = "c";
+        t.entries = {e};
+        Bytes built = aml::build(t);
+        built.resize(2048 + 40);  // cut inside the tree
+        const layout::Layout l = layout::aml(built);
+        const layout::Region* r = find_name(l, "device tree 0");
+        EXPECT(r && r->offset == 2048 && r->size == 40);
+        built.resize(60);  // cut inside the table
+        EXPECT(layout::aml(built).regions.size() == 1);
+        EXPECT(layout::aml(built).regions[0].size == 12);  // (no entry is whole: the table has the header)
     }
 }
 
@@ -1573,6 +1673,7 @@ int run_layout_tests() {
     test_dtbo();
     test_uimage_and_dtb();
     test_qcdt();
+    test_aml();
     test_tree_sections();
     test_krnl();
     test_elf_boot();

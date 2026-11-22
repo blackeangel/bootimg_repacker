@@ -21,6 +21,7 @@ build-time contents:
 | dtbo | `dtbo.img` (and the ACPIO variant) |
 | dtb | raw or concatenated Flattened Device Tree blobs, with the gaps between them and an AVB hash footer on the partition; see below |
 | QCDT (v1-v3) | Qualcomm's device tree table (`QCDT`, what `dtbTool` makes): `dt.img`, or the table of a boot image; a folder of `.dts` or `.dtb` files is packed into one; see below |
+| AML_ (v1, v2) | Amlogic's container of device trees (`AML_`): the `dtb` partition of an Amlogic box, or the `second` of its boot image (the TWRP recoveries for the S905, S912 and the like); see below |
 | vbmeta (AVB) | `vbmeta.img`, `vbmeta_system.img`, and AVB footers appended to other partitions |
 | uboot | U-Boot's legacy `mkimage`/uImage container |
 | U-Boot FIT image | what `mkimage -f` makes (`.itb`, `.fit`): a flattened device tree whose `/images` hold the kernel, ramdisks and device trees, the data in the tree or behind it (`-E`, `-E -B n`, `-E -p n`); see below |
@@ -608,7 +609,7 @@ No FIT image of a device has been tried.
 Beside the boot images, `abr` opens the small images that the firmware of MediaTek and Qualcomm chips keeps in partitions of their
 own: the loader of the boot ROM, the logo, the modem's image of a MediaTek phone, the secure-boot images of Qualcomm, the splash
 pictures. What an image is, is told by its bytes -- `abr info` names it on its first lines (`format: mtk_image`, `mtk_preloader`, `mbn`,
-`mbn_elf`, `splash`, `oplus_logo`, `xiaomi_logo`, `moto_logo`, `qcdt`) -- and not by the name of the file or of the partition, which
+`mbn_elf`, `splash`, `oplus_logo`, `xiaomi_logo`, `moto_logo`, `qcdt`, `aml`) -- and not by the name of the file or of the partition, which
 differs from maker to maker, so nothing is said on the command line. The rest is as for every other image: an untouched image comes back
 byte for byte, `unpack`, `pack` and `info` print where every part lies, a part that is compressed in the image is unpacked from its
 compression and put back at the level it had (see *Compressed parts, and the level they were compressed with*), and the manifest keeps
@@ -625,6 +626,7 @@ every field that `abr` has no name for, so that nothing is lost that it does not
 | `xiaomi_logo` | the `LOGO!!!!` image of Xiaomi and Redmi phones (MIUI before 13): a table of pictures in units of 4096 bytes | the BMP or PNG file of every picture |
 | `moto_logo` | the `MotoLogo` image of Motorola phones: a table of names, the pictures at multiples of 512 bytes | a PNG for every `MotoRun` picture, the other pictures as they are |
 | `qcdt` | Qualcomm's table of device trees (see *Device trees* below) | the trees and the entries of the table |
+| `aml` | Amlogic's container of device trees (see *Device trees* below) | the trees and the entries of the container |
 
 A FAT12/16/32 file system image (the modem partition of a Qualcomm phone, `NON-HLOS.bin`, is one) and a GPT are recognised and
 explained, not opened: "Filesystems are out of scope for abr; 7-Zip or mtools open it". A split Qualcomm image (the `.mdt` file and its
@@ -853,6 +855,23 @@ table of the same folder: the two tables are the same bytes (versions 1 to 3, pa
 is exactly one page long, and the two trees of a real boot image, which make that image's table again). A table that another tool made in
 another way (for instance, a byte that `dtbTool` leaves zero) is refused by `unpack` with the reason -- `abr` takes only a table that it can
 write again byte for byte -- and `info` says what is different.
+
+An **`AML_`** container is what the u-boot of an Amlogic board searches for the tree of the board it runs on (`common/aml_dt.c` of the Amlogic
+u-boot; the tool that makes it is a `dtbTool` of the family of the Qualcomm one): `AML_`, a version (1 or 2: an id is 4 or 16 bytes long), the
+number of entries, the entries -- three ids, the SoC, the platform and the variant (`gxl`, `p212`, `2g` for the board `gxl_p212_2g`, which is
+also the `amlogic-dt-id` that the tree itself has), the offset and the size of the tree -- and the trees, each at a multiple of the page size and
+padded to the next one. It is a partition of its own (`dtb`) and the `second` of the boot image of an Amlogic TV box (the TWRP recoveries for
+the S905 and S912 put it there). `unpack` treats it as the QCDT table: the trees are `dtb<N>.dts` (`second/dtb<N>.dts` in a boot image), the
+entries are `entry<K>_soc`, `_platform`, `_variant` and `_dtb` -- the ids are text, `gxl` and not the bytes they are stored as -- with `version`,
+`page_size` and `entry_count`; in a boot image the keys begin with `second_` (`second_format=aml`, `second_version`, `second_dtb0_file`) and there
+is no file `second`. The page size is not in the container: `abr` takes the one that the offsets and sizes allow (the page size of the boot image
+first, then 2048) and writes it into the manifest, where it can be changed. `pack` lays the container out again from the entries and the trees, so
+a tree that grows moves the ones behind it on by the pages it needs, and an entry that is added or an id that is changed is what u-boot finds. As
+with the QCDT table `abr` takes only a container that it can write again byte for byte: one that another tool made in another way (zeros that are
+not zeros, a tree that is not where the layout puts it, an id with a space in it, which the reader of u-boot would cut short) is refused by `unpack`
+with the reason, and a `second` that is such a container, or that has bytes behind the container, stays the file `second` with a note. The format
+was read from the source of u-boot and from the container in the `second` of a real TWRP image for an S905X box; the 124 bytes of its header are
+in the unit test, and the tests read what `abr` writes the way u-boot does.
 
 ### Threads, console and progress
 
@@ -1398,13 +1417,17 @@ read what `abr` wrote with readers of their own. `livelib.py` is their harness: 
   names with control bytes in the tables of the images, which must not reach a terminal as they are.
 - `qcdt_live.py` and `qcdt_check.py` (a judge of a QCDT table that shares no code with `abr`; the trees are made by `dtc`), and
   `dtb_live.py` (dtb partitions with gaps and with an AVB hash footer, which `avbtool verify_image` judges).
+- `aml_live.py`: `AML_` containers of both versions and page sizes from 512 to 4096, written by the driver from the description of the format and
+  read back by a reader that does what the u-boot of an Amlogic board does (it shares no code with `abr`; the trees are made by `dtc`),
+  unpacked, edited (a tree that grows past a page, an id changed, an entry added, another page size, another version), refused where they
+  should be, as the `second` of a boot image, in the real image of a TWRP recovery for an S905X box, and damaged.
 - `png_oracle.py`: `abr`'s PNG reader and writer against Pillow and, where it is installed, ImageMagick -- every colour type and bit
   depth, interlaced files.
 - The FAT and GPT files of `run_tests.sh`, and the fuzzers below, which take every one of these images as a seed.
 
-A judge that never fails judges nothing, so `tests/tools/sabotage_check.sh <abr> <directory>` runs the six drivers that run `abr` against the
+A judge that never fails judges nothing, so `tests/tools/sabotage_check.sh <abr> <directory>` runs the seven drivers that run `abr` against the
 real one and against two copies of it that change a single byte: one in the image that `pack` writes, one in the biggest file that `unpack`
-writes (`tests/tools/abr_sabotage.py`). A driver has to pass the first and fail the other two; all six do. Pillow and `cryptography` are
+writes (`tests/tools/abr_sabotage.py`). A driver has to pass the first and fail the other two; all seven do. Pillow and `cryptography` are
 judges of the suite: where Python does not have them those checks are skipped with a note, and `ABR_REQUIRE_ORACLES` makes that a failure
 (the CI does).
 

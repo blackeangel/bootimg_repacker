@@ -10,6 +10,7 @@
 #include <string_view>
 #include <vector>
 
+#include "abr/aml.hpp"
 #include "abr/boot_image.hpp"
 #include "abr/compression.hpp"
 #include "abr/console.hpp"
@@ -123,7 +124,9 @@ Layout boot(const BootImage& img) {
     if (const auto glued = kernel::find_appended_trees(img.kernel))
         tree_section(l, Bytes(img.kernel.begin() + static_cast<std::ptrdiff_t>(glued->start), img.kernel.end()), kernel_at + glued->start, 1, "kernel_dtb");
     part("ramdisk", "ramdisk", img.ramdisk);
-    part("second", "second", img.second, "second stage");
+    const uint64_t second_at = pos;
+    part("second", "second", img.second, aml::looks_like(img.second) ? "Amlogic device tree container (AML_)" : "second stage");
+    if (aml::looks_like(img.second)) nest(l, aml(img.second, "second_"), second_at, 1);  // (the table and its trees, which are files of their own)
     const uint64_t dt_at = pos;
     part("dt", "dt", img.dt, qcdt::looks_like(img.dt) ? "Qualcomm device tree table (QCDT)" : "device tree");
     if (qcdt::looks_like(img.dt)) nest(l, qcdt(img.dt, "dt_"), dt_at, 1);  // (the table and its trees, which are files of their own)
@@ -488,6 +491,50 @@ Layout qcdt(const Bytes& d, const std::string& kp) {
         std::string note = "device tree";
         if (within(d, off, 8) && be32(d, off) == 0xd00dfeed) note += " of " + std::to_string(be32(d, off + 4)) + " bytes, zeros up to the page";
         l.add("device tree " + std::to_string(j), kp + "dtb" + std::to_string(j), off, std::min<uint64_t>(size, d.size() - off), 0, note);
+        ++j;
+    }
+    return l;
+}
+
+Layout aml(const Bytes& d, const std::string& kp) {
+    Layout l;
+    l.format = "Amlogic device tree container (AML_)";
+    l.size = d.size();
+    if (d.size() < aml::kHeaderSize || !aml::looks_like(d)) return l;
+    const uint32_t version = le32(d, 4), count = le32(d, 8);
+    const size_t es = aml::entry_size(version), idlen = aml::id_size(version);
+    if (!es) return l;
+    const uint64_t fits = (d.size() - aml::kHeaderSize) / es;
+    const uint64_t n = std::min<uint64_t>(count, fits);
+    l.add("AML_ table", "", 0, aml::kHeaderSize + n * es, 0, "version " + std::to_string(version) + ", " + std::to_string(count) + (count == 1 ? " entry" : " entries"));
+    // The name of the board an entry is for, as the three ids give it: the words of an id turned round, the spaces cut off.
+    const auto id = [&](uint64_t at) {
+        std::string s;
+        for (size_t w = 0; w + 4 <= idlen; w += 4)
+            for (size_t j = 0; j < 4; ++j) s += static_cast<char>(d[at + w + 3 - j]);
+        while (!s.empty() && (s.back() == ' ' || s.back() == '\0')) s.pop_back();
+        return s;
+    };
+    struct Tree {
+        uint64_t size = 0;
+        std::string boards;  // "gxl_p212_1g, gxl_p212_2g"
+    };
+    std::map<uint64_t, Tree> trees;  // by offset, in the order of the file
+    for (uint64_t k = 0; k < n; ++k) {
+        const uint64_t er = aml::kHeaderSize + k * es;
+        const uint32_t off = le32(d, er + es - 8), size = le32(d, er + es - 4);
+        if (!within(d, off, 1)) continue;
+        Tree& t = trees[off];
+        t.size = size;
+        const std::string board = id(er) + "_" + id(er + idlen) + "_" + id(er + 2 * idlen);
+        if (t.boards.size() < 120) t.boards += (t.boards.empty() ? "" : ", ") + board;  // (the table of the layout makes every note safe to show)
+    }
+    size_t j = 0;
+    for (const auto& [off, t] : trees) {
+        std::string note = "device tree";
+        if (within(d, off, 8) && be32(d, off) == 0xd00dfeed) note += " of " + std::to_string(be32(d, off + 4)) + " bytes, zeros up to the page";
+        if (!t.boards.empty()) note += ", for " + t.boards;
+        l.add("device tree " + std::to_string(j), kp + "dtb" + std::to_string(j), off, std::min<uint64_t>(t.size, d.size() - off), 0, note);
         ++j;
     }
     return l;

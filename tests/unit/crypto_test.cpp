@@ -225,6 +225,7 @@ int run_mtkgfh_tests();  // mtkgfh_test.cpp
 int run_mbn_tests();  // mbn_test.cpp
 int run_splash_tests();  // splash_test.cpp
 int run_qcdt_tests();  // qcdt_test.cpp
+int run_aml_tests();  // aml_test.cpp
 int run_codec_tool(int argc, char** argv);  // compression_test.cpp
 
 int main(int argc, char** argv) {
@@ -255,6 +256,7 @@ int main(int argc, char** argv) {
         if (cmd == "mbn") return run_mbn_tests();
         if (cmd == "splash") return run_splash_tests();
         if (cmd == "qcdt") return run_qcdt_tests();
+        if (cmd == "aml") return run_aml_tests();
         if (cmd == "png-decode" || cmd == "png-encode") return run_png_tool(argc, argv);
         if (cmd == "codec-compress" || cmd == "codec-decompress" || cmd == "codec-level" || cmd == "codec-detect") return run_codec_tool(argc, argv);
         if (cmd == "fit") return run_fit_tests();

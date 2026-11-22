@@ -1597,7 +1597,7 @@ fi
 # The other groups of unit tests: device trees (fdt), a device tree in the folder of an unpack (dtfile), what a kernel holds besides the kernel (kernel), the filter that makes output safe for a terminal (console), the readers of AVB keys
 # (avbkeys), the tables of the layout (layout), compression levels (levels), PNG (png), the MediaTek containers (mtkimg) and the preloader
 # (mtkgfh), the Qualcomm secure boot images (mbn), the picture partitions (splash), the device tree tables (qcdt) and FIT (fit).
-for unit_group in fdt dtfile kernel console avbkeys layout levels png mtkimg mtkgfh mbn splash qcdt fit; do
+for unit_group in fdt dtfile kernel console avbkeys layout levels png mtkimg mtkgfh mbn splash qcdt aml fit; do
     if [ -x "$UNIT" ]; then
         if out=$("$UNIT" "$unit_group" 2>&1); then
             pass "unit tests of the group $unit_group ($(tail -n 1 <<<"$out"))"
@@ -7993,6 +7993,19 @@ rm -rf lv_qcdt_work
 live_driver "QCDT: tables from folders of trees (versions 1 to 3, page sizes, forced versions; the real dtbTool makes the same tables where it is built), edits, refusals, a table in a boot image, a real table, damaged tables" \
     lv_qcdt.log python3 -I "$TOOLS/qcdt_live.py" "$ABR" lv_qcdt_work "$lv_real_qcdt"
 [ "$lv_real_qcdt" = "-" ] && echo "note: no real QCDT was tried (ABR_REAL_IMAGES has no boot_lk2nd.img)"
+
+# ---- AML_: the multi-tree container of Amlogic. The driver writes containers from the description of the format and reads what abr makes the way the
+# u-boot of an Amlogic board reads it (it shares nothing with abr); the trees are made by dtc. The image of a real device is used where there is one.
+lv_real_aml="-"
+[ -n "${ABR_REAL_IMAGES:-}" ] && [ -f "$ABR_REAL_IMAGES/TWRP Recovery Amlogic S9xx.img" ] && lv_real_aml="$ABR_REAL_IMAGES/TWRP Recovery Amlogic S9xx.img"
+if command -v dtc >/dev/null 2>&1; then
+    rm -rf lv_aml_work
+    live_driver "AML_: containers of both versions and several page sizes (written by the driver, read again the way u-boot reads them), edits, refusals, the container as the second of a boot image, a real image, damaged containers" \
+        lv_aml.log python3 -I "$TOOLS/aml_live.py" "$ABR" lv_aml_work "$lv_real_aml"
+    [ "$lv_real_aml" = "-" ] && echo "note: no real AML_ container was tried (ABR_REAL_IMAGES has no TWRP Recovery Amlogic S9xx.img)"
+else
+    echo "SKIP: AML_ containers (dtc is not installed: the driver makes its trees with it)"
+fi
 
 # ---- dtb: trees that are not back to back, and an AVB footer on a dtb partition
 if [ -f "$AVBTOOL" ] && command -v openssl >/dev/null 2>&1; then
