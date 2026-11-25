@@ -62,7 +62,13 @@ inline constexpr size_t kMaxDecompressedSize = 0x40000000;
 // when only the check value at the end is missing), an lz4-legacy stream whose last block is shorter than its size says (its plain data
 // stops with the block before). It is left as it was for a stream that is whole, and for one with other bytes behind its end (a device tree
 // put after a kernel, zeros): those are not part of the stream. The other codecs refuse a stream that is cut short.
-Bytes decompress(Codec codec, const Bytes& data, size_t max_size = kMaxDecompressedSize, std::string* damage = nullptr);
+//
+// `consumed`, when given, is set to how many bytes at the start of `data` the stream is, its end mark included: what is behind them is not
+// part of it (for a stream that is cut short: all of `data`; for an lz4-legacy stream, which has no end mark: up to the end of its last block;
+// for zstd it asks for the first frame only, and that frame is what is decoded). A stream that something else is put behind -- one that is
+// found in the middle of other data -- is measured this way.
+Bytes decompress(Codec codec, const Bytes& data, size_t max_size = kMaxDecompressedSize, std::string* damage = nullptr,
+                 size_t* consumed = nullptr);
 
 // The settings of a "LZMA alone" stream that its first thirteen bytes tell (the properties byte, the dictionary size, the size of the plain data),
 // and that a stream that is made again has to have for the decoder that reads it to be the same as the one that read the first.

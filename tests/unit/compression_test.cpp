@@ -20,6 +20,7 @@
 //   * a stream that is cut short (gzip, zlib, lz4 frame, lz4_legacy take it) is told by the `damage` of decompress(): what comes out is a
 //     prefix of the data, a whole stream says nothing, nor does one with other bytes behind its end (zeros, a pad of 0xFF, a device tree);
 //     the other codecs refuse such a stream, as they always did;
+//   * `consumed` says how long a stream is that has something else behind it (zeros, a pad, a device tree, another stream), for every codec;
 //   * the progress that compress() reports (`on_progress`) adds up to the size of the data for every codec, at every size around
 //     the slices gzip is fed in and the blocks lz4_legacy is cut into, from any number of threads, and the stream is the same as
 //     the one made without anybody listening and decompresses to the data.
@@ -250,6 +251,87 @@ void test_cut_short_streams() {
     }
 }
 
+// `consumed` of decompress(): how long the stream is that begins the data, with whatever is behind it (zeros, a pad of 0xFF, a device tree,
+// another stream) not counted -- for every codec, for streams of several sizes, and for a stream that is cut short.
+void test_consumed() {
+    const Bytes behind[] = {Bytes{}, Bytes(1, 0), Bytes(3, 0xFF), Bytes(4, 0), Bytes(100, 0), Bytes(8, 0xFF),
+                            Bytes{0xD0, 0x0D, 0xFE, 0xED, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x38}};
+    const Bytes samples[] = {Bytes{}, Bytes{'a'}, Bytes(5, 0), mixed(300000, 31)};
+    for (const Codec codec : {Codec::GZIP, Codec::ZLIB, Codec::LZ4_LEGACY, Codec::LZ4, Codec::ZSTD, Codec::XZ, Codec::LZMA, Codec::BZIP2, Codec::LZO}) {
+        const std::string name(codec_name(codec));
+        for (const Bytes& data : samples) {
+            const Bytes stream = compress(codec, data, codec == Codec::LZ4_LEGACY ? 1 : -1);
+            for (const Bytes& tail : behind) {
+                Bytes with = stream;
+                with.insert(with.end(), tail.begin(), tail.end());
+                size_t consumed = SIZE_MAX;
+                std::string said;
+                Bytes out;
+                try {
+                    out = decompress(codec, with, kMaxDecompressedSize, nullptr, &consumed);
+                } catch (const FormatError& e) {
+                    said = e.what();
+                }
+                if (!said.empty()) std::printf("  note %s of %zu bytes with %zu bytes behind it: %s\n", name.c_str(), data.size(), tail.size(), said.c_str());
+                EXPECT(said.empty());
+                EXPECT(out == data);
+                if (consumed != stream.size())
+                    std::printf("  note %s of %zu bytes with %zu bytes behind it: consumed %zu, the stream is %zu\n", name.c_str(), data.size(), tail.size(), consumed, stream.size());
+                EXPECT(consumed == stream.size());
+            }
+        }
+    }
+    // an lz4_legacy stream of two blocks, and zstd/gzip streams one after the other: the first is what is taken
+    {
+        const Bytes big = mixed((size_t(8) << 20) + 5000, 32);
+        const Bytes stream = compress(Codec::LZ4_LEGACY, big, 1);
+        size_t consumed = 0;
+        EXPECT(decompress(Codec::LZ4_LEGACY, stream, kMaxDecompressedSize, nullptr, &consumed) == big);
+        EXPECT(consumed == stream.size());
+    }
+    for (const Codec codec : {Codec::ZSTD, Codec::GZIP, Codec::XZ, Codec::BZIP2}) {
+        const Bytes a = mixed(20000, 33), b = mixed(30000, 34);
+        const Bytes sa = compress(codec, a), sb = compress(codec, b);
+        Bytes both = sa;
+        both.insert(both.end(), sb.begin(), sb.end());
+        size_t consumed = 0;
+        EXPECT(decompress(codec, both, kMaxDecompressedSize, nullptr, &consumed) == a);
+        EXPECT(consumed == sa.size());
+        // ... and the second begins where the first ends
+        const Bytes rest(both.begin() + static_cast<std::ptrdiff_t>(consumed), both.end());
+        EXPECT(decompress(codec, rest, kMaxDecompressedSize, nullptr, &consumed) == b);
+        EXPECT(consumed == sb.size());
+    }
+    // a stream that is cut short and is taken all the same (gzip, zlib, lz4, lz4_legacy) is all of the data
+    for (const Codec codec : {Codec::GZIP, Codec::ZLIB, Codec::LZ4}) {
+        const Bytes stream = compress(codec, mixed(300000, 35));
+        const Bytes part(stream.begin(), stream.end() - 100);
+        size_t consumed = 0;
+        std::string damage;
+        decompress(codec, part, kMaxDecompressedSize, &damage, &consumed);
+        EXPECT(!damage.empty());
+        EXPECT(consumed == part.size());
+    }
+    // no stream at all: refused, as before
+    for (const Codec codec : kCodecs) {
+        size_t consumed = 0;
+        bool refused = false;
+        try {
+            decompress(codec, Bytes(64, 0x5A), kMaxDecompressedSize, nullptr, &consumed);
+        } catch (const FormatError&) {
+            refused = true;
+        }
+        EXPECT(refused);
+    }
+    // the plain data: no stream, all of it
+    {
+        size_t consumed = 0;
+        const Bytes data = mixed(1000, 36);
+        EXPECT(decompress(Codec::NONE, data, kMaxDecompressedSize, nullptr, &consumed) == data);
+        EXPECT(consumed == data.size());
+    }
+}
+
 // A zstd frame, made by hand: `n` zeros as run-length blocks (4 bytes for up to 128 KiB), and in its header either the size it
 // declares (in the 8 bytes of a single-segment frame) or no size (a window descriptor instead).
 Bytes zstd_rle_frame(uint64_t n, std::optional<uint64_t> declared) {
@@ -428,6 +510,7 @@ int run_compression_tests() {
     test_default_limit();
     test_damaged_streams();
     test_cut_short_streams();
+    test_consumed();
     test_zstd_frames();
     test_limits_every_codec();
     test_bombs();

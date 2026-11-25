@@ -138,7 +138,8 @@ Bytes zlib_encode(const Bytes& in, int level, int window_bits, Reporter& report)
 }
 
 // The decoder. `max_out` is the most it may produce. `damage`, when given, says that the stream ends before its end marker.
-Bytes zlib_decode(const Bytes& in, int window_bits, size_t max_out, std::string* damage = nullptr) {
+// `consumed`, when given, is how many bytes of `in` the stream took.
+Bytes zlib_decode(const Bytes& in, int window_bits, size_t max_out, std::string* damage = nullptr, size_t* consumed = nullptr) {
     z_stream strm{};
     if (inflateInit2(&strm, window_bits) != Z_OK) fail("zlib init failed");
 
@@ -175,6 +176,7 @@ Bytes zlib_decode(const Bytes& in, int window_bits, size_t max_out, std::string*
             break;
         }
     }
+    if (consumed) *consumed = static_cast<size_t>(strm.next_in - in.data());
     inflateEnd(&strm);
     if (produced > max_out) too_big(max_out);  // (a stream that ends with the room filled up to its last byte)
     out.resize(produced);
@@ -185,8 +187,8 @@ Bytes gzip_compress(const Bytes& in, int level, Reporter& report) {
     if (level < 0) level = Z_DEFAULT_COMPRESSION;
     return zlib_encode(in, level, /*windowBits=*/15 + 16, report);
 }
-Bytes gzip_decompress(const Bytes& in, size_t max_out, std::string* damage = nullptr) {
-    return zlib_decode(in, /*windowBits=*/15 + 32 /* auto zlib/gzip */, max_out, damage);
+Bytes gzip_decompress(const Bytes& in, size_t max_out, std::string* damage = nullptr, size_t* consumed = nullptr) {
+    return zlib_decode(in, /*windowBits=*/15 + 32 /* auto zlib/gzip */, max_out, damage, consumed);
 }
 
 // ------------------------------------------------------------ lz4 frame --
@@ -223,7 +225,7 @@ Bytes lz4_frame_compress(const Bytes& in, int level) {
     }
 }
 
-Bytes lz4_frame_decompress(const Bytes& in, size_t max_out, std::string* damage = nullptr) {
+Bytes lz4_frame_decompress(const Bytes& in, size_t max_out, std::string* damage = nullptr, size_t* consumed = nullptr) {
     LZ4F_decompressionContext_t ctx;
     if (LZ4F_isError(LZ4F_createDecompressionContext(&ctx, LZ4F_VERSION)))
         fail("LZ4F_createDecompressionContext failed");
@@ -251,6 +253,7 @@ Bytes lz4_frame_decompress(const Bytes& in, size_t max_out, std::string* damage 
         }
         if (src_size == 0 && dst_size == 0) break;  // no progress; avoid spinning
     }
+    if (consumed) *consumed = in_pos;
     if (!done && damage)
         *damage = "the frame is cut short: its input ends before its end mark (" + std::to_string(out.size()) +
                   " bytes of plain data came out of it; when only the end mark or the checksum behind the last block is missing, that is all of them)";
@@ -302,7 +305,8 @@ Bytes lz4_legacy_compress(const Bytes& in, int level, Reporter& report) {
     return w.take();
 }
 
-Bytes lz4_legacy_decompress(const Bytes& in, size_t max_out, std::string* damage = nullptr) {
+// The stream has no end mark: what it takes of `in` (`consumed`) is up to the end of its last block.
+Bytes lz4_legacy_decompress(const Bytes& in, size_t max_out, std::string* damage = nullptr, size_t* consumed = nullptr) {
     BinaryReader r(in);
     if (!r.starts_with(reinterpret_cast<const char*>(kLz4LegacyMagic), 4))
         fail("not an lz4-legacy stream (bad magic)");
@@ -310,6 +314,7 @@ Bytes lz4_legacy_decompress(const Bytes& in, size_t max_out, std::string* damage
     Bytes out;
     out.reserve(first_buffer(in.size() * 3 + 4096, max_out));
     Bytes scratch(kLz4LegacyBlockSize);
+    if (consumed) *consumed = r.pos();
     while (r.remaining() > 0) {
         if (r.remaining() < 4) break;  // trailing pad, not a real block
         uint32_t block_size = r.le32();
@@ -317,9 +322,12 @@ Bytes lz4_legacy_decompress(const Bytes& in, size_t max_out, std::string* damage
         if (block_size > r.remaining()) {
             // Not a block of the stream: what comes behind it (a device tree after a kernel says 0xedfe0dd0, a pad of 0xFF bytes says
             // 0xffffffff), unless the size is one that a block of the stream can have -- then the stream was cut short in its last block.
-            if (damage && block_size <= static_cast<uint32_t>(LZ4_compressBound(static_cast<int>(kLz4LegacyBlockSize))))
-                *damage = "the last block is cut short: it says it is " + std::to_string(block_size) + " bytes and " + std::to_string(r.remaining()) +
-                          " are left (" + std::to_string(out.size()) + " bytes of plain data came out of the blocks before it)";
+            if (block_size <= static_cast<uint32_t>(LZ4_compressBound(static_cast<int>(kLz4LegacyBlockSize)))) {
+                if (damage)
+                    *damage = "the last block is cut short: it says it is " + std::to_string(block_size) + " bytes and " + std::to_string(r.remaining()) +
+                              " are left (" + std::to_string(out.size()) + " bytes of plain data came out of the blocks before it)";
+                if (consumed) *consumed = in.size();  // (the stream goes on to the end of the data, and ends there)
+            }
             break;
         }
         Bytes block = r.bytes(block_size);
@@ -329,6 +337,7 @@ Bytes lz4_legacy_decompress(const Bytes& in, size_t max_out, std::string* damage
                                      static_cast<int>(scratch.size()));
         if (n < 0) fail("LZ4_decompress_safe failed on lz4-legacy block");
         append_up_to(out, scratch.data(), static_cast<size_t>(n), max_out);
+        if (consumed) *consumed = r.pos();
     }
     return out;
 }
@@ -368,7 +377,16 @@ Bytes zstd_compress(const Bytes& in, int level) {
     return out;
 }
 
-Bytes zstd_decompress(const Bytes& in, size_t max_out) {
+// `consumed`, when given, asks for the first frame only (what a stream is when something else is put behind it): that frame is what is
+// decoded, and its size what is said. Without it, the data may be several frames one after the other, as zstd takes them.
+Bytes zstd_decompress(const Bytes& in, size_t max_out, size_t* consumed = nullptr) {
+    if (consumed) {
+        const size_t frame = ZSTD_findFrameCompressedSize(in.data(), in.size());
+        if (ZSTD_isError(frame)) fail(std::string("not a valid zstd frame: ") + ZSTD_getErrorName(frame));
+        *consumed = frame;
+        const Bytes first(in.begin(), in.begin() + static_cast<std::ptrdiff_t>(frame));
+        return zstd_decompress(first, max_out, nullptr);
+    }
     unsigned long long content_size = ZSTD_getFrameContentSize(in.data(), in.size());
     if (content_size == ZSTD_CONTENTSIZE_ERROR) fail("not a valid zstd frame");
     if (content_size == ZSTD_CONTENTSIZE_UNKNOWN) {
@@ -420,7 +438,7 @@ Bytes xz_compress(const Bytes& in, int level) {
     return out;
 }
 
-Bytes xz_decompress(const Bytes& in, size_t max_out) {
+Bytes xz_decompress(const Bytes& in, size_t max_out, size_t* consumed = nullptr) {
     const size_t room = room_for(max_out);
     Bytes out(first_buffer(std::max<size_t>(in.size() * 4, 4096), room));
     for (;;) {
@@ -430,6 +448,7 @@ Bytes xz_decompress(const Bytes& in, size_t max_out) {
                                                  in.size(), out.data(), &out_pos, out.size());
         if (rc == LZMA_OK) {
             if (out_pos > max_out) too_big(max_out);  // (a stream that ends with the room filled up to its last byte)
+            if (consumed) *consumed = in_pos;
             out.resize(out_pos);
             return out;
         }
@@ -444,8 +463,9 @@ Bytes xz_decompress(const Bytes& in, size_t max_out) {
 
 // -------------------------------------------------- lzma "alone" stream --
 
-// `max_out` is the most a decoder may produce; an encoder (`encode`) is not limited.
-Bytes lzma_stream_run(const Bytes& in, bool encode, size_t max_out = 0, const LzmaAloneParams* params = nullptr) {
+// `max_out` is the most a decoder may produce; an encoder (`encode`) is not limited. A decoder says in `consumed` (when given) how much
+// of `in` the stream took.
+Bytes lzma_stream_run(const Bytes& in, bool encode, size_t max_out = 0, const LzmaAloneParams* params = nullptr, size_t* consumed = nullptr) {
     lzma_stream strm = LZMA_STREAM_INIT;
     lzma_ret rc;
     if (encode) {
@@ -490,6 +510,7 @@ Bytes lzma_stream_run(const Bytes& in, bool encode, size_t max_out = 0, const Lz
             fail("lzma_code failed: rc=" + std::to_string(rc));
         }
     }
+    if (consumed) *consumed = in.size() - strm.avail_in;
     lzma_end(&strm);
     if (!encode && produced > max_out) too_big(max_out);  // (a stream that ends with the room filled up to its last byte)
     out.resize(produced);
@@ -540,29 +561,45 @@ Bytes bzip2_compress(const Bytes& in, int level) {
     return out;
 }
 
-Bytes bzip2_decompress(const Bytes& in, size_t max_out) {
-    // (The library counts in 32 bits: a limit above what they hold is as much as they hold.)
-    const size_t room = std::min<size_t>(room_for(max_out), 0xFFFFFFFFull);
-    size_t out_len = first_buffer(std::max<size_t>(in.size() * 4, 4096), room);
+// The library's streaming interface, not its one-call function: that one starts again from the first byte when its buffer turns out to be too small,
+// and cannot say where the stream ended in the input (`consumed`, for a stream that something else is put behind). The stream is decoded in rounds
+// of at most 1 GiB of input and of output (the library counts in 32 bits).
+Bytes bzip2_decompress(const Bytes& in, size_t max_out, size_t* consumed = nullptr) {
+    bz_stream strm{};
+    if (BZ2_bzDecompressInit(&strm, /*verbosity=*/0, /*small=*/0) != BZ_OK) fail("BZ2_bzDecompressInit failed");
+    struct Guard {
+        bz_stream* s;
+        ~Guard() { BZ2_bzDecompressEnd(s); }
+    } guard{&strm};
+
+    constexpr size_t kRound = 0x40000000;
+    const size_t room = room_for(max_out);
+    Bytes out(first_buffer(std::max<size_t>(in.size() * 4, 4096), room));
+    size_t produced = 0, taken = 0;
     for (;;) {
-        Bytes out(out_len);  // (the buffer of the round before is gone: the library decodes from the start again)
-        unsigned int produced = static_cast<unsigned int>(out_len);
-        int rc = BZ2_bzBuffToBuffDecompress(
-            reinterpret_cast<char*>(out.data()), &produced,
-            const_cast<char*>(reinterpret_cast<const char*>(in.data())),
-            static_cast<unsigned int>(in.size()), 0, 0);
-        if (rc == BZ_OK) {
-            if (produced > max_out) too_big(max_out);  // (a stream that ends with the room filled up to its last byte)
-            out.resize(produced);
-            return out;
+        if (produced == out.size()) {
+            if (out.size() >= room) too_big(max_out);  // the room is filled: more than max_out
+            out.resize(next_buffer(out.size(), room));
         }
-        if (rc == BZ_OUTBUFF_FULL) {
-            if (out_len >= room) too_big(max_out);
-            out_len = next_buffer(out_len, room);
-            continue;
-        }
-        fail("BZ2_bzBuffToBuffDecompress failed: rc=" + std::to_string(rc));
+        const auto give = static_cast<unsigned int>(std::min(in.size() - taken, kRound));
+        const auto space = static_cast<unsigned int>(std::min(out.size() - produced, kRound));
+        strm.next_in = const_cast<char*>(reinterpret_cast<const char*>(in.data())) + taken;
+        strm.avail_in = give;
+        strm.next_out = reinterpret_cast<char*>(out.data()) + produced;
+        strm.avail_out = space;
+        const int rc = BZ2_bzDecompress(&strm);
+        const size_t read = give - strm.avail_in, wrote = space - strm.avail_out;
+        taken += read;
+        produced += wrote;
+        if (rc == BZ_STREAM_END) break;
+        if (rc != BZ_OK) fail("BZ2_bzDecompress failed: rc=" + std::to_string(rc));
+        // BZ_OK with nothing read and nothing written: the input is used up and the stream is not at its end
+        if (read == 0 && wrote == 0) fail("BZ2_bzDecompress failed: the stream is cut short (rc=" + std::to_string(BZ_UNEXPECTED_EOF) + ")");
     }
+    if (produced > max_out) too_big(max_out);  // (a stream that ends with the room filled up to its last byte)
+    if (consumed) *consumed = taken;
+    out.resize(produced);
+    return out;
 }
 
 // -------------------------------------------------------- lzo (lzop) --
@@ -713,7 +750,7 @@ Bytes lzo_compress(const Bytes& in, int level, Reporter& report) {
     return w.take();
 }
 
-Bytes lzo_decompress(const Bytes& in, size_t max_out) {
+Bytes lzo_decompress(const Bytes& in, size_t max_out, size_t* consumed = nullptr) {
     lzo_init_once();
     BinaryReader r(in);
     if (!r.starts_with(reinterpret_cast<const char*>(kLzopMagic), sizeof(kLzopMagic)))
@@ -746,7 +783,10 @@ Bytes lzo_decompress(const Bytes& in, size_t max_out) {
     Bytes scratch(kLzoBlockSize);
     for (;;) {
         uint32_t dst_len = r.be32();
-        if (dst_len == 0) break;  // end-of-stream marker
+        if (dst_len == 0) {  // end-of-stream marker
+            if (consumed) *consumed = r.pos();
+            break;
+        }
         if (dst_len > kLzoMaxBlockSize) fail("lzo block's uncompressed size exceeds the max block size");
         if (scratch.size() < dst_len) scratch.resize(dst_len);  // (blocks of 256 KiB, unless the tool that made the stream was told otherwise)
         uint32_t src_len = r.be32();
@@ -811,18 +851,20 @@ Codec detect_codec(const Bytes& d) {
     return Codec::NONE;
 }
 
-Bytes decompress(Codec codec, const Bytes& data, size_t max_size, std::string* damage) {
+Bytes decompress(Codec codec, const Bytes& data, size_t max_size, std::string* damage, size_t* consumed) {
     switch (codec) {
-        case Codec::NONE: return data;
-        case Codec::GZIP: return gzip_decompress(data, max_size, damage);
-        case Codec::LZ4_LEGACY: return lz4_legacy_decompress(data, max_size, damage);
-        case Codec::LZ4: return lz4_frame_decompress(data, max_size, damage);
-        case Codec::ZSTD: return zstd_decompress(data, max_size);
-        case Codec::XZ: return xz_decompress(data, max_size);
-        case Codec::LZMA: return lzma_stream_run(data, /*encode=*/false, max_size);
-        case Codec::BZIP2: return bzip2_decompress(data, max_size);
-        case Codec::LZO: return lzo_decompress(data, max_size);
-        case Codec::ZLIB: return zlib_decode(data, /*windowBits=*/15, max_size, damage);
+        case Codec::NONE:
+            if (consumed) *consumed = data.size();
+            return data;
+        case Codec::GZIP: return gzip_decompress(data, max_size, damage, consumed);
+        case Codec::LZ4_LEGACY: return lz4_legacy_decompress(data, max_size, damage, consumed);
+        case Codec::LZ4: return lz4_frame_decompress(data, max_size, damage, consumed);
+        case Codec::ZSTD: return zstd_decompress(data, max_size, consumed);
+        case Codec::XZ: return xz_decompress(data, max_size, consumed);
+        case Codec::LZMA: return lzma_stream_run(data, /*encode=*/false, max_size, nullptr, consumed);
+        case Codec::BZIP2: return bzip2_decompress(data, max_size, consumed);
+        case Codec::LZO: return lzo_decompress(data, max_size, consumed);
+        case Codec::ZLIB: return zlib_decode(data, /*windowBits=*/15, max_size, damage, consumed);
     }
     fail("unknown codec");
 }
