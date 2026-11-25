@@ -51,10 +51,11 @@ tools" below.
 | picture partitions: Qualcomm `SPLASH!!` (RLE24 or raw), OPLUS `SPLASH LOGO!`, Xiaomi `LOGO!!!!`, Motorola `MotoLogo` | **done** (10-12 Nov 2026): two real `SPLASH!!` samples come back byte for byte; the other three from the layouts of the sources |
 | QCDT (dtbTool's table) as trees + entries, and made from a folder of trees | **done + verified** (3 and 12-16 Nov 2026) against the real `dtbTool` (built from the Code Aurora source, run as a judge: 12 tables, the same bytes) and the table of one real boot image |
 | Amlogic's container of device trees (`AML_`: a `dtb` partition, or the `second` of the boot image of an Amlogic box) as trees + entries | **done + verified** (22 Nov 2026): the `second` of one real image (`TWRP Recovery Amlogic S9xx.img`: 2 trees) comes back byte for byte, judged by an independent Python writer and reader written after u-boot's `common/aml_dt.c`, `dtc`, and 22 + 12 deliberate breakages of the code; only containers that `abr` writes again byte for byte are taken apart; **no container is made from a folder of trees yet**, see "Amlogic's container of device trees" |
+| what a kernel says about itself, in a folder that `pack` never reads (`kernel_info/`: the build configuration, the symbol table, the initramfs built into it, the certificates and keys, the files linked into it -- the vDSO, device trees, compressed streams --, the banner, the `vermagic`) | **done + verified** (25 Nov 2026): 8 symbol tables and 3 configurations of real kernels (6 of the tables confirmed by the kernel itself), one real certificate judged by `openssl`, the vDSO of 5 kernels judged by `readelf`; a finder of the symbol table written after `scripts/kallsyms.c` (a matrix of 176 layouts in the unit group, 12 in the live driver); judged by `cpio`, `openssl`, `dtc`, `readelf` and `zlib`; a changed byte in each of 57 places of the folder and 12 deliberate breakages of the code are all noticed; see "`kernel_info/`" |
 | `abr`'s own PNG reader and writer (no libpng) | **done + verified** against Pillow (and ImageMagick where present): every colour type and bit depth, interlaced |
 | FAT volumes and GPT files named (not unpacked) | **done** (12 Nov 2026), recognition only |
 | what reaches a terminal from the tables of an image (picture names, certificate subjects, ...) | **done** (15 Nov 2026): the cells of the layout table are escaped; unit and live regression tests; sanitizer fuzz after the fix: 30 837 runs, nothing |
-| the judges are judged: every live driver fails against an `abr` that changes one byte of what `pack` or `unpack` wrote | **done** (16 Nov 2026): `tests/tools/sabotage_check.sh` |
+| the judges are judged: every live driver fails against an `abr` that changes one byte of what `pack` or `unpack` wrote | **done** (16 Nov 2026): `tests/tools/sabotage_check.sh`; the driver of `kernel_info/` too (25 Nov 2026: a changed byte in each of 57 places of that folder) |
 | CMake: FetchContent-vendored static zlib/lz4/zstd/xz/bzip2 | **done + build-verified natively on Linux**, both the dynamic and the `-DABR_STATIC_BINARY=ON` fully-static configurations |
 | Test suite (`tests/run_tests.sh`) | **done**; the last complete run is the CI's run 44000758114 (commit `2cfef05`, 16 Nov): all six jobs green, 535 passed and 0 failed on x86-64 (g++-14 with all judges required, clang-20, ASan+UBSan with a fuzz run), 534 for arm64 under qemu-user. Since then: the console work of 17 Nov (unit groups `console` and `layout`, the live driver `console_live.py`: 118 checks) has been run on its own; the local full run of that day was cut short by a pause in the block of the real images (506 passed, 0 failed up to there). The whole matrix is run once more when the work of 17 Nov (device trees as text, the kernel) is done -- see "Next steps". CI runs the matrix (g++-14, clang-20, ASan+UBSan with a fuzz run, Windows under wine, arm64 under qemu-user, android-arm64) -- see Verification |
 | CMake cross toolchains (mingw-w64, Android NDK) | **done + verified** (mingw reproduced locally; NDK only provable via CI, see below) |
@@ -2475,6 +2476,74 @@ SoCs, in one file, and a partition of its own (`dtb`) holds the same on other bo
   reason (`info` says `unpack: no, ...` and the same reason), and stays the file `second` in a boot image, with a note. (Zeros behind a
   container in a file of its own are the generic `fill`, kept.)
 
+## `kernel_info/`: what a kernel says about itself (done, 25 Nov 2026)
+
+Step c of the request of 17 Nov: learn from the kernel as much as there is to learn -- the build configuration, the symbol table, the
+binaries glued to it, the initramfs built into it, the cryptographic keys, the text metadata -- save all of it in a folder named
+`kernel_info`, and do not use it when the image is built again.
+
+* **What `unpack` does** (`include/abr/kernelinfo.hpp` + `src/kernelinfo.cpp`: the analysis; `src/kernelinfo_out.cpp`: `summary.txt` and the
+  files; `include/abr/kallsyms.hpp` + `src/kallsyms.cpp`: the symbol table; `main.cpp`: the calls and `--no-kernel-info`): beside every file
+  `kernel` that is plain (its compression taken off, the glued trees cut away) it writes `kernel_info/` -- `summary.txt` (everything in one text,
+  with the offsets), `config` (IKCONFIG: `IKCFG_ST`, a gzip stream, `IKCFG_ED`), `kallsyms.txt` (address, type, name, as `/proc/kallsyms`),
+  `payload.bin` (what the compressed stream of a `zImage` or `bzImage` holds), `initramfs.cpio` + `initramfs/` + `initramfs.meta` (the folder made
+  the way `ramdisk/` is; a second archive is `initramfs2.*`), `certs/NN-<CN>.der|pem` + `.txt` (subject, issuer, serial, validity, signature, key,
+  sha256) and the PEM keys, `binaries/NN_<kind>_<offset>[_from_<codec>].elf|dtb|dts|txt|bin` (the vDSO, firmware, device trees with their
+  sources, compressed streams that hold one), and `README.txt`. Boot and recovery images (headers 0 to 4), uImage, FIT (a folder for every
+  kernel: `kernel_info`, `kernel_info_2`, ...), Sony ELF, Rockchip KRNL and Intel OSIP images are all hooked; the kinds of kernel that have a header are
+  arm64 `Image`, ARM `zImage`, x86 `bzImage`, RISC-V `Image` and ELF, anything else is searched as a whole and called "kernel (no header that abr knows)".
+  The offsets of the text and of the names are those of the file `kernel` (of `payload.bin` for a `zImage` or `bzImage`, and the second line of
+  `summary.txt` says so).
+* **Information only**: `pack` never reads the folder and the manifest never mentions it -- deleted, edited, replaced by a file or by a FIFO, the
+  image comes back the same (checked). A second `unpack` replaces a folder that `abr` made (the first line of `README.txt` says so, `is_ours()`)
+  and nothing else: a `kernel_info/` that is somebody else's is left alone, with a note; `--no-kernel-info` writes nothing and takes away one that
+  `abr` made. The seven searches (the text, the configuration, the symbols, the streams, the plain archives, the certificates, the ELF files and trees) run side by
+  side and are joined in the order of the offsets, so the result does not depend on the number of threads (1, 2 and 8 are compared).
+  Nothing is guessed: a symbol table is reported only when its structure proves it, a stream only when it decodes, a certificate only when it
+  parses.
+* **The symbol table** is not marked in the kernel, so it is found by what `scripts/kallsyms.c` makes of it: the 256 tokens with the digits `0` to
+  `9` in their places (0x30 to 0x39) and the index of 256 `u16` that proves them, the markers of every 256th name (4 or 8 bytes), the names (a length
+  byte, an ULEB128 in 6.x), the number of symbols (`.long`, or the size of a pointer in old kernels), and the addresses in order -- absolute, or
+  `s32` offsets from `relative_base`, or the x86-64 per-CPU variant -- with the alignment of each array (4, 8, or `.align 8` = 256 on ARM), both
+  byte orders. One lesson of a real kernel: a table of 4-byte addresses behind zeros also reads as a sorted table of 8-byte ones (the first half of each
+  number is zero), so the narrow reading is tried first; it is the other way round that is not sorted (a unit test of its own).
+  Streams are looked for by their magic and the fields of their headers that can be checked on the spot (gzip, xz, zstd, bzip2, lz4 frame and
+  legacy, lzo, lzma-alone) and decoded with `decompress(..., consumed)`; one that holds a cpio archive is an initramfs, any other is a file.
+* **Verified by**: unit group `kinfo` (6462 checks: a writer of kallsyms tables in every layout and a matrix of 176 of them -- 3.x to 6.x, absolute,
+  relative and per-CPU, 4 and 8 bytes, both byte orders, every alignment --, tables damaged in one place that must not be found, tables behind
+  zeros, headers of every kind, DER certificates made by hand, cpio archives, ELF files and trees, what the writer puts in the folder, thread counts,
+  cuts and flips that must never throw, noise that must give nothing); `tests/tools/kinfo_live.py` (2200 checks, 2320 with the real images; 13
+  sections: a boot image with a plain kernel and every CLI behaviour above, a gzip kernel, header version 4, `zImage` and `bzImage`, glued trees,
+  uImage, Sony ELF, KRNL, OSIP, a FIT with two kernels, 12 layouts of the symbol table, 110 runs on damaged kernels, the real kernels), which builds the kernels from what
+  `cpio`, `openssl`, `dtc` and `gcc` make and judges the folders with the same programs (`cpio -t` lists the archive and the folder holds its
+  files, `openssl x509` gives the serial, the dates, the key and the fingerprint of the text, `dtc` compiles every `.dts` to the blob that was in
+  the kernel, `readelf` reads every ELF file) and with `zlib` (IKCONFIG, the payload of a `zImage`).
+  **The real images**: 9 of the 14 carry a kernel. 8 symbol tables (40359 to 126517 symbols; 6 of them confirmed by the kernel itself: the address
+  of `linux_proc_banner` in the table minus the offset of the banner `abr` found is where `"%s version %s ("` is, `__initramfs_start` is where the
+  initramfs is; the other two, kernels 4.9.117+ and 5.4.125, hold only text symbols and have nothing to be confirmed by), 3 configurations (3022, 3349
+  and 1678 options, `zlib` makes the same bytes), the one certificate of the 14 (`CN=sforshee`, RSA 2048, serial and sha256 as `openssl` says), the vDSO
+  of 5 kernels (`readelf`), the initramfs of 8 (the default one: 3 entries in a gzip stream of 131 to 135 bytes) and a plain archive of 480 bytes in
+  5.4.125; `boot_lk2nd.img` (a 295 KiB `zImage` of a bootloader) gives its header and nothing else. All images that went back byte for byte before still
+  do (13 of 14; the 14th is the ext4 image that `abr` refuses with the reason). Every other unit group passes as before (21 groups).
+  **The judges were judged twice**: the sabotage check changes one byte at a time in 57 places of the folder (the config, the listing, both
+  archives, the files of the initramfs folders, every certificate file and the fields of its text, each kind of file in `binaries/`, `README.txt`,
+  every field of `summary.txt`) and the driver has to fail on each: it found five places the driver did not read (the bytes of `initramfs.cpio`
+  and `initramfs2.cpio`, the `flags` line, the byte order of the table of symbols, the line of a tree in a gzip stream), all are read now; then 12 deliberate breakages of
+  `src/` (the order of the widths of the address table, the page size of the arm64 flags, the length of a plain cpio, a foreign folder removed,
+  `--no-kernel-info` ignored, the label column of `summary.txt`, the payload offset of a `bzImage`, the sign of the relative offsets, the
+  naming of a certificate, the name of the second initramfs, the one-line report, the name of a kernel without a header) -- each was caught by the
+  unit group, the live driver or both.
+* **Found on the way**: (1) the 4-before-8 reading of the address table above, on the 32-bit real kernels; (2) a label of 16 characters or more
+  ran into its value in `summary.txt` (the column is 20 now, and there is always a blank); (3) the judge of a certificate told an RSA certificate from an EC one by
+  the text of its CN (it goes by `openssl`'s output now); (4) the first layout of the test kernel put a tree 0x6000 bytes from the end, which is where the
+  rule of "Device trees as text" takes a tree for a glued one (trees to the end of the field with only zeros or at most 64 KiB behind them) and the
+  kernel was cut there -- the tree went to 0x5000, and the glued case has a test of its own; (5) the five judge gaps of the sabotage check above.
+* **Not done**: a table of 256 symbols or fewer is not found (the markers prove nothing then); the kernel inside a ChromeOS (vboot) blob is not
+  looked at; `initramfs.meta` is not judged by anything that is not `abr` (the ramdisk drivers judge the same writer); `abr info` does not say anything of
+  the folder (it is written by `unpack` only); the two real tables in the relative layout (4.9.117+, 5.4.125) are text-only, and the real tables with
+  data symbols are all absolute (3.14 to 3.18): the relative layout with data symbols is judged by the synthetic tables only (176 in the unit group,
+  12 in the live driver).
+
 ## Next steps (in order)
 
 1. The user's requests of 17 Nov 2026, in this order (one commit per step; narrow checks while they are built, then the one full run):
@@ -2484,7 +2553,8 @@ SoCs, in one file, and a partition of its own (`dtb`) holds the same on other bo
    b. **Deeper than the first layer** for everything that has more inside it (the kernel, and what else `unpack` leaves as a file that a person
       cannot read or edit).
    c. **`kernel_info/`**: what can be learnt from the kernel -- the build configuration, the symbol table, the binaries glued to it, the
-      initramfs inside it, the keys, the text metadata -- in a folder of its own that `pack` never reads.
+      initramfs inside it, the keys, the text metadata -- in a folder of its own that `pack` never reads. **Done** (25 Nov 2026, see
+      "`kernel_info/`: what a kernel says about itself").
 2. Then the one full run of the whole matrix, with the CI on all six jobs.
 3. Housekeeping: AIK-like default levels as an opt-in, gzip OS-byte determinism, `zlib-ng` for faster gzip, splitting `main.cpp`, an atomic
    write of the manifest block that `pack` rewrites.

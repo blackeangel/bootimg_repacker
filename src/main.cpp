@@ -45,6 +45,7 @@
 #include "abr/fit.hpp"
 #include "abr/identify.hpp"
 #include "abr/kernel.hpp"
+#include "abr/kernelinfo.hpp"
 #include "abr/layout.hpp"
 #include "abr/legacy/amonet.hpp"
 #include "abr/legacy/avb1.hpp"
@@ -651,6 +652,79 @@ void record_component(Manifest& m, const std::string& prefix, const std::string&
         m.set(prefix + "_lzma_dict", std::to_string(d.lzma->dict_size));
     }
     m.set_hex(prefix + "_orig_hash", d.plain_hash);
+}
+
+// kernel_info/ (abr/kernelinfo.hpp): everything that can be learned from the kernel -- its symbols, its configuration, the initramfs and the
+// certificates inside it, the files that are linked into it -- as files to read. It is information only: pack never reads it, and a failure
+// here is a note, never an error of the unpack. `unpack --no-kernel-info` clears this.
+bool g_kernel_info = true;
+
+// What the field of the image that held the kernel was, for the first lines of kernel_info/summary.txt.
+std::vector<std::string> kernel_container_lines(const DecodedComponent& k, const Bytes& raw) {
+    std::vector<std::string> out;
+    if (k.mtk_name) out.push_back("a MediaTek sub-header (" + *k.mtk_name + ") in front of it, kept for pack");
+    if (k.codec == Codec::NONE) out.push_back("the kernel is not compressed (the file kernel)");
+    else
+        out.push_back(std::string(codec_name(k.codec)) + " stream of " + std::to_string(k.stored(raw).size()) + " bytes that holds " + std::to_string(k.plain.size()) +
+                      " bytes: the file kernel is what it holds");
+    if (k.glued) out.push_back("device trees glued behind it, " + std::to_string(k.glued->size()) + " bytes: kernel_dtb/");
+    return out;
+}
+
+// A kernel for kernel_info/: its bytes (a stream decompressed) and what the field it was in was.
+struct KernelForInfo {
+    const Bytes* plain = nullptr;
+    std::vector<std::string> container;
+};
+
+KernelForInfo kernel_for_info(const DecodedComponent& k, const Bytes& raw) {
+    KernelForInfo out;
+    if (k.present && !k.plain.empty()) {
+        out.plain = &k.plain;
+        out.container = kernel_container_lines(k, raw);
+    }
+    return out;
+}
+
+// The folder of the n-th kernel of an image: kernel_info, kernel_info_2, ...
+std::string kernel_info_folder(size_t n) { return n == 0 ? "kernel_info" : "kernel_info_" + std::to_string(n + 1); }
+
+void save_kernel_info(const fs::path& dir, const std::vector<KernelForInfo>& kernels) {
+    std::error_code ec;
+    // What an earlier unpack wrote is replaced (all of it, whatever the number of kernels was); a folder of that name that abr did not
+    // write is somebody's, and is not touched.
+    std::set<std::string> theirs;
+    for (const fs::directory_entry& e : fs::directory_iterator(dir, ec)) {
+        const std::string name = e.path().filename().string();
+        if (name.rfind("kernel_info", 0) != 0) continue;
+        const std::string rest = name.substr(11);
+        const bool numbered = rest.size() > 1 && rest[0] == '_' && std::all_of(rest.begin() + 1, rest.end(), [](char c) { return std::isdigit(static_cast<unsigned char>(c)) != 0; });
+        if (!rest.empty() && !numbered) continue;
+        if (kernelinfo::is_ours(e.path())) fs::remove_all(e.path(), ec);
+        else theirs.insert(name);
+    }
+    if (!g_kernel_info) return;
+    for (size_t n = 0; n < kernels.size(); ++n) {
+        if (!kernels[n].plain) continue;
+        const std::string folder = kernel_info_folder(n);
+        if (theirs.count(folder)) {
+            note(folder + " is there already and was not made by abr: the information about the kernel is not written");
+            continue;
+        }
+        const fs::path where = dir / folder;
+        progress::enter("kernel_info", kernels[n].plain->size());
+        const progress::Activity doing(folder + "/");
+        try {
+            kernelinfo::Report r = kernelinfo::analyze(*kernels[n].plain);
+            r.container = kernels[n].container;
+            kernelinfo::write(r, where);
+            std::cout << folder << ": " << kernelinfo::one_line(r) << " -> " << where.generic_string() << "/\n";
+        } catch (const std::exception& e) {
+            fs::remove_all(where, ec);
+            note(std::string("the information about the kernel could not be written: ") + e.what());
+        }
+        progress::advance(kernels[n].plain->size());
+    }
 }
 
 // A ramdisk that is a cpio archive is also written as a directory (ramdisk_tree.hpp): the file
@@ -1838,6 +1912,7 @@ void unpack_boot(const Bytes& whole, const fs::path& dir) {
             record_component(m, "second", "second", parts[2]);
         }
         save_ramdisk_trees(m, dir, {{"ramdisk", "ramdisk.cpio", &parts[1]}});
+        save_kernel_info(dir, {kernel_for_info(parts[0], img.kernel)});
     }
     {
         // A Qualcomm device tree table that abr can write again byte for byte is unpacked into its trees and its entries; any other dt is a file.
@@ -2257,6 +2332,7 @@ void unpack_uimage(const Bytes& data, const fs::path& dir) {
     {
         const std::vector<DecodedComponent> parts = save_components(dir, {{&img.data, "data.bin"}});
         record_component(m, "data", "data.bin", parts[0]);
+        if (uboot_type_name(img.type) == "kernel" || uboot_type_name(img.type) == "kernel_noload") save_kernel_info(dir, {kernel_for_info(parts[0], img.data)});
     }
     // What lies behind the image (fill up to the size of a partition, a trailer): kept like the bytes around a boot image.
     const Envelope env = Envelope::capture(data, 0, img.consumed);
@@ -2461,6 +2537,12 @@ bool unpack_fit(const Bytes& data, const fs::path& dir, std::string& why) {
     for (size_t i = 0; i < o.images.size(); ++i)
         if (o.images[i].type == "ramdisk" && parts[i].present) jobs.push_back({names[i].prefix, names[i].filename, &parts[i]});
     save_ramdisk_trees(m, dir, jobs);
+    {
+        std::vector<KernelForInfo> kernels;
+        for (size_t i = 0; i < o.images.size(); ++i)
+            if (o.images[i].type == "kernel" && parts[i].present) kernels.push_back(kernel_for_info(parts[i], o.images[i].data));
+        save_kernel_info(dir, kernels);
+    }
 
     const std::string text =
         "// A U-Boot FIT image, as abr unpacked it. `data = /incbin/(\"file\")` is the data of an image: the file is in this directory\n"
@@ -2713,6 +2795,12 @@ void unpack_elf_boot(const Bytes& data, const fs::path& dir) {
     for (size_t i = 0; i < img.segments.size(); ++i)
         if (names.prefix[i] == "ramdisk") tree_jobs.push_back({"ramdisk", names.filename[i], &segment_parts[i]});
     save_ramdisk_trees(m, dir, tree_jobs);
+    {
+        std::vector<KernelForInfo> kernels;
+        for (size_t i = 0; i < img.segments.size(); ++i)
+            if (img.segments[i].role == "kernel") kernels.push_back(kernel_for_info(segment_parts[i], img.segments[i].data));
+        save_kernel_info(dir, kernels);
+    }
     if (img.layout) {
         const legacy::ElfLayout& L = *img.layout;
         std::vector<uint64_t> order(L.order.begin(), L.order.end());
@@ -2819,6 +2907,7 @@ void unpack_krnl(const Bytes& host, const fs::path& dir) {
         write_file(dir / ".abr_raw" / (filename + ".raw"), part.stored(img.payload));
         record_component(m, prefix, filename, part);
         if (ramdisk) save_ramdisk_trees(m, dir, {{"ramdisk", "ramdisk.cpio", &part}});
+        else save_kernel_info(dir, {kernel_for_info(part, img.payload)});
     }
     if (!img.crc_ok) {
         // Put back as it was while the payload is untouched, so that the round trip stays exact.
@@ -3363,6 +3452,12 @@ void unpack_osip(const Bytes& host, const fs::path& dir) {
         write_file(dir / ".abr_raw" / "ramdisk.cpio.raw", ramdisk.stored(img.ramdisk));
         record_component(m, "ramdisk", "ramdisk.cpio", ramdisk);
         save_ramdisk_trees(m, dir, {{"ramdisk", "ramdisk.cpio", &ramdisk}});
+    }
+    if (!img.kernel.empty()) {
+        KernelForInfo k;
+        k.plain = &img.kernel;
+        k.container = {"the kernel as the OSIP image holds it (the file kernel)"};
+        save_kernel_info(dir, {k});
     }
 
     m.set_u64("osip_body_size", img.body_size());
@@ -6235,7 +6330,7 @@ void self_check(const fs::path& outdir, const Bytes& original, const char* what 
 }
 
 void do_unpack(const fs::path& in, const fs::path& outdir) {
-    const progress::Scope progress_scope("unpack", {{"read", 1}, {"decode", 6}, {"tree", 2}, {"dts", 2}, {"verify", 5}});
+    const progress::Scope progress_scope("unpack", {{"read", 1}, {"decode", 6}, {"tree", 2}, {"dts", 2}, {"kernel_info", 2}, {"verify", 5}});
     progress::enter("read", 1);
     Bytes data = read_file(in);
     progress::advance(1);
@@ -6546,6 +6641,11 @@ void usage(std::ostream& os, int columns) {
               "ramdisk.cpio (exactly what the image held) and, when it can be one, the folder ramdisk/ with ramdisk.meta (owners, modes, "
               "order). Edit either; pack takes the one that changed (the folder, when both did).");
     os << "\n";
+    paragraph("A kernel is looked into as far as it goes: the device trees behind it are sources (kernel_dtb/*.dts), and what the kernel says "
+              "about itself is written to the folder kernel_info/ -- its symbol table (kallsyms.txt), build configuration (config), initramfs, "
+              "certificates and keys, the files linked into it, the version and the build, all told in summary.txt. That folder is "
+              "information only: pack never reads it. `unpack --no-kernel-info` leaves it out.");
+    os << "\n";
     paragraph("A folder of device trees (files that end in .dtb) and no manifest.txt is packed as a Qualcomm device tree table (QCDT, what "
               "dtbTool makes); a manifest.txt of `type=qcdt` with `page_size=` and `table_version=` (1, 2 or 3) says how.");
     os << "\n";
@@ -6579,6 +6679,7 @@ void usage(std::ostream& os, int columns) {
 struct IoArgs {
     std::optional<std::string> input;
     std::optional<std::string> output;
+    bool no_kernel_info = false;  // unpack --no-kernel-info
 };
 
 bool is_io_option(const std::string& a) { return a == "-i" || a == "--input" || a == "-o" || a == "--output"; }
@@ -6601,6 +6702,10 @@ IoArgs parse_io(const std::string& command, const std::vector<std::string>& args
         }
         const bool is_in = option == "-i" || option == "--input";
         const bool is_out = option == "-o" || option == "--output";
+        if (option == "--no-kernel-info" && command == "unpack" && !has_value) {
+            io.no_kernel_info = true;
+            continue;
+        }
         if (!is_in && !is_out) {
             if (args[i].size() > 1 && args[i][0] == '-') throw UsageError("unknown option " + shown(args[i]));
             bare.push_back(args[i]);
@@ -6710,6 +6815,7 @@ int main(int argc, char** argv) {
             if (!io.output && fs::exists(outdir) && !(fs::is_directory(outdir) && fs::is_empty(outdir)))
                 throw FormatError(shown(outdir.string()) + " is there already: unpack does not write into a folder it chose itself when it is not empty. "
                                   "Take another with -o, or -o " + shown(outdir.string()) + " to unpack into this one");
+            g_kernel_info = !io.no_kernel_info;
             do_unpack(in, outdir);
         } else if (cmd == "pack") {
             const IoArgs io = parse_io(cmd, args, true);

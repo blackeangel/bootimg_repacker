@@ -1596,8 +1596,8 @@ fi
 
 # The other groups of unit tests: device trees (fdt), a device tree in the folder of an unpack (dtfile), what a kernel holds besides the kernel (kernel), the filter that makes output safe for a terminal (console), the readers of AVB keys
 # (avbkeys), the tables of the layout (layout), compression levels (levels), PNG (png), the MediaTek containers (mtkimg) and the preloader
-# (mtkgfh), the Qualcomm secure boot images (mbn), the picture partitions (splash), the device tree tables (qcdt) and FIT (fit).
-for unit_group in fdt dtfile kernel console avbkeys layout levels png mtkimg mtkgfh mbn splash qcdt aml fit; do
+# (mtkgfh), the Qualcomm secure boot images (mbn), the picture partitions (splash), the device tree tables (qcdt), Amlogic's (aml), what a kernel says about itself (kinfo) and FIT (fit).
+for unit_group in fdt dtfile kernel console avbkeys layout levels png mtkimg mtkgfh mbn splash qcdt aml kinfo fit; do
     if [ -x "$UNIT" ]; then
         if out=$("$UNIT" "$unit_group" 2>&1); then
             pass "unit tests of the group $unit_group ($(tail -n 1 <<<"$out"))"
@@ -8007,6 +8007,17 @@ else
     echo "SKIP: AML_ containers (dtc is not installed: the driver makes its trees with it)"
 fi
 
+# ---- kernel_info/: what `unpack` writes about the kernel of an image (the banner, the config, the symbols, the initramfs archives, the certificates and keys,
+# the trees and ELF files inside it). The driver builds kernels (kallsyms tables from the description in scripts/kallsyms.c, in every layout; archives by cpio,
+# certificates by openssl, trees by dtc, an ELF file by gcc; containers by mkimage and the tools of this directory) and judges what abr writes with the same
+# programs; `pack` must never read the folder; the real kernels of ABR_REAL_IMAGES are judged by themselves (the address of linux_proc_banner against the banner
+# that abr found, __initramfs_start against the initramfs, the config against zlib). A program that is not there is a SKIP line of the log, and a failure in the CI.
+rm -rf lv_kinfo_work
+live_driver "kernel_info/: every piece of a kernel judged by cpio, openssl, dtc, readelf and zlib; boot images, uImage, FIT, Sony ELF, KRNL and OSIP; every kallsyms layout; pack never reads the folder; replacing, --no-kernel-info and foreign folders; threads; damaged kernels; real kernels" \
+    lv_kinfo.log python3 -I "$TOOLS/kinfo_live.py" "$ABR" lv_kinfo_work "${ABR_REAL_IMAGES:--}"
+grep -h '^SKIP' lv_kinfo.log 2>/dev/null || true
+[ -n "${ABR_REAL_IMAGES:-}" ] || echo "note: no real kernel was tried (ABR_REAL_IMAGES is not set)"
+
 # ---- dtb: trees that are not back to back, and an AVB footer on a dtb partition
 if [ -f "$AVBTOOL" ] && command -v openssl >/dev/null 2>&1; then
     rm -rf lv_dtb_work
@@ -8088,7 +8099,7 @@ fi
 # Judges that have to be there. A judge that is not (rkcrc, mboot, sony_dump, ...) is a note in its section and the
 # comparisons with it are skipped, which is right on a machine that has not got it and wrong in a run that is meant to have
 # them all (the CI): a skipped comparison passes unseen. ABR_REQUIRE_ORACLES=<names, separated by commas> makes the absence
-# of the named judges a failure: futility, cpio, rkcrc, blobtools, mboot, loki, pxa, sony_dump, elftool, dtbtool, dtc, dtctests, dumpimage, pillow, cryptography. A name that is not
+# of the named judges a failure: futility, cpio, rkcrc, blobtools, mboot, loki, pxa, sony_dump, elftool, dtbtool, dtc, dtctests, dumpimage, pillow, cryptography, openssl, readelf, mkimage, gcc. A name that is not
 # on this list is a failure too (a misspelt name would otherwise check nothing).
 # =========================================================================
 oracle_have() {
@@ -8108,6 +8119,10 @@ oracle_have() {
         dumpimage) [ "$FIT_DUMPIMAGE" = 1 ] ;;
         pillow) have_pillow ;;
         cryptography) have_cryptography ;;
+        openssl) command -v openssl >/dev/null 2>&1 ;;
+        readelf) command -v readelf >/dev/null 2>&1 ;;
+        mkimage) command -v mkimage >/dev/null 2>&1 ;;
+        gcc) command -v gcc >/dev/null 2>&1 ;;
         *) return 2 ;;
     esac
 }
@@ -8121,7 +8136,7 @@ if [ -n "${ABR_REQUIRE_ORACLES:-}" ]; then
         oracle_have "$oracle"
         case $? in
             0) pass "the judge '$oracle' is there (ABR_REQUIRE_ORACLES)" ;;
-            2) fail "ABR_REQUIRE_ORACLES names '$oracle', which is not a judge of this suite (futility, cpio, rkcrc, blobtools, mboot, loki, pxa, sony_dump, elftool, dtbtool, dtc, dtctests, dumpimage, pillow, cryptography)" ;;
+            2) fail "ABR_REQUIRE_ORACLES names '$oracle', which is not a judge of this suite (futility, cpio, rkcrc, blobtools, mboot, loki, pxa, sony_dump, elftool, dtbtool, dtc, dtctests, dumpimage, pillow, cryptography, openssl, readelf, mkimage, gcc)" ;;
             *) fail "the judge '$oracle' is required (ABR_REQUIRE_ORACLES) and is not there: its comparisons were skipped" ;;
         esac
     done

@@ -89,7 +89,10 @@ image itself; `pack` finds them again in the folder's `manifest.txt`. A folder o
 
 `unpack` writes a human-readable, human-editable `manifest.txt` plus
 one file per component (kernel, ramdisk, dtb, ...) into the output
-directory. Edit whatever you need to, then `pack`.
+directory. Edit whatever you need to, then `pack`. What a component holds is taken out as far as it goes: a ramdisk becomes a folder, the
+device trees (those glued behind a kernel too) become `.dts` sources, and what the kernel says about itself -- the symbol table, the build
+configuration, the initramfs inside it, the certificates and keys -- is written to `kernel_info/`, which is information only (`pack` never reads
+it; `unpack --no-kernel-info` leaves it out), see *What the kernel says about itself* below.
 
 The environment variable `ABR_THREADS=N` limits the number of threads (the result never depends on it); `NO_COLOR` and
 `ABR_PROGRESS=0` turn the colours and the progress bar off, and `ABR_COLUMNS=N` sets the width the lines are made for, see
@@ -873,6 +876,42 @@ with the reason, and a `second` that is such a container, or that has bytes behi
 was read from the source of u-boot and from the container in the `second` of a real TWRP image for an S905X box; the 124 bytes of its header are
 in the unit test, and the tests read what `abr` writes the way u-boot does.
 
+### What the kernel says about itself: `kernel_info/`
+
+`unpack` looks into a kernel as far as it goes. The compression is the first layer (the ramdisk and the kernel are decompressed, the trees glued behind
+the kernel are `kernel_dtb/*.dts`); behind it a kernel carries a good deal that a person wants to read, and all of it is written to a folder beside
+the file `kernel`: `kernel_info/`. It is **information only**. `pack` never reads it: the folder can be deleted, edited, replaced by a file or by
+anything else, and the image comes back the same byte for byte (the tests do all of these); the manifest never mentions it. `unpack --no-kernel-info`
+leaves it out, and removes one that an earlier unpack wrote. `abr` replaces only a folder that it made (the first line of `README.txt` says so): a
+`kernel_info/` that is somebody else's is not touched, and `unpack` says that it is there already and was not made by `abr`. An image with more than one
+kernel (a FIT, ...) has `kernel_info/`, `kernel_info_2/`, ... in the order of its kernels. The kernels of boot and recovery images, uImage, FIT,
+Sony ELF, Rockchip KRNL and Intel OSIP images are all looked at; a kernel that has no header `abr` knows is searched as a whole, and `summary.txt` says
+"kernel (no header that abr knows)" as its kind.
+
+What is in it:
+
+| file | what |
+|---|---|
+| `summary.txt` | everything in one text. The **kind** of kernel and what its header says (arm64 `Image`: `text_offset`, `image_size`, the flags, an EFI stub; ARM `zImage`: start and end; x86 `bzImage`: the boot protocol, `setup_sects`, where the payload is; RISC-V `Image`; ELF `vmlinux`); how the field of the image holds it (the codec and sizes, trees glued behind it); the **version** (release, who built it with which compiler, the build, the `vermagic` that a module has to match), the `Linux version` banner and where it is, the `androidboot.*` parameters that the kernel looks for; a summary of the configuration and of the symbols; the initramfs archives, the certificates and keys, the files inside the kernel, and what lies behind the end of the image (a signature, a tail) |
+| `config` | the build configuration: what `CONFIG_IKCONFIG` puts into the kernel (`IKCFG_ST`, a gzip stream, `IKCFG_ED`; it is `/proc/config.gz` of the running kernel) |
+| `kallsyms.txt` | the **symbol table**, as `/proc/kallsyms` prints it: address, type, name. The kernel does not mark the table, so it is found by its structure (`scripts/kallsyms.c`): the 256 tokens with the digits in their places and the index that proves them, the markers every 256 names, the names, the number of symbols, and the addresses in order, absolute or as offsets from `kallsyms_relative_base` (or with the per-CPU symbols of x86-64), 4 or 8 bytes, little or big endian, the lengths of Linux 6.x. A kernel with 256 symbols or fewer has no table that can be told from other data |
+| `payload.bin` | for a `zImage` or a `bzImage`: the kernel that its compressed stream holds (and the offsets of every other part of the information are those of `payload.bin`, which `summary.txt` says in its second line) |
+| `initramfs.cpio`, `initramfs/`, `initramfs.meta` | an archive that is built into the kernel (`CONFIG_INITRAMFS_SOURCE`), plain or compressed; the folder and the metadata are made the way `ramdisk/` and `ramdisk.meta` are; a second archive is `initramfs2.*`, and so on |
+| `certs/` | the X.509 certificates (`NN-<name>.der`, or `.pem` where the kernel has the text) and the PEM keys, each with a `NN-<name>.txt` that says where it is in the kernel and its subject, issuer, serial, validity, signature, key and sha256 fingerprint (the ones that a kernel checks signed modules and firmware with) |
+| `binaries/` | what is linked into the kernel: ELF files (the vDSO, firmware), device trees with their `.dts` sources, compressed streams that hold a tree, an ELF file or text -- `NN_<kind>_<offset in hex>[_from_<codec>]` |
+| `README.txt` | what the folder is |
+
+The offsets in `summary.txt` and in the names of the files of `binaries/` and `certs/` are offsets in the file `kernel` (in `payload.bin` for a
+`zImage` or `bzImage`), so that `dd` or a hex editor finds a piece where the text says. `--no-kernel-info` is for the one who does not want the folder;
+the threads look through the kernel in parallel and the result never depends on how many there are.
+
+The tests: the unit group `kinfo` (`abr_unit_tests kinfo`: a writer of kallsyms tables in every layout and a matrix of 176 of them -- 3.x to 6.x,
+absolute and relative, per-CPU, 4 and 8 bytes, both byte orders, every alignment --, tables that are damaged in one place and must not be found,
+headers of every kind, DER certificates made by hand with every field that `describe` reads, cpio archives, ELF files and trees, what the writer puts
+in the folder, thread counts, cuts and flips that must never throw, and noise that must give nothing) and the live driver `kinfo_live.py`, which
+builds kernels from what `cpio`, `openssl`, `dtc` and `gcc` make and judges the folders with the same programs, and with `zlib` (see *How it is
+verified*).
+
 ### Threads, console and progress
 
 `abr` runs at least two threads: one **writes to the terminal** and the others do the work. While a command runs, everything
@@ -1421,15 +1460,34 @@ read what `abr` wrote with readers of their own. `livelib.py` is their harness: 
   read back by a reader that does what the u-boot of an Amlogic board does (it shares no code with `abr`; the trees are made by `dtc`),
   unpacked, edited (a tree that grows past a page, an id changed, an entry added, another page size, another version), refused where they
   should be, as the `second` of a boot image, in the real image of a TWRP recovery for an S905X box, and damaged.
+- `kinfo_live.py`: the `kernel_info/` folder. The driver builds a kernel that carries what the folder is made of -- a banner, the strings of a
+  module's `vermagic` and of the `androidboot` parameters, IKCONFIG, kallsyms tables written from the description in `scripts/kallsyms.c` (12
+  layouts), initramfs archives made by `cpio` (plain and gzip), a DER and a PEM certificate and a PEM key made by `openssl` (EC and RSA), device trees
+  made by `dtc` (one of them compressed), an ELF file linked by `gcc` -- and puts it into a boot image (header versions 0 and 4, the kernel plain and
+  gzip, glued device trees, a `zImage`, a `bzImage`), a uImage, a FIT with two kernels (`mkimage`), a Sony ELF, a Rockchip KRNL and an Intel OSIP image.
+  What comes out is judged with the programs that are not `abr`: `cpio -t` lists the archive and the folder holds the archived files, `openssl x509`
+  gives the serial, the dates, the key and the fingerprint that `.txt` says, `dtc` compiles each `.dts` to the blob that was in the kernel,
+  `readelf` reads each ELF file; the config, the symbols and the offsets are what the driver wrote. It checks that `pack` gives the same image
+  with `kernel_info/` there, gone, edited, replaced by a file or by a FIFO, that unpacking again replaces what `abr` wrote and only that, that
+  `--no-kernel-info` writes nothing, that a foreign folder is left alone, that the second kernel is `kernel_info_2/`, that 1, 2 and 8 threads write the
+  same folder, and that bytes changed inside every piece of the kernel and a kernel that is cut short never make an unpack fail. With the real images
+  (`ABR_REAL_IMAGES`) the kernels judge themselves: the address of `linux_proc_banner` in the symbol table minus the offset at which `abr` found the
+  banner is where `"%s version %s ("` has to be, `__initramfs_start` is where the initramfs is, `payload.bin` is what `zlib` makes of the stream, the
+  config is what `zlib` makes of the IKCONFIG stream, and `openssl`, `cpio`, `readelf` and `dtc` judge what is in the folders.
 - `png_oracle.py`: `abr`'s PNG reader and writer against Pillow and, where it is installed, ImageMagick -- every colour type and bit
   depth, interlaced files.
 - The FAT and GPT files of `run_tests.sh`, and the fuzzers below, which take every one of these images as a seed.
 
 A judge that never fails judges nothing, so `tests/tools/sabotage_check.sh <abr> <directory>` runs the seven drivers that run `abr` against the
 real one and against two copies of it that change a single byte: one in the image that `pack` writes, one in the biggest file that `unpack`
-writes (`tests/tools/abr_sabotage.py`). A driver has to pass the first and fail the other two; all seven do. Pillow and `cryptography` are
-judges of the suite: where Python does not have them those checks are skipped with a note, and `ABR_REQUIRE_ORACLES` makes that a failure
-(the CI does).
+writes (`tests/tools/abr_sabotage.py`). A driver has to pass the first and fail the other two; all seven do. The driver of `kernel_info/`
+(`kinfo_live.py`) is judged by a third copy that changes one byte of one place at a time -- 57 places: the config, the listing of the symbols, the
+bytes of each `initramfs*.cpio` and of the files in the folders of an initramfs, every certificate file and every field of the text beside it, every
+kind of file in `binaries/` with its source, `README.txt`, and each field of `summary.txt` -- and has to fail on every one of them; it does. (Its
+first runs found five places that it did not look at: the bytes of the archives `initramfs.cpio`, the `flags` line, the byte order of the table of
+symbols and the line about a tree in a gzip stream; it reads all of them now.) Pillow and `cryptography` are judges of the suite: where Python does
+not have them those checks are skipped with a note, and `ABR_REQUIRE_ORACLES` makes that a failure (the CI does) -- as it does for `openssl`,
+`readelf`, `mkimage` and `gcc`, which `kinfo_live.py` needs.
 
 What has **not** been done for these images:
 
