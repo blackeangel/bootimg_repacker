@@ -460,6 +460,27 @@ else
     FAIL=$((FAIL + 1))
 fi
 
+# A vbmeta partition is the blob and then fill up to the size of the partition (zeros; 0xFF from some flash tools), or the blob and
+# something else: all of it has to come back as it was.
+python3 - <<'PYEOF'
+import os
+blob = open("vbmeta_signed.img", "rb").read()
+open("vbmeta_zero_fill.img", "wb").write(blob + b"\x00" * (4096 - len(blob)))
+open("vbmeta_ff_fill.img", "wb").write(blob + b"\xff" * (12288 - len(blob)))
+open("vbmeta_tail.img", "wb").write(blob + os.urandom(5000))
+PYEOF
+roundtrip_check vbmeta_zero_fill.img "vbmeta partition (the blob and zeros up to 4096 bytes)" vbmz
+roundtrip_check vbmeta_ff_fill.img "vbmeta partition (the blob and 0xFF up to 12288 bytes)" vbmff
+roundtrip_check vbmeta_tail.img "vbmeta partition (the blob and 5000 bytes that are not fill)" vbmt
+if said "fill, all bytes 0x00" "$ABR" info -i vbmeta_zero_fill.img &&
+    said "fill, all bytes 0xff" "$ABR" info -i vbmeta_ff_fill.img; then
+    echo "PASS: info shows the fill of a vbmeta partition"
+    PASS=$((PASS + 1))
+else
+    echo "FAIL: info does not show the fill of a vbmeta partition"
+    FAIL=$((FAIL + 1))
+fi
+
 python3 - <<'PYEOF'
 import struct
 host = open("payload.bin", "rb").read()

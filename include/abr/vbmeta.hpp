@@ -97,6 +97,9 @@ struct VbmetaImage {
     Bytes host_prefix;  // the other partition's bytes before the vbmeta blob
     uint64_t footer_original_image_size = 0;
     uint64_t source_total_size = 0;  // total size of the file this was parsed from
+    // The size of the vbmeta blob itself as read -- header, authentication block, auxiliary block -- in a standalone image (no footer).
+    // What follows it in the file (zero fill up to the size of the partition, as a rule) is the envelope's, not this struct's.
+    uint64_t blob_size = 0;
 
     static VbmetaImage parse(const Bytes& image);
 

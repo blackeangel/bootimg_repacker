@@ -321,10 +321,12 @@ VbmetaImage parse_header_at(const Bytes& image, size_t header_start) {
             v.reserved = std::move(reserved);
     }
 
+    // Both sizes are 64-bit numbers from the file: they are compared before they are added, so that a huge one cannot wrap around.
+    if (auth_size > image.size() || aux_size > image.size() || header_start + kVbmetaHeaderSize + auth_size + aux_size > image.size())
+        throw FormatError("AVB auxiliary data block runs past the end of the image");
     size_t auth_start = header_start + kVbmetaHeaderSize;
     size_t aux_start = auth_start + static_cast<size_t>(auth_size);
-    if (aux_start + aux_size > image.size())
-        throw FormatError("AVB auxiliary data block runs past the end of the image");
+    v.blob_size = kVbmetaHeaderSize + auth_size + aux_size;
 
     if (hash_size > 0) {
         BinaryReader hr(image);

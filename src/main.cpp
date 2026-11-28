@@ -2255,6 +2255,14 @@ void unpack_vbmeta(const Bytes& data, const fs::path& dir) {
         m.set_u64("footer_original_image_size", v.footer_original_image_size);
         m.set_u64("source_total_size", v.source_total_size);
         save_raw(m, dir, "host_prefix", v.host_prefix, "host_prefix.bin");
+    } else {
+        // A vbmeta partition is the blob and then fill up to the size of the partition (zeros, as a rule; 0xFF when a flash tool made it), and
+        // what follows the blob is not always fill: whatever it is, it is kept, like the bytes around a boot image.
+        const size_t blob = static_cast<size_t>(v.blob_size);
+        const Envelope env = Envelope::capture(data, 0, blob);
+        save_envelope(m, dir, env, data, 0, blob);
+        if (!env.tail.empty())
+            note(std::to_string(env.tail.size()) + " bytes after the vbmeta blob are not fill: they are kept verbatim (tail.bin)");
     }
 
     m.set_u32("descriptor_count", static_cast<uint32_t>(v.descriptors.size()));
@@ -2306,7 +2314,8 @@ Bytes repack_vbmeta(const Manifest& m, const fs::path& dir, const RepackOptions&
     Bytes built = v.build(signing_key, &notes);
     if (!warned)
         for (auto& n : notes) warn(n);
-    return built;
+    if (v.has_footer) return built;  // the footer's own layout already pads the image out to the partition
+    return assemble_envelope(m, dir, built, opt);
 }
 
 // -------------------------------------------------------------- uimage --
@@ -5993,6 +6002,7 @@ void print_info(const fs::path& path) {
             std::cout << "has_footer: " << (v.has_footer ? "yes" : "no") << "\n";
             std::cout << "descriptors: " << v.descriptors.size() << "\n";
             for (auto& d : v.descriptors) std::cout << "  - " << d.describe() << "\n";
+            if (!v.has_footer) print_envelope_info(Envelope::capture(data, 0, static_cast<size_t>(v.blob_size)));
             break;
         }
         case Fmt::UIMAGE: {
